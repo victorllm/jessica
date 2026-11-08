@@ -1,0 +1,13 @@
+[package]
+name = "jessica-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jessica-core = { path = "../jessica-core" }
+jessica-runtime = { path = "../jessica-runtime" }
+jessica-sandbox = { path = "../jessica-sandbox" }
+jessica-harness = { path = "../jessica-harness" }
+jessica-providers = { path = "../jessica-providers" }
+jessica-tools = { path = "../jessica-tools" }
+jessica-memory = { path = "../jessica-memory" }

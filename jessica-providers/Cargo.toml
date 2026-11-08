@@ -1,0 +1,7 @@
+[package]
+name = "jessica-providers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jessica-core = { path = "../jessica-core" }
