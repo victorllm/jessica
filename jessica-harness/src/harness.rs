@@ -6,14 +6,18 @@ use std::sync::Arc;
 use jessica_core::guard::{Guard, GuardContext, GuardDecision};
 use jessica_core::hook::Hook;
 use jessica_core::policy::{DenyAll, Policy, PolicyDecision};
-use jessica_core::types::{AgentEvent, SessionEndReason, SessionId, ToolCall};
+use jessica_core::sensor::{Sensor, SensorContext};
+use jessica_core::types::{AgentEvent, SessionEndReason, SessionId, ToolCall, ToolResult};
 use tokio::sync::broadcast;
 use tracing::warn;
+
+use crate::sensors::{SensorPipeline, SensorReport};
 
 /// Default number of events retained by the harness broadcast channel.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
-/// Holds middleware hooks, guards, and a tool policy around a single agent run.
+/// Holds middleware hooks, guards, a tool policy, and sensors around a single
+/// agent run.
 ///
 /// The harness owns the event channel the agent loop must use. It subscribes
 /// before polling the agent, so hooks observe the same event sequence as every
@@ -22,13 +26,16 @@ pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 ///
 /// Guards and the policy are evaluated explicitly at caller-supplied
 /// checkpoints: [`Harness::check_guards`] and [`Harness::authorize_tool_call`]
-/// return the structured event that must stop the session. [`Harness::run`]
-/// itself does not poll them, because the event stream does not carry token
-/// usage, round boundaries, or measured tool durations.
+/// return the structured event that must stop the session. Sensors run through
+/// [`Harness::run_sensors`] after a tool result is available. [`Harness::run`]
+/// itself does not poll any of them, because the event stream does not carry
+/// token usage, round boundaries, measured tool durations, or tool results in a
+/// form that can be replayed through a sensor.
 pub struct Harness {
     hooks: Vec<Arc<dyn Hook>>,
     guards: Vec<Arc<dyn Guard>>,
     policy: Arc<dyn Policy>,
+    sensors: SensorPipeline,
     events: broadcast::Sender<AgentEvent>,
 }
 
@@ -48,6 +55,7 @@ impl Harness {
             hooks,
             guards: Vec::new(),
             policy: Arc::new(DenyAll),
+            sensors: SensorPipeline::default(),
             events,
         }
     }
@@ -67,6 +75,28 @@ impl Harness {
     pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Replaces the sensor list.
+    ///
+    /// Sensors run sequentially in registration order after a tool result is
+    /// available.
+    pub fn with_sensors(mut self, sensors: Vec<Arc<dyn Sensor>>) -> Self {
+        self.sensors = SensorPipeline::new(sensors);
+        self
+    }
+
+    /// Runs every configured sensor against a completed tool execution.
+    ///
+    /// Sensors run in registration order and all of them run even when one
+    /// fails. The returned report preserves that order.
+    pub async fn run_sensors(&self, call: &ToolCall, result: &ToolResult) -> SensorReport {
+        self.sensors
+            .run(&SensorContext {
+                tool_call: call,
+                tool_result: result,
+            })
+            .await
     }
 
     /// Evaluates guards in registration order at a caller-supplied checkpoint.

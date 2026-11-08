@@ -261,7 +261,7 @@ Task 1.2 ☑ 约 30 分钟 新增 tokio-util（rt feature）提供 CancellationT
 Task 1.3 ☑ 约 45 分钟 原生工具实现在 jessica-tools，CLI 只负责装配；read_file 与 write_file 均限制在当前目录内（计划仅要求 read_file），用 canonicalize 拒绝 `..`、绝对路径与 symlink 逃逸，仍存 TOCTOU 竞态；bash 默认 10s 超时、每流 64 KiB 上限，kill_on_drop 只杀直接子进程；workspace 为 CLI 增加 tokio `io-std` feature；REPL 每次输入是独立 session，不保留跨输入历史；无参数进入 REPL，有参数时全部拼接为一个 prompt；无真实 API key，验收改用本地 mock SSE server，并额外验证缺失 key 报错与 SIGINT 中断
 Task 2.1 ☑ 约 30 分钟 按依赖单向规则 harness 只能依赖 core，不能直接引用 jessica-runtime 的 AgentLoop；Harness 改为自持 broadcast 通道并用泛型 agent future 包裹，真实 AgentLoop 在 Task 2.4 由 CLI 接入。固定检查点仅 Hook 已定义的 on_session_start/on_event/on_session_end，未提前实现 Guard/Sensor/Policy。新增 harness 依赖 async-trait/tokio/tracing（均为 workspace 已有依赖），测试另加 serde_json dev-dependency；LoggingHook 用 tracing debug 且只记录事件类型，避免泄露模型文本；广播容量有界，hook 过慢时接收端 lag 会丢事件并告警
 Task 2.2 ☑ 约 40 分钟 Harness 新增 with_guards/with_policy 与 check_guards/authorize_tool_call 显式检查点；四种 Guard 与 AllowlistPolicy 已实现，10 个行为测试覆盖每种 guard 触发、allowlist 拒绝、默认 DenyAll、首命中顺序、同轮幂等/reset 与空上下文不 panic；无新增依赖；因 AgentEvent 不携带 token usage、round 或 tool elapsed，Harness::run 仍不能自动治理，真实接入留待 Task 2.4；StuckDetectionGuard 有跨轮状态，每 session 需新建或 reset；AllowlistPolicy 由调用方注入名单，配置文件在 Task 2.4
-Task 2.3 ☐  
+Task 2.3 ☑ 约 40 分钟 新增 SensorPipeline/SensorReport 与 CommandSensor（直接 exec、无 shell、采集 stdout+stderr、spawn 失败转为 fail）；Harness 增加 with_sensors/run_sensors；新增 AcceptanceRunner：仅在 Completed 尝试后运行 AcceptanceCheck，失败时发 AcceptanceFailed 事件、把 feedback 作为 user Message 注入并重入，max_retries 为额外重试次数；9 个行为测试覆盖 sensor pass/fail、command pass/fail/spawn 失败、acceptance 首次通过/失败重入/重试耗尽/非 Completed 跳过；无新增依赖；harness 不能依赖 runtime，acceptance 通过泛型 attempt 闭包驱动，真实 AgentLoop 接入与最终 SessionEnded 事件留待 Task 2.4；CommandSensor 暂未设超时或输出上限
 Task 2.4 ☐  
 Task 3.1 ☐  
 Task 3.2 ☐  
@@ -283,6 +283,10 @@ Deferred（待办，由用户决定是否单开 Task）
 · bash 超时只杀死直接子进程，不杀进程组，后代进程可能残留；后续可考虑 process group / setsid。
 · CLI 传入的 token 与 tool_timeout 预算尚未被运行时强制，等 Task 2.4 接入 Guards。
 · StuckDetectionGuard 为单 session 有状态 guard；复用实例需调用 reset()，且同 round 的重复检查是幂等的。Task 2.4 装配时必须按 session 创建或重置。
+· Task 2.3 的 SensorPipeline 与 AcceptanceRunner 均需显式调用，未由 Harness::run 自动驱动；Task 2.4 装配 CLI 时需在工具结果后运行 sensors、在模型停止后运行 acceptance。
+· AcceptanceRunner 需要“完整 messages + last_output”的 attempt 结果，但 runtime::AgentLoop::run 目前只返回 SessionEndReason；Task 2.4 需扩展 loop 的返回值或从事件重建 transcript，且不修改 jessica-core 冻结 API。
+· AcceptanceRunner 只发 AcceptanceFailed 事件，最终 SessionEnded { AcceptanceFailed } 需由外层会话负责；多次 attempt 若各自发 SessionEnded，Task 2.4 需定义去重/最终事件语义。
+· CommandSensor 运行固定命令，暂无超时和输出大小上限；恶意或挂起的检查命令可无限阻塞，Task 2.4 前若需要可单开 Task 增加 timeout/output cap。
 
 ---
 
