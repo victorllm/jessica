@@ -3,25 +3,32 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use jessica_core::guard::{Guard, GuardContext, GuardDecision};
 use jessica_core::hook::Hook;
-use jessica_core::types::{AgentEvent, SessionEndReason, SessionId};
+use jessica_core::policy::{DenyAll, Policy, PolicyDecision};
+use jessica_core::types::{AgentEvent, SessionEndReason, SessionId, ToolCall};
 use tokio::sync::broadcast;
 use tracing::warn;
 
 /// Default number of events retained by the harness broadcast channel.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
-/// Holds middleware hooks and wraps a single agent run.
+/// Holds middleware hooks, guards, and a tool policy around a single agent run.
 ///
 /// The harness owns the event channel the agent loop must use. It subscribes
 /// before polling the agent, so hooks observe the same event sequence as every
 /// other subscriber. Hooks are awaited in vector order at each lifecycle point;
 /// an empty hook list is therefore a transparent wrapper.
 ///
-/// This type only observes. Guards, policies, and sensors are added by later
-/// tasks, once they can influence execution rather than just record it.
+/// Guards and the policy are evaluated explicitly at caller-supplied
+/// checkpoints: [`Harness::check_guards`] and [`Harness::authorize_tool_call`]
+/// return the structured event that must stop the session. [`Harness::run`]
+/// itself does not poll them, because the event stream does not carry token
+/// usage, round boundaries, or measured tool durations.
 pub struct Harness {
     hooks: Vec<Arc<dyn Hook>>,
+    guards: Vec<Arc<dyn Guard>>,
+    policy: Arc<dyn Policy>,
     events: broadcast::Sender<AgentEvent>,
 }
 
@@ -37,7 +44,63 @@ impl Harness {
     /// [`broadcast::channel`].
     pub fn with_event_capacity(hooks: Vec<Arc<dyn Hook>>, event_capacity: usize) -> Self {
         let (events, _receiver) = broadcast::channel(event_capacity.max(1));
-        Self { hooks, events }
+        Self {
+            hooks,
+            guards: Vec::new(),
+            policy: Arc::new(DenyAll),
+            events,
+        }
+    }
+
+    /// Replaces the guard list.
+    ///
+    /// Guards are evaluated in this order at every checkpoint.
+    pub fn with_guards(mut self, guards: Vec<Arc<dyn Guard>>) -> Self {
+        self.guards = guards;
+        self
+    }
+
+    /// Replaces the tool policy.
+    ///
+    /// The default is [`DenyAll`]: no tool call is permitted until an explicit
+    /// allowlist is installed.
+    pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Evaluates guards in registration order at a caller-supplied checkpoint.
+    ///
+    /// Returns `None` when every guard allows execution. Otherwise it returns
+    /// the [`AgentEvent::BudgetExceeded`] for the first exceeded guard; the
+    /// caller must stop the loop and emit that event. Deterministic guard order
+    /// means the first configured limit wins when several would trip.
+    pub fn check_guards(&self, context: &GuardContext<'_>) -> Option<AgentEvent> {
+        self.guards
+            .iter()
+            .find_map(|guard| match guard.check(context) {
+                GuardDecision::Allow => None,
+                GuardDecision::Exceeded { kind, reason } => Some(AgentEvent::BudgetExceeded {
+                    kind,
+                    message: reason,
+                }),
+            })
+    }
+
+    /// Evaluates the tool policy for `call`.
+    ///
+    /// Returns `None` when the call is allowed, or the
+    /// [`AgentEvent::PolicyDenied`] describing the denial. The caller must emit
+    /// the event and must not execute the tool. The default policy is
+    /// [`DenyAll`].
+    pub fn authorize_tool_call(&self, call: &ToolCall) -> Option<AgentEvent> {
+        match self.policy.check(call) {
+            PolicyDecision::Allow => None,
+            PolicyDecision::Deny(reason) => Some(AgentEvent::PolicyDenied {
+                call: call.clone(),
+                reason,
+            }),
+        }
     }
 
     /// Returns a sender the agent loop must use for its events.

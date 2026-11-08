@@ -260,7 +260,7 @@ Task 1.1 ☑ 约 25 分钟 新增 reqwest（rustls-tls/json/stream）用于流�
 Task 1.2 ☑ 约 30 分钟 新增 tokio-util（rt feature）提供 CancellationToken；循环只强制 max_rounds，token/tool_timeout 按计划留给 Phase 2 guards；ToolResult.tool_call_id 由循环按原始 ToolCall 重写（Tool::execute 只能拿到 args，拿不到 call id）；未知工具以错误 ToolResult 回填而非终止；LlmEvent::Done 的 usage 暂未消费，已记入 Deferred
 Task 1.3 ☑ 约 45 分钟 原生工具实现在 jessica-tools，CLI 只负责装配；read_file 与 write_file 均限制在当前目录内（计划仅要求 read_file），用 canonicalize 拒绝 `..`、绝对路径与 symlink 逃逸，仍存 TOCTOU 竞态；bash 默认 10s 超时、每流 64 KiB 上限，kill_on_drop 只杀直接子进程；workspace 为 CLI 增加 tokio `io-std` feature；REPL 每次输入是独立 session，不保留跨输入历史；无参数进入 REPL，有参数时全部拼接为一个 prompt；无真实 API key，验收改用本地 mock SSE server，并额外验证缺失 key 报错与 SIGINT 中断
 Task 2.1 ☑ 约 30 分钟 按依赖单向规则 harness 只能依赖 core，不能直接引用 jessica-runtime 的 AgentLoop；Harness 改为自持 broadcast 通道并用泛型 agent future 包裹，真实 AgentLoop 在 Task 2.4 由 CLI 接入。固定检查点仅 Hook 已定义的 on_session_start/on_event/on_session_end，未提前实现 Guard/Sensor/Policy。新增 harness 依赖 async-trait/tokio/tracing（均为 workspace 已有依赖），测试另加 serde_json dev-dependency；LoggingHook 用 tracing debug 且只记录事件类型，避免泄露模型文本；广播容量有界，hook 过慢时接收端 lag 会丢事件并告警
-Task 2.2 ☐  
+Task 2.2 ☑ 约 40 分钟 Harness 新增 with_guards/with_policy 与 check_guards/authorize_tool_call 显式检查点；四种 Guard 与 AllowlistPolicy 已实现，10 个行为测试覆盖每种 guard 触发、allowlist 拒绝、默认 DenyAll、首命中顺序、同轮幂等/reset 与空上下文不 panic；无新增依赖；因 AgentEvent 不携带 token usage、round 或 tool elapsed，Harness::run 仍不能自动治理，真实接入留待 Task 2.4；StuckDetectionGuard 有跨轮状态，每 session 需新建或 reset；AllowlistPolicy 由调用方注入名单，配置文件在 Task 2.4
 Task 2.3 ☐  
 Task 2.4 ☐  
 Task 3.1 ☐  
@@ -274,14 +274,15 @@ Task 4.3 ☐
 
 Deferred（待办，由用户决定是否单开 Task）
 
-· TokenBudgetGuard 需要 token usage，但 AgentEvent 没有 usage 字段。Phase 2 可通过包装 LlmProvider（拦截 LlmEvent::Done）或在 runtime 内部计数接入，不应修改 jessica-core 公共 API；若必须修改，先单开 Task。
+· TokenBudgetGuard 需要 token usage，但 AgentEvent 没有 usage 字段。Task 2.2 已提供 check_guards 检查点，但计数仍未接入；Phase 2 可通过包装 LlmProvider（拦截 LlmEvent::Done）或在 runtime 内部计数，不应修改 jessica-core 公共 API；若必须修改，先单开 Task。
 · 未实现 crate（memory/sandbox）仍保留 cargo new 生成的 add/it_works 示例，将在对应 Task 实现时替换。
-· Task 2.1 的 Harness 仅观察：它通过 broadcast 事件调用 Hook，无法阻止工具执行或改变循环。Task 2.2/2.4 需要解决治理逻辑如何真正介入 AgentLoop（可能需扩展 runtime 接受 Harness，或由 CLI 层做工具代理），且不得破坏 harness→core 的单向依赖。
+· Task 2.2 的 Guards/Policy 仍不会由 Harness::run 自动执行：调用方必须在每轮前调用 check_guards，并在执行工具前调用 authorize_tool_call。AgentEvent 不携带 token usage、round 与 tool elapsed，且 Guard 需要在工具执行后取得结果大小/耗时；Task 2.4 由 CLI 装配完整治理链时需显式接入（可能需 runtime 扩展或 CLI 工具代理），且不得破坏 harness→core 的单向依赖。
 · Harness 的 broadcast 通道有界；Hook 阻塞超过容量时接收端会 lag 并漏事件，目前只以 tracing 告警。若治理要求“每个事件必达”，后续需改为同步回调或独立无界队列并定义背压。
 · CLI REPL 每次输入开启全新 session，不保留跨输入对话历史；会话恢复留到 Phase 4。
 · 文件工具的路径校验存在 TOCTOU 竞态（canonicalize 与实际读写之间路径可被替换），需 Phase 2 policy / Phase 3 sandbox 进一步约束。
 · bash 超时只杀死直接子进程，不杀进程组，后代进程可能残留；后续可考虑 process group / setsid。
-· CLI 传入的 token 与 tool_timeout 预算尚未被运行时强制，等 Phase 2 Guards 接入。
+· CLI 传入的 token 与 tool_timeout 预算尚未被运行时强制，等 Task 2.4 接入 Guards。
+· StuckDetectionGuard 为单 session 有状态 guard；复用实例需调用 reset()，且同 round 的重复检查是幂等的。Task 2.4 装配时必须按 session 创建或重置。
 
 ---
 
