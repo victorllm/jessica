@@ -20,3 +20,5 @@ thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+# Task 1.1: OpenAI-compatible provider needs a streaming HTTP client.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
