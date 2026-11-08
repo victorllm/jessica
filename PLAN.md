@@ -258,7 +258,7 @@ Task 0.1 ☑ 约 20 分钟 环境原先无 Rust：经 rsproxy.cn 镜像安装 ru
 Task 0.2 ☑ 约 25 分钟 契约补充：Message 增加 tool_call_id（OpenAI tool 消息必需）；LlmEvent::Done 带可选 TokenUsage；AgentEvent 增加 Error/PolicyDenied，SessionEnded 增加 reason；Guard 统一为 check(GuardContext) 签名；ToolRegistry 用 BTreeMap 保证确定性迭代顺序；crates.io 依赖经 rsproxy 镜像拉取（环境配置）
 Task 1.1 ☑ 约 25 分钟 新增 reqwest（rustls-tls/json/stream）用于流式 HTTP（已在 workspace.dependencies 说明理由）；SSE 解码自行实现（字节级缓冲，处理跨 chunk 的 UTF-8/换行）；请求带 stream_options.include_usage 以填充 TokenUsage；环境变量 OPENAI_API_KEY 必需，OPENAI_BASE_URL/OPENAI_MODEL 可选；未做真实网络调用（无 API key），按计划用 mock SSE 流验收
 Task 1.2 ☑ 约 30 分钟 新增 tokio-util（rt feature）提供 CancellationToken；循环只强制 max_rounds，token/tool_timeout 按计划留给 Phase 2 guards；ToolResult.tool_call_id 由循环按原始 ToolCall 重写（Tool::execute 只能拿到 args，拿不到 call id）；未知工具以错误 ToolResult 回填而非终止；LlmEvent::Done 的 usage 暂未消费，已记入 Deferred
-Task 1.3 ☐  
+Task 1.3 ☑ 约 45 分钟 原生工具实现在 jessica-tools，CLI 只负责装配；read_file 与 write_file 均限制在当前目录内（计划仅要求 read_file），用 canonicalize 拒绝 `..`、绝对路径与 symlink 逃逸，仍存 TOCTOU 竞态；bash 默认 10s 超时、每流 64 KiB 上限，kill_on_drop 只杀直接子进程；workspace 为 CLI 增加 tokio `io-std` feature；REPL 每次输入是独立 session，不保留跨输入历史；无参数进入 REPL，有参数时全部拼接为一个 prompt；无真实 API key，验收改用本地 mock SSE server，并额外验证缺失 key 报错与 SIGINT 中断
 Task 2.1 ☐  
 Task 2.2 ☐  
 Task 2.3 ☐  
@@ -275,7 +275,11 @@ Task 4.3 ☐
 Deferred（待办，由用户决定是否单开 Task）
 
 · TokenBudgetGuard 需要 token usage，但 AgentEvent 没有 usage 字段。Phase 2 可通过包装 LlmProvider（拦截 LlmEvent::Done）或在 runtime 内部计数接入，不应修改 jessica-core 公共 API；若必须修改，先单开 Task。
-· 未实现 crate（harness/memory/sandbox/tools）仍保留 cargo new 生成的 add/it_works 示例，将在对应 Task 实现时替换。
+· 未实现 crate（harness/memory/sandbox）仍保留 cargo new 生成的 add/it_works 示例，将在对应 Task 实现时替换。
+· CLI REPL 每次输入开启全新 session，不保留跨输入对话历史；会话恢复留到 Phase 4。
+· 文件工具的路径校验存在 TOCTOU 竞态（canonicalize 与实际读写之间路径可被替换），需 Phase 2 policy / Phase 3 sandbox 进一步约束。
+· bash 超时只杀死直接子进程，不杀进程组，后代进程可能残留；后续可考虑 process group / setsid。
+· CLI 传入的 token 与 tool_timeout 预算尚未被运行时强制，等 Phase 2 Guards 接入。
 
 ---
 

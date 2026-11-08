@@ -11,3 +11,6 @@ jessica-harness = { path = "../jessica-harness" }
 jessica-providers = { path = "../jessica-providers" }
 jessica-tools = { path = "../jessica-tools" }
 jessica-memory = { path = "../jessica-memory" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
