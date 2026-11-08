@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }

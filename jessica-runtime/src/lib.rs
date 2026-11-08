@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Deterministic agent loop for Jessica.
+//!
+//! The runtime depends only on the frozen contracts in `jessica-core`; concrete
+//! providers and tools are injected as trait objects by the caller. Every state
+//! transition is broadcast as an [`jessica_core::types::AgentEvent`], which is
+//! the trace consumed by the CLI, the harness, and (in Phase 4) the event store.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![deny(missing_docs)]
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+mod agent;
+
+pub use agent::AgentLoop;
