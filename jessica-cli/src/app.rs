@@ -28,6 +28,7 @@ use crate::config::{ConfigError, HarnessConfig};
 use crate::events::{EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::pump::{EventPump, SessionSnapshot};
+use crate::replay::ReplayError;
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -639,6 +640,30 @@ pub(crate) enum CliError {
     /// `--resume` was requested without a configured event store.
     #[error("`--resume` requires an `[events]` path in the configuration")]
     ResumeRequiresEventStore,
+    /// `replay` was requested without a configured event store.
+    #[error("`replay` requires an `[events]` path in the configuration")]
+    ReplayRequiresEventStore,
+    /// A `replay` argument was not recognized.
+    #[error("unexpected replay argument `{argument}`")]
+    UnknownReplayArgument {
+        /// Unrecognized argument.
+        argument: String,
+    },
+    /// `replay --session` was given without a session id.
+    #[error("`replay --session` requires a session id")]
+    MissingReplaySession,
+    /// `replay --session` was given more than once.
+    #[error("`replay --session` may be given only once")]
+    DuplicateReplaySession,
+    /// `replay --out` was given without a path.
+    #[error("`replay --out` requires a path")]
+    MissingReplayOut,
+    /// `replay --out` was given more than once.
+    #[error("`replay --out` may be given only once")]
+    DuplicateReplayOut,
+    /// Offline replay failed.
+    #[error("replay failed: {0}")]
+    Replay(#[from] ReplayError),
     /// The requested session is absent from the event store.
     #[error("session `{session_id}` was not found in the event store")]
     UnknownSession {

@@ -6,6 +6,7 @@ mod config;
 mod events;
 mod governance;
 mod pump;
+mod replay;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -37,17 +38,19 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
     let Some(options) = parse_args()? else {
         return Ok(None);
     };
+    let Options {
+        config: config_path,
+        mode,
+    } = options;
 
-    let config = match &options.config {
+    let config = match &config_path {
         Some(path) => HarnessConfig::load(path).await?,
         None => HarnessConfig::default(),
     };
-    let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::from_env()?);
     let root = tokio::task::spawn_blocking(std::env::current_dir)
         .await
         .map_err(CliError::CurrentDirTask)?
         .map_err(CliError::CurrentDir)?;
-    let wasm_tools = load_wasm_tools(&config, &root).await?;
     let recorder = match config.events.path.clone() {
         Some(path) => {
             let path = if path.is_absolute() {
@@ -59,17 +62,40 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         }
         None => None,
     };
-    let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder);
 
-    if let Some(session_id) = options.resume {
-        return Ok(Some(runtime.resume_turn(session_id).await?));
-    }
-
-    match options.prompt {
-        Some(input) => Ok(Some(runtime.run_turn(input).await?)),
-        None => {
-            repl(&runtime).await?;
+    match mode {
+        Mode::Replay { session, out } => {
+            let recorder = recorder.ok_or(CliError::ReplayRequiresEventStore)?;
+            let stored =
+                recorder
+                    .load(session.clone())
+                    .await?
+                    .ok_or_else(|| CliError::UnknownSession {
+                        session_id: session.to_string(),
+                    })?;
+            let events = replay::replay_session(&session, &stored).await?;
+            let count = events.len();
+            let output_path = out.display().to_string();
+            replay::write_jsonl(out, events).await?;
+            println!("[replay] wrote {count} events for session {session} to {output_path}");
             Ok(None)
+        }
+        Mode::Turn { resume, prompt } => {
+            let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::from_env()?);
+            let wasm_tools = load_wasm_tools(&config, &root).await?;
+            let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder);
+
+            if let Some(session_id) = resume {
+                return Ok(Some(runtime.resume_turn(session_id).await?));
+            }
+
+            match prompt {
+                Some(input) => Ok(Some(runtime.run_turn(input).await?)),
+                None => {
+                    repl(&runtime).await?;
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -78,10 +104,26 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
 struct Options {
     /// Optional TOML configuration path.
     config: Option<PathBuf>,
-    /// Session to resume instead of starting a new turn.
-    resume: Option<SessionId>,
-    /// One-shot prompt; absent means REPL mode.
-    prompt: Option<String>,
+    /// Selected execution mode.
+    mode: Mode,
+}
+
+/// Command selected by the arguments.
+enum Mode {
+    /// Runs one governed turn, resumes a session, or starts the REPL.
+    Turn {
+        /// Session to resume instead of starting a new turn.
+        resume: Option<SessionId>,
+        /// One-shot prompt; absent means REPL mode.
+        prompt: Option<String>,
+    },
+    /// Replays a recorded session without calling the model or tools.
+    Replay {
+        /// Session to replay.
+        session: SessionId,
+        /// JSONL output path.
+        out: PathBuf,
+    },
 }
 
 /// Parses arguments, returning `None` after printing help.
@@ -107,6 +149,15 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                     .filter(|path| !path.is_empty())
                     .ok_or(CliError::MissingConfigPath)?;
                 set_config(&mut config, PathBuf::from(path))?;
+            }
+            "replay" if resume.is_none() && prompt_parts.is_empty() => {
+                let Some((session, out)) = parse_replay_args(args)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(Options {
+                    config,
+                    mode: Mode::Replay { session, out },
+                }));
             }
             "--resume" => {
                 let id = args.next().ok_or(CliError::MissingResumeSessionId)?;
@@ -135,9 +186,52 @@ fn parse_args() -> Result<Option<Options>, CliError> {
 
     Ok(Some(Options {
         config,
-        resume,
-        prompt,
+        mode: Mode::Turn { resume, prompt },
     }))
+}
+
+/// Parses the arguments following the `replay` subcommand.
+fn parse_replay_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<(SessionId, PathBuf)>, CliError> {
+    let mut session = None;
+    let mut out = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(None);
+            }
+            "--session" => {
+                let id = args.next().ok_or(CliError::MissingReplaySession)?;
+                set_replay_session(&mut session, &id)?;
+            }
+            _ if arg.starts_with("--session=") => {
+                let id = arg
+                    .strip_prefix("--session=")
+                    .filter(|id| !id.is_empty())
+                    .ok_or(CliError::MissingReplaySession)?;
+                set_replay_session(&mut session, id)?;
+            }
+            "--out" => {
+                let path = args.next().ok_or(CliError::MissingReplayOut)?;
+                set_replay_out(&mut out, PathBuf::from(path))?;
+            }
+            _ if arg.starts_with("--out=") => {
+                let path = arg
+                    .strip_prefix("--out=")
+                    .filter(|path| !path.is_empty())
+                    .ok_or(CliError::MissingReplayOut)?;
+                set_replay_out(&mut out, PathBuf::from(path))?;
+            }
+            _ => return Err(CliError::UnknownReplayArgument { argument: arg }),
+        }
+    }
+
+    let session = session.ok_or(CliError::MissingReplaySession)?;
+    let out = out.ok_or(CliError::MissingReplayOut)?;
+    Ok(Some((session, out)))
 }
 
 fn set_resume(slot: &mut Option<SessionId>, id: &str) -> Result<(), CliError> {
@@ -145,6 +239,22 @@ fn set_resume(slot: &mut Option<SessionId>, id: &str) -> Result<(), CliError> {
         return Err(CliError::DuplicateResume);
     }
     *slot = Some(SessionId::new(id));
+    Ok(())
+}
+
+fn set_replay_session(slot: &mut Option<SessionId>, id: &str) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateReplaySession);
+    }
+    *slot = Some(SessionId::new(id));
+    Ok(())
+}
+
+fn set_replay_out(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateReplayOut);
+    }
+    *slot = Some(path);
     Ok(())
 }
 
@@ -166,7 +276,14 @@ fn print_usage() {
          \n\
          --resume <session_id> continues an interrupted session recorded in the\n\
          [events] database. It cannot be combined with a prompt and requires an\n\
-         [events] path in the configuration."
+         [events] path in the configuration.\n\
+         \n\
+         Usage: jessica [--config <path>] replay --session <session_id> --out <path>\n\
+         \n\
+         Replays a recorded session offline: the recorded model responses and tool\n\
+         results drive the loop, and the resulting events are written as JSONL. It\n\
+         requires an [events] path, never calls the model or a tool, and never reads\n\
+         the clock or the network."
     );
 }
 
