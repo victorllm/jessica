@@ -7,3 +7,4 @@ edition = "2024"
 jessica-core = { path = "../jessica-core" }
 thiserror = { workspace = true }
 wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }

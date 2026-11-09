@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use jessica_sandbox::{SandboxError, WasmEngine};
+use jessica_sandbox::{SandboxError, SandboxPolicy, WasmEngine};
 
 /// Precompiled fixture checked in next to its `.wat` source and build script.
 const FIXTURE_BYTES: &[u8] = include_bytes!("fixtures/fixed_value.wasm");
@@ -18,12 +18,18 @@ fn engine() -> WasmEngine {
     WasmEngine::new().expect("wasmtime engine must initialize")
 }
 
+fn policy() -> SandboxPolicy {
+    SandboxPolicy::default()
+}
+
 #[test]
 fn loads_file_instantiates_and_calls_exported_function() {
     let module = engine()
         .load_file(fixture_path())
         .expect("fixture must compile");
-    let mut instance = module.instantiate().expect("fixture must instantiate");
+    let mut instance = module
+        .instantiate(&policy())
+        .expect("fixture must instantiate");
 
     assert_eq!(
         instance.call_i32("answer").expect("answer must execute"),
@@ -42,7 +48,9 @@ fn loads_module_from_compiled_bytes() {
     let module = engine()
         .load_bytes(FIXTURE_BYTES)
         .expect("fixture bytes must compile");
-    let mut instance = module.instantiate().expect("fixture must instantiate");
+    let mut instance = module
+        .instantiate(&policy())
+        .expect("fixture must instantiate");
 
     assert_eq!(
         instance.call_i32("answer").expect("answer must execute"),
@@ -73,7 +81,9 @@ fn missing_export_is_reported_by_name() {
     let module = engine()
         .load_file(fixture_path())
         .expect("fixture must compile");
-    let mut instance = module.instantiate().expect("fixture must instantiate");
+    let mut instance = module
+        .instantiate(&policy())
+        .expect("fixture must instantiate");
 
     match instance.call_i32("missing") {
         Err(SandboxError::UnknownExport { name }) => assert_eq!(name, "missing"),
@@ -86,7 +96,9 @@ fn a_trap_is_returned_as_an_error_and_the_instance_remains_usable() {
     let module = engine()
         .load_file(fixture_path())
         .expect("fixture must compile");
-    let mut instance = module.instantiate().expect("fixture must instantiate");
+    let mut instance = module
+        .instantiate(&policy())
+        .expect("fixture must instantiate");
 
     match instance.call_i32("trap") {
         Err(SandboxError::Trap { name, .. }) => assert_eq!(name, "trap"),
