@@ -1,0 +1,21 @@
+# Example configuration for a session that must use the wasm echo plugin.
+#
+# Only `echo_json` is allowed. Native tools are still registered and visible in
+# the model's tool list, but calling one produces a PolicyDenied event and an
+# error ToolResult that the model can recover from.
+#
+# Run from the repository root:
+#   cargo run -p jessica-cli -- --config examples/wasm_tool.toml "echo hello"
+
+[budget]
+max_tokens = 20000
+tool_timeout_ms = 5000
+max_rounds = 6
+max_stuck_rounds = 2
+max_result_bytes = 4096
+
+[policy]
+allowed_tools = ["echo_json"]
+
+[wasm]
+manifests = ["examples/plugins/echo/manifest.json"]

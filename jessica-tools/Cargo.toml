@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }
+# Task 3.3: the wasm tool adapter instantiates sandboxed guest modules.
+jessica-sandbox = { path = "../jessica-sandbox" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }

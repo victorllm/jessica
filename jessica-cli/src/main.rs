@@ -16,7 +16,7 @@ use jessica_core::types::SessionEndReason;
 use jessica_providers::OpenAiProvider;
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 
-use crate::app::{CliError, CliRuntime};
+use crate::app::{CliError, CliRuntime, load_wasm_tools};
 use crate::config::HarnessConfig;
 
 #[tokio::main]
@@ -45,7 +45,8 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         .await
         .map_err(CliError::CurrentDirTask)?
         .map_err(CliError::CurrentDir)?;
-    let runtime = CliRuntime::new(provider, config, root);
+    let wasm_tools = load_wasm_tools(&config, &root).await?;
+    let runtime = CliRuntime::new(provider, config, root, wasm_tools);
 
     match options.prompt {
         Some(input) => Ok(Some(runtime.run_turn(input).await?)),

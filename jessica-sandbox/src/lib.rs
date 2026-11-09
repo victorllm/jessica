@@ -125,6 +125,50 @@ impl WasmModule {
     }
 }
 
+/// Export names for the guest side of a length-prefixed buffer ABI.
+///
+/// The guest must export two functions:
+///
+/// - `alloc(len: i32) -> i32`, returning a pointer to at least `len` writable
+///   bytes of linear memory;
+/// - `invoke(ptr: i32, len: i32) -> i64`, reading `len` input bytes at `ptr`
+///   and returning a packed output buffer. The low 32 bits are the output
+///   pointer and the high 32 bits are the output length.
+///
+/// The host writes the input bytes into the allocation, invokes `invoke`, and
+/// copies the returned output range out of guest memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferAbi {
+    alloc: String,
+    invoke: String,
+}
+
+impl BufferAbi {
+    /// Creates an ABI using the given export names.
+    pub fn new(alloc: impl Into<String>, invoke: impl Into<String>) -> Self {
+        Self {
+            alloc: alloc.into(),
+            invoke: invoke.into(),
+        }
+    }
+
+    /// Returns the allocator export name.
+    pub fn alloc_export(&self) -> &str {
+        &self.alloc
+    }
+
+    /// Returns the invocation export name.
+    pub fn invoke_export(&self) -> &str {
+        &self.invoke
+    }
+}
+
+impl Default for BufferAbi {
+    fn default() -> Self {
+        Self::new("jessica_alloc", "jessica_invoke")
+    }
+}
+
 /// An instantiated module and its execution store.
 #[derive(Debug)]
 pub struct WasmInstance {
@@ -169,6 +213,113 @@ impl WasmInstance {
             |store| typed.call(store, ()),
         )
         .map_err(|failure| failure.into_call(name, self.wall_timeout))
+    }
+
+    /// Calls a guest entry point using a length-prefixed buffer ABI.
+    ///
+    /// The host allocates guest memory through [`BufferAbi::alloc_export`],
+    /// writes `input` there, calls [`BufferAbi::invoke_export`] with
+    /// `(pointer, length)`, and copies the returned range back out. Output
+    /// larger than `max_output_bytes`, ranges outside guest memory, a negative
+    /// allocation pointer, missing exports, and all traps are reported as
+    /// structured errors. The byte payload is opaque; JSON encoding belongs to
+    /// the caller.
+    ///
+    /// Fuel and the wall-clock deadline are reset independently for the
+    /// allocation call and the invocation call. Both calls use the policy
+    /// budgets captured when the instance was created.
+    ///
+    /// This is a blocking call. WASI host functions used by the guest run
+    /// through a synchronous shim that must not execute directly on a Tokio
+    /// worker; async callers must use `tokio::task::spawn_blocking` (or a
+    /// dedicated OS thread).
+    pub fn call_buffer(
+        &mut self,
+        abi: &BufferAbi,
+        input: &[u8],
+        max_output_bytes: usize,
+    ) -> Result<Vec<u8>, SandboxError> {
+        let input_length = i32::try_from(input.len()).map_err(|_| SandboxError::InputTooLarge {
+            length: input.len(),
+        })?;
+        let alloc_name = abi.alloc_export();
+        let invoke_name = abi.invoke_export();
+
+        let alloc_function = self
+            .instance
+            .get_func(&mut self.store, alloc_name)
+            .ok_or_else(|| SandboxError::UnknownExport {
+                name: alloc_name.to_owned(),
+            })?;
+        let alloc = alloc_function
+            .typed::<i32, i32>(&self.store)
+            .map_err(|source| SandboxError::Signature {
+                name: alloc_name.to_owned(),
+                source,
+            })?;
+
+        let invoke_function = self
+            .instance
+            .get_func(&mut self.store, invoke_name)
+            .ok_or_else(|| SandboxError::UnknownExport {
+                name: invoke_name.to_owned(),
+            })?;
+        let invoke = invoke_function
+            .typed::<(i32, i32), i64>(&self.store)
+            .map_err(|source| SandboxError::Signature {
+                name: invoke_name.to_owned(),
+                source,
+            })?;
+
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or(SandboxError::MissingMemory)?;
+
+        let pointer = run_limited(
+            &mut self.store,
+            &self.engine,
+            self.fuel,
+            self.wall_timeout,
+            |store| alloc.call(store, input_length),
+        )
+        .map_err(|failure| failure.into_call(alloc_name, self.wall_timeout))?;
+        if pointer < 0 {
+            return Err(SandboxError::InvalidAllocation {
+                export: alloc_name.to_owned(),
+                requested: input.len(),
+                returned: pointer,
+            });
+        }
+        let pointer = pointer as usize;
+
+        ensure_buffer_range(pointer, input.len(), memory.data_size(&self.store))?;
+        memory
+            .write(&mut self.store, pointer, input)
+            .map_err(SandboxError::MemoryWrite)?;
+
+        let packed = run_limited(
+            &mut self.store,
+            &self.engine,
+            self.fuel,
+            self.wall_timeout,
+            |store| invoke.call(store, (pointer as i32, input_length)),
+        )
+        .map_err(|failure| failure.into_call(invoke_name, self.wall_timeout))?;
+
+        let packed = packed as u64;
+        let output_pointer = (packed & 0xFFFF_FFFF) as usize;
+        let output_length = packed >> 32;
+        if output_length > max_output_bytes as u64 {
+            return Err(SandboxError::OutputTooLarge {
+                length: output_length,
+                limit: max_output_bytes,
+            });
+        }
+        let output_length = output_length as usize;
+
+        ensure_buffer_range(output_pointer, output_length, memory.data_size(&self.store))?;
+        Ok(memory.data(&self.store)[output_pointer..output_pointer + output_length].to_vec())
     }
 }
 
@@ -293,6 +444,26 @@ impl RunFailure {
     }
 }
 
+/// Rejects a guest buffer range that is not entirely inside linear memory.
+fn ensure_buffer_range(
+    pointer: usize,
+    length: usize,
+    memory_size: usize,
+) -> Result<(), SandboxError> {
+    if pointer
+        .checked_add(length)
+        .is_some_and(|end| end <= memory_size)
+    {
+        Ok(())
+    } else {
+        Err(SandboxError::OutOfBounds {
+            pointer,
+            length,
+            memory_size,
+        })
+    }
+}
+
 /// Resets fuel, arms the wall-clock watchdog, and runs `execute`.
 ///
 /// The watchdog is dropped before this function returns, which cancels and
@@ -401,7 +572,7 @@ pub enum SandboxError {
         /// Requested export name.
         name: String,
     },
-    /// The export exists but does not match `() -> i32`.
+    /// The export exists but has an unexpected signature.
     #[error("wasm export `{name}` has an incompatible signature: {source}")]
     Signature {
         /// Export name.
@@ -410,6 +581,52 @@ pub enum SandboxError {
         #[source]
         source: wasmtime::Error,
     },
+    /// The module does not export a linear memory named `memory`.
+    #[error("wasm module does not export a linear memory named `memory`")]
+    MissingMemory,
+    /// The allocator export returned a negative pointer.
+    #[error(
+        "wasm export `{export}` returned invalid allocation pointer {returned} for \
+         {requested} bytes"
+    )]
+    InvalidAllocation {
+        /// Allocator export name.
+        export: String,
+        /// Number of bytes the host asked for.
+        requested: usize,
+        /// Pointer value returned by the guest.
+        returned: i32,
+    },
+    /// A guest-supplied buffer range lies outside linear memory.
+    #[error(
+        "wasm buffer range at {pointer} with length {length} is outside the guest \
+         memory of {memory_size} bytes"
+    )]
+    OutOfBounds {
+        /// Start of the rejected range.
+        pointer: usize,
+        /// Length of the rejected range.
+        length: usize,
+        /// Current size of guest linear memory.
+        memory_size: usize,
+    },
+    /// The guest returned an input larger than the wasm32 address space.
+    #[error("wasm input length {length} exceeds the wasm32 address space")]
+    InputTooLarge {
+        /// Requested input length.
+        length: usize,
+    },
+    /// The guest returned output larger than the caller's limit.
+    #[error("wasm output length {length} exceeds the limit of {limit} bytes")]
+    OutputTooLarge {
+        /// Length reported by the guest.
+        length: u64,
+        /// Caller-provided limit.
+        limit: usize,
+    },
+    /// The host could not write the input buffer into guest memory.
+    #[error("failed to write the wasm input buffer: {0}")]
+    MemoryWrite(#[source] wasmtime::MemoryAccessError),
     /// The export exhausted its fuel budget.
     #[error("wasm export `{name}` exhausted its fuel budget")]
     FuelExhausted {

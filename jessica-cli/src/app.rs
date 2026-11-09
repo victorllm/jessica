@@ -18,7 +18,7 @@ use jessica_harness::{
     ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard,
 };
 use jessica_runtime::AgentLoop;
-use jessica_tools::{BashTool, ReadFileTool, WriteFileTool};
+use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -37,14 +37,19 @@ pub(crate) struct CliRuntime {
     config: Arc<HarnessConfig>,
     root: PathBuf,
     system_prompt: String,
+    wasm_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl CliRuntime {
     /// Creates a runtime for the current workspace.
+    ///
+    /// `wasm_tools` contains plugins already loaded by [`load_wasm_tools`].
+    /// Compilation happens once at startup rather than on every turn.
     pub(crate) fn new(
         provider: Arc<dyn LlmProvider>,
         config: HarnessConfig,
         root: PathBuf,
+        wasm_tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
         let system_prompt = system_prompt(&root, &config);
         Self {
@@ -52,6 +57,7 @@ impl CliRuntime {
             config: Arc::new(config),
             root,
             system_prompt,
+            wasm_tools,
         }
     }
 
@@ -210,7 +216,7 @@ impl CliRuntime {
         registry
             .register(Arc::new(read))
             .map_err(|source| CliError::RegisterTool {
-                name: "read_file",
+                name: "read_file".to_owned(),
                 source,
             })?;
 
@@ -226,9 +232,24 @@ impl CliRuntime {
         registry
             .register(Arc::new(write))
             .map_err(|source| CliError::RegisterTool {
-                name: "write_file",
+                name: "write_file".to_owned(),
                 source,
             })?;
+
+        for tool in &self.wasm_tools {
+            let name = tool.name().to_owned();
+            let governed = GovernedTool::new(
+                Arc::clone(tool),
+                Arc::clone(&harness),
+                Arc::clone(&governance),
+                timeout,
+                Arc::clone(&timeout_guard),
+                Arc::clone(&result_guard),
+            );
+            registry
+                .register(Arc::new(governed))
+                .map_err(|source| CliError::RegisterTool { name, source })?;
+        }
 
         let bash: Arc<dyn Tool> = Arc::new(BashTool::new());
         let bash = GovernedTool::new(
@@ -242,12 +263,50 @@ impl CliRuntime {
         registry
             .register(Arc::new(bash))
             .map_err(|source| CliError::RegisterTool {
-                name: "bash",
+                name: "bash".to_owned(),
                 source,
             })?;
 
         Ok(registry)
     }
+}
+
+/// Loads every wasm tool manifest declared in `config`.
+///
+/// Manifest reading and wasm compilation are blocking, so all manifests are
+/// loaded in one `spawn_blocking` task. Relative manifest paths resolve
+/// against the workspace root. The returned tools are shared across turns;
+/// each turn still wraps them in fresh governance.
+pub(crate) async fn load_wasm_tools(
+    config: &HarnessConfig,
+    root: &Path,
+) -> Result<Vec<Arc<dyn Tool>>, CliError> {
+    if config.wasm.manifests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let paths: Vec<PathBuf> = config
+        .wasm
+        .manifests
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        })
+        .collect();
+
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| WasmTool::load(path).map(|tool| Arc::new(tool) as Arc<dyn Tool>))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(CliError::WasmToolTask)?
+    .map_err(CliError::WasmTool)
 }
 
 /// Runs one agent attempt and waits until its transcript is complete.
@@ -399,11 +458,17 @@ pub(crate) enum CliError {
     #[error("failed to register the `{name}` tool: {source}")]
     RegisterTool {
         /// Name of the tool that could not be registered.
-        name: &'static str,
+        name: String,
         /// Underlying registry error.
         #[source]
         source: ToolRegistryError,
     },
+    /// A wasm tool manifest or module could not be loaded.
+    #[error("failed to load wasm tools: {0}")]
+    WasmTool(#[from] jessica_tools::WasmToolError),
+    /// The blocking wasm tool loading task failed.
+    #[error("wasm tool loading task failed: {0}")]
+    WasmToolTask(#[source] tokio::task::JoinError),
     /// `--config` was given without a path.
     #[error("`--config` requires a path")]
     MissingConfigPath,

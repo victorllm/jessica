@@ -36,6 +36,8 @@ pub struct HarnessConfig {
     pub budget: BudgetConfig,
     /// Tool allowlist.
     pub policy: PolicyConfig,
+    /// Optional WebAssembly tool plugins registered next to native tools.
+    pub wasm: WasmConfig,
     /// Optional command run after every tool result.
     pub sensor: Option<SensorConfig>,
     /// Optional external acceptance check with retry orchestration.
@@ -83,6 +85,11 @@ impl HarnessConfig {
         if let Some(sensor) = &self.sensor {
             validate_command("sensor", &sensor.name, &sensor.command)?;
             validate_working_dir("sensor.working_dir", sensor.working_dir.as_deref())?;
+        }
+        for manifest in &self.wasm.manifests {
+            if manifest.as_os_str().is_empty() {
+                return Err(invalid("wasm.manifests entries must not be empty"));
+            }
         }
         if let Some(acceptance) = &self.acceptance {
             validate_command("acceptance", &acceptance.name, &acceptance.command)?;
@@ -150,6 +157,18 @@ impl Default for PolicyConfig {
             allowed_tools: NATIVE_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
+}
+
+/// WebAssembly tool plugin settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WasmConfig {
+    /// Manifest paths. Relative paths resolve against the workspace root.
+    ///
+    /// Names declared by these manifests are still subject to
+    /// [`PolicyConfig::allowed_tools`]; registering a plugin does not grant it
+    /// execution permission.
+    pub manifests: Vec<PathBuf>,
 }
 
 /// One command sensor run after a tool result.
@@ -330,6 +349,35 @@ mod tests {
         let timeout = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 0\n")
             .expect_err("zero timeout must fail");
         assert!(timeout.to_string().contains("tool_timeout_ms"));
+    }
+
+    #[test]
+    fn wasm_manifests_are_parsed_and_remain_subject_to_the_allowlist() {
+        let config = HarnessConfig::from_toml_str(
+            "[policy]\nallowed_tools = [\"echo_json\"]\n\
+             [wasm]\nmanifests = [\"examples/plugins/echo/manifest.json\"]\n",
+        )
+        .expect("wasm section must parse");
+
+        assert_eq!(
+            config.wasm.manifests,
+            vec![PathBuf::from("examples/plugins/echo/manifest.json")]
+        );
+        assert_eq!(config.policy.allowed_tools, vec!["echo_json"]);
+    }
+
+    #[test]
+    fn blank_wasm_manifest_paths_are_rejected() {
+        let error = HarnessConfig::from_toml_str("[wasm]\nmanifests = [\"\"]\n")
+            .expect_err("blank manifest path must fail");
+        assert!(error.to_string().contains("wasm.manifests"));
+    }
+
+    #[test]
+    fn unknown_wasm_fields_are_rejected() {
+        let error = HarnessConfig::from_toml_str("[wasm]\nplugins = [\"plugin.json\"]\n")
+            .expect_err("unknown wasm fields must fail");
+        assert!(error.to_string().contains("plugins"));
     }
 
     #[test]

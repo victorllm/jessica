@@ -917,8 +917,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "jessica-core",
+ "jessica-sandbox",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

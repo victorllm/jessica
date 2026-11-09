@@ -1,0 +1,29 @@
+{
+  "name": "echo_json",
+  "description": "Echo the JSON arguments back. Demonstrates the wasm tool buffer ABI.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to echo back in the JSON result."
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "module": "echo.wasm",
+  "abi": {
+    "alloc": "jessica_alloc",
+    "invoke": "jessica_invoke"
+  },
+  "permissions": {
+    "fuel": 10000000,
+    "wall_timeout_ms": 5000,
+    "max_memory_bytes": 131072,
+    "max_table_elements": 1000,
+    "max_instances": 1,
+    "max_result_bytes": 65536,
+    "read_only_dirs": []
+  }
+}
