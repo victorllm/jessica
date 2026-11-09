@@ -24,3 +24,6 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Task 1.2: AgentLoop accepts a CancellationToken for cooperative cancellation.
 tokio-util = { version = "0.7", features = ["rt"] }
+# Task 2.4: the CLI reads its harness assembly (budgets, policy,
+# sensor, acceptance check) from an explicit TOML file.
+toml = "0.9"

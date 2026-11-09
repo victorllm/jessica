@@ -1,0 +1,42 @@
+# Jessica governed CLI example.
+#
+# Run from the workspace root:
+#
+#   cargo run -p jessica-cli -- --config examples/harness.toml \
+#     "修改 README 中的拼写错误并验证"
+#
+# The tool policy intentionally omits `bash`: calls to it reach the policy,
+# are denied, and return an error result to the model.
+#
+# The acceptance command intentionally fails until README.md contains the
+# correct spelling. The first model attempt can therefore fail acceptance and
+# force a feedback-driven retry.
+
+[budget]
+# Prompt plus completion tokens across all attempts in this turn.
+max_tokens = 20_000
+# Wall-clock limit applied by the CLI tool wrapper.
+tool_timeout_ms = 10_000
+# Structural model-round limit enforced by AgentLoop.
+max_rounds = 12
+# Harness stuck-detection guard threshold.
+max_stuck_rounds = 3
+# Maximum size of one tool result.
+max_result_bytes = 65_536
+
+[policy]
+allowed_tools = ["read_file", "write_file"]
+
+[sensor]
+name = "diff-check"
+command = "git"
+args = ["diff", "--check"]
+
+[acceptance]
+name = "readme-spelling"
+command = "sh"
+args = [
+  "-c",
+  "grep -q 'deterministic Rust agent runtime' README.md || { echo 'README.md still contains the misspelled word; expected phrase: deterministic Rust agent runtime'; exit 1; }",
+]
+max_retries = 2

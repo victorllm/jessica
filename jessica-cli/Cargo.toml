@@ -11,6 +11,11 @@ jessica-harness = { path = "../jessica-harness" }
 jessica-providers = { path = "../jessica-providers" }
 jessica-tools = { path = "../jessica-tools" }
 jessica-memory = { path = "../jessica-memory" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+toml = { workspace = true }
