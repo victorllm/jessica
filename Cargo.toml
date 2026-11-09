@@ -36,3 +36,7 @@ wasmtime = { version = "50.0", default-features = false, features = ["cranelift"
 # `component-model` and `async` features; this is required by wasmtime-wasi
 # itself, not a capability granted to guest modules.
 wasmtime-wasi = { version = "50.0", default-features = false, features = ["p1"] }
+# Task 4.1: jessica-memory persists the append-only agent event log in SQLite.
+# `bundled` compiles the SQLite amalgamation so builds do not depend on a
+# system libsqlite3 or its development headers.
+rusqlite = { version = "0.41", features = ["bundled"] }

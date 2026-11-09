@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }
+# Task 4.1: append-only event storage in SQLite.
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
