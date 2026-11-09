@@ -15,6 +15,7 @@ use jessica_core::types::{AgentEvent, Message, SessionEndReason, SessionId, Tool
 use jessica_harness::{Harness, SensorReport};
 use tokio::sync::{Notify, broadcast};
 
+use crate::events::EventRecorder;
 use crate::governance::GovernanceState;
 
 /// Conversation and final text recovered from one attempt's event stream.
@@ -153,26 +154,43 @@ struct PumpState {
 pub(crate) struct EventPump {
     harness: Arc<Harness>,
     governance: Arc<GovernanceState>,
+    recorder: Option<Arc<EventRecorder>>,
     state: Mutex<PumpState>,
     notify: Notify,
 }
 
 impl EventPump {
     /// Creates a pump around the harness and governance of one CLI turn.
-    pub(crate) fn new(harness: Arc<Harness>, governance: Arc<GovernanceState>) -> Self {
+    ///
+    /// When `recorder` is present, every event is appended to the session's
+    /// event stream before it is rendered. Persistence is best-effort: a store
+    /// failure is warned about and does not stop the agent.
+    pub(crate) fn new(
+        harness: Arc<Harness>,
+        governance: Arc<GovernanceState>,
+        recorder: Option<Arc<EventRecorder>>,
+    ) -> Self {
         Self {
             harness,
             governance,
+            recorder,
             state: Mutex::new(PumpState::default()),
             notify: Notify::new(),
         }
     }
 
     /// Registers the initial conversation before the agent starts.
+    ///
+    /// The session becomes the current attribution target so a resumed stream,
+    /// which has no `SessionStarted` event, still reaches the transcript and
+    /// the recorder.
     pub(crate) fn register(&self, session_id: SessionId, messages: Vec<Message>) {
         let mut state = self.lock_state();
         state.ended.remove(&session_id);
-        state.active.insert(session_id, Transcript::new(messages));
+        state
+            .active
+            .insert(session_id.clone(), Transcript::new(messages));
+        state.current = Some(session_id);
     }
 
     /// Consumes events until the channel closes.
@@ -210,6 +228,8 @@ impl EventPump {
 
     /// Applies one event to the observable, sensor, and guard paths.
     async fn handle(&self, event: AgentEvent) {
+        self.persist(&event).await;
+
         // When a CLI budget trip cuts the attempt short, the runtime still
         // reports Completed or Cancelled because it does not know about the
         // trip. The outer session event that follows carries BudgetExceeded,
@@ -292,6 +312,32 @@ impl EventPump {
             | AgentEvent::BudgetExceeded { .. }
             | AgentEvent::AcceptanceFailed { .. }
             | AgentEvent::Error { .. } => {}
+        }
+    }
+
+    /// Appends one event to the store when recording is enabled.
+    ///
+    /// Events are processed sequentially by [`EventPump::run`], so the store
+    /// observes the same order as every other subscriber. Events with no
+    /// attributed session (for example an acceptance failure emitted between
+    /// attempts) are not persisted.
+    async fn persist(&self, event: &AgentEvent) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let session_id = {
+            let state = self.lock_state();
+            match event {
+                AgentEvent::SessionStarted { session_id }
+                | AgentEvent::SessionEnded { session_id, .. } => Some(session_id.clone()),
+                _ => state.current.clone(),
+            }
+        };
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if let Err(error) = recorder.append(&session_id, event).await {
+            eprintln!("[warn] failed to persist an event for session {session_id}: {error}");
         }
     }
 

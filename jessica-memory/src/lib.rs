@@ -15,6 +15,12 @@
 //! | `payload_json` | serialized [`AgentEvent`] |
 //! | `timestamp` | milliseconds since the Unix epoch |
 //!
+//! The store also keeps immutable session bootstrap metadata (the system and
+//! user messages a session started with) in a `sessions` table. `AgentEvent`
+//! has no user-message variant, so those messages cannot be recovered from the
+//! event log alone; recording them separately lets recovery rebuild the exact
+//! conversation without changing the frozen core event model.
+//!
 //! The API is synchronous because SQLite is synchronous. Callers inside a Tokio
 //! runtime must invoke it through `tokio::task::spawn_blocking`, and the store
 //! never reads the host clock itself so callers control event timestamps.
@@ -23,9 +29,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use jessica_core::types::{AgentEvent, SessionId};
-use rusqlite::{Connection, params};
+use jessica_core::types::{AgentEvent, Message, SessionId};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 /// SQLite schema and the append-only guards installed on every open.
@@ -50,7 +57,28 @@ BEFORE DELETE ON events
 BEGIN
     SELECT RAISE(ABORT, 'events are append-only: DELETE is not allowed');
 END;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    messages_json TEXT NOT NULL,
+    started_at INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TRIGGER IF NOT EXISTS sessions_append_only_update
+BEFORE UPDATE ON sessions
+BEGIN
+    SELECT RAISE(ABORT, 'sessions are immutable: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_append_only_delete
+BEFORE DELETE ON sessions
+BEGIN
+    SELECT RAISE(ABORT, 'sessions are immutable: DELETE is not allowed');
+END;
 "#;
+
+/// How long SQLite waits for a competing writer before returning `Busy`.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
 ///
@@ -165,9 +193,80 @@ impl EventStore {
     /// Installs the schema and wraps the connection.
     fn initialize(connection: Connection) -> Result<Self, EventStoreError> {
         connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(EventStoreError::Schema)?;
+        connection
             .execute_batch(SCHEMA)
             .map_err(EventStoreError::Schema)?;
         Ok(Self { connection })
+    }
+
+    /// Records the immutable bootstrap messages for `session_id`.
+    ///
+    /// Recording the same session with byte-identical messages twice is
+    /// idempotent. Recording different messages for an existing session returns
+    /// [`EventStoreError::SessionConflict`] and leaves the original metadata in
+    /// place.
+    pub fn record_session(
+        &mut self,
+        session_id: &SessionId,
+        messages: &[Message],
+        timestamp: Timestamp,
+    ) -> Result<(), EventStoreError> {
+        let messages_json = serde_json::to_string(messages)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| session_error(session_id, source))?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sessions (session_id, messages_json, started_at) \
+                 VALUES (?1, ?2, ?3)",
+                params![session_id.as_str(), messages_json, timestamp.as_millis()],
+            )
+            .map_err(|source| session_error(session_id, source))?;
+        let stored: String = transaction
+            .query_row(
+                "SELECT messages_json FROM sessions WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| session_error(session_id, source))?;
+        if stored != messages_json {
+            return Err(EventStoreError::SessionConflict {
+                session_id: session_id.to_string(),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| session_error(session_id, source))?;
+        Ok(())
+    }
+
+    /// Returns the bootstrap messages recorded for `session_id`.
+    ///
+    /// Returns `None` when the session has no metadata row.
+    pub fn session_messages(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Vec<Message>>, EventStoreError> {
+        let messages_json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT messages_json FROM sessions WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| session_error(session_id, source))?;
+        messages_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|source| EventStoreError::SessionDecode {
+                    session_id: session_id.to_string(),
+                    source,
+                })
+            })
+            .transpose()
     }
 
     /// Appends `event` to `session_id`'s stream and returns the stored record.
@@ -345,6 +444,14 @@ fn read_error(session_id: &SessionId, source: rusqlite::Error) -> EventStoreErro
     }
 }
 
+/// Builds a session-metadata error for `session_id`.
+fn session_error(session_id: &SessionId, source: rusqlite::Error) -> EventStoreError {
+    EventStoreError::Session {
+        session_id: session_id.to_string(),
+        source,
+    }
+}
+
 /// Errors raised while opening, appending to, or reading the event store.
 #[derive(Debug, Error)]
 pub enum EventStoreError {
@@ -383,6 +490,31 @@ pub enum EventStoreError {
         /// Underlying SQLite error.
         #[source]
         source: rusqlite::Error,
+    },
+    /// Session metadata could not be recorded or read.
+    #[error("failed to access metadata for session `{session_id}`: {source}")]
+    Session {
+        /// Session the operation targeted.
+        session_id: String,
+        /// Underlying SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// Stored session metadata is not valid JSON for a list of messages.
+    #[error("metadata for session `{session_id}` is not a valid message list: {source}")]
+    SessionDecode {
+        /// Session whose metadata is corrupt.
+        session_id: String,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// An attempt was made to change the immutable bootstrap messages of a
+    /// session that already has metadata.
+    #[error("session `{session_id}` already has different bootstrap messages")]
+    SessionConflict {
+        /// Session whose metadata was rejected.
+        session_id: String,
     },
     /// A stored payload is not a valid [`AgentEvent`].
     #[error("event {seq} for session `{session_id}` is not a valid agent event: {source}")]

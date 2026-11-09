@@ -42,6 +42,8 @@ pub struct HarnessConfig {
     pub sensor: Option<SensorConfig>,
     /// Optional external acceptance check with retry orchestration.
     pub acceptance: Option<AcceptanceConfig>,
+    /// Optional persistent event log used by `--resume`.
+    pub events: EventsConfig,
 }
 
 impl HarnessConfig {
@@ -94,6 +96,14 @@ impl HarnessConfig {
         if let Some(acceptance) = &self.acceptance {
             validate_command("acceptance", &acceptance.name, &acceptance.command)?;
             validate_working_dir("acceptance.working_dir", acceptance.working_dir.as_deref())?;
+        }
+        if self
+            .events
+            .path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(invalid("events.path must not be empty when present"));
         }
         Ok(())
     }
@@ -157,6 +167,16 @@ impl Default for PolicyConfig {
             allowed_tools: NATIVE_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
+}
+
+/// Persistent event log settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventsConfig {
+    /// SQLite database path. Relative paths resolve against the workspace root.
+    ///
+    /// When omitted, events are not persisted and `--resume` is unavailable.
+    pub path: Option<PathBuf>,
 }
 
 /// WebAssembly tool plugin settings.
@@ -378,6 +398,30 @@ mod tests {
         let error = HarnessConfig::from_toml_str("[wasm]\nplugins = [\"plugin.json\"]\n")
             .expect_err("unknown wasm fields must fail");
         assert!(error.to_string().contains("plugins"));
+    }
+
+    #[test]
+    fn event_store_path_is_optional_and_parsed() {
+        let config = HarnessConfig::from_toml_str("[events]\npath = \"state/events.sqlite\"\n")
+            .expect("events section must parse");
+        assert_eq!(
+            config.events.path,
+            Some(PathBuf::from("state/events.sqlite"))
+        );
+
+        let default = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(default.events.path, None);
+    }
+
+    #[test]
+    fn blank_event_store_paths_and_unknown_fields_are_rejected() {
+        let blank = HarnessConfig::from_toml_str("[events]\npath = \"\"\n")
+            .expect_err("blank event path must fail");
+        assert!(blank.to_string().contains("events.path"));
+
+        let unknown = HarnessConfig::from_toml_str("[events]\ndatabase = \"events.sqlite\"\n")
+            .expect_err("unknown events fields must fail");
+        assert!(unknown.to_string().contains("database"));
     }
 
     #[test]

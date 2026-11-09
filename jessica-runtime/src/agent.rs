@@ -15,6 +15,8 @@ use jessica_core::types::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::recovery::SessionCheckpoint;
+
 /// Drives model/tool rounds for a single session.
 ///
 /// The loop owns its dependencies and can be reused for multiple sessions.
@@ -81,16 +83,60 @@ impl AgentLoop {
     pub async fn run(
         &self,
         session_id: SessionId,
-        mut messages: Vec<Message>,
+        messages: Vec<Message>,
         cancel: CancellationToken,
     ) -> SessionEndReason {
-        self.emit(AgentEvent::SessionStarted {
-            session_id: session_id.clone(),
-        });
+        self.run_loop(session_id, messages, 0, true, cancel).await
+    }
+
+    /// Continues an interrupted session from a recovered [`SessionCheckpoint`].
+    ///
+    /// The checkpoint's messages and round count are used as-is: no model or
+    /// tool call is replayed. The loop emits the same events the uninterrupted
+    /// run would have emitted after the checkpoint, without a second
+    /// [`AgentEvent::SessionStarted`], and it gets exactly the remaining round
+    /// budget (`max_rounds - rounds_completed`).
+    ///
+    /// A checkpoint that already contains a terminal event returns the recorded
+    /// [`SessionEndReason`] immediately and emits nothing, because there is no
+    /// work left to continue.
+    pub async fn resume(
+        &self,
+        checkpoint: SessionCheckpoint,
+        cancel: CancellationToken,
+    ) -> SessionEndReason {
+        let (session_id, messages, rounds_completed, end_reason) = checkpoint.into_parts();
+        if let Some(reason) = end_reason {
+            return reason;
+        }
+        self.run_loop(session_id, messages, rounds_completed, false, cancel)
+            .await
+    }
+
+    /// Runs rounds until completion, cancellation, error, or budget exhaustion.
+    ///
+    /// `rounds_used` suppresses that many model calls from the round budget so
+    /// a resumed loop spends no more than the session's original allowance.
+    /// `emit_started` is false on resume because the starting event is already
+    /// in the recorded stream.
+    async fn run_loop(
+        &self,
+        session_id: SessionId,
+        mut messages: Vec<Message>,
+        rounds_used: u32,
+        emit_started: bool,
+        cancel: CancellationToken,
+    ) -> SessionEndReason {
+        if emit_started {
+            self.emit(AgentEvent::SessionStarted {
+                session_id: session_id.clone(),
+            });
+        }
 
         let tool_schemas = self.tools.schemas();
+        let remaining_rounds = self.budget.max_rounds.saturating_sub(rounds_used);
 
-        for _ in 0..self.budget.max_rounds {
+        for _ in 0..remaining_rounds {
             if cancel.is_cancelled() {
                 return self.end(session_id, SessionEndReason::Cancelled);
             }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jessica_core::types::{
-    AgentEvent, BudgetKind, SessionEndReason, SessionId, ToolCall, ToolResult,
+    AgentEvent, BudgetKind, Message, SessionEndReason, SessionId, ToolCall, ToolResult,
 };
 use jessica_memory::{EventStore, EventStoreError, StoredEvent, Timestamp};
 use rusqlite::{Connection, params};
@@ -306,6 +306,86 @@ fn reads_follow_sequence_order_even_for_out_of_order_inserts() {
         }
     );
     assert_eq!(store.last_seq(&session).unwrap(), Some(2));
+}
+
+#[test]
+fn session_metadata_is_immutable_and_survives_reopen() {
+    let database = TempDatabase::new("session-metadata");
+    let session = SessionId::new("resumable");
+    let bootstrap = vec![
+        Message::system("you are a helpful agent"),
+        Message::user("calculate the total"),
+    ];
+
+    {
+        let mut store = EventStore::open(database.path()).expect("store should open");
+        assert_eq!(
+            store
+                .session_messages(&session)
+                .expect("lookup should succeed"),
+            None,
+            "a session without metadata must report None"
+        );
+        store
+            .record_session(&session, &bootstrap, Timestamp::from_millis(5))
+            .expect("recording bootstrap messages should succeed");
+        assert_eq!(
+            store
+                .session_messages(&session)
+                .expect("lookup should succeed"),
+            Some(bootstrap.clone())
+        );
+        store
+            .record_session(&session, &bootstrap, Timestamp::from_millis(999))
+            .expect("re-recording identical messages must be idempotent");
+        assert_eq!(
+            store
+                .session_messages(&session)
+                .expect("lookup should succeed"),
+            Some(bootstrap.clone()),
+            "the original timestamp and messages must be retained"
+        );
+
+        let conflicting = vec![Message::user("a different question")];
+        match store.record_session(&session, &conflicting, Timestamp::from_millis(1_000)) {
+            Err(EventStoreError::SessionConflict { session_id }) => {
+                assert_eq!(session_id, "resumable")
+            }
+            other => panic!("expected a SessionConflict error, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .session_messages(&session)
+                .expect("lookup should succeed"),
+            Some(bootstrap.clone()),
+            "a rejected conflict must not overwrite the original metadata"
+        );
+    }
+
+    let reopened = EventStore::open(database.path()).expect("store should reopen");
+    assert_eq!(
+        reopened
+            .session_messages(&session)
+            .expect("lookup should succeed"),
+        Some(bootstrap),
+        "bootstrap messages must survive reopening"
+    );
+
+    let connection = Connection::open(database.path()).expect("raw connection should open");
+    let update_error = connection
+        .execute("UPDATE sessions SET messages_json = '[]'", [])
+        .expect_err("UPDATE must be rejected");
+    assert!(
+        update_error.to_string().contains("immutable"),
+        "unexpected UPDATE error: {update_error}"
+    );
+    let delete_error = connection
+        .execute("DELETE FROM sessions", [])
+        .expect_err("DELETE must be rejected");
+    assert!(
+        delete_error.to_string().contains("immutable"),
+        "unexpected DELETE error: {delete_error}"
+    );
 }
 
 #[test]

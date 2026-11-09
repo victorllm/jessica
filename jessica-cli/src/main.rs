@@ -3,6 +3,7 @@
 mod acceptance_check;
 mod app;
 mod config;
+mod events;
 mod governance;
 mod pump;
 
@@ -12,12 +13,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use jessica_core::llm::LlmProvider;
-use jessica_core::types::SessionEndReason;
+use jessica_core::types::{SessionEndReason, SessionId};
 use jessica_providers::OpenAiProvider;
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 
 use crate::app::{CliError, CliRuntime, load_wasm_tools};
 use crate::config::HarnessConfig;
+use crate::events::EventRecorder;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -46,7 +48,22 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         .map_err(CliError::CurrentDirTask)?
         .map_err(CliError::CurrentDir)?;
     let wasm_tools = load_wasm_tools(&config, &root).await?;
-    let runtime = CliRuntime::new(provider, config, root, wasm_tools);
+    let recorder = match config.events.path.clone() {
+        Some(path) => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            Some(Arc::new(EventRecorder::open(path).await?))
+        }
+        None => None,
+    };
+    let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder);
+
+    if let Some(session_id) = options.resume {
+        return Ok(Some(runtime.resume_turn(session_id).await?));
+    }
 
     match options.prompt {
         Some(input) => Ok(Some(runtime.run_turn(input).await?)),
@@ -61,6 +78,8 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
 struct Options {
     /// Optional TOML configuration path.
     config: Option<PathBuf>,
+    /// Session to resume instead of starting a new turn.
+    resume: Option<SessionId>,
     /// One-shot prompt; absent means REPL mode.
     prompt: Option<String>,
 }
@@ -68,6 +87,7 @@ struct Options {
 /// Parses arguments, returning `None` after printing help.
 fn parse_args() -> Result<Option<Options>, CliError> {
     let mut config = None;
+    let mut resume = None;
     let mut prompt_parts = Vec::new();
     let mut args = std::env::args().skip(1);
 
@@ -88,8 +108,23 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                     .ok_or(CliError::MissingConfigPath)?;
                 set_config(&mut config, PathBuf::from(path))?;
             }
+            "--resume" => {
+                let id = args.next().ok_or(CliError::MissingResumeSessionId)?;
+                set_resume(&mut resume, &id)?;
+            }
+            _ if arg.starts_with("--resume=") => {
+                let id = arg
+                    .strip_prefix("--resume=")
+                    .filter(|id| !id.is_empty())
+                    .ok_or(CliError::MissingResumeSessionId)?;
+                set_resume(&mut resume, id)?;
+            }
             _ => prompt_parts.push(arg),
         }
+    }
+
+    if resume.is_some() && !prompt_parts.is_empty() {
+        return Err(CliError::ResumeWithPrompt);
     }
 
     let prompt = if prompt_parts.is_empty() {
@@ -98,7 +133,19 @@ fn parse_args() -> Result<Option<Options>, CliError> {
         Some(prompt_parts.join(" "))
     };
 
-    Ok(Some(Options { config, prompt }))
+    Ok(Some(Options {
+        config,
+        resume,
+        prompt,
+    }))
+}
+
+fn set_resume(slot: &mut Option<SessionId>, id: &str) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateResume);
+    }
+    *slot = Some(SessionId::new(id));
+    Ok(())
 }
 
 fn set_config(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), CliError> {
@@ -111,11 +158,15 @@ fn set_config(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), CliError>
 
 fn print_usage() {
     println!(
-        "Usage: jessica [--config <path>] [prompt...]\n\
+        "Usage: jessica [--config <path>] [--resume <session_id>] [prompt...]\n\
          \n\
          Runs one governed agent turn when a prompt is given; otherwise starts a REPL.\n\
          The configuration file controls budgets, tool allowlist, command sensor, and\n\
-         acceptance retries. See examples/harness.toml."
+         acceptance retries. See examples/harness.toml.\n\
+         \n\
+         --resume <session_id> continues an interrupted session recorded in the\n\
+         [events] database. It cannot be combined with a prompt and requires an\n\
+         [events] path in the configuration."
     );
 }
 

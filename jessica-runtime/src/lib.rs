@@ -8,5 +8,7 @@
 #![deny(missing_docs)]
 
 mod agent;
+mod recovery;
 
 pub use agent::AgentLoop;
+pub use recovery::{RecordedEvent, RecoveryError, SessionCheckpoint, recover_session};
