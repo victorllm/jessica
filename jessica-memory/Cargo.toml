@@ -9,3 +9,19 @@ jessica-core = { path = "../jessica-core" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Task 5.1.2: the Embedder trait is async so a future HTTP or local model
+# implementation can be substituted without changing the memory store.
+async-trait = { workspace = true }
+# Task 5.1.3: the async MemoryStore adapter uses spawn_blocking so rusqlite
+# never runs on a Tokio worker thread.
+tokio = { workspace = true }
+# Task 5.1.3: degraded recall paths are reported at runtime through tracing.
+tracing = { workspace = true }
+# Task 5.1.3 (user-approved): workspace_scope is the first 16 hex characters of
+# sha256(canonical workspace path).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Task 5.1.2: exercising the async Embedder trait without pulling a full
+# asynchronous runtime into the storage crate.
+futures = { workspace = true }

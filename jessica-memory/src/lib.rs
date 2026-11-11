@@ -24,8 +24,25 @@
 //! The API is synchronous because SQLite is synchronous. Callers inside a Tokio
 //! runtime must invoke it through `tokio::task::spawn_blocking`, and the store
 //! never reads the host clock itself so callers control event timestamps.
+//!
+//! [`MemoryLog`] is the append-only storage foundation for layered memory. It
+//! stores raw entries scoped by session and workspace, indexes them with FTS5,
+//! and permits only one-way soft deletion.
+//!
+//! [`Embedder`] and [`VectorIndex`] add the deterministic vector layer:
+//! [`DeterministicEmbedder`] produces reproducible, non-semantic vectors and
+//! [`BruteForceIndex`] ranks stored vectors by cosine similarity.
+//!
+//! [`SqliteMemoryStore`] is the asynchronous adapter that implements the frozen
+//! [`jessica_core::memory::MemoryStore`] contract. It fuses short-term session
+//! entries, mid-term workspace keyword matches, and long-term vector matches
+//! with reciprocal rank fusion while degrading individual failures to warnings.
 
 #![deny(missing_docs)]
+
+mod embedding;
+mod memory_log;
+mod memory_store;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -34,6 +51,15 @@ use std::time::Duration;
 use jessica_core::types::{AgentEvent, Message, SessionId};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+
+pub use embedding::{
+    BruteForceIndex, DeterministicEmbedder, EmbedError, Embedder, VectorError, VectorIndex,
+    VectorIndexError, VectorMatch, decode_vector, encode_vector,
+};
+pub use memory_log::{
+    MemoryEntryId, MemoryLog, MemoryLogError, MemoryRecord, NewMemoryEntry, WorkspaceScope,
+};
+pub use memory_store::{RecallRequest, SqliteMemoryStore, SqliteMemoryStoreError};
 
 /// SQLite schema and the append-only guards installed on every open.
 const SCHEMA: &str = r#"
