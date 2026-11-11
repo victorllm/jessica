@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod events;
 mod governance;
+mod memory;
 mod pump;
 mod replay;
 
@@ -21,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 use crate::app::{CliError, CliRuntime, load_wasm_tools};
 use crate::config::HarnessConfig;
 use crate::events::EventRecorder;
+use crate::memory::MemoryAssembly;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -83,7 +85,10 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         Mode::Turn { resume, prompt } => {
             let provider = build_provider()?;
             let wasm_tools = load_wasm_tools(&config, &root).await?;
-            let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder);
+            // Memory is assembled only on the turn path. Replay returns above
+            // and therefore never opens, creates, or reads the memory database.
+            let memory = MemoryAssembly::open(&config.memory, &root).await;
+            let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder, memory);
 
             if let Some(session_id) = resume {
                 return Ok(Some(runtime.resume_turn(session_id).await?));

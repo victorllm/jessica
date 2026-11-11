@@ -8,6 +8,8 @@ jessica-core = { path = "../jessica-core" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Task 5.1.4: structured errors for the backend-agnostic Guide trait.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
