@@ -273,13 +273,246 @@ Phase 5：能力扩展与加固（按需拆 Task）
 
 这一阶段每个子方向独立成 Task，按你的优先级排序：
 
-· Task 5.1 分层记忆：短期/中期（FTS5）/长期（SQLite-vec 或 Qdrant），MemoryStore 的完整实现，Guide 注入真实记忆。
+· Task 5.1 分层记忆：短期（会话近期）/中期（FTS5 关键词）/长期（向量）三层召回，MemoryStore 的完整实现，Guide 注入真实记忆。拆分为 5.1.1–5.1.6，详见本节之后的“Task 5.1 拆分”。
 · Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。
 · Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。
 · Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。
 · Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。
 
 每个 Task 的验收都要求：cargo test --workspace 全绿 + cargo clippy --workspace -- -D warnings + 一个端到端场景。
+
+Task 5.1 拆分：分层记忆
+
+5.1 全局约束（适用于 5.1.1–5.1.6）：
+
+· 记忆层只处理确定性数据：原始文本、既有事件、结构化 metadata。不得在记忆层实现 LLM 摘要、LLM 相关性判断、LLM 记忆提取或 LLM 改写；这些语义加工属于 Task 5.2 技能沉淀，且 5.2 的触发条件也必须是确定性规则。
+· 不修改 jessica-core 已冻结的公共 API。MemoryStore / MemoryEntry / MemoryError 的签名保持不变；需要更多召回参数时，在 jessica-memory 内提供固有方法（如 recall_with(RecallRequest)），Trait 方法只做默认参数委派。
+· 不引入未在 workspace Cargo.toml 中批准的新第三方 crate。5.1.3 的 sha256 已获用户批准新增 `sha2`；5.1.3 开工时必须在 workspace Cargo.toml 中声明并在 Task 记录中说明理由。其他新增依赖仍需逐项批准。
+· 记忆层不得把 LLM 调用、网络或宿主时钟带入确定性路径。条目时间戳由调用方显式提供（与 EventStore 的 Timestamp 一致）；库本身不读时钟。
+· jessica-memory 的 SQLite 操作是同步阻塞的；所有异步入口必须把连接操作放进 tokio::task::spawn_blocking，禁止在 async worker 上直接执行 rusqlite 调用。
+
+基线（5.1.1 开工前已确认）：
+
+· jessica-core 的 MemoryStore 只有 write(session, entry) 与 recall(session, query, limit)，无 scope/权重/字节上限参数。
+· jessica-memory 目前只有 EventStore；rusqlite 0.41（bundled）已在 workspace 中，FTS5 已在 libsqlite3-sys 构建中启用。
+· SessionId 接受任意字符串，可直接作为 SQLite TEXT。
+· CLI 已有 EventRecorder、EventPump、replay 与 --resume 装配，可作为 5.1.5 的接入点。
+
+依赖顺序：5.1.1 → 5.1.2 → 5.1.3 → 5.1.4 → 5.1.5；5.1.6 在 5.1.5 稳定后单开，不阻塞 5.1 验收。
+
+每个子 Task 完成前，除下方自身 crate 的验收命令外，都必须运行 `cargo test --workspace` 与 `cargo clippy --workspace --all-targets -- -D warnings`。5.1 的端到端场景由 5.1.5 提供一个；5.1.1–5.1.4 不单独要求 CLI E2E。
+
+Task 5.1.1：SQLite 记忆基础 + 短期/中期召回（FTS5）
+
+目标：在 jessica-memory 中建立可迁移、只追加的记忆存储与全文检索，提供“会话近期”与“工作区关键词”两种召回。本 Task 不实现 MemoryStore Trait，不接 CLI。
+
+操作：
+
+1. 开工先做 FTS5 tokenizer spike：在内存库创建 `fts5(content, tokenize='trigram')` 并执行一次中文/英文 MATCH。若当前 bundled SQLite 不支持 trigram，退回 unicode61，并把“trigram 不可用/中文子串检索受限”记入 PLAN Deferred；不得因此阻塞 Task。
+2. 新建 `memory_entries` 表：`id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, workspace_scope TEXT NOT NULL, content TEXT NOT NULL, metadata_json TEXT NOT NULL, created_at INTEGER NOT NULL, deleted_at INTEGER NULL`；另建部分唯一索引 `CREATE UNIQUE INDEX ... ON memory_entries(session_id, workspace_scope, content) WHERE deleted_at IS NULL`，使软删除后的相同内容可以重新写入。
+   - `session_id` 用于短期召回；`workspace_scope` 用于中期/长期召回（5.1.3 由规范化工作区路径的 sha256 前 16 个 hex 字符生成）。
+   - `deleted_at` 为预留的可空列；本 Task 只允许“软删除”，物理 UPDATE/DELETE 一律拒绝。
+3. 创建外部内容 FTS5 表 `memory_fts USING fts5(content, content='memory_entries', content_rowid='id', tokenize=<spike 结果>)`，并用 INSERT/UPDATE/DELETE 触发器同步；触发器必须允许后续的软删除路径正确移除索引（软删除 = 从 FTS 可见集合排除，同时保留原行）。
+4. 追加写约束：BEFORE UPDATE 触发器只允许 `OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL` 且其余列逐列相等的一次性软删除；其他 UPDATE 与所有 DELETE 用 RAISE(ABORT)。已软删除的行再次软删除必须被拒绝。
+5. 打开数据库时设置 `PRAGMA busy_timeout = 5000`；用 `PRAGMA user_version` 做 schema 版本：0 → 建表并置为 1；大于当前支持版本 → 结构化错误，不自动降级。
+6. 去重：写入走 `INSERT OR IGNORE`，依赖部分唯一索引（session_id, workspace_scope, content）；重复写入返回 Ok 且不新增行。
+7. 提供内部同步 API（名称可调整）：`append(NewMemoryEntry)`、`recent_for_session(session, workspace_scope, limit)`、`search_keyword(workspace_scope, query, limit)`、`soft_delete(id, deleted_at)`。短期召回也必须同时过滤 workspace_scope，避免同一 session id 在不同工作区之间泄漏。
+8. FTS 查询清洗：不得把用户输入原样拼进 MATCH。按空白/标点切词，逐词加双引号并转义内部双引号，再以 AND 连接；空查询或清洗后无 token 返回空结果。查询有效 token 长度 < 3（trigram 无法命中）时退回 `LIKE '%escaped%' ESCAPE '\'`，转义 `%`、`_`、`\`；LIKE 分支同样按 workspace_scope 过滤并保持确定性排序。
+9. 错误用 thiserror 定义结构化 enum（Open/Schema/Migration/UnsupportedVersion/Serialize/Query/Corrupt 等），库代码不得 unwrap/expect。
+10. `metadata_json` 用 serde_json 序列化；反序列化失败作为 Corrupt/Decode 错误，不吞掉。
+
+行为测试（至少）：
+
+· schema 创建后 user_version=1；重开数据库数据仍在；未来版本号被拒绝。
+· 九类特殊查询（`"`、`*`、`AND`、`NEAR`、`-`、括号、冒号、`%`、`_`）不报错且返回确定结果。
+· 中文 2 字/3 字以上查询、英文前缀、子串查询分别走 trigram 或 LIKE 回退，命中符合预期。
+· 同一 (session, workspace) 重复写入只保留一行；不同 session 或不同 workspace 的相同内容各自保留。
+· 软删除后从 recent/search 中消失、FTS 无残留；再次软删除报错；对 content 的 UPDATE 与 DELETE 均被触发器拒绝且原行不变。
+· session A 的近期召回不会返回 session B 的条目；同一 session id 在不同 workspace 下互不可见；workspace 召回不会泄漏到另一个 workspace。
+· created_at 相同（同一毫秒）时顺序仍确定（created_at DESC, id DESC）。
+
+验收：
+
+```bash
+cargo test -p jessica-memory
+cargo clippy -p jessica-memory --all-targets -- -D warnings
+```
+
+禁止：不实现向量层、RRF、MemoryStore Trait、Guide 或 CLI 接入；不修改 jessica-core。
+
+Task 5.1.2：Embedder 抽象 + DeterministicEmbedder + 向量层
+
+目标：在不引入任何新的第三方 crate 的前提下，提供可替换的 Embedder 抽象、一个确定性演示 Embedder，以及可暴力扫描的向量索引。
+
+操作：
+
+1. 定义 `Embedder` Trait（jessica-memory）：`async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError>`；另提供 `fn model_id(&self) -> &str` 与 `fn dims(&self) -> usize`。Trait 用 async_trait（workspace 已有），为 5.1.6 的 HTTP/本地实现留出异步接口。
+2. 实现 `DeterministicEmbedder`：
+   - 固定 256 维；对 UTF-8 字节取 n=2..=4 的字节 n-gram。
+   - 每个 n-gram 用项目内实现的 FNV-1a 64 位哈希：bucket = hash % 256，符号取 hash 的最高位；vector[bucket] += ±1。
+   - 最后做 L2 归一化；空串/纯空白返回全零向量（不 panic、不返回 NaN）。
+   - `model_id = "deterministic-v1"`。doc comment 必须明确：仅用于测试与演示，不具备语义理解，碰撞会导致相似度噪声，不得作为生产语义检索质量依据。
+3. 新建 `memory_embeddings` 表：`entry_id INTEGER NOT NULL REFERENCES memory_entries(id), model TEXT NOT NULL, dims INTEGER NOT NULL, vector BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(entry_id, model)`。向量只随条目追加，条目软删除后查询必须过滤。
+4. 手写 f32 小端编解码：`encode_vector` / `decode_vector`；长度不是 4 的倍数、dims 与 BLOB 长度不一致、NaN/Inf 全部返回结构化错误，拒绝写入。
+5. 定义 `VectorIndex` Trait 与 `BruteForceIndex` 实现：
+   - `add(entry_id, model, vector)` 写入/覆盖该 (entry, model) 的向量；
+   - `search(query, model, workspace_scope, limit)` 只扫描同 workspace、同 model、dims == query.len() 且未软删除的行；
+   - 余弦相似度 = dot / (||a|| * ||b||)；零范数相似度定义为 0.0；分数降序，分数相同时按 entry_id 升序，保证确定性；
+   - 空 query、维度不匹配或 model 无数据返回空结果，不报错。
+6. 所有 SQLite 访问仍为同步实现；5.1.3 的 async MemoryStore 包装负责 spawn_blocking。
+
+行为测试（至少）：
+
+· 同一文本多次嵌入逐字节一致；硬编码一条样本向量的字节，锁住算法与字节序（防止无意改动破坏已存数据）。
+· 256 维、L2 范数 ≈ 1.0、空串为全零；不同文本产生不同向量。
+· 编码→解码逐值相等且为小端；非法长度、dims 不匹配、NaN、Inf 分别报错。
+· 余弦排序：完全相同 > 部分重叠 > 无关；同分时 entry_id 升序。
+· 查询只返回同 model、同 dims、同 workspace 且未删除的条目；软删除条目不出现。
+· `model_id`/`dims` 不匹配时返回空而不是错。
+
+验收：
+
+```bash
+cargo test -p jessica-memory
+cargo clippy -p jessica-memory --all-targets -- -D warnings
+```
+
+禁止：不实现 RRF、不实现 MemoryStore、不接 CLI；不新增第三方 crate；不得把 DeterministicEmbedder 描述为语义模型。
+
+Task 5.1.3：分层召回融合（RRF）+ MemoryStore 完整实现
+
+目标：把短期、中期、长期三路召回融合成稳定的排序，实现冻结的 MemoryStore Trait，并定义确定性的工作区作用域与字节上限。
+
+操作：
+
+1. 定义 `RecallRequest`（jessica-memory 固有类型）：session、query、limit、三路权重（short/keyword/vector）、rrf_k（默认 60）、max_bytes。workspace_scope 由 store 固定，不在请求中覆盖。Trait 的 recall(session, query, limit) 用默认权重、k=60、max_bytes=4096 委派到 `recall_with`。
+2. 三路候选：
+   - 短期：`recent_for_session(session, workspace_scope, limit)`，按 created_at DESC, id DESC；
+   - 中期：`search_keyword(workspace_scope, query, limit)`；
+   - 长期：`BruteForceIndex::search(embed(query), "deterministic-v1", workspace_scope, limit)`（embedder 为 none 时跳过）。
+3. RRF 融合：对每个候选条目累加 `weight_i / (k + rank_i)`（rank 从 1 开始）；按融合分降序，分数相同按 entry_id 升序；再按 limit 截断。权重可配置但必须为非负有限数；k 必须 > 0。
+4. 降级：任一路失败（FTS 语法/不支持、向量表缺失、embedder 错误）只跳过该路并 tracing::warn，其余路继续；只有数据库本身不可用才返回 MemoryError::Backend。降级不得改变 query 或静默伪造结果。
+5. 字节上限：融合后逐条累计 content 字节 + `---` 分隔符；总返回内容不得超过 max_bytes。边界处按 UTF-8 char boundary 截断，绝不产生非法 UTF-8；单条即超限时截断该条而不是整体返回空。max_bytes=0 返回空。
+6. 实现 `SqliteMemoryStore`（或等价命名）并实现 `MemoryStore`：
+   - 构造时接收 canonical workspace path，计算 `workspace_scope = hex(sha256(canonical_path))[..16]` 并固定；构造后 chdir 不影响作用域；
+   - `write(session, entry)`：写入 session_id + 固定 workspace_scope；content 为空拒绝，metadata 原样保存；
+   - `recall(session, query, limit)`：按 RecallRequest 默认值执行；
+   - 每条目写入后同步生成 embedding（embedder 为 none 时跳过），embedding 失败按降级处理并 warn，不回滚条目；
+   - 所有 rusqlite 调用在 spawn_blocking 中执行，Connection 用 Arc<Mutex<_>> 串行化；async 方法不得直接做阻塞 IO。
+7. workspace scope 使用 `sha2` 计算 sha256（已获用户批准）：开工时在 workspace Cargo.toml 增加 `sha2`，在 Task 记录中说明理由，并固定 `workspace_scope = hex(sha256(canonical_path))[..16]`。
+
+行为测试（至少）：
+
+· 写入后 recall 能取回；不同 session 的短期召回互不干扰；同 workspace 的其他 session 可通过中期/长期召回。
+· 不同 workspace、不同 session 的隔离：构造同内容条目，断言不会跨 workspace 泄漏。
+· RRF：构造一条同时出现在短期与关键词榜单的条目与只出现在单榜的条目，断言双榜条目排前；调整权重可改变顺序；同分按 entry_id。
+· 字节上限：多字节中文内容在 max_bytes 边界被截断为合法 UTF-8 且总字节 <= max_bytes；max_bytes 极小/为 0 的行为确定。
+· 降级：无 embedding 的条目仍可被关键词召回；伪造 embedder 错误时 recall 仍返回关键词结果且不 panic。
+· 写入去重、软删除后不再召回、重开数据库仍可召回。
+· MemoryStore Trait 方法（write/recall）可直接通过 `Arc<dyn MemoryStore>` 使用。
+
+验收：
+
+```bash
+cargo test -p jessica-memory
+cargo clippy -p jessica-memory --all-targets -- -D warnings
+```
+
+禁止：不实现 Guide/CLI；不修改 core Trait；不引入 sqlite-vec/Qdrant；不新增 sha2 之外的依赖。
+
+Task 5.1.4：Guide Trait + MemoryGuide（jessica-harness）
+
+目标：在 jessica-harness 中定义与具体记忆实现解耦的 Guide 抽象，并实现把召回结果渲染为一条 system Message 的 MemoryGuide。
+
+操作：
+
+1. 在 jessica-harness 定义：
+   ```rust
+   #[async_trait]
+   pub trait Guide: Send + Sync {
+       async fn render(&self, session: &SessionId, query: &str) -> Result<Option<Message>, GuideError>;
+   }
+   ```
+   GuideError 用 thiserror；Guide 不得依赖 jessica-memory，只依赖 jessica-core。
+2. 实现 `MemoryGuide { store: Arc<dyn MemoryStore>, limit: usize, max_inject_bytes: usize }`。冻结的 `MemoryStore::recall` 没有字节上限参数，因此 store 侧先按 5.1.3 的默认上限返回候选，Guide 再对最终完整消息（标题 + 条目 + 分隔符）做一次 `max_inject_bytes` 截断。
+3. render 行为：
+   - 调用 store.recall(session, query, limit)；
+   - 空结果返回 Ok(None)，不产生空 system message；
+   - 非空时构造一条 `Message::system`，首行为：`[记忆参考 — 以下内容来自历史会话，仅供参考，不代表当前事实]`；
+   - 每条记忆之间用单独一行 `---` 分隔；总字节（含标题与分隔符）不超过 max_inject_bytes，UTF-8 安全截断；
+   - 顺序遵循 MemoryStore 的返回顺序，不重排；
+   - fail-open：MemoryError 记录 tracing::warn 后返回 Ok(None)，绝不把记忆故障升级为 turn 失败；
+   - 不写记忆、不调用 LLM、不读时钟。
+4. 测试必须用行为化 mock（可记录调用与返回错误/条目），不得只断言 Ok。
+
+行为测试（至少）：
+
+· 空结果 → None；有结果 → 恰好一条 system message，内容含标题、条目与 `---`。
+· 顺序与 recall 返回一致；超过 max_inject_bytes 时截断为合法 UTF-8 且不超限。
+· store 返回 MemoryError → Ok(None)，不 panic、不传播错误。
+· render 期间 mock 的 write 调用次数为 0。
+· 构造含多字节中文的条目，断言截断不破坏字符。
+
+验收：
+
+```bash
+cargo test -p jessica-harness
+cargo clippy -p jessica-harness --all-targets -- -D warnings
+```
+
+禁止：不修改 Harness 的 Guard/Policy/Sensor 语义；不自动把 Guide 接入 AgentLoop；不依赖 jessica-memory；不实现 CLI。
+
+Task 5.1.5：CLI 装配 + 写入策略 + E2E
+
+目标：把记忆接入真实 CLI：配置、召回注入、Completed 后写入、失败降级，并验证 resume/replay 的确定性边界。
+
+操作：
+
+1. `HarnessConfig` 新增 `[memory]`：
+   ```toml
+   [memory]
+   enabled = false
+   path = ".jessica/memory.db"
+   recall_limit = 5
+   max_inject_bytes = 4096
+   embedder = "deterministic"   # "deterministic" | "none"
+   write_policy = "completed"   # "completed" | "explicit"
+   ```
+   path 相对 CLI 的 root 解析（与 [events] 一致）；enabled=false 时完全不创建/打开数据库文件；非法枚举值报结构化配置错误。
+2. 新增 `memory.rs` 装配模块：enabled 时在 spawn_blocking 中打开 SqliteMemoryStore、按 embedder 选择 DeterministicEmbedder 或 none、构造 MemoryGuide；打开失败按 fail-open 处理并 warn（非法配置值除外，仍应报错）。
+3. 注入：fresh turn 的消息顺序固定为 `system_prompt → Guide 返回的 memory system message（若有）→ user`。memory disabled / Guide 返回 None / Guide 失败时退化为原顺序。resume 绝不重新注入：checkpoint 的 messages 已包含首次 turn 注入的 guide 消息，重复注入会破坏恢复一致性。
+4. 写入策略：
+   - `completed`：仅当本次 turn 最终 Completed（acceptance 重试后的最终结果）后写入一条 `kind=turn` 记忆；
+   - 内容 = 用户输入截断 2KB + 最终 assistant 回答截断 4KB；两处均按 UTF-8 char boundary 截断；
+   - metadata = `{ "kind": "turn", "truncated": bool, "tool_call_count": N, "turn_index": N }`；不写入任何工具结果/工具输出；
+   - 依赖 5.1.1 的唯一约束去重；重复 turn 不新增行；
+   - 写入失败只 warn，不改变 SessionEndReason/退出码。
+   - `explicit`（已确认）：不自动写入；本 Task 只保留配置解析与“无自动写入”的行为，显式写入入口记入 Deferred，不发明 LLM 意图判断。
+5. replay：replay 路径绝不打开、创建或读取记忆数据库；在 replay 分支提前返回，保证无 memory 文件也能重放。
+6. E2E（必须新增）：用动态脚本化 SSE server 跑两次真实 CLI（同一临时 workspace，memory enabled）：
+   - 第一次：模型回复一个独特事实（如 `the launch code is ORANGE-7`），CLI Completed 后断言 DB 中存在 kind=turn 条目；
+   - 第二次：新 session 输入能命中该事实的问题，断言发往 provider 的请求体中出现 `[记忆参考` 和 ORANGE-7，且该消息位于 system prompt 之后、user 之前；
+   - 断言第二次的最终回答来自脚本化模型，退出码 0；
+   - 追加断言：`--resume` 恢复不会产生第二次 recall/注入；`replay` 在无 memory 路径时仍可运行且不创建 DB。
+7. 测试：配置解析默认值/相对路径/非法值；注入顺序；disabled 无注入；Completed 写入与截断/metadata/去重；resume 不注入；replay 不触库；fail-open；E2E 上述场景。
+
+验收：
+
+```bash
+cargo test -p jessica-cli
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+并执行上述两次 CLI 的端到端场景（测试内自动执行，不依赖真实 API key）。
+
+禁止：不修改 jessica-core；不让 memory 故障改变退出码；不在 resume/replay 中读记忆；不写工具结果；不实现 5.1.6。
+
+Task 5.1.6：（后续、非阻塞）真实 Embedder
+
+目标：在 5.1.5 稳定后单开，接入真实 HTTP embeddings（OpenAI 兼容）或本地模型，替换/补充 DeterministicEmbedder。
+
+范围（届时细化）：`embedder="http"` 配置、超时/重试/失败降级、模型维度与 model_id 迁移、批量写入、成本与速率限制。不得改变已冻结的 MemoryStore 契约；不得把网络失败升级为 turn 失败。5.1.6 未完成不阻塞 5.1.1–5.1.5 的验收。
 
 ---
 
@@ -315,6 +548,12 @@ Task 4.1 ☑ 约 20 分钟 jessica-memory 新增 workspace 依赖 rusqlite 0.41�
 Task 4.2 ☑ 约 60 分钟 jessica-memory 新增 sessions 元数据表（session_id, messages_json, started_at）及 UPDATE/DELETE 拒绝触发器：AgentEvent 没有 user/system message 变体且 core 已冻结，恢复所需的初始消息无法从事件流重建，因此由 CLI 在 fresh session 开始前写入不可变 bootstrap；EventStore 增加 record_session/session_messages 与 Session/SessionDecode/SessionConflict 错误，并设置 5s busy_timeout。jessica-runtime 新增 recovery 模块（RecordedEvent/SessionCheckpoint/RecoveryError/recover_session），纯函数重放事件到指定 seq：校验 session id 与严格递增 seq，按 ModelDelta/ToolCallStarted/ToolCallFinished 重建 assistant+tool messages，SessionEnded 立即终结；模型回合中途或工具批次缺结果时以 IncompleteModelTurn/IncompleteRound 拒绝，绝不重放 LLM 或工具。AgentLoop 抽出 run_loop 并新增 resume：已终结 checkpoint 直接返回记录 reason 且零调用；未终结时用 checkpoint.messages 与 rounds_completed 继续，不重复发 SessionStarted，剩余 round 预算 = max_rounds - rounds_completed。验收测试用三段脚本 provider/tool：不中断跑到 Completed，取第一个 ToolCallFinished 为 checkpoint，用全新 provider/tool 恢复，断言恢复事件序列与不中断尾部逐事件相等、provider 第二次调用 messages 与 checkpoint 完全一致、工具只执行未完成的 step2。CLI 新增 [events].path 与 events.rs（EventRecorder 全部走 spawn_blocking，时间戳由 CLI 读取宿主时钟）；EventPump 按事件顺序持久化并在 register 时设置 current 以归属没有 SessionStarted 的恢复流；--resume <id>/--resume=<id> 只能单独使用（不可与 prompt 同用），恢复后沿用同一 session id 续写。E2E：预置 SQLite 中停在完整工具批次的中断会话，真实 CLI --resume 只发 1 次模型请求，请求体含既有 user message/tool call/tool result，结束后同一 session 追加到 seq 5。已知限制：事件模型无显式 round 边界，连续无文本的纯工具模型回合会被计为一个 round（只会低估，不会高估）；恢复路径不经过 acceptance 重试；AcceptanceFailed 发生在两个 attempt 之间、无 current session，不会持久化。workspace 共 183 个测试全绿。
 Task 4.3 ☑ 约 50 分钟 jessica-cli 新增 replay 模块（Script/ScriptBuilder/ScriptedProvider/ReplayTool）。从 recorder.load 的 RecordedEvent 重建模型轮次：ModelDelta→LlmEvent::TextDelta，ToolCallStarted→LlmEvent::ToolCallRequested，ToolCallFinished→按工具名与调用顺序入队的记录结果，Error→LlmEvent::Error；因事件不保存 Done usage，每轮结束时合成 Done { usage: None }。用真实 AgentLoop::run + 脚本化 Provider/ReplayTool 驱动循环，Budget.max_rounds 取脚本轮数：不发起任何模型请求，不执行任何真实工具，不读宿主时钟/随机数/网络，工具结果完全来自事件流。支持 Completed、Error 与 max-rounds BudgetExceeded：Completed 若末尾是工具批（事件流看不到随后空回复的模型轮），补一个仅含 Done 的空轮以让循环自然 Completed；Error 由脚本中的 Error 事件复现；BudgetExceeded 由 round 预算复现；Cancelled/AcceptanceFailed 与缺少 SessionEnded 的中断流明确拒绝（中断请用 --resume）。输出 JSONL 每行一个紧凑 AgentEvent，无 seq/timestamp；write_jsonl 在 spawn_blocking 中写文件。CLI 解析 `jessica [--config <path>] replay --session <id> --out <path>`：--session/--out 支持 `=` 形式，重复/缺失/未知参数均结构化报错，且 replay 分支在创建 OpenAiProvider/加载 wasm 工具之前返回，因此无需 OPENAI_API_KEY，也不会触网。测试：replay 模块 3 个行为测试（三次终端复现、精确事件/字节一致、拒绝半批与不支持的终止原因）与 1 个真实 CLI E2E（无 API key、无 server，连续跑两次并逐字节比较，同时断言输出等于记录的 6 个事件）。手工验收：用 Python 生成含 sessions/events 的 SQLite，执行 `cargo run -p jessica-cli -- --config ... replay --session manual-replay --out a.jsonl` 两次，`diff a.jsonl b.jsonl` 退出 0，输出 6 行且与记录事件一致。workspace 共 187 个测试全绿；jessica-core/runtime/memory 未改。偏离：replay 只重建 runtime 循环层，不重放 CLI 治理事件（PolicyDenied/AcceptanceFailed/CLI 侧 BudgetExceeded 不会重新发出，其可观察结果已在记录的 ToolResult/终止原因中）；replay 使用脚本轮数而非配置的 max_rounds。
 
+Task 5.1.1 ☐ 未开始 待执行
+Task 5.1.2 ☐ 未开始 待执行
+Task 5.1.3 ☐ 未开始 待执行
+Task 5.1.4 ☐ 未开始 待执行
+Task 5.1.5 ☐ 未开始 待执行
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
@@ -347,6 +586,7 @@ Deferred（待办，由用户决定是否单开 Task）
 · AgentEvent 不保存 LlmEvent::Done 的 TokenUsage，replay 只能合成 usage=None，因此 token 计费无法重放或校验。要支持计费重放，需要在事件模型增加 usage（修改冻结 core，需单开 Task）。
 · replay 要求事件流以 SessionEnded 结尾，只支持 Completed、Error 与 max-rounds BudgetExceeded；Cancelled、AcceptanceFailed 以及中断的流会被拒绝（中断恢复用 --resume）。若需要重放中断会话，应先定义“无终态时如何合成终态”。
 · replay 输出为紧凑 JSONL，每行一个 AgentEvent，不含 seq/timestamp；事件顺序隐含在行序中，消费者不应依赖文件元数据做确定性判断。
+· Task 5.1.5 的 `[memory].write_policy = "explicit"` 只定义为“不自动写入”；显式记忆写入入口（CLI 命令或工具）尚未设计，需单开 Task，且不得用 LLM 判断何时写入。
 · replay 通过容量 1024 的 broadcast 通道收集事件，超大 session 可能因 lag 报 EventLag；如需支持任意长度，应改为同步观察者或可配置容量。
 · replay 事件流是运行时事件的再序列化，不是对 Provider 原始请求/响应的逐字节录制；若要审计原始响应，需要额外记录 provider wire log（单开 Task）。
 · 文件工具的路径校验存在 TOCTOU 竞态（canonicalize 与实际读写之间路径可被替换），需 Phase 2 policy / Phase 3 sandbox 进一步约束。
