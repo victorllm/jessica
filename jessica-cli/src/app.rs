@@ -12,7 +12,7 @@ use jessica_core::llm::{LlmError, LlmProvider};
 use jessica_core::policy::Policy;
 use jessica_core::sensor::Sensor;
 use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError};
-use jessica_core::types::{AgentEvent, Message, SessionEndReason, SessionId};
+use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, SessionId};
 use jessica_harness::{
     AcceptanceRunner, AllowlistPolicy, CommandSensor, DEFAULT_EVENT_CAPACITY, Harness,
     ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard,
@@ -27,6 +27,7 @@ use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::config::{ConfigError, HarnessConfig};
 use crate::events::{EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
+use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, SessionSnapshot};
 use crate::replay::ReplayError;
 
@@ -37,6 +38,8 @@ const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
 enum AttemptStart {
     /// A new session with a fresh conversation.
     Fresh {
+        /// Identifier assigned to the new session.
+        session_id: SessionId,
         /// Messages the session starts with.
         messages: Vec<Message>,
     },
@@ -119,6 +122,8 @@ pub(crate) struct CliRuntime {
     system_prompt: String,
     wasm_tools: Vec<Arc<dyn Tool>>,
     recorder: Option<Arc<EventRecorder>>,
+    memory: Option<MemoryAssembly>,
+    turn_counter: AtomicU64,
 }
 
 impl CliRuntime {
@@ -127,12 +132,14 @@ impl CliRuntime {
     /// `wasm_tools` contains plugins already loaded by [`load_wasm_tools`].
     /// Compilation happens once at startup rather than on every turn.
     /// `recorder` is present when the configuration enables event persistence.
+    /// `memory` is present only when enabled and opened successfully.
     pub(crate) fn new(
         provider: Arc<dyn LlmProvider>,
         config: HarnessConfig,
         root: PathBuf,
         wasm_tools: Vec<Arc<dyn Tool>>,
         recorder: Option<Arc<EventRecorder>>,
+        memory: Option<MemoryAssembly>,
     ) -> Self {
         let system_prompt = system_prompt(&root, &config);
         Self {
@@ -142,42 +149,81 @@ impl CliRuntime {
             system_prompt,
             wasm_tools,
             recorder,
+            memory,
+            turn_counter: AtomicU64::new(0),
         }
     }
 
     /// Runs one user request with the configured governance.
+    ///
+    /// A fresh turn starts with `system prompt → recalled memory (if any) →
+    /// user`. Memory is recalled exactly once per turn, before the first
+    /// attempt; acceptance retries reuse the same initial conversation. A turn
+    /// that finally completes is written to memory according to the configured
+    /// write policy.
     pub(crate) async fn run_turn(&self, input: String) -> Result<SessionEndReason, CliError> {
         let setup = self.build_turn()?;
-        let initial = vec![
-            Message::system(self.system_prompt.clone()),
-            Message::user(input),
-        ];
+        let first_session = next_session_id();
+        let initial = self.initial_messages(&first_session, input.as_str()).await;
 
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
-        let (reason, emit_outer) = if let Some(acceptance) = &self.config.acceptance {
-            let check = CommandAcceptanceCheck::new(
-                acceptance.name.clone(),
-                acceptance.command.clone(),
-                acceptance.args.clone(),
-                resolve_dir(&self.root, acceptance.working_dir.as_deref()),
-            );
-            let runner = AcceptanceRunner::new(
-                Arc::new(check) as Arc<dyn AcceptanceCheck>,
-                acceptance.max_retries,
-                setup.events.clone(),
-            );
-            let outcome = runner
-                .run(initial, |messages| {
-                    let context = context.clone();
-                    async move { run_attempt(context, AttemptStart::Fresh { messages }).await }
-                })
-                .await;
+        let (reason, emit_outer, final_session, final_output, final_messages) =
+            if let Some(acceptance) = &self.config.acceptance {
+                let check = CommandAcceptanceCheck::new(
+                    acceptance.name.clone(),
+                    acceptance.command.clone(),
+                    acceptance.args.clone(),
+                    resolve_dir(&self.root, acceptance.working_dir.as_deref()),
+                );
+                let runner = AcceptanceRunner::new(
+                    Arc::new(check) as Arc<dyn AcceptanceCheck>,
+                    acceptance.max_retries,
+                    setup.events.clone(),
+                );
+                let mut next_session = Some(first_session.clone());
+                let mut latest_session = None;
+                let outcome = runner
+                    .run(initial, |messages| {
+                        let session_id = next_session.take().unwrap_or_else(next_session_id);
+                        latest_session = Some(session_id.clone());
+                        let context = context.clone();
+                        async move {
+                            run_attempt(
+                                context,
+                                AttemptStart::Fresh {
+                                    session_id,
+                                    messages,
+                                },
+                            )
+                            .await
+                        }
+                    })
+                    .await;
 
-            (outcome.reason, true)
-        } else {
-            let attempt = run_attempt(context, AttemptStart::Fresh { messages: initial }).await;
-            (attempt.reason, setup.governance.tripped())
-        };
+                (
+                    outcome.reason,
+                    true,
+                    latest_session.unwrap_or(first_session),
+                    outcome.last_output,
+                    outcome.messages,
+                )
+            } else {
+                let attempt = run_attempt(
+                    context,
+                    AttemptStart::Fresh {
+                        session_id: first_session.clone(),
+                        messages: initial,
+                    },
+                )
+                .await;
+                (
+                    attempt.reason,
+                    setup.governance.tripped(),
+                    first_session,
+                    attempt.last_output,
+                    attempt.messages,
+                )
+            };
 
         // A budget trip overrides the runtime's Completed/Cancelled reason.
         // Emit an outer session event so the final observable reason is the
@@ -185,9 +231,58 @@ impl CliRuntime {
         if emit_outer {
             emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
         }
+        if reason == SessionEndReason::Completed {
+            self.record_turn_memory(&final_session, &input, &final_output, &final_messages)
+                .await;
+        }
 
         setup.shutdown();
         Ok(reason)
+    }
+
+    /// Builds the initial conversation for a fresh turn.
+    ///
+    /// The order is fixed: system prompt, optional guide message, user input.
+    /// A disabled or failed guide simply omits the middle message.
+    async fn initial_messages(&self, session: &SessionId, input: &str) -> Vec<Message> {
+        let memory_message = match &self.memory {
+            Some(memory) => memory.recall(session, input).await,
+            None => None,
+        };
+        fresh_conversation(&self.system_prompt, memory_message, input)
+    }
+
+    /// Writes the completed turn to memory when the policy allows it.
+    ///
+    /// Memory failures are warned about and never change the reason or exit
+    /// code of the turn.
+    async fn record_turn_memory(
+        &self,
+        session_id: &SessionId,
+        user_input: &str,
+        assistant_answer: &str,
+        messages: &[Message],
+    ) {
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let turn_index = self.turn_counter.fetch_add(1, Ordering::Relaxed);
+        let tool_call_count = messages
+            .iter()
+            .map(|message| message.tool_calls.len())
+            .sum();
+        if let Err(error) = memory
+            .record_completed_turn(
+                session_id,
+                user_input,
+                assistant_answer,
+                tool_call_count,
+                turn_index,
+            )
+            .await
+        {
+            eprintln!("[warn] failed to write memory for session {session_id}: {error}");
+        }
     }
 
     /// Continues the interrupted loop recorded for `session_id`.
@@ -219,12 +314,28 @@ impl CliRuntime {
             return Ok(reason);
         }
 
+        let user_input = checkpoint
+            .messages()
+            .iter()
+            .find(|message| message.role == Role::User)
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+
         let setup = self.build_turn()?;
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }).await;
         let reason = attempt.reason;
         if setup.governance.tripped() {
             emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
+        }
+        if reason == SessionEndReason::Completed {
+            self.record_turn_memory(
+                &session_id,
+                &user_input,
+                &attempt.last_output,
+                &attempt.messages,
+            )
+            .await;
         }
 
         setup.shutdown();
@@ -434,7 +545,10 @@ pub(crate) async fn load_wasm_tools(
 async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAttempt {
     context.stuck_guard.reset();
     let (session_id, initial_messages) = match &start {
-        AttemptStart::Fresh { messages } => (next_session_id(), messages.clone()),
+        AttemptStart::Fresh {
+            session_id,
+            messages,
+        } => (session_id.clone(), messages.clone()),
         AttemptStart::Continue { checkpoint } => (
             checkpoint.session_id().clone(),
             checkpoint.messages().to_vec(),
@@ -443,7 +557,7 @@ async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAtt
 
     // A fresh session needs its immutable bootstrap messages before any event
     // is appended. A resumed session already has them in the store.
-    if let AttemptStart::Fresh { messages } = &start
+    if let AttemptStart::Fresh { messages, .. } = &start
         && let Some(recorder) = &context.recorder
         && let Err(error) = recorder.record_session_start(&session_id, messages).await
     {
@@ -456,7 +570,7 @@ async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAtt
     let fallback_messages = initial_messages;
 
     let raw_reason = match start {
-        AttemptStart::Fresh { messages } => {
+        AttemptStart::Fresh { messages, .. } => {
             context
                 .harness
                 .run(
@@ -570,6 +684,24 @@ fn resolve_dir(root: &Path, configured: Option<&Path>) -> PathBuf {
         Some(path) => root.join(path),
         None => root.to_path_buf(),
     }
+}
+
+/// Builds a fresh conversation in its required order.
+///
+/// The system prompt is always first and the user input is always last. A
+/// recalled memory message, when present, sits between them.
+fn fresh_conversation(
+    system_prompt: &str,
+    memory_message: Option<Message>,
+    input: &str,
+) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(3);
+    messages.push(Message::system(system_prompt));
+    if let Some(message) = memory_message {
+        messages.push(message);
+    }
+    messages.push(Message::user(input));
+    messages
 }
 
 fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
@@ -688,4 +820,40 @@ pub(crate) enum CliError {
     /// The blocking current-directory task failed.
     #[error("current-directory task failed: {0}")]
     CurrentDirTask(#[source] tokio::task::JoinError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recalled_memory_is_injected_between_the_system_prompt_and_the_user() {
+        let messages = fresh_conversation(
+            "system prompt",
+            Some(Message::system("[记忆参考] remembered fact")),
+            "new question",
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0], Message::system("system prompt"));
+        assert_eq!(messages[1], Message::system("[记忆参考] remembered fact"));
+        assert_eq!(messages[2], Message::user("new question"));
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![Role::System, Role::System, Role::User]
+        );
+    }
+
+    #[test]
+    fn absent_memory_keeps_the_original_system_then_user_order() {
+        let messages = fresh_conversation("system prompt", None, "question");
+
+        assert_eq!(
+            messages,
+            vec![Message::system("system prompt"), Message::user("question"),]
+        );
+    }
 }

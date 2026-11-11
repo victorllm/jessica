@@ -1,9 +1,9 @@
 //! TOML configuration for the governed CLI.
 //!
 //! Every setting that governs a session is explicit in the file: budgets,
-//! the tool allowlist, the post-tool command sensor, and the acceptance check.
-//! Missing optional sections disable that component; the policy default is the
-//! same allowlist the CLI has always exposed natively.
+//! the tool allowlist, the post-tool command sensor, the acceptance check, and
+//! layered memory. Missing optional sections disable that component; the policy
+//! default is the same allowlist the CLI has always exposed natively.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,6 +27,12 @@ const DEFAULT_MAX_STUCK_ROUNDS: u32 = 3;
 const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024;
 /// Default additional acceptance attempts after the first failure.
 const DEFAULT_MAX_RETRIES: u32 = 2;
+/// Default memory database path, resolved against the CLI workspace root.
+const DEFAULT_MEMORY_PATH: &str = ".jessica/memory.db";
+/// Default number of memory entries requested by one recall.
+const DEFAULT_RECALL_LIMIT: usize = 5;
+/// Default byte budget for the injected memory system message.
+const DEFAULT_MAX_INJECT_BYTES: usize = 4096;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -44,6 +50,8 @@ pub struct HarnessConfig {
     pub acceptance: Option<AcceptanceConfig>,
     /// Optional persistent event log used by `--resume`.
     pub events: EventsConfig,
+    /// Optional layered memory used for context injection and turn writes.
+    pub memory: MemoryConfig,
 }
 
 impl HarnessConfig {
@@ -104,6 +112,9 @@ impl HarnessConfig {
             .is_some_and(|path| path.as_os_str().is_empty())
         {
             return Err(invalid("events.path must not be empty when present"));
+        }
+        if self.memory.path.as_os_str().is_empty() {
+            return Err(invalid("memory.path must not be empty"));
         }
         Ok(())
     }
@@ -177,6 +188,62 @@ pub struct EventsConfig {
     ///
     /// When omitted, events are not persisted and `--resume` is unavailable.
     pub path: Option<PathBuf>,
+}
+
+/// Layered memory settings.
+///
+/// Memory is disabled by default. When disabled, the CLI neither creates nor
+/// opens the configured database file, and no memory is injected or written.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Whether layered memory is enabled for this run.
+    pub enabled: bool,
+    /// SQLite database path. Relative paths resolve against the workspace root.
+    pub path: PathBuf,
+    /// Maximum number of entries requested by one recall.
+    pub recall_limit: usize,
+    /// Maximum bytes in the injected memory system message.
+    pub max_inject_bytes: usize,
+    /// Embedder used for the long-term vector path.
+    pub embedder: MemoryEmbedderKind,
+    /// Policy governing automatic writes after a completed turn.
+    pub write_policy: MemoryWritePolicy,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from(DEFAULT_MEMORY_PATH),
+            recall_limit: DEFAULT_RECALL_LIMIT,
+            max_inject_bytes: DEFAULT_MAX_INJECT_BYTES,
+            embedder: MemoryEmbedderKind::default(),
+            write_policy: MemoryWritePolicy::default(),
+        }
+    }
+}
+
+/// Embedder selected for long-term memory recall.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryEmbedderKind {
+    /// Reproducible, non-semantic byte n-gram embeddings.
+    #[default]
+    Deterministic,
+    /// Disable the vector path and rely on short-term and keyword recall.
+    None,
+}
+
+/// Policy for automatic memory writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryWritePolicy {
+    /// Write one `kind=turn` entry after a turn finishes with `Completed`.
+    #[default]
+    Completed,
+    /// Never write automatically; an explicit entry point is not implemented.
+    Explicit,
 }
 
 /// WebAssembly tool plugin settings.
@@ -411,6 +478,60 @@ mod tests {
 
         let default = HarnessConfig::from_toml_str("").expect("empty config must parse");
         assert_eq!(default.events.path, None);
+    }
+
+    #[test]
+    fn memory_defaults_are_disabled_with_the_documented_values() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert!(!config.memory.enabled);
+        assert_eq!(config.memory.path, PathBuf::from(".jessica/memory.db"));
+        assert_eq!(config.memory.recall_limit, 5);
+        assert_eq!(config.memory.max_inject_bytes, 4096);
+        assert_eq!(config.memory.embedder, MemoryEmbedderKind::Deterministic);
+        assert_eq!(config.memory.write_policy, MemoryWritePolicy::Completed);
+    }
+
+    #[test]
+    fn memory_section_parses_every_documented_setting() {
+        let config = HarnessConfig::from_toml_str(
+            "[memory]\n\
+             enabled = true\n\
+             path = \"state/memory.db\"\n\
+             recall_limit = 9\n\
+             max_inject_bytes = 128\n\
+             embedder = \"none\"\n\
+             write_policy = \"explicit\"\n",
+        )
+        .expect("memory section must parse");
+
+        assert!(config.memory.enabled);
+        assert_eq!(config.memory.path, PathBuf::from("state/memory.db"));
+        assert_eq!(config.memory.recall_limit, 9);
+        assert_eq!(config.memory.max_inject_bytes, 128);
+        assert_eq!(config.memory.embedder, MemoryEmbedderKind::None);
+        assert_eq!(config.memory.write_policy, MemoryWritePolicy::Explicit);
+    }
+
+    #[test]
+    fn invalid_memory_enum_values_report_the_offending_field() {
+        let embedder = HarnessConfig::from_toml_str("[memory]\nembedder = \"http\"\n")
+            .expect_err("unknown embedders must fail");
+        assert!(embedder.to_string().contains("embedder"));
+
+        let policy = HarnessConfig::from_toml_str("[memory]\nwrite_policy = \"always\"\n")
+            .expect_err("unknown write policies must fail");
+        assert!(policy.to_string().contains("write_policy"));
+    }
+
+    #[test]
+    fn blank_memory_paths_and_unknown_fields_are_rejected() {
+        let blank = HarnessConfig::from_toml_str("[memory]\npath = \"\"\n")
+            .expect_err("blank memory path must fail");
+        assert!(blank.to_string().contains("memory.path"));
+
+        let unknown = HarnessConfig::from_toml_str("[memory]\ndatabase = \"memory.db\"\n")
+            .expect_err("unknown memory fields must fail");
+        assert!(unknown.to_string().contains("database"));
     }
 
     #[test]
