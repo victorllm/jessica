@@ -11,3 +11,9 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Task 1.1b: loopback mock HTTP tests drive AnthropicProvider through reqwest's
+# Tokio reactor. No new third-party crate: tokio is already a workspace
+# dependency.
+tokio = { workspace = true }

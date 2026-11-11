@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use jessica_core::llm::LlmProvider;
 use jessica_core::types::{SessionEndReason, SessionId};
-use jessica_providers::OpenAiProvider;
+use jessica_providers::{AnthropicProvider, OpenAiProvider};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 
 use crate::app::{CliError, CliRuntime, load_wasm_tools};
@@ -81,7 +81,7 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
             Ok(None)
         }
         Mode::Turn { resume, prompt } => {
-            let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiProvider::from_env()?);
+            let provider = build_provider()?;
             let wasm_tools = load_wasm_tools(&config, &root).await?;
             let runtime = CliRuntime::new(provider, config, root, wasm_tools, recorder);
 
@@ -97,6 +97,51 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
                 }
             }
         }
+    }
+}
+
+/// Environment variable selecting which provider the CLI assembles.
+const PROVIDER_ENV: &str = "JESSICA_PROVIDER";
+
+/// Provider families the CLI can assemble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    /// OpenAI-compatible chat completions, configured by `OPENAI_*`.
+    OpenAi,
+    /// Anthropic-compatible Messages API, configured by `ANTHROPIC_*`.
+    Anthropic,
+}
+
+impl ProviderKind {
+    /// Parses a `JESSICA_PROVIDER` value; `None` means the variable is unset.
+    ///
+    /// Unset defaults to OpenAI so existing deployments keep their behavior.
+    fn from_env_value(value: Option<&str>) -> Result<Self, CliError> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("openai") => Ok(Self::OpenAi),
+            Some("anthropic") => Ok(Self::Anthropic),
+            Some(other) => Err(CliError::InvalidProvider {
+                name: other.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Builds the provider selected by `JESSICA_PROVIDER`.
+fn build_provider() -> Result<Arc<dyn LlmProvider>, CliError> {
+    let selection = match std::env::var(PROVIDER_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CliError::InvalidProvider {
+                name: "<non-Unicode>".to_owned(),
+            });
+        }
+    };
+
+    match ProviderKind::from_env_value(selection.as_deref())? {
+        ProviderKind::OpenAi => Ok(Arc::new(OpenAiProvider::from_env()?)),
+        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::from_env()?)),
     }
 }
 
@@ -274,6 +319,9 @@ fn print_usage() {
          The configuration file controls budgets, tool allowlist, command sensor, and\n\
          acceptance retries. See examples/harness.toml.\n\
          \n\
+         JESSICA_PROVIDER selects `openai` (default) or `anthropic`; the matching\n\
+         OPENAI_* or ANTHROPIC_* variables configure it.\n\
+         \n\
          --resume <session_id> continues an interrupted session recorded in the\n\
          [events] database. It cannot be combined with a prompt and requires an\n\
          [events] path in the configuration.\n\
@@ -343,5 +391,39 @@ fn exit_code(reason: SessionEndReason) -> ExitCode {
         SessionEndReason::BudgetExceeded
         | SessionEndReason::AcceptanceFailed
         | SessionEndReason::Error => ExitCode::FAILURE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_selection_defaults_to_openai_when_unset() {
+        assert_eq!(
+            ProviderKind::from_env_value(None).expect("unset selection must parse"),
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            ProviderKind::from_env_value(Some("openai")).expect("explicit selection must parse"),
+            ProviderKind::OpenAi
+        );
+    }
+
+    #[test]
+    fn provider_selection_accepts_anthropic_case_insensitively() {
+        assert_eq!(
+            ProviderKind::from_env_value(Some(" Anthropic ")).expect("selection must parse"),
+            ProviderKind::Anthropic
+        );
+    }
+
+    #[test]
+    fn provider_selection_rejects_unknown_names() {
+        let error = ProviderKind::from_env_value(Some("gemini"))
+            .expect_err("unsupported providers must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("JESSICA_PROVIDER"));
+        assert!(message.contains("gemini"));
     }
 }

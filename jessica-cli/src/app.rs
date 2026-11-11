@@ -604,6 +604,12 @@ pub(crate) enum CliError {
     /// The LLM provider could not be configured.
     #[error("provider setup failed: {0}")]
     Provider(#[from] LlmError),
+    /// `JESSICA_PROVIDER` named an unsupported provider.
+    #[error("unsupported JESSICA_PROVIDER `{name}`; expected `openai` or `anthropic`")]
+    InvalidProvider {
+        /// Unsupported value read from the environment.
+        name: String,
+    },
     /// The harness configuration could not be loaded or validated.
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),

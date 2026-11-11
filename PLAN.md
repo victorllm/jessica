@@ -76,7 +76,7 @@ cargo clippy -p jessica-core -- -D warnings
 
 ---
 
-Phase 1：裸循环（3 个 Task）
+Phase 1：裸循环（4 个 Task）
 
 Task 1.1：OpenAI 兼容 Provider
 
@@ -90,6 +90,50 @@ cargo test -p jessica-providers
 ```
 
 禁止：不要在 Provider 中实现重试/熔断（Phase 5 的事）；不要硬编码 API key，从环境变量读取。
+
+Task 1.1b：Anthropic 兼容 Provider 【新增】
+
+目标：新增 AnthropicProvider，实现与 OpenAI Provider 等价的 LlmProvider 契约，使运行时能在两家模型供应商之间确定性切换。这是与 Task 1.1 对称的 Task，不改变任何下游契约。
+
+背景：Anthropic Messages API 与 OpenAI Chat Completions API 在三处关键差异，必须在 Provider 内部吸收，不得泄漏到 jessica-core 的 Message/LlmEvent 契约中：
+
+1. 消息结构：Anthropic 用 system 顶层字段（非 messages 内的 system role）；content 是 block 数组（text / tool_use / tool_result block），而非字符串 + 独立 tool_calls 字段。
+2. 工具定义：tools[] 的元素是 { name, description, input_schema }，不是 OpenAI 的 { type: "function", function: {...} }。
+3. 流式事件：SSE 使用具名事件（message_start / content_block_start / content_block_delta / content_block_stop / message_delta / message_stop），文本增量是 content_block_delta 中的 text_delta，工具参数增量是 input_json_delta 的 partial_json，需要按 content_block 的 index 聚合，而不是按 tool_calls[].index。
+
+操作：
+
+在 jessica-providers 中新增 anthropic 模块，实现 AnthropicProvider，结构与 OpenAiProvider 对称：
+
+- 请求构造（独立函数 + 单测）：build_anthropic_request(messages, tools) -> serde_json::Value。需正确完成：system 消息抽取到顶层 system 字段；ToolResult 映射为 tool_result block 且 tool_use_id 与之前的 tool_use 关联；ToolCall 映射为 tool_use block；工具 schema 从 JSON Schema 直接放入 input_schema。
+- SSE 解析（独立函数 + 单测）：parse_anthropic_sse_line，识别 event: 与 data:，把每一行解析为强类型 enum AnthropicSseEvent。
+- 流式聚合（独立函数 + 单测）：AnthropicStreamAssembler，按 content_block 的 index 维护状态机——text block 累积文本，tool_use block 累积 partial_json 并在 content_block_stop 时尝试 serde_json::from_str 得到完整 ToolCall。必须测试：单文本 block、单工具调用（参数分 2+ 个 delta）、文本与工具交错、多工具并行、JSON 参数被拆断在任意字节边界（含 Unicode 多字节字符）。
+- LlmProvider 实现：stream_chat 装配请求 + HTTP 客户端（用 reqwest，加入 [workspace.dependencies] 和批准列表）+ SSE 聚合，输出标准 LlmEvent 流。
+- 配置：从环境变量 ANTHROPIC_API_KEY、ANTHROPIC_BASE_URL（默认 https://api.anthropic.com）、ANTHROPIC_MODEL（默认取一个当前可用模型名，作为常量集中定义便于替换）读取；支持自定义 base_url 以兼容第三方 Anthropic 兼容网关。
+- 错误映射：HTTP 非 2xx、event: error、JSON 解析失败，全部映射为 LlmEvent::Error，不得 unwrap。
+
+验收：
+
+```bash
+cargo test -p jessica-providers anthropic
+# 至少覆盖：
+#  1. build_anthropic_request：system 抽取、tool_use/tool_result 往返、schema 映射
+#  2. SSE 解析：message_start → text delta → tool_use delta → message_stop 的完整 mock 流
+#  3. 聚合器：工具参数被拆断在多字节字符中间仍能正确拼接
+#  4. 错误事件：event: error 与 HTTP 500 都产生 LlmEvent::Error
+cargo clippy -p jessica-providers -- -D warnings
+```
+
+提供一个 tests/fixtures/anthropic_sse_*.txt 的 mock SSE 流样本文件，测试读取本地文件，不依赖真实网络。
+
+禁止：
+
+- 不要在 Provider 内部实现重试/熔断/限流（Phase 5）。
+- 不要把 Anthropic 特有的 block 结构泄漏到 jessica-core 类型中；ToolResult/ToolCall 的映射只在 Provider 内完成。
+- 不要硬编码 API key。
+- 不要在 Task 1.1 未完成时开工（复用 SSE 行读取与 HTTP 骨架，避免重复造轮子）。
+
+Deferred 记录点：Prompt caching（cache_control）、thinking block、多模态 image block 不在本 Task 范围，记入 PLAN.md 的 Deferred 列表，由用户决定是否单开 Task。
 
 Task 1.2：jessica-runtime 的 Agent 循环
 
@@ -257,6 +301,7 @@ Task 0 ☑ 约 5 分钟 无；仅创建 CLAUDE.md 与更新本表，未写 Rust 
 Task 0.1 ☑ 约 20 分钟 环境原先无 Rust：经 rsproxy.cn 镜像安装 rustup 并固定 Rust 1.99.1；cargo new 用 --vcs none 避免嵌套 git；外部依赖仅在 workspace.dependencies 集中声明，尚未被成员使用
 Task 0.2 ☑ 约 25 分钟 契约补充：Message 增加 tool_call_id（OpenAI tool 消息必需）；LlmEvent::Done 带可选 TokenUsage；AgentEvent 增加 Error/PolicyDenied，SessionEnded 增加 reason；Guard 统一为 check(GuardContext) 签名；ToolRegistry 用 BTreeMap 保证确定性迭代顺序；crates.io 依赖经 rsproxy 镜像拉取（环境配置）
 Task 1.1 ☑ 约 25 分钟 新增 reqwest（rustls-tls/json/stream）用于流式 HTTP（已在 workspace.dependencies 说明理由）；SSE 解码自行实现（字节级缓冲，处理跨 chunk 的 UTF-8/换行）；请求带 stream_options.include_usage 以填充 TokenUsage；环境变量 OPENAI_API_KEY 必需，OPENAI_BASE_URL/OPENAI_MODEL 可选；未做真实网络调用（无 API key），按计划用 mock SSE 流验收
+Task 1.1b ☑ 约 40 分钟 jessica-providers 新增 anthropic 模块（config/request/sse/stream/provider），实现 AnthropicProvider。请求构造把 system 消息合并到顶层 system；Message content 转 block 数组，assistant text + tool_calls 转 text/tool_use blocks，连续 Tool 消息合并为一个 user 消息的 tool_result blocks；OpenAI 风格 function schema 解包为 {name, description, input_schema}，同时接受直接 name/parameters 形式。SSE 层自行实现按行缓冲的 AnthropicSseDecoder（字节级缓冲，保留跨 chunk 多字节 UTF-8），parse_anthropic_sse_line 识别 event:/data:，完整帧反序列化为强类型 AnthropicSseEvent 并校验 event 名与 payload type 一致。AnthropicStreamAssembler 以 content_block index 维护 BTreeMap 状态：text block 累积并逐 delta 发出 TextDelta；tool_use block 累积 input_json_delta.partial_json，在 content_block_stop 解析为 ToolCall（空参数回退 start 时的 input），usage 从 message_start/message_delta 合并为 TokenUsage。stream_chat 用 reqwest 发送 x-api-key + anthropic-version: 2023-06-01，base_url 兼容带/不带 /v1；HTTP 非 2xx、event: error、SSE/JSON 解析失败全部转为 LlmEvent::Error，网络发送与配置错误仍为 Err(LlmError::Request)（与 OpenAI Provider 一致）。配置 ANTHROPIC_API_KEY 必需，ANTHROPIC_BASE_URL 默认 https://api.anthropic.com，ANTHROPIC_MODEL 默认 claude-sonnet-5-5（常量集中定义），Debug 脱敏；max_tokens 固定 8192（Messages API 必填，本 Task 未做配置项）。新增 tests/fixtures/anthropic_sse_text_and_tool.txt 与 anthropic_sse_error.txt；31 个新增测试覆盖 system 抽取、tool_use/tool_result 往返、连续 tool_result 合并、schema 映射、完整具名事件流、1 字节切分（含中文）、text/tool 交错、多工具并行、非法工具 JSON、event: error、缺少 message_stop、loopback mock HTTP 完整流与 HTTP 500 错误事件。未新增第三方 crate：reqwest 复用 Task 1.1 的 workspace 声明；仅为测试增加 workspace tokio dev-dependency。jessica-core 未改，Anthropic block 结构未泄漏。workspace 共 218 个测试全绿。补充真实端点验证：新增 tests/anthropic_live.rs 两个 #[ignore] 测试（需 ANTHROPIC_API_KEY/ANTHROPIC_BASE_URL/ANTHROPIC_MODEL 与真实网络），覆盖文本流与工具调用 + tool_result 两轮往返；2026-11-11 对本机配置的 Anthropic 兼容端点实测 2 passed（文本回复 pong；工具调用 get_weather {"city":"Paris"}；回填结果后返回 21°C/clear 的文本回答），默认套件仍为 218 passed + 2 ignored。应“用 Jessica 跑一个 hello world Python 程序”的真实运行请求，CLI 增加 JESSICA_PROVIDER 开关（openai 默认 / anthropic，读取对应 OPENAI_* 或 ANTHROPIC_*），新增 3 个选择解析测试；以 JESSICA_PROVIDER=anthropic 真实跑通：模型调用 write_file 写入 hello.py（23 字节），再调用 bash 执行 python3 hello.py，实际输出 Hello, World!、exit 0、session Completed。该 CLI 接入属于 Task 1.1b 范围外的用户临时请求，是否正式立 Task 由用户决定；workspace 共 221 个测试全绿。
 Task 1.2 ☑ 约 30 分钟 新增 tokio-util（rt feature）提供 CancellationToken；循环只强制 max_rounds，token/tool_timeout 按计划留给 Phase 2 guards；ToolResult.tool_call_id 由循环按原始 ToolCall 重写（Tool::execute 只能拿到 args，拿不到 call id）；未知工具以错误 ToolResult 回填而非终止；LlmEvent::Done 的 usage 暂未消费，已记入 Deferred
 Task 1.3 ☑ 约 45 分钟 原生工具实现在 jessica-tools，CLI 只负责装配；read_file 与 write_file 均限制在当前目录内（计划仅要求 read_file），用 canonicalize 拒绝 `..`、绝对路径与 symlink 逃逸，仍存 TOCTOU 竞态；bash 默认 10s 超时、每流 64 KiB 上限，kill_on_drop 只杀直接子进程；workspace 为 CLI 增加 tokio `io-std` feature；REPL 每次输入是独立 session，不保留跨输入历史；无参数进入 REPL，有参数时全部拼接为一个 prompt；无真实 API key，验收改用本地 mock SSE server，并额外验证缺失 key 报错与 SIGINT 中断
 Task 2.1 ☑ 约 30 分钟 按依赖单向规则 harness 只能依赖 core，不能直接引用 jessica-runtime 的 AgentLoop；Harness 改为自持 broadcast 通道并用泛型 agent future 包裹，真实 AgentLoop 在 Task 2.4 由 CLI 接入。固定检查点仅 Hook 已定义的 on_session_start/on_event/on_session_end，未提前实现 Guard/Sensor/Policy。新增 harness 依赖 async-trait/tokio/tracing（均为 workspace 已有依赖），测试另加 serde_json dev-dependency；LoggingHook 用 tracing debug 且只记录事件类型，避免泄露模型文本；广播容量有界，hook 过慢时接收端 lag 会丢事件并告警
@@ -274,6 +319,7 @@ Task 4.3 ☑ 约 50 分钟 jessica-cli 新增 replay 模块（Script/ScriptBuild
 
 Deferred（待办，由用户决定是否单开 Task）
 
+· Anthropic Provider 暂不支持 Prompt caching（cache_control）、thinking block 与多模态 image block；未知 content block 目前按 Other 忽略（thinking/image 内容不会进入 LlmEvent），若需要这些能力须单开 Task。
 · TokenBudgetGuard 的计数已由 CLI 的 TokenCountingProvider 接入，但依赖 Provider 在 LlmEvent::Done 报告 usage；Provider 未报告 usage 时无法计费或限额。若需在 runtime 内强制，必须先单开 Task 修改冻结契约或事件模型。
 · jessica-memory 当前只实现 EventStore（SQLite 事件日志）；core 的 MemoryStore Trait（分层记忆）尚未实现，留待 Phase 5。EventStore 为同步 API，异步调用方必须使用 spawn_blocking；SQLite 的 append 目前单连接串行，跨进程并发写入依赖 SQLite 锁，已设置 5s busy_timeout，但仍未启用 WAL 或迁移机制。
 · WasmInstance 支持 `() -> i32` 与 BufferAbi 的 alloc/invoke 调用；尚无 component model、typed values、dealloc 或有状态复用。WasmTool 的 ABI 固定为 JSON bytes + 高 32 位长度/低 32 位指针的 packed i64；需要更丰富接口时应单开 Task，避免在适配器里扩协议。
