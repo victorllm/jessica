@@ -40,3 +40,7 @@ wasmtime-wasi = { version = "50.0", default-features = false, features = ["p1"] 
 # `bundled` compiles the SQLite amalgamation so builds do not depend on a
 # system libsqlite3 or its development headers.
 rusqlite = { version = "0.41", features = ["bundled"] }
+# Task 5.1.3 (user-approved): workspace scopes are the first 16 hex characters
+# of sha256(canonical workspace path). This is the only new third-party crate
+# approved for the layered-memory work.
+sha2 = "0.10"

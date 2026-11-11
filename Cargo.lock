@@ -894,10 +894,15 @@ dependencies = [
 name = "jessica-memory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "jessica-core",
  "rusqlite",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
