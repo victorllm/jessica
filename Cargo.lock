@@ -884,6 +884,7 @@ name = "jessica-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "jessica-core",
  "serde_json",
  "thiserror 2.0.21",
