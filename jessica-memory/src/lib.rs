@@ -44,6 +44,7 @@ mod embedding;
 mod fts_query;
 mod memory_log;
 mod memory_store;
+mod skill_jobs;
 mod skill_log;
 mod workspace;
 
@@ -63,6 +64,10 @@ pub use memory_log::{
     MemoryEntryId, MemoryLog, MemoryLogError, MemoryRecord, NewMemoryEntry, WorkspaceScope,
 };
 pub use memory_store::{RecallRequest, SqliteMemoryStore, SqliteMemoryStoreError};
+pub use skill_jobs::{
+    MAX_LAST_ERROR_BYTES, MAX_SOURCE_JSON_BYTES, NewSkillJob, SkillJob, SkillJobError, SkillJobId,
+    SkillJobStatus,
+};
 pub use skill_log::{
     NewSkill, Skill, SkillId, SkillLog, SkillLogError, SkillSource, SkillStatus, SqliteSkillStore,
     SqliteSkillStoreError,

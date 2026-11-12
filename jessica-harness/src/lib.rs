@@ -19,6 +19,7 @@ mod harness;
 mod logging;
 mod policy;
 mod sensors;
+mod skill_source;
 
 pub use acceptance::{AcceptanceOutcome, AcceptanceRunner, SessionAttempt};
 pub use guards::{ResultSizeGuard, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard};
@@ -27,3 +28,7 @@ pub use harness::{DEFAULT_EVENT_CAPACITY, Harness};
 pub use logging::LoggingHook;
 pub use policy::AllowlistPolicy;
 pub use sensors::{CommandSensor, SensorObservation, SensorPipeline, SensorReport};
+pub use skill_source::{
+    DEFAULT_MIN_ROUNDS, DEFAULT_MIN_TOOL_CALLS, DistillSource, DistillSourceInput,
+    MAX_TOOL_SUMMARY_BYTES, SkillTrigger, TurnSignals, escape_untrusted,
+};

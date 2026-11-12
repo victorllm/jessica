@@ -33,6 +33,11 @@
 //! a mutex, so SQLite never blocks a Tokio worker thread. The synchronous
 //! `open` constructors perform schema setup; call them during startup or from a
 //! blocking context.
+//!
+//! The same `skills.db` also contains the persistent skill-job queue. Job
+//! state is deliberately not part of the event stream; the `skill_jobs` module
+//! records the Plan B dual-source-of-truth boundary and the
+//! `TODO(reconciliation)` path to Plan A.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -51,6 +56,11 @@ use crate::memory_log::WorkspaceScope;
 use crate::workspace::{WorkspaceScopeError, workspace_scope_for};
 
 /// Version stored in SQLite's `user_version` pragma.
+///
+/// `skill_jobs` is installed as an additive table under this version: every
+/// open runs the idempotent schema, so existing version-1 databases gain the
+/// table without a destructive migration. A future breaking change must bump
+/// this version and add an explicit migration.
 const SCHEMA_VERSION: i64 = 1;
 
 /// How long SQLite waits for a competing writer before returning `Busy`.
@@ -84,6 +94,8 @@ const LIKE_SCORE: f64 = 0.0;
 /// table kept in sync by the triggers below. The update trigger removes the old
 /// FTS row and re-inserts it only while the skill is live, so soft-deleted rows
 /// disappear from keyword search without rewriting the source row's content.
+/// `skill_jobs` is the persistent queue described in `skill_jobs`; its unique
+/// key is the enqueue idempotency boundary.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS skills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,6 +212,24 @@ BEGIN
     INSERT INTO skills_fts (skills_fts, rowid, name, description, instructions, tags_json)
     VALUES ('delete', OLD.id, OLD.name, OLD.description, OLD.instructions, OLD.tags_json);
 END;
+
+CREATE TABLE IF NOT EXISTS skill_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_scope TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    source_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','processing','done','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    last_error TEXT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    claimed_at INTEGER NULL,
+    UNIQUE (workspace_scope, session_id, turn_index)
+);
+
+CREATE INDEX IF NOT EXISTS skill_jobs_claim_order
+ON skill_jobs (workspace_scope, status, created_at, id);
 "#;
 
 /// Columns selected for one [`Skill`], in [`RawSkill`] order.
@@ -527,6 +557,15 @@ impl SkillLog {
             });
         }
 
+        // WAL lets concurrent readers proceed while the single writer holds the
+        // lock. In-memory databases report `memory`; file databases report
+        // `wal`, and both outcomes are accepted.
+        connection
+            .query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(SkillLogError::Schema)?;
+
         connection
             .execute_batch(SCHEMA)
             .map_err(SkillLogError::Schema)?;
@@ -537,6 +576,14 @@ impl SkillLog {
         }
 
         Ok(Self { connection })
+    }
+
+    /// Returns the raw connection for the skill-job module to reuse.
+    ///
+    /// The queue lives in the same database and must share this connection's
+    /// WAL mode and busy timeout.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// Appends `skill`, returning its identifier.
@@ -988,6 +1035,11 @@ impl SqliteSkillStore {
     /// Returns the fixed workspace scope used by this store.
     pub fn workspace_scope(&self) -> &WorkspaceScope {
         &self.workspace_scope
+    }
+
+    /// Returns the shared synchronous log for the skill-job adapter.
+    pub(crate) fn shared_log(&self) -> Arc<Mutex<SkillLog>> {
+        Arc::clone(&self.log)
     }
 
     /// Appends `skill` if it belongs to this store's workspace.
