@@ -47,7 +47,7 @@ pub use skill_guide::{
 };
 pub use skill_source::{
     DEFAULT_MIN_ROUNDS, DEFAULT_MIN_TOOL_CALLS, DistillSource, DistillSourceInput,
-    MAX_TOOL_SUMMARY_BYTES, SkillTrigger, TurnSignals, escape_untrusted,
+    DistillSourcePersistError, MAX_TOOL_SUMMARY_BYTES, SkillTrigger, TurnSignals, escape_untrusted,
 };
 pub use skill_worker::{
     DEFAULT_DRAIN_TIMEOUT, DEFAULT_IDLE_INTERVAL, DEFAULT_MAX_ATTEMPTS, SkillJob, SkillJobId,

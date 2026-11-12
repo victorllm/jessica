@@ -14,8 +14,9 @@ use jessica_core::sensor::Sensor;
 use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError};
 use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, SessionId};
 use jessica_harness::{
-    AcceptanceRunner, AllowlistPolicy, CommandSensor, DEFAULT_EVENT_CAPACITY, Harness,
-    ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard,
+    AcceptanceOutcome, AcceptanceRunner, AllowlistPolicy, CommandSensor, DEFAULT_EVENT_CAPACITY,
+    Harness, ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard,
+    ToolTimeoutGuard, TurnSignals,
 };
 use jessica_runtime::{AgentLoop, SessionCheckpoint, recover_session};
 use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
@@ -30,6 +31,7 @@ use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, SessionSnapshot};
 use crate::replay::ReplayError;
+use crate::skills::{SkillCommandError, SkillsAssembly};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,7 +125,7 @@ pub(crate) struct CliRuntime {
     wasm_tools: Vec<Arc<dyn Tool>>,
     recorder: Option<Arc<EventRecorder>>,
     memory: Option<MemoryAssembly>,
-    turn_counter: AtomicU64,
+    skills: Option<SkillsAssembly>,
 }
 
 impl CliRuntime {
@@ -133,6 +135,7 @@ impl CliRuntime {
     /// Compilation happens once at startup rather than on every turn.
     /// `recorder` is present when the configuration enables event persistence.
     /// `memory` is present only when enabled and opened successfully.
+    /// `skills` is present only when enabled and opened successfully.
     pub(crate) fn new(
         provider: Arc<dyn LlmProvider>,
         config: HarnessConfig,
@@ -140,6 +143,7 @@ impl CliRuntime {
         wasm_tools: Vec<Arc<dyn Tool>>,
         recorder: Option<Arc<EventRecorder>>,
         memory: Option<MemoryAssembly>,
+        skills: Option<SkillsAssembly>,
     ) -> Self {
         let system_prompt = system_prompt(&root, &config);
         Self {
@@ -150,7 +154,17 @@ impl CliRuntime {
             wasm_tools,
             recorder,
             memory,
-            turn_counter: AtomicU64::new(0),
+            skills,
+        }
+    }
+
+    /// Drains the skill worker before the process exits.
+    ///
+    /// The drain is bounded by `drain_timeout_ms`; failures only warn and never
+    /// change the process exit code.
+    pub(crate) async fn shutdown(&self) {
+        if let Some(skills) = &self.skills {
+            skills.drain().await;
         }
     }
 
@@ -167,63 +181,78 @@ impl CliRuntime {
         let initial = self.initial_messages(&first_session, input.as_str()).await;
 
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
-        let (reason, emit_outer, final_session, final_output, final_messages) =
-            if let Some(acceptance) = &self.config.acceptance {
-                let check = CommandAcceptanceCheck::new(
-                    acceptance.name.clone(),
-                    acceptance.command.clone(),
-                    acceptance.args.clone(),
-                    resolve_dir(&self.root, acceptance.working_dir.as_deref()),
-                );
-                let runner = AcceptanceRunner::new(
-                    Arc::new(check) as Arc<dyn AcceptanceCheck>,
-                    acceptance.max_retries,
-                    setup.events.clone(),
-                );
-                let mut next_session = Some(first_session.clone());
-                let mut latest_session = None;
-                let outcome = runner
-                    .run(initial, |messages| {
-                        let session_id = next_session.take().unwrap_or_else(next_session_id);
-                        latest_session = Some(session_id.clone());
-                        let context = context.clone();
-                        async move {
-                            run_attempt(
-                                context,
-                                AttemptStart::Fresh {
-                                    session_id,
-                                    messages,
-                                },
-                            )
-                            .await
-                        }
-                    })
-                    .await;
-
-                (
-                    outcome.reason,
-                    true,
-                    latest_session.unwrap_or(first_session),
-                    outcome.last_output,
-                    outcome.messages,
-                )
-            } else {
-                let attempt = run_attempt(
-                    context,
-                    AttemptStart::Fresh {
-                        session_id: first_session.clone(),
-                        messages: initial,
-                    },
-                )
+        let (
+            reason,
+            emit_outer,
+            final_session,
+            final_output,
+            final_messages,
+            signals,
+            attempt_start,
+        ) = if let Some(acceptance) = &self.config.acceptance {
+            let check = CommandAcceptanceCheck::new(
+                acceptance.name.clone(),
+                acceptance.command.clone(),
+                acceptance.args.clone(),
+                resolve_dir(&self.root, acceptance.working_dir.as_deref()),
+            );
+            let runner = AcceptanceRunner::new(
+                Arc::new(check) as Arc<dyn AcceptanceCheck>,
+                acceptance.max_retries,
+                setup.events.clone(),
+            );
+            let mut next_session = Some(first_session.clone());
+            let mut latest_session = None;
+            let mut latest_attempt_start = 0_usize;
+            let outcome = runner
+                .run(initial, |messages| {
+                    latest_attempt_start = messages.len();
+                    let session_id = next_session.take().unwrap_or_else(next_session_id);
+                    latest_session = Some(session_id.clone());
+                    let context = context.clone();
+                    async move {
+                        run_attempt(
+                            context,
+                            AttemptStart::Fresh {
+                                session_id,
+                                messages,
+                            },
+                        )
+                        .await
+                    }
+                })
                 .await;
-                (
-                    attempt.reason,
-                    setup.governance.tripped(),
-                    first_session,
-                    attempt.last_output,
-                    attempt.messages,
-                )
-            };
+            let signals = acceptance_signals(&outcome, latest_attempt_start);
+
+            (
+                outcome.reason,
+                true,
+                latest_session.unwrap_or(first_session),
+                outcome.last_output,
+                outcome.messages,
+                signals,
+                latest_attempt_start,
+            )
+        } else {
+            let attempt = run_attempt(
+                context,
+                AttemptStart::Fresh {
+                    session_id: first_session.clone(),
+                    messages: initial,
+                },
+            )
+            .await;
+            let (tool_calls, rounds) = structured_counts(&attempt.messages, 0);
+            (
+                attempt.reason,
+                setup.governance.tripped(),
+                first_session,
+                attempt.last_output,
+                attempt.messages,
+                TurnSignals::new(attempt.reason, tool_calls, rounds),
+                0,
+            )
+        };
 
         // A budget trip overrides the runtime's Completed/Cancelled reason.
         // Emit an outer session event so the final observable reason is the
@@ -231,9 +260,27 @@ impl CliRuntime {
         if emit_outer {
             emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
         }
-        if reason == SessionEndReason::Completed {
-            self.record_turn_memory(&final_session, &input, &final_output, &final_messages)
-                .await;
+        let governed_completed =
+            reason == SessionEndReason::Completed && !setup.governance.tripped();
+        let turn_index = stable_turn_index(&final_messages);
+        if governed_completed {
+            self.record_turn_memory(
+                &final_session,
+                &input,
+                &final_output,
+                &final_messages,
+                turn_index,
+            )
+            .await;
+            self.record_skill_job(
+                &final_session,
+                turn_index,
+                &input,
+                &final_output,
+                &signals,
+                final_messages.get(attempt_start..).unwrap_or(&[]),
+            )
+            .await;
         }
 
         setup.shutdown();
@@ -249,7 +296,11 @@ impl CliRuntime {
             Some(memory) => memory.recall(session, input).await,
             None => None,
         };
-        fresh_conversation(&self.system_prompt, memory_message, input)
+        let skill_message = match &self.skills {
+            Some(skills) => skills.recall(session, input).await,
+            None => None,
+        };
+        fresh_conversation(&self.system_prompt, memory_message, skill_message, input)
     }
 
     /// Writes the completed turn to memory when the policy allows it.
@@ -262,11 +313,11 @@ impl CliRuntime {
         user_input: &str,
         assistant_answer: &str,
         messages: &[Message],
+        turn_index: u64,
     ) {
         let Some(memory) = &self.memory else {
             return;
         };
-        let turn_index = self.turn_counter.fetch_add(1, Ordering::Relaxed);
         let tool_call_count = messages
             .iter()
             .map(|message| message.tool_calls.len())
@@ -283,6 +334,35 @@ impl CliRuntime {
         {
             eprintln!("[warn] failed to write memory for session {session_id}: {error}");
         }
+    }
+
+    /// Enqueues a skill job when the completed turn crosses the thresholds.
+    ///
+    /// Counts are taken from the final attempt: `messages` must already be
+    /// sliced to that attempt. The enqueue is idempotent and fail-open; it
+    /// never writes the event stream and never awaits distillation.
+    async fn record_skill_job(
+        &self,
+        session_id: &SessionId,
+        turn_index: u64,
+        user_input: &str,
+        assistant_answer: &str,
+        signals: &TurnSignals,
+        messages: &[Message],
+    ) {
+        let Some(skills) = &self.skills else {
+            return;
+        };
+        skills
+            .after_completed_turn(
+                session_id,
+                turn_index,
+                user_input,
+                assistant_answer,
+                signals,
+                messages,
+            )
+            .await;
     }
 
     /// Continues the interrupted loop recorded for `session_id`.
@@ -328,11 +408,28 @@ impl CliRuntime {
         if setup.governance.tripped() {
             emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
         }
-        if reason == SessionEndReason::Completed {
+        let governed_completed =
+            reason == SessionEndReason::Completed && !setup.governance.tripped();
+        let turn_index = stable_turn_index(&attempt.messages);
+        if governed_completed {
+            let (tool_calls, rounds) = structured_counts(&attempt.messages, 0);
+            let signals = TurnSignals::new(reason, tool_calls, rounds);
             self.record_turn_memory(
                 &session_id,
                 &user_input,
                 &attempt.last_output,
+                &attempt.messages,
+                turn_index,
+            )
+            .await;
+            // Resume never injects skills, but a completed resumed turn may
+            // enqueue idempotently through the skills.db unique index.
+            self.record_skill_job(
+                &session_id,
+                turn_index,
+                &user_input,
+                &attempt.last_output,
+                &signals,
                 &attempt.messages,
             )
             .await;
@@ -688,20 +785,60 @@ fn resolve_dir(root: &Path, configured: Option<&Path>) -> PathBuf {
 
 /// Builds a fresh conversation in its required order.
 ///
-/// The system prompt is always first and the user input is always last. A
-/// recalled memory message, when present, sits between them.
+/// The order is fixed: system prompt, optional memory guide, optional skill
+/// guide, then user input.
 fn fresh_conversation(
     system_prompt: &str,
     memory_message: Option<Message>,
+    skill_message: Option<Message>,
     input: &str,
 ) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(3);
+    let mut messages = Vec::with_capacity(4);
     messages.push(Message::system(system_prompt));
     if let Some(message) = memory_message {
         messages.push(message);
     }
+    if let Some(message) = skill_message {
+        messages.push(message);
+    }
     messages.push(Message::user(input));
     messages
+}
+
+/// Counts tool calls and assistant rounds in `messages[attempt_start..]`.
+///
+/// The acceptance runner passes the accumulated conversation into each retry,
+/// so the CLI records the start of the final attempt and counts only that
+/// attempt. Counts come from structured messages, never from model text.
+fn structured_counts(messages: &[Message], attempt_start: usize) -> (usize, usize) {
+    let attempt = messages.get(attempt_start..).unwrap_or(&[]);
+    let tool_calls = attempt.iter().map(|message| message.tool_calls.len()).sum();
+    let rounds = attempt
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .count();
+    (tool_calls, rounds)
+}
+
+/// Builds trigger signals from an acceptance outcome and the final attempt
+/// start offset.
+fn acceptance_signals(outcome: &AcceptanceOutcome, attempt_start: usize) -> TurnSignals {
+    let (tool_calls, rounds) = structured_counts(&outcome.messages, attempt_start);
+    TurnSignals::from_acceptance(outcome, tool_calls, rounds)
+}
+
+/// Derives a stable turn index from the session transcript.
+///
+/// The index is the number of user turns already present before this one,
+/// counted from structured messages. This CLI starts one session per turn, so
+/// a fresh turn and every resume of that turn both derive `0`. The value never
+/// depends on a process-local counter and is stable across restarts.
+fn stable_turn_index(messages: &[Message]) -> u64 {
+    let user_turns = messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .count();
+    u64::try_from(user_turns.saturating_sub(1)).unwrap_or(u64::MAX)
 }
 
 fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
@@ -820,40 +957,145 @@ pub(crate) enum CliError {
     /// The blocking current-directory task failed.
     #[error("current-directory task failed: {0}")]
     CurrentDirTask(#[source] tokio::task::JoinError),
+    /// A `skills` argument was missing, unknown, or malformed.
+    #[error("invalid skills command: {message}")]
+    InvalidSkillsCommand {
+        /// Human-readable parse failure.
+        message: String,
+    },
+    /// A `skills` subcommand failed.
+    #[error("skill command failed: {0}")]
+    SkillsCommand(#[from] SkillCommandError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use jessica_core::types::ToolCall;
+    use serde_json::json;
+
     #[test]
-    fn recalled_memory_is_injected_between_the_system_prompt_and_the_user() {
+    fn guides_are_injected_in_system_memory_skill_user_order() {
         let messages = fresh_conversation(
             "system prompt",
             Some(Message::system("[记忆参考] remembered fact")),
+            Some(Message::system("[技能参考] reusable procedure")),
             "new question",
         );
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0], Message::system("system prompt"));
         assert_eq!(messages[1], Message::system("[记忆参考] remembered fact"));
-        assert_eq!(messages[2], Message::user("new question"));
+        assert_eq!(
+            messages[2],
+            Message::system("[技能参考] reusable procedure")
+        );
+        assert_eq!(messages[3], Message::user("new question"));
         assert_eq!(
             messages
                 .iter()
                 .map(|message| message.role)
                 .collect::<Vec<_>>(),
-            vec![Role::System, Role::System, Role::User]
+            vec![Role::System, Role::System, Role::System, Role::User]
         );
     }
 
     #[test]
-    fn absent_memory_keeps_the_original_system_then_user_order() {
-        let messages = fresh_conversation("system prompt", None, "question");
+    fn absent_guides_keep_the_original_system_then_user_order() {
+        let messages = fresh_conversation("system prompt", None, None, "question");
 
         assert_eq!(
             messages,
             vec![Message::system("system prompt"), Message::user("question"),]
         );
+    }
+
+    #[test]
+    fn a_skill_guide_without_memory_stays_adjacent_to_the_user() {
+        let messages = fresh_conversation(
+            "system prompt",
+            None,
+            Some(Message::system("[技能参考] reuse")),
+            "question",
+        );
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::system("system prompt"),
+                Message::system("[技能参考] reuse"),
+                Message::user("question"),
+            ]
+        );
+    }
+
+    #[test]
+    fn acceptance_counts_use_only_the_final_attempt() {
+        let first_attempt = vec![
+            Message::system("system"),
+            Message::user("goal"),
+            Message::assistant_with_tool_calls(
+                "first",
+                vec![ToolCall::new("call-1", "read_file", json!({}))],
+            ),
+            Message::tool("call-1", "first output"),
+            Message::assistant("first answer"),
+            Message::user("acceptance feedback"),
+        ];
+        let final_attempt = vec![
+            Message::assistant_with_tool_calls(
+                "second",
+                vec![ToolCall::new("call-2", "bash", json!({}))],
+            ),
+            Message::tool("call-2", "second output"),
+            Message::assistant("second answer"),
+        ];
+        let mut messages = first_attempt;
+        let start = messages.len();
+        messages.extend(final_attempt);
+        let outcome = AcceptanceOutcome {
+            reason: SessionEndReason::Completed,
+            messages,
+            last_output: "second answer".to_owned(),
+            attempts: 2,
+        };
+
+        let signals = acceptance_signals(&outcome, start);
+
+        assert_eq!(signals.tool_call_count(), 1);
+        assert_eq!(signals.assistant_rounds(), 2);
+        assert_eq!(signals.acceptance_failures(), 1);
+        assert!(!jessica_harness::SkillTrigger::new(1, 2).should_trigger(&signals));
+    }
+
+    #[test]
+    fn structured_counts_include_recovered_checkpoint_work_on_resume() {
+        let messages = vec![
+            Message::system("system"),
+            Message::user("goal"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new("call-1", "read_file", json!({}))],
+            ),
+            Message::tool("call-1", "output"),
+            Message::assistant("finished"),
+        ];
+
+        assert_eq!(structured_counts(&messages, 0), (1, 2));
+        assert_eq!(stable_turn_index(&messages), 0);
+    }
+
+    #[test]
+    fn the_turn_index_is_stable_and_does_not_use_a_process_counter() {
+        let first = vec![Message::system("system"), Message::user("goal")];
+        let resumed = vec![
+            Message::system("system"),
+            Message::user("goal"),
+            Message::assistant("partial"),
+        ];
+
+        assert_eq!(stable_turn_index(&first), 0);
+        assert_eq!(stable_turn_index(&resumed), 0);
     }
 }
