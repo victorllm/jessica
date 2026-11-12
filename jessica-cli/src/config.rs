@@ -33,6 +33,26 @@ const DEFAULT_MEMORY_PATH: &str = ".jessica/memory.db";
 const DEFAULT_RECALL_LIMIT: usize = 5;
 /// Default byte budget for the injected memory system message.
 const DEFAULT_MAX_INJECT_BYTES: usize = 4096;
+/// Default skill database path, resolved against the CLI workspace root.
+const DEFAULT_SKILLS_PATH: &str = ".jessica/skills.db";
+/// Default minimum tool calls required to distill a turn.
+const DEFAULT_SKILL_MIN_TOOL_CALLS: usize = 5;
+/// Default minimum assistant rounds required to distill a turn.
+const DEFAULT_SKILL_MIN_ROUNDS: usize = 2;
+/// Default byte budget for the escaped distillation source content.
+const DEFAULT_SKILL_MAX_SOURCE_BYTES: usize = 16 * 1024;
+/// Default number of skills requested by one recall.
+const DEFAULT_SKILL_RECALL_LIMIT: usize = 3;
+/// Default byte budget for the injected skill system message.
+const DEFAULT_SKILL_MAX_INJECT_BYTES: usize = 2048;
+/// Default skill relevance floor; zero disables score filtering.
+const DEFAULT_SKILL_MIN_SCORE: f64 = 0.0;
+/// Default wall-clock timeout for one controlled distillation call.
+const DEFAULT_SKILL_DISTILL_TIMEOUT_MS: u64 = 30_000;
+/// Default grace period for draining the skill worker before exit.
+const DEFAULT_SKILL_DRAIN_TIMEOUT_MS: u64 = 30_000;
+/// Default attempts per distillation job, including the first.
+const DEFAULT_SKILL_MAX_ATTEMPTS: usize = 2;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,6 +72,8 @@ pub struct HarnessConfig {
     pub events: EventsConfig,
     /// Optional layered memory used for context injection and turn writes.
     pub memory: MemoryConfig,
+    /// Optional skill distillation, retrieval, and manual review.
+    pub skills: SkillsConfig,
 }
 
 impl HarnessConfig {
@@ -116,6 +138,7 @@ impl HarnessConfig {
         if self.memory.path.as_os_str().is_empty() {
             return Err(invalid("memory.path must not be empty"));
         }
+        self.skills.validate()?;
         Ok(())
     }
 }
@@ -244,6 +267,95 @@ pub enum MemoryWritePolicy {
     Completed,
     /// Never write automatically; an explicit entry point is not implemented.
     Explicit,
+}
+
+/// Skill distillation, retrieval, and manual review settings.
+///
+/// Skills are disabled by default. When disabled, the CLI neither creates nor
+/// opens the configured database, and no skill job is enqueued or injected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Whether skill triggering, distillation, retrieval, and review are enabled.
+    pub enabled: bool,
+    /// SQLite database path. Relative paths resolve against the workspace root.
+    pub path: PathBuf,
+    /// Minimum tool calls in the final attempt required to trigger distillation.
+    pub min_tool_calls: usize,
+    /// Minimum assistant rounds in the final attempt required to trigger.
+    pub min_rounds: usize,
+    /// Maximum byte budget for escaped source content.
+    pub max_source_bytes: usize,
+    /// Maximum number of active skills requested by one recall.
+    pub recall_limit: usize,
+    /// Maximum bytes in the injected skill system message.
+    pub max_inject_bytes: usize,
+    /// Minimum relevance score; `0.0` disables score filtering.
+    pub min_score: f64,
+    /// Timeout for one controlled distillation call, in milliseconds.
+    pub distill_timeout_ms: u64,
+    /// Maximum wait for the worker to drain before exit, in milliseconds.
+    pub drain_timeout_ms: u64,
+    /// Attempts per distillation job, including the first.
+    pub max_attempts: usize,
+    /// Whether bounded tool-output excerpts are included in the source.
+    ///
+    /// Full tool outputs are never included. The default is `false`.
+    pub include_tool_outputs: bool,
+    /// Whether a newly written skill starts active instead of as a draft.
+    pub auto_activate: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from(DEFAULT_SKILLS_PATH),
+            min_tool_calls: DEFAULT_SKILL_MIN_TOOL_CALLS,
+            min_rounds: DEFAULT_SKILL_MIN_ROUNDS,
+            max_source_bytes: DEFAULT_SKILL_MAX_SOURCE_BYTES,
+            recall_limit: DEFAULT_SKILL_RECALL_LIMIT,
+            max_inject_bytes: DEFAULT_SKILL_MAX_INJECT_BYTES,
+            min_score: DEFAULT_SKILL_MIN_SCORE,
+            distill_timeout_ms: DEFAULT_SKILL_DISTILL_TIMEOUT_MS,
+            drain_timeout_ms: DEFAULT_SKILL_DRAIN_TIMEOUT_MS,
+            max_attempts: DEFAULT_SKILL_MAX_ATTEMPTS,
+            include_tool_outputs: false,
+            auto_activate: false,
+        }
+    }
+}
+
+impl SkillsConfig {
+    /// Rejects values that would make skill processing ambiguous or unusable.
+    ///
+    /// Zero trigger thresholds and a zero recall or injection budget are
+    /// accepted as explicit boundaries. Source budgets, timeouts, and attempts
+    /// must be positive, and the relevance floor must be finite and
+    /// non-negative.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.path.as_os_str().is_empty() {
+            return Err(invalid("skills.path must not be empty"));
+        }
+        if self.max_source_bytes == 0 {
+            return Err(invalid("skills.max_source_bytes must be at least 1"));
+        }
+        if !self.min_score.is_finite() || self.min_score < 0.0 {
+            return Err(invalid(
+                "skills.min_score must be a finite non-negative value",
+            ));
+        }
+        if self.distill_timeout_ms == 0 {
+            return Err(invalid("skills.distill_timeout_ms must be at least 1"));
+        }
+        if self.drain_timeout_ms == 0 {
+            return Err(invalid("skills.drain_timeout_ms must be at least 1"));
+        }
+        if self.max_attempts == 0 {
+            return Err(invalid("skills.max_attempts must be at least 1"));
+        }
+        Ok(())
+    }
 }
 
 /// WebAssembly tool plugin settings.
@@ -542,6 +654,106 @@ mod tests {
 
         let unknown = HarnessConfig::from_toml_str("[events]\ndatabase = \"events.sqlite\"\n")
             .expect_err("unknown events fields must fail");
+        assert!(unknown.to_string().contains("database"));
+    }
+
+    #[test]
+    fn skills_defaults_are_disabled_with_the_documented_values() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        let skills = &config.skills;
+
+        assert!(!skills.enabled);
+        assert_eq!(skills.path, PathBuf::from(".jessica/skills.db"));
+        assert_eq!(skills.min_tool_calls, 5);
+        assert_eq!(skills.min_rounds, 2);
+        assert_eq!(skills.max_source_bytes, 16 * 1024);
+        assert_eq!(skills.recall_limit, 3);
+        assert_eq!(skills.max_inject_bytes, 2048);
+        assert_eq!(skills.min_score, 0.0);
+        assert_eq!(skills.distill_timeout_ms, 30_000);
+        assert_eq!(skills.drain_timeout_ms, 30_000);
+        assert_eq!(skills.max_attempts, 2);
+        assert!(!skills.include_tool_outputs);
+        assert!(!skills.auto_activate);
+    }
+
+    #[test]
+    fn skills_section_parses_every_documented_setting() {
+        let config = HarnessConfig::from_toml_str(
+            "[skills]\n\
+             enabled = true\n\
+             path = \"state/skills.db\"\n\
+             min_tool_calls = 1\n\
+             min_rounds = 0\n\
+             max_source_bytes = 2048\n\
+             recall_limit = 7\n\
+             max_inject_bytes = 512\n\
+             min_score = 0.25\n\
+             distill_timeout_ms = 1500\n\
+             drain_timeout_ms = 2500\n\
+             max_attempts = 3\n\
+             include_tool_outputs = true\n\
+             auto_activate = true\n",
+        )
+        .expect("skills section must parse");
+
+        assert!(config.skills.enabled);
+        assert_eq!(config.skills.path, PathBuf::from("state/skills.db"));
+        assert_eq!(config.skills.min_tool_calls, 1);
+        assert_eq!(config.skills.min_rounds, 0);
+        assert_eq!(config.skills.max_source_bytes, 2048);
+        assert_eq!(config.skills.recall_limit, 7);
+        assert_eq!(config.skills.max_inject_bytes, 512);
+        assert_eq!(config.skills.min_score, 0.25);
+        assert_eq!(config.skills.distill_timeout_ms, 1500);
+        assert_eq!(config.skills.drain_timeout_ms, 2500);
+        assert_eq!(config.skills.max_attempts, 3);
+        assert!(config.skills.include_tool_outputs);
+        assert!(config.skills.auto_activate);
+    }
+
+    #[test]
+    fn invalid_skill_values_are_rejected_at_load_time() {
+        for (document, field) in [
+            ("[skills]\npath = \"\"\n", "skills.path"),
+            (
+                "[skills]\nmax_source_bytes = 0\n",
+                "skills.max_source_bytes",
+            ),
+            ("[skills]\nmin_score = -0.5\n", "skills.min_score"),
+            ("[skills]\nmin_score = inf\n", "skills.min_score"),
+            (
+                "[skills]\ndistill_timeout_ms = 0\n",
+                "skills.distill_timeout_ms",
+            ),
+            (
+                "[skills]\ndrain_timeout_ms = 0\n",
+                "skills.drain_timeout_ms",
+            ),
+            ("[skills]\nmax_attempts = 0\n", "skills.max_attempts"),
+        ] {
+            let error = HarnessConfig::from_toml_str(document)
+                .expect_err("invalid skills values must fail at load time");
+            assert!(
+                error.to_string().contains(field),
+                "error for {document:?} should name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_skill_boundaries_and_unknown_fields_are_handled_explicitly() {
+        let config = HarnessConfig::from_toml_str(
+            "[skills]\nmin_tool_calls = 0\nmin_rounds = 0\nrecall_limit = 0\nmax_inject_bytes = 0\n",
+        )
+        .expect("zero thresholds and budgets are explicit boundaries");
+        assert_eq!(config.skills.min_tool_calls, 0);
+        assert_eq!(config.skills.min_rounds, 0);
+        assert_eq!(config.skills.recall_limit, 0);
+        assert_eq!(config.skills.max_inject_bytes, 0);
+
+        let unknown = HarnessConfig::from_toml_str("[skills]\ndatabase = \"skills.db\"\n")
+            .expect_err("unknown skills fields must fail");
         assert!(unknown.to_string().contains("database"));
     }
 

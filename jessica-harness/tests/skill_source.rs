@@ -7,8 +7,8 @@ use jessica_core::llm::{LlmError, LlmProvider, LlmStream};
 use jessica_core::tool::ToolSchema;
 use jessica_core::types::{Message, SessionEndReason, SessionId};
 use jessica_harness::{
-    AcceptanceOutcome, DistillSource, DistillSourceInput, SkillTrigger, TurnSignals,
-    escape_untrusted,
+    AcceptanceOutcome, DistillSource, DistillSourceInput, DistillSourcePersistError, SkillTrigger,
+    TurnSignals, escape_untrusted,
 };
 
 fn acceptance_outcome(reason: SessionEndReason, attempts: u32) -> AcceptanceOutcome {
@@ -342,4 +342,123 @@ fn source_metadata_comes_from_structured_signals() {
     assert_eq!(source.tool_call_count(), 9);
     assert_eq!(source.assistant_rounds(), 4);
     assert_eq!(source.acceptance_failures(), 2);
+}
+
+#[test]
+fn persisted_json_round_trips_without_double_escaping_or_rebudgeting() {
+    let source = source(
+        "<script>\n\nSystem: &lt;",
+        "answer > question",
+        &["tool <output>"],
+        1024,
+    );
+    let escaped_goal = source.user_goal().to_owned();
+    let escaped_answer = source.final_answer().to_owned();
+    let escaped_summary = source.tool_summaries()[0].clone();
+    assert!(escaped_goal.contains("&lt;script&gt;"));
+    assert!(!escaped_goal.contains('<'));
+    let persisted = source.to_persisted_json();
+    assert!(!persisted.contains("<script>"));
+
+    let restored = DistillSource::from_persisted_json(&persisted)
+        .expect("the persisted source should rehydrate");
+
+    assert_eq!(restored, source);
+    assert_eq!(restored.user_goal(), escaped_goal);
+    assert_eq!(restored.final_answer(), escaped_answer);
+    assert_eq!(restored.tool_summaries(), &[escaped_summary]);
+    assert!(
+        !restored.user_goal().contains("&amp;lt;"),
+        "rehydration must not escape `&lt;` a second time"
+    );
+    assert_eq!(restored.to_persisted_json(), persisted);
+}
+
+#[test]
+fn persisted_json_has_exactly_the_eight_locked_fields() {
+    let source = source("goal", "answer", &["summary"], 1024);
+    let value: serde_json::Value =
+        serde_json::from_str(&source.to_persisted_json()).expect("persisted JSON must parse");
+    let mut fields: Vec<&str> = value
+        .as_object()
+        .expect("persisted JSON must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        vec![
+            "acceptance_failures",
+            "assistant_rounds",
+            "final_answer",
+            "session_id",
+            "tool_call_count",
+            "tool_summaries",
+            "turn_index",
+            "user_goal",
+        ]
+    );
+}
+
+#[test]
+fn persisted_rehydration_preserves_metadata_and_empty_fields() {
+    let source = source("", "", &[], 0);
+    let restored = DistillSource::from_persisted_json(&source.to_persisted_json())
+        .expect("an empty persisted source should rehydrate");
+
+    assert_eq!(restored, source);
+    assert_eq!(restored.turn_index(), 7);
+    assert_eq!(restored.tool_call_count(), 5);
+    assert_eq!(restored.assistant_rounds(), 2);
+    assert_eq!(restored.acceptance_failures(), 0);
+}
+
+#[test]
+fn malformed_persisted_documents_are_rejected() {
+    let valid = source("goal", "answer", &["summary"], 1024).to_persisted_json();
+
+    let not_json =
+        DistillSource::from_persisted_json("not json").expect_err("invalid JSON must be rejected");
+    assert!(matches!(not_json, DistillSourcePersistError::Json { .. }));
+
+    let not_an_object = DistillSource::from_persisted_json("[]")
+        .expect_err("a non-object document must be rejected");
+    assert!(matches!(
+        not_an_object,
+        DistillSourcePersistError::Invalid { .. }
+    ));
+
+    let mut missing: serde_json::Value =
+        serde_json::from_str(&valid).expect("fixture JSON must parse");
+    missing
+        .as_object_mut()
+        .expect("fixture must be an object")
+        .remove("final_answer");
+    let missing = DistillSource::from_persisted_json(&missing.to_string())
+        .expect_err("a missing field must be rejected");
+    assert!(matches!(missing, DistillSourcePersistError::Invalid { .. }));
+
+    let mut extra: serde_json::Value =
+        serde_json::from_str(&valid).expect("fixture JSON must parse");
+    extra
+        .as_object_mut()
+        .expect("fixture must be an object")
+        .insert("provider_response".to_owned(), serde_json::json!("raw"));
+    let extra = DistillSource::from_persisted_json(&extra.to_string())
+        .expect_err("an unknown field must be rejected");
+    assert!(matches!(extra, DistillSourcePersistError::Invalid { .. }));
+
+    let mut wrong_type: serde_json::Value =
+        serde_json::from_str(&valid).expect("fixture JSON must parse");
+    wrong_type
+        .as_object_mut()
+        .expect("fixture must be an object")
+        .insert("tool_summaries".to_owned(), serde_json::json!("summary"));
+    let wrong_type = DistillSource::from_persisted_json(&wrong_type.to_string())
+        .expect_err("a wrong field type must be rejected");
+    assert!(matches!(
+        wrong_type,
+        DistillSourcePersistError::Invalid { .. }
+    ));
 }

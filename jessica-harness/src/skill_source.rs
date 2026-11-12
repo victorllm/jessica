@@ -13,6 +13,7 @@
 //! at [`MAX_TOOL_SUMMARY_BYTES`] after escaping.
 
 use jessica_core::types::{SessionEndReason, SessionId};
+use thiserror::Error;
 
 use crate::acceptance::AcceptanceOutcome;
 
@@ -304,6 +305,111 @@ impl DistillSource {
         self.turn_index
     }
 
+    /// Serializes this source into the bounded queue representation.
+    ///
+    /// The produced JSON object has exactly the eight persisted fields:
+    /// `session_id`, `turn_index`, `user_goal`, `final_answer`,
+    /// `tool_summaries`, `tool_call_count`, `assistant_rounds`, and
+    /// `acceptance_failures`. The content fields are the already-escaped,
+    /// already-budgeted values held by this source; serialization never
+    /// escapes or truncates them again.
+    #[must_use]
+    pub fn to_persisted_json(&self) -> String {
+        serde_json::json!({
+            "session_id": self.session_id.as_str(),
+            "turn_index": self.turn_index,
+            "user_goal": self.user_goal,
+            "final_answer": self.final_answer,
+            "tool_summaries": self.tool_summaries,
+            "tool_call_count": self.tool_call_count,
+            "assistant_rounds": self.assistant_rounds,
+            "acceptance_failures": self.acceptance_failures,
+        })
+        .to_string()
+    }
+
+    /// Rehydrates a source previously produced by [`DistillSource::to_persisted_json`].
+    ///
+    /// The persisted content is already escaped and bounded. This constructor
+    /// copies the fields verbatim: it must not re-run [`escape_untrusted`] or
+    /// re-apply the byte budget, because either would corrupt the saved
+    /// evidence (for example by turning `&lt;` into `&amp;lt;`).
+    ///
+    /// The document must be a JSON object with exactly the eight persisted
+    /// fields and the documented types. Rehydration performs structural
+    /// validation only; it does not re-validate the content budget.
+    pub fn from_persisted_json(json: &str) -> Result<Self, DistillSourcePersistError> {
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|error| DistillSourcePersistError::Json {
+                message: error.to_string(),
+            })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid_persisted("document must be a JSON object"))?;
+
+        const FIELDS: [&str; 8] = [
+            "session_id",
+            "turn_index",
+            "user_goal",
+            "final_answer",
+            "tool_summaries",
+            "tool_call_count",
+            "assistant_rounds",
+            "acceptance_failures",
+        ];
+        if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+            return Err(invalid_persisted(format!(
+                "document must contain exactly these fields: {}",
+                FIELDS.join(", ")
+            )));
+        }
+
+        let session_id = object
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_persisted("field `session_id` must be a string"))?;
+        let turn_index = object
+            .get("turn_index")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                invalid_persisted("field `turn_index` must be a non-negative integer")
+            })?;
+        let user_goal = object
+            .get("user_goal")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_persisted("field `user_goal` must be a string"))?;
+        let final_answer = object
+            .get("final_answer")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_persisted("field `final_answer` must be a string"))?;
+        let summaries = object
+            .get("tool_summaries")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid_persisted("field `tool_summaries` must be an array"))?;
+        let mut tool_summaries = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let summary = summary
+                .as_str()
+                .ok_or_else(|| invalid_persisted("field `tool_summaries` must contain strings"))?;
+            tool_summaries.push(summary.to_owned());
+        }
+
+        let tool_call_count = persisted_count(object, "tool_call_count")?;
+        let assistant_rounds = persisted_count(object, "assistant_rounds")?;
+        let acceptance_failures = persisted_count(object, "acceptance_failures")?;
+
+        Ok(Self {
+            session_id: SessionId::new(session_id),
+            turn_index,
+            user_goal: user_goal.to_owned(),
+            final_answer: final_answer.to_owned(),
+            tool_summaries,
+            tool_call_count,
+            assistant_rounds,
+            acceptance_failures,
+        })
+    }
+
     /// Renders the bounded content as one explicitly untrusted block.
     ///
     /// The returned text starts with `<source>` and ends with `</source>`.
@@ -347,6 +453,45 @@ impl DistillSource {
         block.push_str("</source>");
         block
     }
+}
+
+/// Errors raised while rehydrating a persisted [`DistillSource`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DistillSourcePersistError {
+    /// The stored document is not valid JSON.
+    #[error("persisted skill source is not valid JSON: {message}")]
+    Json {
+        /// Parser failure description.
+        message: String,
+    },
+    /// The stored document does not match the persisted schema.
+    #[error("persisted skill source is invalid: {message}")]
+    Invalid {
+        /// Validation failure description.
+        message: String,
+    },
+}
+
+/// Builds a structured invalid-document error.
+fn invalid_persisted(message: impl Into<String>) -> DistillSourcePersistError {
+    DistillSourcePersistError::Invalid {
+        message: message.into(),
+    }
+}
+
+/// Reads one non-negative integer counter from a persisted source object.
+fn persisted_count(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<usize, DistillSourcePersistError> {
+    let value = object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            invalid_persisted(format!("field `{field}` must be a non-negative integer"))
+        })?;
+    usize::try_from(value)
+        .map_err(|_| invalid_persisted(format!("field `{field}` is out of range")))
 }
 
 /// Escapes untrusted boundary markers before any truncation.
