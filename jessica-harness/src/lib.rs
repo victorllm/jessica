@@ -8,7 +8,9 @@
 //!
 //! [`Guide`] and [`MemoryGuide`] provide backend-agnostic context injection:
 //! a guide renders recalled memory into one bounded system message without
-//! coupling the harness to a concrete storage implementation.
+//! coupling the harness to a concrete storage implementation. [`SkillDistiller`]
+//! and [`LlmSkillDistiller`] turn an eligible, bounded turn source into a
+//! strictly parsed skill draft without writing storage or the event stream.
 
 #![deny(missing_docs)]
 
@@ -19,6 +21,7 @@ mod harness;
 mod logging;
 mod policy;
 mod sensors;
+mod skill_distiller;
 mod skill_source;
 
 pub use acceptance::{AcceptanceOutcome, AcceptanceRunner, SessionAttempt};
@@ -28,6 +31,11 @@ pub use harness::{DEFAULT_EVENT_CAPACITY, Harness};
 pub use logging::LoggingHook;
 pub use policy::AllowlistPolicy;
 pub use sensors::{CommandSensor, SensorObservation, SensorPipeline, SensorReport};
+pub use skill_distiller::{
+    DistillError, DistilledSkill, LlmSkillDistiller, MAX_SKILL_DESCRIPTION_BYTES,
+    MAX_SKILL_INSTRUCTIONS_BYTES, MAX_SKILL_NAME_BYTES, MAX_SKILL_TAG_BYTES, MAX_SKILL_TAGS,
+    SKILL_DISTILL_SYSTEM_PROMPT, SkillDistiller,
+};
 pub use skill_source::{
     DEFAULT_MIN_ROUNDS, DEFAULT_MIN_TOOL_CALLS, DistillSource, DistillSourceInput,
     MAX_TOOL_SUMMARY_BYTES, SkillTrigger, TurnSignals, escape_untrusted,

@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 jessica-core = { path = "../jessica-core" }
 async-trait = { workspace = true }
+# Task 5.2.3: consume the provider stream and parse strict JSON output.
+futures = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 # Task 5.1.4: structured errors for the backend-agnostic Guide trait.
 thiserror = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
