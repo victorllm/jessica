@@ -10,6 +10,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Task 5.2.4: the skill worker cooperatively stops claiming after shutdown.
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 # Task 5.1.4: structured errors for the backend-agnostic Guide trait.
 thiserror = { workspace = true }

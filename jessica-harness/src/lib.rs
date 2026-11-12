@@ -11,6 +11,9 @@
 //! coupling the harness to a concrete storage implementation. [`SkillDistiller`]
 //! and [`LlmSkillDistiller`] turn an eligible, bounded turn source into a
 //! strictly parsed skill draft without writing storage or the event stream.
+//! [`SkillWorker`] is the single-worker consumer that claims a queued job,
+//! distills it, writes it through an injected sink, and records the terminal
+//! transition through the injected queue.
 
 #![deny(missing_docs)]
 
@@ -23,6 +26,7 @@ mod policy;
 mod sensors;
 mod skill_distiller;
 mod skill_source;
+mod skill_worker;
 
 pub use acceptance::{AcceptanceOutcome, AcceptanceRunner, SessionAttempt};
 pub use guards::{ResultSizeGuard, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard};
@@ -39,4 +43,9 @@ pub use skill_distiller::{
 pub use skill_source::{
     DEFAULT_MIN_ROUNDS, DEFAULT_MIN_TOOL_CALLS, DistillSource, DistillSourceInput,
     MAX_TOOL_SUMMARY_BYTES, SkillTrigger, TurnSignals, escape_untrusted,
+};
+pub use skill_worker::{
+    DEFAULT_DRAIN_TIMEOUT, DEFAULT_IDLE_INTERVAL, DEFAULT_MAX_ATTEMPTS, SkillJob, SkillJobId,
+    SkillJobQueue, SkillQueueError, SkillSink, SkillSinkError, SkillWorker, SkillWorkerConfig,
+    SkillWorkerError, WorkerClock, WorkerOutcome, WorkerTimestamp,
 };
