@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use jessica_core::memory::{MemoryEntry, MemoryError, MemoryStore};
 use jessica_core::types::SessionId;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::Timestamp;
@@ -35,6 +34,7 @@ use crate::embedding::{BruteForceIndex, Embedder, VectorIndex};
 use crate::memory_log::{
     MemoryEntryId, MemoryLog, MemoryLogError, MemoryRecord, NewMemoryEntry, WorkspaceScope,
 };
+use crate::workspace::{WorkspaceScopeError, workspace_scope_for};
 
 /// Default RRF constant added to every one-based rank.
 const DEFAULT_RRF_K: usize = 60;
@@ -44,9 +44,6 @@ const DEFAULT_MAX_BYTES: usize = 4096;
 
 /// Default weight applied to each candidate path.
 const DEFAULT_WEIGHT: f32 = 1.0;
-
-/// Number of hexadecimal characters kept from the workspace path digest.
-const WORKSPACE_SCOPE_HEX_LEN: usize = 16;
 
 /// Number of bytes occupied by the `---` separator between recalled entries.
 const SEPARATOR_BYTES: usize = 3;
@@ -188,7 +185,11 @@ impl SqliteMemoryStore {
         canonical_workspace: &Path,
         embedder: Option<Arc<dyn Embedder>>,
     ) -> Result<Self, SqliteMemoryStoreError> {
-        let workspace_scope = workspace_scope_for(canonical_workspace)?;
+        let workspace_scope =
+            workspace_scope_for(canonical_workspace).map_err(|error| match error {
+                WorkspaceScopeError::EmptyPath => SqliteMemoryStoreError::EmptyWorkspacePath,
+                WorkspaceScopeError::InvalidScope => SqliteMemoryStoreError::WorkspaceScope,
+            })?;
         Ok(Self {
             log: Arc::new(Mutex::new(log)),
             workspace_scope,
@@ -636,26 +637,6 @@ fn backend_error(message: impl Into<String>) -> MemoryError {
     MemoryError::Backend {
         message: message.into(),
     }
-}
-
-/// Derives `hex(sha256(canonical_workspace))[..16]`.
-fn workspace_scope_for(
-    canonical_workspace: &Path,
-) -> Result<WorkspaceScope, SqliteMemoryStoreError> {
-    let bytes = canonical_workspace.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() {
-        return Err(SqliteMemoryStoreError::EmptyWorkspacePath);
-    }
-
-    let digest = Sha256::digest(bytes);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut scope = String::with_capacity(WORKSPACE_SCOPE_HEX_LEN);
-    for byte in &digest[..WORKSPACE_SCOPE_HEX_LEN / 2] {
-        scope.push(char::from(HEX[usize::from(byte >> 4)]));
-        scope.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-
-    WorkspaceScope::new(scope).map_err(|_| SqliteMemoryStoreError::WorkspaceScope)
 }
 
 /// Errors raised while constructing a [`SqliteMemoryStore`].

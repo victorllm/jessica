@@ -274,7 +274,7 @@ Phase 5：能力扩展与加固（按需拆 Task）
 这一阶段每个子方向独立成 Task，按你的优先级排序：
 
 · Task 5.1 分层记忆：短期（会话近期）/中期（FTS5 关键词）/长期（向量）三层召回，MemoryStore 的完整实现，Guide 注入真实记忆。拆分为 5.1.1–5.1.6，详见本节之后的“Task 5.1 拆分”。
-· Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。
+· Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。拆分为 5.2.1–5.2.6，其中 5.2.2 再拆为 5.2.2a / 5.2.2b，详见本节之后的“Task 5.2 拆分”。
 · Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。
 · Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。
 · Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。
@@ -514,6 +514,295 @@ Task 5.1.6：（后续、非阻塞）真实 Embedder
 
 范围（届时细化）：`embedder="http"` 配置、超时/重试/失败降级、模型维度与 model_id 迁移、批量写入、成本与速率限制。不得改变已冻结的 MemoryStore 契约；不得把网络失败升级为 turn 失败。5.1.6 未完成不阻塞 5.1.1–5.1.5 的验收。
 
+Task 5.2 拆分：技能沉淀
+
+5.2 全局约束（适用于 5.2.1–5.2.6）：
+
+· 本阶段所有 5.2 子 Task 都不修改 jessica-core 已冻结的公共 API。需要新 Trait 时放在 jessica-harness。5.2.2b 采用方案 B：不改 core、不新增 AgentEvent；resume 的入队幂等依赖 skills.db 唯一索引，并显式记录双真相源边界与迁移到方案 A 的 TODO(reconciliation)。
+· 不新增第三方 crate。复用现有 rusqlite、tokio、serde_json、thiserror、async-trait、tracing、futures、sha2。
+· 触发规则只读结构化计数：最终 Completed、tool_call_count、assistant_rounds、acceptance_failures。不得用 LLM 判断是否触发。
+· LLM 只用于提炼技能内容，绝不参与触发判断、技能检索、排序或注入决策。
+· 新技能默认 draft，人工激活后才注入；注入消息必须标注来源与“仅供参考”。
+· 任何“LLM 判断技能是否值得注入”的改动需单开 Task 并经 review。
+· skill_jobs 的持久化与幂等以 skills.db 的 (workspace_scope, session_id, turn_index) 唯一索引为准；本阶段不把 job 状态写入事件流。必须在 skill_jobs 模块留下 `TODO(reconciliation)` 与文档段落，说明“双真相源”是已知取舍、replay 不触库、以及未来迁移到方案 A 的路径；不得声称 skill_jobs 已是事件流的物化视图。
+· 单 worker 假设必须在文档中明确；claim_next 必须用 BEGIN IMMEDIATE 原子领取；多进程并发不损坏数据但不保证不重复处理。
+· 所有技能故障 fail-open：打开、入队、提炼、写入、检索、注入失败只 tracing::warn，不改变 SessionEndReason、退出码，也不向事件流注入 Agent-level Error；job 状态仅记录在 skills.db。
+· 提炼输入中的用户可控内容（用户目标、工具参数）必须经过转义再截断，防止注入字符被截断后逃逸。转义在截断之前。
+· replay 绝不打开技能库或调用模型；resume 绝不重新注入技能。
+· 不得把密钥或完整敏感输出写入技能库。
+· 每子 Task 完成前必须运行 cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace；5.2.6 另外运行 CLI E2E。
+
+依赖顺序：5.2.1 → 5.2.2a → 5.2.2b → 5.2.3 → 5.2.4 → 5.2.5 → 5.2.6。5.2.2b 采用方案 B，不修改 core；未来迁移到方案 A 必须单开 Task 并经 core review；5.1.6 不阻塞 5.2。
+
+Task 5.2.1：技能库存储 + FTS（jessica-memory，70–90 分钟）
+
+目标：建立工作区隔离、只追加、可软删除、可人工激活的技能库与全文检索；本 Task 不接 Harness/CLI，不调用 LLM。
+
+操作：
+
+1. 新建 `jessica-memory/src/skill_log.rs`，使用独立 `skills.db`（与 `memory.db` 分离）；打开时设置 `PRAGMA busy_timeout = 5000`，`PRAGMA user_version = 1`，未来版本报 UnsupportedVersion。
+2. `skills` 表字段：`id INTEGER PRIMARY KEY AUTOINCREMENT`、`workspace_scope TEXT NOT NULL`、`source_session TEXT NOT NULL`、`source_turn_index INTEGER NOT NULL`、`source_tool_calls INTEGER NOT NULL`、`source_rounds INTEGER NOT NULL`、`source_acceptance_failures INTEGER NOT NULL`、`name TEXT NOT NULL`、`description TEXT NOT NULL`、`instructions TEXT NOT NULL`、`tags_json TEXT NOT NULL`、`content_hash TEXT NOT NULL`、`status TEXT NOT NULL CHECK(status IN ('draft','active'))`、`created_at INTEGER NOT NULL`、`deleted_at INTEGER NULL`、`activated_at INTEGER NULL`。
+3. `content_hash = sha256(name || '\0' || description || '\0' || instructions || '\0' || canonical_tags_json)`，排除 source 字段；tags 先排序再序列化，`tags_json` 存储也使用同一 canonical JSON，保证同一技能跨来源稳定去重。
+4. 唯一约束：部分唯一索引 `(workspace_scope, source_session, source_turn_index) WHERE deleted_at IS NULL`；部分唯一索引 `(workspace_scope, content_hash) WHERE deleted_at IS NULL`。`INSERT OR IGNORE`；命中时返回 `Duplicate(id)`，保留首条来源与状态，不得因重复插入而自动激活。
+5. FTS5 trigram 外部内容表 `skills_fts`（name/description/instructions/tags）与同步触发器；把 5.1.1 的 FTS 查询清洗逻辑抽取到 `jessica-memory/src/fts_query.rs` 并在 memory/skill 两处复用，禁止复制两套实现。短 token 的 LIKE 回退、`%`/`_`/`\` 转义与确定性排序必须保持一致。
+6. 追加写约束：BEFORE UPDATE 只允许两类转换：`deleted_at` 由 NULL 单向置值且其余列不变；或 `status` 由 `draft` 变为 `active` 且同时设置 `activated_at`、其余列不变。其他 UPDATE 与所有 DELETE 用 RAISE(ABORT)。`append` 可以按 `auto_activate` 直接插入 active（INSERT 不受 BEFORE UPDATE 限制），但重复插入不得把已有 draft 自动激活。
+7. 同步 `SkillLog` + 异步 `SqliteSkillStore`；所有 rusqlite 调用在 `spawn_blocking` 中执行，异步入口不得直接阻塞 runtime。
+8. API（名称可微调，语义固定）：`append(NewSkill) -> Result<SkillId, SkillLogError>`、`get(id)`、`list_recent(workspace_scope, limit)`、`list_by_status(workspace_scope, status, limit)`、`search_keyword(workspace_scope, query, limit, min_score) -> Vec<(Skill, f64)>`、`soft_delete(id, deleted_at)`、`activate(id, activated_at)`、`find_by_source(workspace_scope, session, turn_index)`。
+9. 字段上限：`name ≤ 128` 字节、`description ≤ 512` 字节、`instructions ≤ 8192` 字节、`tags ≤ 16` 个且每个 `≤ 64` 字节；超限返回结构化校验错误，不截断静默写入。
+10. workspace scope 复用 5.1.3 的 `hex(sha256(canonical_workspace))[..16]` 生成逻辑，把私有 helper 提升为共享实现；不得让技能跨 workspace 可见。
+11. 错误用 thiserror 定义结构化 enum（Open/Schema/Migration/UnsupportedVersion/Validation/Serialize/Query/Duplicate/NotFound/Corrupt 等），库代码不得 unwrap/expect。
+
+行为测试（至少）：
+
+· user_version=1、重开保留数据、未来版本拒绝。
+· 相同 source 重复 append 返回 Duplicate 且只保留首条；软删除后同一 source 可重新写入。
+· 相同内容不同 source 去重，`content_hash` 对 tags 顺序不敏感；不同 workspace 相同内容各自保留。
+· name/description/instructions/tags 上限边界与超限错误。
+· FTS 特殊字符、中文 trigram、2 字 LIKE 回退、英文前缀均不报错且结果确定。
+· draft 默认不可见（检索只返回 active）；activate 后可见；重复 activate 的行为必须锁定并测试；软删除后检索/FTS 均不可见。
+· 物理 UPDATE/DELETE 及非法状态转换被触发器拒绝且原行不变。
+· `find_by_source` 命中/未命中、跨 workspace 隔离、limit/排序、损坏 tags_json/未知 status 报错。
+· 所有异步 API 的 SQLite 操作确实走 spawn_blocking（至少一个并发/阻塞行为测试）。
+
+验收：
+
+```bash
+cargo test -p jessica-memory
+cargo clippy -p jessica-memory --all-targets -- -D warnings
+```
+
+禁止：不实现 Harness/Guide/Worker/CLI；不调用 LLM；不修改 jessica-core；不新增 crate；不把技能写入 memory.db。
+
+Task 5.2.2a：确定性触发 + 提炼源（jessica-harness，30–45 分钟）
+
+目标：只根据结构化计数判断是否触发，并把可用于提炼的最小上下文整理为有界、已转义、不可信内容。
+
+操作：
+
+1. 定义 `SkillTrigger { min_tool_calls: usize, min_rounds: usize }`，默认 5/2（可在 5.2.6 配置覆盖）。
+2. 触发条件必须是：最终 `Completed` 且 `acceptance_failures == 0` 且 `tool_call_count >= min_tool_calls` 且 `assistant_rounds >= min_rounds`。不得读取模型文本、不得调用 LLM、不得使用时间/随机数。
+3. `acceptance_failures` 只能来自结构化结果：优先使用最终 `AcceptanceOutcome.attempts.saturating_sub(1)`；若改用事件计数，必须在本 Task 锁定唯一来源并测试。不得把 `attempts` 直接当失败数。
+4. 定义 `DistillSource`：`user_goal`、`final_answer`、`tool_summaries`、`tool_call_count`、`assistant_rounds`、`acceptance_failures`、`session_id`、`turn_index`。默认不包含工具输出；可选包含每个工具摘要，单个工具输出/摘要上限 512 字节。
+5. `escape_untrusted()`：在截断之前转义用户可控内容中的 `</source>`、`<|im_end|>`、`\n\nSystem:`、`\n\nHuman:`、`\n\nAssistant:` 等边界标记；采用一套锁定的方法并文档化，测试必须锁定逐字节输出，防止转义字符被截断后逃逸。
+6. 预算不足时的截断优先级：先丢弃 `tool_summaries` 尾部，再截断 `final_answer`，最后才截断 `user_goal`；所有截断在转义之后执行，且按 UTF-8 字符边界。`max_source_bytes` 的默认值由 5.2.6 配置（16384），本 Task 接收显式预算。
+7. `to_untrusted_block()` 把来源包装为明确的不可信块（如 `<source>...</source>`），供 5.2.3 作为独立 user message 使用；块内不得出现可跳出边界的未转义标记。
+
+行为测试（至少）：
+
+· 阈值恰好满足/差 1 不触发；非 Completed、acceptance_failures>0 不触发。
+· 只读计数：提供一个会 panic/计数的 LLM mock，断言触发判断期间零调用。
+· 五种以上注入标记在转义后不可逃逸；跨截断边界的半个标记不产生有效边界。
+· 预算不足时按“tool_summaries 尾部 → final_answer → user_goal”顺序削减，且不破坏 UTF-8。
+· 默认不含工具输出；开启后单个工具摘要不超过 512 字节。
+
+验收：
+
+```bash
+cargo test -p jessica-harness
+cargo clippy -p jessica-harness --all-targets -- -D warnings
+```
+
+禁止：不调用 LLM；不写技能库；不接 CLI；不修改 core；不新增 crate。
+
+Task 5.2.2b：技能任务队列（方案 B，jessica-memory，60–90 分钟）
+
+目标：建立可持久化、可跨进程恢复的技能任务队列。采用方案 B：job 状态只存 skills.db，入队幂等依赖 `(workspace_scope, session_id, turn_index)` 唯一索引；不修改 jessica-core、不新增 AgentEvent。模块必须显式记录双真相源边界与迁移到方案 A 的路径。
+
+操作：
+
+1. `skill_jobs` 表：`id`、`workspace_scope`、`session_id`、`turn_index`、`source_json`、`status`、`attempts`、`last_error`、`created_at`、`updated_at`、`claimed_at`；唯一约束 `(workspace_scope, session_id, turn_index)`；`status` 用 CHECK 限制为 `pending|processing|done|failed`。`source_json` 必须是 5.2.2a 产出的有界 `DistillSource`，不得直接存原始会话或完整工具输出。
+2. 状态机：`pending → processing → done|failed`。入队幂等：同一 `(workspace_scope, session_id, turn_index)` 重复入队返回已有 job，不新增行；done/failed 的 job 不得被重新入队覆盖。实现必须并发安全（`INSERT OR IGNORE` + 回读，或等价事务）。
+3. `claim_next` 必须用 `BEGIN IMMEDIATE` + `UPDATE ... RETURNING` 原子领取，设置 `claimed_at` 与 `attempts`；只领取 `pending` 或超过 stale 阈值的 `processing`；stale claim 可恢复。
+4. SQLite 启用 WAL 与 `busy_timeout=5000`；文档明确单 worker 假设。多进程并发不得损坏数据，但不保证同一 job 不被重复处理；重复处理必须由 5.2.1 的幂等技能写入兜底。
+5. `last_error` 必须脱敏、截断（建议 ≤512 字节）后再写入；不得把 provider 原始响应、密钥、完整工具输出写入 skills.db。
+6. 所有 SQLite 操作同步 API，异步调用方使用 `spawn_blocking`；错误用 thiserror 结构化 enum（Open/Schema/Serialize/Query/Claim/Corrupt/Event 等）。
+7. 在 `skill_log.rs` / skill_jobs 模块头加入文档段落与显式 `TODO(reconciliation)` 注释，至少写明：
+   - 本阶段采用方案 B：job 状态不在 AgentEvent 中；resume 的入队幂等读 skills.db 唯一索引；事件流与 skills.db 是双真相源，不假装单一真相。
+   - replay 不打开 skills.db，因此 replay 的确定性不受 job 表状态影响；但 resume 的行为依赖 skills.db 的外部可变状态。
+   - 迁移触发条件：如果 resume 在不同 skills.db 初始状态下需要产生完全一致的事件/决策，或需要从事件流重建 job 状态，则迁到方案 A。
+   - 迁移路径：单开 Task → 在 jessica-core 新增 `AgentEvent::SkillJobEnqueued` / `SkillJobCompleted` 及 payload → enqueue/complete 发事件 → 实现 `rebuild_from_events` 物化 skill_jobs → resume 改为读事件流/物化视图 → replay 跳过物化 → 补双真相源一致性测试。该 Task 必须单独 review core 变更。
+8. 不实现 `rebuild_from_events`；不得在文档或注释中声称 skill_jobs 可随时从事件流重建。`source_json` 是 skills.db 的持久化数据，不是事件的派生物。
+
+方案 B 的已知限制（必须写入模块文档）：
+
+· resume 的入队幂等依赖 skills.db，而不是事件流；如果 skills.db 被删除/替换，resume 可能重复入队，最终由唯一索引与幂等写入兜底。
+· 事件流重放不能恢复 job 状态；这是本阶段接受的取舍，不是“已解决”。
+· 迁移到方案 A 前，不得把 skill_jobs 用于任何“必须从事件流确定性重建”的场景。
+
+行为测试（至少）：
+
+· 重复 enqueue 幂等；不同 turn 各自入队；done/failed 后重复 enqueue 不覆盖状态。
+· claim 顺序确定（created_at/id），BEGIN IMMEDIATE 下并发 claim 不重复分配；stale claim 可恢复。
+· 成功/失败状态转换只写 skills.db，断言 EventStore 中没有新增 skill job 事件。
+· 损坏 `source_json` 返回 Corrupt，不 panic。
+· WAL 与 busy_timeout 生效；错误脱敏截断。
+· 关闭重开后 job 状态与唯一索引仍生效；删除 skills.db 后 resume 式幂等依赖失效（以文档/测试锁定该限制）。
+
+验收：
+
+```bash
+cargo test -p jessica-memory
+cargo clippy -p jessica-memory --all-targets -- -D warnings
+```
+
+禁止：不修改 jessica-core；不新增 AgentEvent；不实现事件流物化；不声称 skill_jobs 是事件流物化视图；不长期保存敏感输出；不在本 Task 接 CLI。
+
+Task 5.2.3：LLM 技能提炼器（jessica-harness，60–80 分钟）
+
+目标：只用一个受控 LLM 调用把 `DistillSource` 提炼成结构化技能草稿；LLM 不参与任何触发/检索/注入决策。
+
+操作：
+
+1. 定义 `SkillDistiller` Trait：`async fn distill(&self, source: &DistillSource) -> Result<DistilledSkill, DistillError>`；`DistilledSkill { name, description, instructions, tags }`。
+2. `DistillError` 区分 `Retryable { message }`（超时、流错误、临时 provider 错误）与 `Permanent { message }`（非法 JSON、schema 不符、内容超限、工具调用）。
+3. `LlmSkillDistiller` 接收 `Arc<dyn LlmProvider>`、超时、最大输出字节；固定 system prompt；把 `source.to_untrusted_block()` 作为独立 user message；`tools` 始终为空。
+4. 必须拒绝 `LlmEvent::ToolCallRequested`；必须收到 `Done` 才算成功；流中 `Error` 映射为 Retryable；超时用 `tokio::time::timeout`；缺少 `Done` 视为不完整流，按 Retryable 处理。
+5. 严格解析模型输出：只接受纯 JSON 对象，拒绝 Markdown fence、额外字段、空字段、未知字段、超长内容；字段上限与 5.2.1 一致；tags 去重并排序。
+6. 不得写技能库、不得写事件流、不得发通知；只返回 `DistilledSkill` 或结构化错误。
+7. 技能内容不得包含密钥/完整敏感输出；提示词明确要求只提炼可复用步骤，不复制工具原始输出。
+
+行为测试（至少）：
+
+· 合法 JSON → 正确字段与 canonical tags；空/超长/未知字段/fence → Permanent。
+· provider 返回 `ToolCallRequested` → Permanent；流 `Error`/超时 → Retryable；缺少 `Done` → Retryable。
+· 注入内容作为不可信块传递，模型响应不能改变 system prompt 边界；provider 收到的 tools 为空、消息顺序固定。
+· 失败路径零存储写入、零事件写入。
+
+验收：
+
+```bash
+cargo test -p jessica-harness
+cargo clippy -p jessica-harness --all-targets -- -D warnings
+```
+
+禁止：不把 LLM 用于触发/检索/排序/注入；不接 CLI；不新增 crate。
+
+Task 5.2.4：单 worker 提炼队列（jessica-harness，60–90 分钟）
+
+目标：用单 worker 异步消费技能任务，失败重试与幂等写入，不阻塞 turn 结束。
+
+操作：
+
+1. 定义 `SkillJobQueue`（claim/complete/fail）、`SkillSink`（接收 job 来源与 `DistilledSkill`，幂等写入）、`WorkerClock`（时间戳由调用方注入）。队列/存储的具体 SQLite 实现由 CLI 装配时注入，Harness 不依赖 jessica-memory。
+2. `SkillWorker` 循环：claim → distill → sink.write → complete；捕获错误并按 `DistillError` 分类处理。
+3. Retryable 错误最多重试 `max_attempts`（默认 2，含首次尝试）；Permanent 错误直接 failed；重试耗尽后 failed，并记录脱敏错误。不得用 panic 作为控制流。
+4. 写入必须幂等：同一 `(workspace_scope, source_session, source_turn_index)` 或同一 content_hash 重复写入不得产生重复技能；写入成功后才标记 done。
+5. 支持 shutdown/drain：收到取消后停止 claim，等待当前 job 完成或超时；`drain_timeout` 由调用方配置。worker 必须可被测试驱动（不读宿主时钟）。
+6. 每次状态转换写回 `SkillJobQueue`（complete/fail）；不得静默改变状态，也不修改事件流。单 worker 假设写入文档。
+7. 提供可注入的 `WorkerClock` 与确定性测试时钟；生产环境由 CLI 提供当前时间。
+
+行为测试（至少）：
+
+· 成功路径：claim → 一次 distill → 幂等 write → done 状态。
+· Retryable 首次失败、第二次成功；超过 max_attempts → failed；Permanent 不重试。
+· 重复 job/重复写入不产生重复技能；sink 失败可重试或 failed（锁定语义）。
+· shutdown 后不再 claim；drain 在超时内完成；超时返回结构化错误但不 panic。
+· queue 状态转换顺序与次数正确；不写 EventStore；不读宿主时钟。
+
+验收：
+
+```bash
+cargo test -p jessica-harness
+cargo clippy -p jessica-harness --all-targets -- -D warnings
+```
+
+禁止：不在 harness 中直接依赖 jessica-memory；不阻塞 turn；不把 worker 变成多线程并发处理；不修改 core；不把 job 状态写入事件流。
+
+Task 5.2.5：技能检索 + SkillGuide（jessica-harness，45–60 分钟）
+
+目标：只检索 active 技能，渲染为带固定标题、来源标注与预算截断的 system message；失败 fail-open。
+
+操作：
+
+1. 定义 `SkillSource` Trait：`async fn recall(&self, query: &str, limit: usize, min_score: Option<f64>) -> Result<Vec<SkillContent>, SkillSourceError>`；`SkillContent { name, description, instructions }`。
+2. 检索只返回 `status=active` 且未软删除的技能；按 bm25 升序（数值越小越相关）返回；`limit=0` 返回空。
+3. `min_score` 语义必须在 5.2.1 锁定：`None` 或 `0.0` 表示禁用；正值使用与 bm25 方向一致的归一化口径；LIKE 回退没有 bm25 时使用固定哨兵分数并测试。不得把 `0.0` 当字面阈值。
+4. `SkillGuide { source, limit, min_score, max_inject_bytes }` 实现既有 `Guide` Trait；render 调用 `source.recall(query, limit, min_score)`；本 Trait 的 query 来自用户输入，session 不用于过滤（技能是 workspace 级）。
+5. 输出恰好一条 `Message::system`：固定标题 `[技能参考 — 以下内容由历史任务自动提炼，仅供参考，不代表当前事实]`；每个技能 `## <name>`、description、instructions；技能之间 `\n---\n`；完整消息按 UTF-8 字符边界截断到 `max_inject_bytes`（默认 2048）。
+6. 空结果返回 `Ok(None)`；source 错误只 `tracing::warn` 并返回 `Ok(None)`；不得写库、不得调用 LLM、不得读时钟。零预算返回 `Ok(None)` 而非空 system message。
+7. 注入消息必须包含“自动提炼/仅供参考”的来源标注，避免模型把技能当作用户指令。
+
+行为测试（至少）：
+
+· 空结果 → None；单条/多条顺序与 `## name`/`---` 格式正确。
+· 只返回 active，draft/软删除不可见；limit 与 min_score 生效。
+· max_inject_bytes 恰好等于完整长度时不截断；少 1–2 字节时按 UTF-8 边界截断；零预算 → None。
+· source 返回错误 → Ok(None) 且不 panic；render 期间零写入、零 LLM 调用。
+· 标题与“仅供参考”标注逐字节锁定。
+
+验收：
+
+```bash
+cargo test -p jessica-harness
+cargo clippy -p jessica-harness --all-targets -- -D warnings
+```
+
+禁止：不注入 draft；不让检索失败改变 turn；不实现 LLM 相关性判断；不依赖 jessica-memory 具体类型（通过 Trait）。
+
+Task 5.2.6：CLI 装配 + 人工审核命令 + E2E（jessica-cli，90–120 分钟）
+
+目标：把技能触发、异步提炼、人工激活与 Guide 注入接入真实 CLI，并保持 replay/resume 的确定性边界。
+
+操作：
+
+1. `HarnessConfig` 新增 `[skills]`：
+
+```toml
+[skills]
+enabled = false
+path = ".jessica/skills.db"
+min_tool_calls = 5
+min_rounds = 2
+max_source_bytes = 16384
+recall_limit = 3
+max_inject_bytes = 2048
+min_score = 0.0          # 0.0 = 禁用
+distill_timeout_ms = 30000
+drain_timeout_ms = 30000
+max_attempts = 2
+include_tool_outputs = false
+auto_activate = false
+```
+
+相对路径按 CLI root 解析；`enabled=false` 时完全不创建/打开 skills.db；非法值在配置加载期报结构化错误。
+
+2. 新增 `skills.rs` 装配模块，位于 replay 提前返回之后：打开 SqliteSkillStore，构造 `SkillTrigger`、`LlmSkillDistiller`、`SkillWorker`、`SkillGuide`，并用适配器实现 `SkillSource`/`SkillJobQueue`/`SkillSink`。打开失败 fail-open 并 `tracing::warn`，不改变退出码。
+3. fresh turn 注入顺序固定为 `system_prompt → memory guide（若有）→ skill guide（若有）→ user`。技能 guide 只注入 active 技能；draft 不注入。resume 绝不重新注入技能（checkpoint 已包含首次注入的消息）。
+4. 最终 Completed 后计算结构化计数（tool_call_count、assistant_rounds、acceptance_failures），调用 `SkillTrigger`；命中则按 `(workspace_scope, session_id, turn_index)` 幂等入队并通知 worker，`turn_index` 必须来自稳定推导（不得用进程内计数器）。不写 AgentEvent，job 状态仅由 skills.db 记录。不得 await 提炼完成；turn 结束与 worker 解耦。
+5. `auto_activate=false` 时新技能一律 draft；`auto_activate=true` 仅影响新写入技能的初始状态，仍必须遵守 5.2.1 的插入语义。人工激活通过子命令完成。
+6. 退出前 drain worker：最多等待 `drain_timeout_ms`；超时只 warn，不改变退出码。replay 分支必须在打开 skills.db 之前返回，且不调用 provider；resume 可以入队但不得注入技能；resume 的入队幂等依赖 skills.db 唯一索引（方案 B），不依赖事件流。
+7. 新增 `jessica skills` 子命令：`list`（按状态/最近）、`show <id>`、`activate <id>`、`delete <id>`（软删除，不物理删除）。这些子命令不得初始化 provider、不得加载 wasm 工具、不得触网；输出面向用户可用 stdout；失败返回结构化错误与非零退出码；不得在输出中打印密钥或完整敏感内容。
+8. E2E（脚本化 SSE，不依赖真实 API key）：
+   - 低于阈值（工具调用 < min_tool_calls 或 rounds < min_rounds）不产生 job；
+   - 达到阈值 → skills.db 产生 job、worker 写入 draft，但下一次 fresh turn 不注入；断言事件流中没有 skill job 事件；
+   - 人工 activate 后下一次 fresh turn 注入，顺序为 system → memory → skills → user，且包含固定标题与“仅供参考”；
+   - 模型返回非法 JSON → job failed、无技能写入、turn 仍 Completed/exit 0；
+   - resume 不重新注入技能；replay 不打开 skills.db、不调用 provider；
+   - 重复 job 不产生重复技能；resume 再次完成同一 turn 时入队幂等（skills.db 唯一索引），不依赖事件流；连续 replay 两次不受 skills.db 状态影响。
+9. 测试：配置默认值/相对路径/非法值；触发边界；draft/active 注入；注入顺序；低阈值；失败 fail-open；resume/replay 边界；worker drain；skills 子命令；方案 B 双真相源边界（resume 幂等读 skills.db、replay 不触库）；E2E 上述场景。
+
+验收：
+
+```bash
+cargo test -p jessica-cli
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+并执行上述脚本化 E2E（测试内自动执行）。
+
+禁止：不让技能故障改变 SessionEndReason/退出码；不在 replay 中打开技能库；不在 resume 中注入技能；不自动激活 draft（除非配置显式 auto_activate）；不把 LLM 用于触发/检索/排序/注入判断；不新增 crate；不修改 core；不把 job 状态写入事件流（本阶段方案 B）。
+
+5.2 开工前必须锁定的实现细节（不改变上述拆分范围）：
+
+1. 方案 B 的双真相源边界：5.2.2b 不修改 core、不新增 AgentEvent；resume 的入队幂等读 skills.db 唯一索引，事件流不恢复 job 状态。必须在 skill_jobs 模块写入 `TODO(reconciliation)` 与迁移到方案 A 的文档；不得声称 skill_jobs 是事件流物化视图。迁移触发条件与路径见 5.2.2b。
+2. 触发计数口径：`tool_call_count` 与 `assistant_rounds` 必须从最终 attempt 的结构化 messages/事件流计算，跨 acceptance 重试的统计口径必须锁定并测试，不得从文本猜测。`AcceptanceOutcome` 暴露的是 `attempts`，不是失败计数；`acceptance_failures` 必须锁定 `attempts.saturating_sub(1)` 或事件计数中的唯一来源，禁止混用。
+3. bm25 与 LIKE 回退：bm25 数值越小越相关；LIKE 回退没有 bm25，必须在 5.2.1 定义固定哨兵分数及 `min_score` 的应用方式，并用测试锁定。
+4. min_score=0.0：配置默认 0.0 表示禁用，不得当作字面阈值；`None` 与 `0.0` 必须等价处理。
+5. 错误脱敏：`last_error` 以及任何 job 失败输出写入 skills.db 前必须有界、脱敏；不得写入密钥、provider 原始响应或完整工具输出。
+6. 重复 activate：5.2.1 必须锁定“幂等成功”或“结构化错误”之一并测试，避免 CLI 子命令行为漂移。
+7. turn_index 稳定性：方案 B 的入队幂等键包含 turn_index，必须从会话/checkpoint 稳定推导，不得使用进程内 AtomicU64；resume 必须复用或按确定规则递增，并测试跨进程重启后的重复入队。
+
 ---
 
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
@@ -553,6 +842,13 @@ Task 5.1.2 ☑ 约 35 分钟 jessica-memory 新增 embedding 模块：async Embe
 Task 5.1.3 ☑ 约 30 分钟 jessica-memory 新增 memory_store 模块，新增 workspace 依赖 sha2 0.10（用户已批准，仅用于 workspace scope），并启用已在 workspace 中的 tokio/tracing（无版本变化）。RecallRequest 含 session/query/limit/short_weight/keyword_weight/vector_weight/rrf_k/max_bytes，默认三路权重 1.0、rrf_k=60、max_bytes=4096；workspace scope 由 store 固定、请求不可覆盖。RRF 对每路候选累加 weight/(k+rank)，rank 从 1 开始，融合分降序、同分 entry_id 升序，再按 limit 截断；权重必须有限非负、k>0。三路候选：短期 recent_for_session(session,scope,limit)、中期 search_keyword(scope,query,limit)、长期 BruteForceIndex::search(embed(query), embedder.model_id(), scope, limit)（无 embedder 或权重 0 时跳过）。任一路失败只 tracing::warn 并继续；若有失败，用 recent_for_session(...,0) 做健康检查，仅当健康检查也失败才返回 MemoryError::Backend。字节上限按融合顺序累计 content 字节与条目间 3 字节 `---` 分隔符，边界回退到 UTF-8 char boundary；条目被截断后停止追加；max_bytes=0/limit=0 返回空；单条超限时截断而非整体返回空。SqliteMemoryStore 构造时接收 canonical workspace path，固定 workspace_scope=hex(sha256(path))[..16]；内部 Arc<Mutex<MemoryLog>>，所有 rusqlite 调用（写入、embedding 写、三路召回、健康检查）均在 tokio::task::spawn_blocking 中执行。write_at(session, entry, Timestamp) 保存 metadata 原样、拒绝空 content，写入后按配置 embedder 生成并存储向量，embedding/向量存储失败只 warn、不回滚条目；冻结 Trait 的 write 无时间戳，委派 write_at 并使用 Unix epoch 0；Trait recall 委派默认 RecallRequest。16 个行为测试覆盖：Arc<dyn MemoryStore> 写入/召回与 metadata、session 短期隔离与 workspace 关键词跨 session、不同 workspace 在短/关键词/向量三路均隔离（同内容用 metadata 区分）、RRF 双榜条目优先与同分 entry_id、权重调整改变顺序、长期路跨 session、20/9/4/0 字节上限与中文 UTF-8 截断/单条超限/limit=0、失败 embedder 降级但关键词仍可召回、删除 FTS 表后关键词路降级而短期路返回、删除条目表后返回 Backend、重复写入去重/软删除后三路均不召回/重写后可召回且审计行保留、重开库后条目与向量均保留、非法权重/NaN/Inf/k=0、空 content（固有与 Trait 两个入口）、scope 为 sha256 前 16 hex 且同路径稳定/不同路径不同/空路径拒绝、Send+Sync。偏离：1) 冻结 write 无时间戳，故新增固有 write_at 并让 write 使用 epoch 0，5.1.5 写入真实 turn 时必须用 write_at 传调用方时间戳；2) 长期路使用 embedder.model_id() 而非硬编码 deterministic-v1，保证查询与写入模型一致并兼容 5.1.6；3) 非法召回参数只能复用 MemoryError::Backend（core 错误枚举仅此变体）；4) `---` 按条目间 3 字节计（n-1 个），5.1.4 Guide 会对最终消息再次做 max_inject_bytes；5) 增加 embedder 输出维度校验，维度不符按该路降级；6) embedder 返回向量前先提交条目，向量写入失败不回滚。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace 全绿（260 passed, 0 failed, 2 ignored；jessica-memory 6 event_store + 15 memory_log + 8 embedding + 16 memory_store = 45）。jessica-core 未改。
 Task 5.1.4 ☑ 约 10 分钟 jessica-harness 新增 guide 模块与 workspace 既有依赖 thiserror（仅用于结构化 GuideError，无新第三方 crate）。定义 `Guide: Send + Sync` 与 `async fn render(&self, session: &SessionId, query: &str) -> Result<Option<Message>, GuideError>`，只依赖 jessica-core 的 MemoryStore/Message/SessionId，不依赖 jessica-memory；GuideError 用 thiserror 的 Render { message }。实现 MemoryGuide { store: Arc<dyn MemoryStore>, limit, max_inject_bytes }（Clone）与构造函数；render 调用 store.recall(session, query, limit)，空结果返回 Ok(None)，非空时按 store 返回顺序渲染一条 Message::system：首行为固定标题 `[记忆参考 — 以下内容来自历史会话，仅供参考，不代表当前事实]`，首条记忆前换行，条目之间用单独一行 `---`（`\n---\n`）分隔。完整消息（标题+条目+分隔符）构造后统一按 UTF-8 char boundary 截断到 max_inject_bytes，截断为空时返回 Ok(None)；不重排、不写记忆、不调用 LLM、不读时钟。recall 出错时 tracing::warn 后返回 Ok(None)，绝不传播为 turn 失败。6 个行为测试用记录调用的 MemoryStore mock 覆盖：空结果→None 且 recall 只调 1 次、write 0 次、session/query/limit 正确转发；三条乱序条目→恰好一条 System 消息且内容严格按返回顺序含标题/条目/---；max_inject_bytes 恰等于完整长度时不截断；比完整长度少 2 字节时回退到 UTF-8 边界、保留前缀、末尾多字节中文整字丢弃且不超限；零预算→None；store 返回 MemoryError 时 Ok(None) 且 write 0 次、不 panic。偏离/边界：截断对完整消息执行，若 max_inject_bytes 小于标题长度则保留标题的合法 UTF-8 前缀；预算为 0 时不产生空 system message，而是返回 None。未接入 AgentLoop、未改 Guard/Policy/Sensor、未实现 CLI。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace 全绿（266 passed, 0 failed, 2 ignored；jessica-harness 10 governance + 6 guide + 5 harness_chain + 9 sensors_acceptance = 30）。jessica-core 未改。
 Task 5.1.5 ☑ 约 8 分钟 jessica-cli 新增 `[memory]` 配置（enabled/path/recall_limit/max_inject_bytes/embedder/write_policy，默认 false、`.jessica/memory.db`、5、4096、deterministic、completed），相对路径按 CLI root 解析，空 path 与未知字段被拒绝，非法枚举值报结构化配置错误；enabled=false 时完全不创建/打开数据库。新增 memory.rs 装配模块：启用时在 spawn_blocking 中创建父目录、按 canonical workspace 打开 SqliteMemoryStore，按 embedder 选择 DeterministicEmbedder 或 none，构造 MemoryGuide；打开失败 fail-open 并 warn，非法配置仍在加载期报错。fresh turn 顺序固定为 system → Guide memory system message（若有）→ user，disabled/None/Guide 失败退化为原顺序；先分配 session id 再传给 AttemptStart::Fresh，使 recall 与实际 attempt 的 session 一致，acceptance 重试使用新 session，最终 Completed 写入使用最后一个 attempt 的 session。resume 从 checkpoint 提取首个 user message，绝不调用 recall。写入策略 completed：仅最终 Completed 后写一条 kind=turn；内容 = 用户输入按 UTF-8 char boundary 截断 2KB + `\n---\n` + 最终回答截断 4KB；metadata 为 kind/truncated/tool_call_count/turn_index；不写工具结果；唯一约束去重；explicit 不自动写入；写入或召回失败只 warn，不改变 SessionEndReason/退出码。replay 分支在 MemoryAssembly::open 之前返回，绝不打开、创建或读取记忆库。测试新增 4 个配置测试、8 个 memory 行为测试（disabled 不建库、相对路径与父目录、打开失败 fail-open、UTF-8 截断与 metadata、边界不截断、去重、explicit 无写入、无 embedder 仍可短期召回）与 2 个 app 注入顺序测试；新增 tests/memory_e2e.rs 5 个真实 CLI E2E（同 workspace 两次运行写入 ORANGE-7 并在第二次请求中位于 system 之后/user 之前且 exit 0、resume 不注入但仍写入 Completed turn、replay 不创建 DB、disabled 无注入、打开失败 warn 且 exit 0）。偏离：启用时自动创建 memory.path 的父目录；turn 内容使用 `\n---\n` 分隔；turn_index 为进程内 AtomicU64（跨进程从 0 重置）；resume 不召回但完成后的 turn 仍按 completed 策略写入；warn 走 CLI 既有 eprintln 约定。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings 通过；cargo test -p jessica-cli 55 passed（47 unit + 5 memory_e2e + 1 replay_e2e + 1 resume_e2e + 1 wasm_tool_e2e）；cargo test --workspace 285 passed, 0 failed, 2 ignored。jessica-core 未改。
+Task 5.2.1 ☑ 约 20 分钟 jessica-memory 新增 skill_log 模块与独立 skills.db（user_version=1、busy_timeout=5000ms）及 fts_query/workspace 共享模块。skills 表包含来源计数、内容字段、tags_json、content_hash、draft/active 状态、created_at/deleted_at/activated_at；两个部分唯一索引分别锁定 live 的 source tuple 与 content_hash，`INSERT OR IGNORE` 命中返回 `Duplicate(id)` 且保留首条来源/状态，重复插入不会自动激活已有 draft。content_hash 严格为 sha256(name || '\0' || description || '\0' || instructions || '\0' || canonical_tags_json)，tags 先 trim、排序、去重；单测用独立 SHA-256 计算逐字节锁定公式。BEFORE UPDATE 仅允许单向软删除或 draft→active（其余列不变），所有 DELETE 及其他 UPDATE 由触发器 RAISE(ABORT)。FTS5 trigram 外部内容表 `skills_fts(name, description, instructions, tags_json)` 与同步触发器；软删除会从 FTS 移除。同步 `SkillLog` 提供 append/get/list_recent/list_by_status/search_keyword/soft_delete/activate/find_by_source；异步 `SqliteSkillStore` 固定 workspace scope，所有 async 方法的 rusqlite 调用均在 spawn_blocking 内，并用一个阻塞写锁测试证明等待 SQLite 时不阻塞 Tokio worker。`search_keyword` 只返回 active live 行，返回原始 bm25（越小越相关）；`min_score=None/0.0` 禁用，正值按 `-bm25 >= min_score` 过滤，短 token LIKE 回退使用哨兵 0.0，因此正阈值会过滤短查询命中；上述语义已写入模块文档与测试。重复 activate 幂等且保留首次 activated_at；软删除后再 activate/soft_delete 返回 AlreadyDeleted。字段上限按 UTF-8 字节校验（name 128/description 512/instructions 8192、tags≤16 且每个≤64），超限返回结构化错误不截断。新增 14 个行为测试覆盖 user_version/重开/未来版本、source 与 content 去重、软删除后重插、tags 顺序与跨 workspace、字节边界、特殊字符/中文 trigram/2 字 LIKE/英文前缀、draft 可见性/activate/重复 activate/软删除 FTS、物理 UPDATE/DELETE 与非法状态转换、find_by_source/limit/排序、损坏 tags_json/未知 status、异步 workspace 隔离与 spawn_blocking。偏离/说明：FTS 外部内容列名为 `tags_json` 以与内容表列名一致（语义仍为 tags）；`list_recent` 同时返回 draft 与 active，`list_by_status` 显式筛选，检索只返回 active；`SkillLog::get(id)` 是底层按 id 读取，跨 workspace 隔离由 `SqliteSkillStore::get/soft_delete/activate` 负责；`SqliteSkillStore::open` 构造期同步建库，已文档要求启动期或 blocking 上下文调用。未新增第三方 crate，未改 jessica-core，未接 Harness/Guide/Worker/CLI，未调用 LLM。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace 全绿（299 passed, 0 failed, 2 ignored；jessica-memory 新增 14 个 skill_log 测试）。
+Task 5.2.2a ☐ 未开始 待执行
+Task 5.2.2b ☐ 未开始 待执行；方案 B，不改 core，记录 reconciliation TODO 与迁移文档
+Task 5.2.3 ☐ 未开始 待执行
+Task 5.2.4 ☐ 未开始 待执行
+Task 5.2.5 ☐ 未开始 待执行
+Task 5.2.6 ☐ 未开始 待执行
 
 ---
 
@@ -583,6 +879,7 @@ Deferred（待办，由用户决定是否单开 Task）
 · 恢复流的事件持久化依赖 EventPump 的 broadcast 接收；通道 lag 或丢事件时，恢复所需的尾部事件也会缺失（与 transcript 风险相同）。若要强一致，需同步持久化 hook 或改事件总线。
 · 恢复时 `rounds_completed` 只来自事件流；若原 session 的 max_rounds 很小且末尾批次已用尽预算，resume 会正确发出 BudgetExceeded + SessionEnded；但若 checkpoint 之后用户修改了配置（例如增大 max_rounds），恢复会使用新配置，不保证与原计划一致。
 · replay 只重建 AgentLoop 层的事件流：CLI 治理发出的 PolicyDenied、AcceptanceFailed 以及 token/result-size 导致的 BudgetExceeded 不会重新生成；它们对循环的影响已经体现在记录的 ToolResult 与终止原因中。若需要完整 turn 级治理重放，必须重新设计 CLI 装配并解决命令 sensor/acceptance 的外部依赖（单开 Task）。
+· 技能任务队列（5.2.2b）当前采用方案 B：job 状态只存 skills.db、不在事件流；resume 的入队幂等依赖 skills.db 唯一索引，事件流无法恢复 job 状态。若未来要求 resume 完全由事件流确定性决定，需单开 Task 迁移到方案 A：在 core 新增 SkillJobEnqueued/SkillJobCompleted 及 payload、实现 rebuild_from_events 物化、resume 改读事件流/物化视图、replay 跳过物化；core 变更必须单独 review。
 · AgentEvent 不保存 LlmEvent::Done 的 TokenUsage，replay 只能合成 usage=None，因此 token 计费无法重放或校验。要支持计费重放，需要在事件模型增加 usage（修改冻结 core，需单开 Task）。
 · replay 要求事件流以 SessionEnded 结尾，只支持 Completed、Error 与 max-rounds BudgetExceeded；Cancelled、AcceptanceFailed 以及中断的流会被拒绝（中断恢复用 --resume）。若需要重放中断会话，应先定义“无终态时如何合成终态”。
 · replay 输出为紧凑 JSONL，每行一个 AgentEvent，不含 seq/timestamp；事件顺序隐含在行序中，消费者不应依赖文件元数据做确定性判断。

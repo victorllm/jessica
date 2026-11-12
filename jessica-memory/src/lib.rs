@@ -41,8 +41,11 @@
 #![deny(missing_docs)]
 
 mod embedding;
+mod fts_query;
 mod memory_log;
 mod memory_store;
+mod skill_log;
+mod workspace;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -60,6 +63,10 @@ pub use memory_log::{
     MemoryEntryId, MemoryLog, MemoryLogError, MemoryRecord, NewMemoryEntry, WorkspaceScope,
 };
 pub use memory_store::{RecallRequest, SqliteMemoryStore, SqliteMemoryStoreError};
+pub use skill_log::{
+    NewSkill, Skill, SkillId, SkillLog, SkillLogError, SkillSource, SkillStatus, SqliteSkillStore,
+    SqliteSkillStoreError,
+};
 
 /// SQLite schema and the append-only guards installed on every open.
 const SCHEMA: &str = r#"

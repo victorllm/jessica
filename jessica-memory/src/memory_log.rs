@@ -38,6 +38,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::Timestamp;
+use crate::fts_query::{like_pattern, quote_fts_token, split_query};
 
 /// Version stored in SQLite's `user_version` pragma.
 ///
@@ -47,9 +48,6 @@ const SCHEMA_VERSION: i64 = 2;
 
 /// How long SQLite waits for a competing writer before returning `Busy`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Shortest query a trigram index can match.
-const TRIGRAM_MIN_CHARS: usize = 3;
 
 /// Tables, indexes, FTS5 index, and append-only guards installed on every open.
 ///
@@ -462,20 +460,16 @@ impl MemoryLog {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MemoryRecord>, MemoryLogError> {
-        let tokens = query_tokens(query);
+        let tokens = split_query(query);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-
-        let (long_tokens, short_tokens): (Vec<_>, Vec<_>) = tokens
-            .into_iter()
-            .partition(|token| token.chars().count() >= TRIGRAM_MIN_CHARS);
 
         let mut values = Vec::new();
         let mut statement = String::new();
         let mut next_parameter;
 
-        if long_tokens.is_empty() {
+        if tokens.long.is_empty() {
             statement.push_str(&format!(
                 "SELECT {SELECT_COLUMNS} FROM memory_entries m \
                  WHERE m.workspace_scope = ?1 AND m.deleted_at IS NULL"
@@ -483,7 +477,8 @@ impl MemoryLog {
             values.push(SqlValue::Text(workspace.as_str().to_owned()));
             next_parameter = 2;
         } else {
-            let match_expression = long_tokens
+            let match_expression = tokens
+                .long
                 .iter()
                 .map(|token| quote_fts_token(token))
                 .collect::<Vec<_>>()
@@ -498,7 +493,7 @@ impl MemoryLog {
             next_parameter = 3;
         }
 
-        for token in short_tokens {
+        for token in tokens.short {
             statement.push_str(&format!(
                 " AND m.content LIKE ?{next_parameter} ESCAPE '\\'"
             ));
@@ -692,52 +687,6 @@ fn decode_record(raw: RawMemoryRecord) -> Result<MemoryRecord, MemoryLogError> {
         created_at: Timestamp::from_millis(raw.created_at),
         deleted_at: raw.deleted_at.map(Timestamp::from_millis),
     })
-}
-
-/// Splits a query into alphanumeric/underscore tokens.
-///
-/// Punctuation and whitespace separate tokens. This is the only transformation
-/// applied before building an FTS expression, so FTS5 operators and quoting
-/// cannot be injected by callers.
-fn query_tokens(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for character in query.chars() {
-        if character.is_alphanumeric() || character == '_' {
-            current.push(character);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
-}
-
-/// Quotes one token as an FTS5 string literal.
-fn quote_fts_token(token: &str) -> String {
-    let escaped = token.replace('"', "\"\"");
-    format!("\"{escaped}\"")
-}
-
-/// Builds an escaped `%token%` pattern for `LIKE ... ESCAPE '\'`.
-fn like_pattern(token: &str) -> String {
-    let mut pattern = String::with_capacity(token.len() + 2);
-    pattern.push('%');
-    for character in token.chars() {
-        match character {
-            '\\' | '%' | '_' => {
-                pattern.push('\\');
-                pattern.push(character);
-            }
-            _ => pattern.push(character),
-        }
-    }
-    pattern.push('%');
-    pattern
 }
 
 /// Converts a row limit into the signed integer SQLite expects.
