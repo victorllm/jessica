@@ -3,6 +3,7 @@
 mod acceptance_check;
 mod app;
 mod config;
+mod delegation;
 mod events;
 mod governance;
 mod memory;
