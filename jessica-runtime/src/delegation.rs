@@ -18,10 +18,16 @@
 //! call, and does not depend on the CLI or any concrete tool. The resulting
 //! [`NarrowedTools`] is the structural input of the child tool factory; later
 //! stages must build exactly these names and nothing else.
+//!
+//! It also owns the `delegate_task` schema, argument parsing, trace hash, and
+//! the exact JSON result contract returned to the parent model.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use jessica_core::tool::ToolSchema;
+use jessica_core::types::ToolResult;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 /// Name of the tool that delegates work to a child agent.
@@ -151,6 +157,196 @@ pub fn narrow_tools(
     Ok(NarrowedTools { names })
 }
 
+/// Parsed and validated arguments for [`DELEGATE_TASK_TOOL_NAME`].
+///
+/// The task is trimmed. Tool names preserve the model's order and any
+/// duplicates; duplicate validation belongs to [`narrow_tools`], not to this
+/// parser, so callers can still compute a deterministic trace hash before
+/// reporting a narrowing error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateTaskArgs {
+    /// Trimmed, self-contained task.
+    task: String,
+    /// Requested tool names in model order.
+    tools: Vec<String>,
+}
+
+impl DelegateTaskArgs {
+    /// Returns the trimmed, self-contained task.
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    /// Returns the requested tool names in model order.
+    pub fn tools(&self) -> &[String] {
+        &self.tools
+    }
+}
+
+/// Parses and validates `delegate_task` arguments.
+///
+/// The value must be an object containing exactly `task` and `tools`. `task`
+/// must be a string with non-whitespace content and at most `max_task_bytes`
+/// UTF-8 bytes after trimming; `tools` must be an array of strings. Duplicate
+/// tool names are accepted here because [`narrow_tools`] owns that check.
+///
+/// # Errors
+///
+/// Returns a structured error when the value is not an object, a field is
+/// unknown or missing, a field has the wrong JSON type, the trimmed task is
+/// empty, or the trimmed task exceeds `max_task_bytes`.
+pub fn parse_delegate_task_args(
+    args: &Value,
+    max_task_bytes: usize,
+) -> Result<DelegateTaskArgs, DelegationError> {
+    let object = args
+        .as_object()
+        .ok_or(DelegationError::ArgumentsNotObject)?;
+
+    for field in object.keys() {
+        if field.as_str() != "task" && field.as_str() != "tools" {
+            return Err(DelegationError::UnknownArgument {
+                field: field.clone(),
+            });
+        }
+    }
+
+    let task = object
+        .get("task")
+        .ok_or(DelegationError::MissingArgument { field: "task" })?
+        .as_str()
+        .ok_or(DelegationError::InvalidArgumentType {
+            field: "task",
+            expected: "a string",
+        })?;
+    let tools = object
+        .get("tools")
+        .ok_or(DelegationError::MissingArgument { field: "tools" })?
+        .as_array()
+        .ok_or(DelegationError::InvalidArgumentType {
+            field: "tools",
+            expected: "an array of strings",
+        })?;
+
+    let mut names = Vec::with_capacity(tools.len());
+    for value in tools {
+        let name = value.as_str().ok_or(DelegationError::InvalidArgumentType {
+            field: "tools",
+            expected: "an array of strings",
+        })?;
+        names.push(name.to_owned());
+    }
+
+    let task = task.trim();
+    if task.is_empty() {
+        return Err(DelegationError::EmptyTask);
+    }
+    if task.len() > max_task_bytes {
+        return Err(DelegationError::TaskTooLong {
+            actual: task.len(),
+            limit: max_task_bytes,
+        });
+    }
+
+    Ok(DelegateTaskArgs {
+        task: task.to_owned(),
+        tools: names,
+    })
+}
+
+/// Returns the fixed provider-facing schema for [`DELEGATE_TASK_TOOL_NAME`].
+///
+/// The description states the child boundary the runtime enforces: the child is
+/// an independent execution unit with no parent history, may use only the
+/// requested native tool subset, and cannot delegate further.
+pub fn delegate_task_schema() -> ToolSchema {
+    json!({
+        "type": "function",
+        "function": {
+            "name": DELEGATE_TASK_TOOL_NAME,
+            "description": "Delegate a self-contained task to an independent child agent. The child has no parent conversation, history, or memory; it can use only the requested subset of native tools and cannot delegate further.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Self-contained task for the child."
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": true,
+                        "description": "Native tool names from the parent allowlist."
+                    }
+                },
+                "required": ["task", "tools"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// Computes the trace-only child session identifier.
+///
+/// The input is FNV-1a 32-bit over the trimmed task, one NUL separator, and each
+/// sorted narrowed tool name followed by a NUL. The result is eight lowercase
+/// hexadecimal digits. Tool names are sorted by [`NarrowedTools`], so request
+/// order does not affect the hash.
+///
+/// The value deliberately excludes the parent session id: a fresh turn builds
+/// its tool set before the session id exists, and the same tool can span
+/// several acceptance attempts. It is a trace label only: it is not persisted,
+/// not an idempotency key, and not a security credential.
+pub fn child_session_hash(task: &str, tools: &NarrowedTools) -> String {
+    hash_names(task.trim(), tools.names())
+}
+
+/// Hashes a trimmed task and an ordered sequence of tool names.
+fn hash_names<'a>(task: &str, names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in task.as_bytes() {
+        hash = hash_byte(hash, *byte);
+    }
+    hash = hash_byte(hash, 0);
+    for name in names {
+        for byte in name.as_bytes() {
+            hash = hash_byte(hash, *byte);
+        }
+        hash = hash_byte(hash, 0);
+    }
+    format!("{hash:08x}")
+}
+
+/// Feeds one byte into an FNV-1a 32-bit hash.
+fn hash_byte(hash: u32, byte: u8) -> u32 {
+    (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+}
+
+/// Computes a best-effort trace hash from arguments that failed validation.
+///
+/// Used only on the error path. The task is taken when it is a string and
+/// trimmed (empty otherwise); tool names are taken from string elements of a
+/// `tools` array, then sorted and de-duplicated. The encoding matches
+/// [`child_session_hash`], but the input may be incomplete, so the result has no
+/// identity meaning beyond determinism.
+#[allow(dead_code)] // Wired into the child executor by Task 5.3.3; tested here.
+pub(crate) fn best_effort_child_session_hash(args: &Value) -> String {
+    let object = args.as_object();
+    let task = object
+        .and_then(|object| object.get("task"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut names: Vec<&str> = object
+        .and_then(|object| object.get("tools"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.dedup();
+    hash_names(task, names)
+}
+
 /// Resource limits for one delegated child run.
 ///
 /// The runtime validates every limit that can be checked without the parent
@@ -236,6 +432,40 @@ pub enum DelegationError {
         /// Tool name that was not allowed.
         name: String,
     },
+    /// `delegate_task` arguments were not a JSON object.
+    #[error("delegate_task arguments must be a JSON object")]
+    ArgumentsNotObject,
+    /// An unknown argument field was supplied.
+    #[error("delegate_task received unknown argument `{field}`")]
+    UnknownArgument {
+        /// Unknown field name.
+        field: String,
+    },
+    /// A required argument field was absent.
+    #[error("delegate_task is missing required argument `{field}`")]
+    MissingArgument {
+        /// Missing field name.
+        field: &'static str,
+    },
+    /// An argument had the wrong JSON type.
+    #[error("delegate_task argument `{field}` must be {expected}")]
+    InvalidArgumentType {
+        /// Field with the wrong type.
+        field: &'static str,
+        /// Human-readable expected type.
+        expected: &'static str,
+    },
+    /// The task was empty after trimming.
+    #[error("delegate_task task must not be empty after trimming")]
+    EmptyTask,
+    /// The trimmed task exceeded the byte limit.
+    #[error("delegate_task task is {actual} bytes, exceeding the {limit}-byte limit")]
+    TaskTooLong {
+        /// Trimmed task length in UTF-8 bytes.
+        actual: usize,
+        /// Configured limit in bytes.
+        limit: usize,
+    },
     /// `max_rounds` was zero.
     #[error("delegation max_rounds must be at least 1")]
     ZeroMaxRounds,
@@ -259,6 +489,377 @@ pub enum DelegationError {
         /// Configured child-run timeout.
         timeout: Duration,
     },
+}
+
+/// Terminal child outcome ready to render as `delegate_task` JSON.
+#[allow(dead_code)] // Constructed by the child executor in Task 5.3.3; tested here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildOutcome {
+    /// The child completed without any failed tool call.
+    Success {
+        /// Completed model rounds.
+        rounds: u32,
+        /// Requested tool calls, including unknown tools.
+        tool_calls: u32,
+        /// Final assistant answer.
+        answer: String,
+        /// Trace-only child session hash.
+        child_session_hash: String,
+    },
+    /// The child failed, timed out, or hit a limit.
+    Error {
+        /// Completed model rounds.
+        rounds: u32,
+        /// Requested tool calls, including unknown tools.
+        tool_calls: u32,
+        /// Unredacted failure text.
+        error: String,
+        /// Trace-only child session hash.
+        child_session_hash: String,
+    },
+}
+
+/// Renders a child outcome as the exact JSON returned to the parent model.
+///
+/// `max_result_bytes` must be at least [`MIN_RESULT_BYTES`]; validated
+/// [`DelegationLimits`] guarantee that. A success whose full JSON exceeds the
+/// limit becomes a fixed truncated object. An error keeps `status=error` and
+/// shortens the redacted error text instead, so an oversized error can never be
+/// mistaken for a truncated success.
+#[allow(dead_code)] // Called by the child executor in Task 5.3.3; tested here.
+pub(crate) fn render_child_outcome(outcome: ChildOutcome, max_result_bytes: usize) -> ToolResult {
+    match outcome {
+        ChildOutcome::Success {
+            rounds,
+            tool_calls,
+            answer,
+            child_session_hash,
+        } => render_success(
+            rounds,
+            tool_calls,
+            &answer,
+            &child_session_hash,
+            max_result_bytes,
+        ),
+        ChildOutcome::Error {
+            rounds,
+            tool_calls,
+            error,
+            child_session_hash,
+        } => render_error(
+            rounds,
+            tool_calls,
+            &error,
+            &child_session_hash,
+            max_result_bytes,
+        ),
+    }
+}
+
+/// Renders a successful child outcome, truncating the answer when necessary.
+fn render_success(
+    rounds: u32,
+    tool_calls: u32,
+    answer: &str,
+    child_session_hash: &str,
+    max_result_bytes: usize,
+) -> ToolResult {
+    let full_value = json!({
+        "status": "ok",
+        "rounds": rounds,
+        "tool_calls": tool_calls,
+        "answer": answer,
+        "child_session_hash": child_session_hash,
+    });
+    let Ok(full) = serde_json::to_string(&full_value) else {
+        return serialization_failure();
+    };
+    if full.len() <= max_result_bytes {
+        return ToolResult::success(String::new(), full);
+    }
+
+    let original_bytes = full.len();
+    let truncated = longest_prefix_by_serialized_len(answer, max_result_bytes, |answer_prefix| {
+        json!({
+            "status": "truncated",
+            "answer": answer_prefix,
+            "original_bytes": original_bytes,
+        })
+    });
+
+    match truncated {
+        Some(json) => ToolResult::success(String::new(), json),
+        None => ToolResult::error(
+            String::new(),
+            "delegate_task result budget is below the minimum serialized size",
+        ),
+    }
+}
+
+/// Renders a failed child outcome, redacting and shortening the error text.
+fn render_error(
+    rounds: u32,
+    tool_calls: u32,
+    error: &str,
+    child_session_hash: &str,
+    max_result_bytes: usize,
+) -> ToolResult {
+    let redacted = redact_secrets(error);
+    let full_value = error_json(rounds, tool_calls, &redacted, child_session_hash);
+    let Ok(full) = serde_json::to_string(&full_value) else {
+        return serialization_failure();
+    };
+    if full.len() <= max_result_bytes {
+        return ToolResult::error(String::new(), full);
+    }
+
+    let shortened = longest_prefix_by_serialized_len(&redacted, max_result_bytes, |error_prefix| {
+        error_json(rounds, tool_calls, error_prefix, child_session_hash)
+    });
+
+    match shortened {
+        Some(json) => ToolResult::error(String::new(), json),
+        None => ToolResult::error(
+            String::new(),
+            "delegate_task error budget is below the minimum serialized size",
+        ),
+    }
+}
+
+/// Builds the fixed error object, including exactly the six contract fields.
+fn error_json(rounds: u32, tool_calls: u32, error: &str, child_session_hash: &str) -> Value {
+    json!({
+        "status": "error",
+        "rounds": rounds,
+        "tool_calls": tool_calls,
+        "answer": "",
+        "error": error,
+        "child_session_hash": child_session_hash,
+    })
+}
+
+/// Returns a fixed failure for the unreachable serialization-error branch.
+fn serialization_failure() -> ToolResult {
+    ToolResult::error(String::new(), "delegate_task result serialization failed")
+}
+
+/// Finds the longest UTF-8 prefix of `text` whose rendered JSON fits.
+///
+/// `build` must produce JSON whose serialized length is monotonic in the prefix
+/// length. The empty prefix is included; `None` means even it does not fit.
+fn longest_prefix_by_serialized_len<F>(text: &str, max_bytes: usize, build: F) -> Option<String>
+where
+    F: Fn(&str) -> Value,
+{
+    let mut boundaries: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    boundaries.push(text.len());
+
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let prefix = &text[..boundaries[mid]];
+        let Ok(serialized) = serde_json::to_string(&build(prefix)) else {
+            return None;
+        };
+        if serialized.len() <= max_bytes {
+            best = Some(serialized);
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    best
+}
+
+/// Replacement marker for credentials removed from error text.
+const REDACTED: &str = "[REDACTED]";
+
+/// Credential key names recognized in `key=value`, `key: value`, and JSON forms.
+const SECRET_KEYS: [&str; 10] = [
+    "authorization",
+    "access_token",
+    "access-token",
+    "client_secret",
+    "api_key",
+    "api-key",
+    "password",
+    "secret",
+    "token",
+    "apikey",
+];
+
+/// Removes common credential forms from model-visible error text.
+///
+/// Bearer tokens and `sk-` prefixed keys are removed first, then values assigned
+/// to known credential keys. Redaction is deliberately conservative: false
+/// positives only shorten diagnostic text, while a missed credential would leak
+/// into the parent transcript.
+fn redact_secrets(input: &str) -> String {
+    let text = redact_bearer_tokens(input);
+    let text = redact_prefixed_tokens(&text, "sk-");
+    redact_key_values(&text)
+}
+
+/// Replaces the token following each `Bearer` keyword.
+fn redact_bearer_tokens(input: &str) -> String {
+    const BEARER: &[u8] = b"bearer";
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index + BEARER.len() <= bytes.len() {
+        if bytes[index..index + BEARER.len()].eq_ignore_ascii_case(BEARER)
+            && (index == 0 || !is_word_byte(bytes[index - 1]))
+            && bytes
+                .get(index + BEARER.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            let mut start = index + BEARER.len();
+            while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+                start += 1;
+            }
+            if start < bytes.len() && (bytes[start] == b'"' || bytes[start] == b'\'') {
+                start += 1;
+            }
+            let end = find_value_end(bytes, start);
+            if end > start {
+                output.push_str(&input[cursor..start]);
+                output.push_str(REDACTED);
+                cursor = end;
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+/// Replaces tokens carrying a literal prefix such as `sk-`.
+fn redact_prefixed_tokens(input: &str, prefix: &str) -> String {
+    let prefix = prefix.as_bytes();
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index + prefix.len() <= bytes.len() {
+        if &bytes[index..index + prefix.len()] == prefix {
+            let mut end = index + prefix.len();
+            while end < bytes.len() && is_secret_token_byte(bytes[end]) {
+                end += 1;
+            }
+            output.push_str(&input[cursor..index]);
+            output.push_str(REDACTED);
+            cursor = end;
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+/// Replaces values assigned to known credential keys.
+fn redact_key_values(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if let Some((start, end)) = secret_assignment(bytes, index) {
+            output.push_str(&input[cursor..start]);
+            output.push_str(REDACTED);
+            cursor = end;
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+/// Finds the value range of a credential assignment starting at `start`.
+fn secret_assignment(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if !bytes.get(start).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    if start > 0 && is_word_byte(bytes[start - 1]) {
+        return None;
+    }
+
+    for key in SECRET_KEYS {
+        let key = key.as_bytes();
+        let key_end = start + key.len();
+        if key_end > bytes.len()
+            || !bytes[start..key_end].eq_ignore_ascii_case(key)
+            || bytes.get(key_end).is_some_and(|byte| is_word_byte(*byte))
+        {
+            continue;
+        }
+
+        let mut position = key_end;
+        if position < bytes.len() && (bytes[position] == b'"' || bytes[position] == b'\'') {
+            position += 1;
+        }
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if position >= bytes.len() || (bytes[position] != b'=' && bytes[position] != b':') {
+            continue;
+        }
+        position += 1;
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if position < bytes.len() && (bytes[position] == b'"' || bytes[position] == b'\'') {
+            position += 1;
+        }
+
+        let end = find_value_end(bytes, position);
+        if end > position && !bytes[position..].starts_with(REDACTED.as_bytes()) {
+            return Some((position, end));
+        }
+    }
+
+    None
+}
+
+/// Returns the end of an unquoted value starting at `start`.
+fn find_value_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && !is_value_terminator(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// Returns whether `byte` terminates an unquoted credential value.
+fn is_value_terminator(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'"' | b'\'' | b',' | b';' | b'&' | b'}' | b']' | b')')
+}
+
+/// Returns whether `byte` can continue an identifier or secret token.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+/// Returns whether `byte` can continue an `sk-` style token.
+fn is_secret_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
 }
 
 #[cfg(test)]
@@ -496,5 +1097,439 @@ mod tests {
         };
 
         assert_eq!(limits.validate(), Ok(()));
+    }
+
+    /// Returns the sorted keys of a JSON object.
+    fn object_keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("value must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Parses a rendered tool result as JSON.
+    fn result_json(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.content).expect("delegate result must be valid JSON")
+    }
+
+    /// Builds a narrowed set from a request order.
+    fn narrowed(names: &[&str]) -> NarrowedTools {
+        let capabilities = parent(names, names);
+        narrow_tools(&capabilities, &request(names)).expect("test tools must narrow")
+    }
+
+    #[test]
+    fn delegate_task_schema_locks_the_argument_contract() {
+        let schema = delegate_task_schema();
+
+        assert_eq!(schema["type"].as_str(), Some("function"));
+        assert_eq!(
+            schema["function"]["name"].as_str(),
+            Some(DELEGATE_TASK_TOOL_NAME)
+        );
+        let parameters = &schema["function"]["parameters"];
+        assert_eq!(parameters["type"].as_str(), Some("object"));
+        assert_eq!(parameters["required"], json!(["task", "tools"]));
+        assert_eq!(parameters["additionalProperties"].as_bool(), Some(false));
+        assert_eq!(
+            parameters["properties"]["task"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(
+            parameters["properties"]["tools"]["type"].as_str(),
+            Some("array")
+        );
+        assert_eq!(
+            parameters["properties"]["tools"]["items"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(
+            parameters["properties"]["tools"]["uniqueItems"].as_bool(),
+            Some(true)
+        );
+
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("description must be a string");
+        for phrase in [
+            "independent",
+            "no parent",
+            "native tools",
+            "cannot delegate",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "description must mention `{phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_trims_the_task_and_preserves_tool_order() {
+        let args = json!({
+            "task": "  inspect the repository  ",
+            "tools": ["read_file", "bash"]
+        });
+
+        let parsed = parse_delegate_task_args(&args, 64).expect("valid arguments");
+
+        assert_eq!(parsed.task(), "inspect the repository");
+        assert_eq!(
+            parsed.tools(),
+            vec!["read_file".to_owned(), "bash".to_owned()].as_slice()
+        );
+    }
+
+    #[test]
+    fn parse_rejects_non_object_unknown_missing_and_wrong_typed_arguments() {
+        assert_eq!(
+            parse_delegate_task_args(&json!([]), 64),
+            Err(DelegationError::ArgumentsNotObject)
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": "x", "tools": [], "extra": true}), 64),
+            Err(DelegationError::UnknownArgument {
+                field: "extra".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({}), 64),
+            Err(DelegationError::MissingArgument { field: "task" })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": "x"}), 64),
+            Err(DelegationError::MissingArgument { field: "tools" })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": 5, "tools": []}), 64),
+            Err(DelegationError::InvalidArgumentType {
+                field: "task",
+                expected: "a string"
+            })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": "x", "tools": "bash"}), 64),
+            Err(DelegationError::InvalidArgumentType {
+                field: "tools",
+                expected: "an array of strings"
+            })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": "x", "tools": ["bash", 5]}), 64),
+            Err(DelegationError::InvalidArgumentType {
+                field: "tools",
+                expected: "an array of strings"
+            })
+        );
+        assert_eq!(
+            parse_delegate_task_args(&json!({"task": "   \n\t ", "tools": []}), 64),
+            Err(DelegationError::EmptyTask)
+        );
+    }
+
+    #[test]
+    fn parse_measures_the_trimmed_task_in_utf8_bytes() {
+        let exact = json!({"task": "  界界  ", "tools": []});
+
+        let parsed = parse_delegate_task_args(&exact, 6).expect("six bytes fit");
+        assert_eq!(parsed.task(), "界界");
+        assert_eq!(
+            parse_delegate_task_args(&exact, 5),
+            Err(DelegationError::TaskTooLong {
+                actual: 6,
+                limit: 5
+            })
+        );
+
+        let ascii = json!({"task": "  12345  ", "tools": []});
+        assert_eq!(
+            parse_delegate_task_args(&ascii, 5)
+                .expect("trimmed ascii fits")
+                .task(),
+            "12345"
+        );
+    }
+
+    #[test]
+    fn parse_leaves_duplicate_tools_for_narrowing_to_reject() {
+        let args = json!({"task": "do work", "tools": ["bash", "bash"]});
+        let parsed = parse_delegate_task_args(&args, 64).expect("duplicates are a narrowing error");
+
+        assert_eq!(
+            parsed.tools(),
+            vec!["bash".to_owned(), "bash".to_owned()].as_slice()
+        );
+        let capabilities = parent(&["bash"], &["bash"]);
+        assert_eq!(
+            narrow_tools(&capabilities, parsed.tools()),
+            Err(DelegationError::DuplicateTool {
+                name: "bash".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn success_json_has_exactly_the_contract_fields() {
+        let outcome = ChildOutcome::Success {
+            rounds: 3,
+            tool_calls: 5,
+            answer: "done".to_owned(),
+            child_session_hash: "a1b2c3d4".to_owned(),
+        };
+
+        let result = render_child_outcome(outcome, 1024);
+
+        assert!(!result.is_error);
+        let value = result_json(&result);
+        assert_eq!(
+            object_keys(&value),
+            vec![
+                "answer",
+                "child_session_hash",
+                "rounds",
+                "status",
+                "tool_calls"
+            ]
+        );
+        assert_eq!(value["status"].as_str(), Some("ok"));
+        assert_eq!(value["rounds"].as_u64(), Some(3));
+        assert_eq!(value["tool_calls"].as_u64(), Some(5));
+        assert_eq!(value["answer"].as_str(), Some("done"));
+        assert_eq!(value["child_session_hash"].as_str(), Some("a1b2c3d4"));
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn error_json_has_exactly_the_contract_fields() {
+        let outcome = ChildOutcome::Error {
+            rounds: 2,
+            tool_calls: 3,
+            error: "boom".to_owned(),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+
+        let result = render_child_outcome(outcome, 1024);
+
+        assert!(result.is_error);
+        let value = result_json(&result);
+        assert_eq!(
+            object_keys(&value),
+            vec![
+                "answer",
+                "child_session_hash",
+                "error",
+                "rounds",
+                "status",
+                "tool_calls"
+            ]
+        );
+        assert_eq!(value["status"].as_str(), Some("error"));
+        assert_eq!(value["rounds"].as_u64(), Some(2));
+        assert_eq!(value["tool_calls"].as_u64(), Some(3));
+        assert_eq!(value["answer"].as_str(), Some(""));
+        assert_eq!(value["error"].as_str(), Some("boom"));
+        assert_eq!(value["child_session_hash"].as_str(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn success_at_the_exact_byte_limit_is_not_truncated_and_one_byte_less_is() {
+        let outcome = ChildOutcome::Success {
+            rounds: 1,
+            tool_calls: 2,
+            answer: "alpha".to_owned(),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+        let full = render_child_outcome(outcome.clone(), usize::MAX);
+        let full_len = full.content.len();
+
+        let exact = render_child_outcome(outcome.clone(), full_len);
+        assert!(!exact.is_error);
+        assert_eq!(exact.content.len(), full_len);
+        assert_eq!(result_json(&exact)["status"].as_str(), Some("ok"));
+
+        let one_less = render_child_outcome(outcome, full_len - 1);
+        assert!(!one_less.is_error);
+        assert!(one_less.content.len() < full_len);
+        let truncated = result_json(&one_less);
+        assert_eq!(truncated["status"].as_str(), Some("truncated"));
+        assert_eq!(truncated["original_bytes"].as_u64(), Some(full_len as u64));
+        assert_eq!(truncated["answer"].as_str(), Some("alpha"));
+    }
+
+    #[test]
+    fn truncation_uses_a_utf8_prefix_and_reports_the_full_result_size() {
+        let answer = "开头🙂中文🚀结尾".repeat(10);
+        let outcome = ChildOutcome::Success {
+            rounds: 0,
+            tool_calls: 0,
+            answer: answer.clone(),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+        let full = render_child_outcome(outcome.clone(), usize::MAX);
+        let original_bytes = full.content.len();
+
+        let result = render_child_outcome(outcome, MIN_RESULT_BYTES);
+
+        assert!(!result.is_error);
+        assert!(result.content.len() <= MIN_RESULT_BYTES);
+        let value = result_json(&result);
+        assert_eq!(
+            object_keys(&value),
+            vec!["answer", "original_bytes", "status"]
+        );
+        assert_eq!(value["status"].as_str(), Some("truncated"));
+        assert_eq!(
+            value["original_bytes"].as_u64(),
+            Some(original_bytes as u64)
+        );
+        let prefix = value["answer"].as_str().expect("answer must be a string");
+        assert!(answer.starts_with(prefix));
+        assert!(!prefix.is_empty());
+        assert!(prefix.len() < answer.len());
+        assert!(value.get("error").is_none());
+        assert!(value.get("rounds").is_none());
+        assert!(value.get("child_session_hash").is_none());
+    }
+
+    #[test]
+    fn error_results_redact_credentials_before_rendering() {
+        let outcome = ChildOutcome::Error {
+            rounds: 0,
+            tool_calls: 1,
+            error: "Authorization: Bearer bearer-secret api_key=key-secret token=tok-secret \
+                    sk-live-secret"
+                .to_owned(),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+
+        let result = render_child_outcome(outcome, 512);
+
+        assert!(result.is_error);
+        assert!(result.content.len() <= 512);
+        let value = result_json(&result);
+        assert_eq!(value["status"].as_str(), Some("error"));
+        let text = value["error"].as_str().expect("error must be a string");
+        for secret in [
+            "bearer-secret",
+            "key-secret",
+            "tok-secret",
+            "sk-live-secret",
+        ] {
+            assert!(!text.contains(secret), "`{secret}` leaked in `{text}`");
+        }
+        assert!(text.contains(REDACTED));
+    }
+
+    #[test]
+    fn an_oversized_error_stays_an_error_at_the_minimum_limit() {
+        let outcome = ChildOutcome::Error {
+            rounds: 7,
+            tool_calls: 9,
+            error: format!("api_key={} {}", "x".repeat(2_000), "padding ".repeat(100)),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+
+        let result = render_child_outcome(outcome, MIN_RESULT_BYTES);
+
+        assert!(result.is_error);
+        assert!(result.content.len() <= MIN_RESULT_BYTES);
+        let value = result_json(&result);
+        assert_eq!(
+            object_keys(&value),
+            vec![
+                "answer",
+                "child_session_hash",
+                "error",
+                "rounds",
+                "status",
+                "tool_calls"
+            ]
+        );
+        assert_eq!(value["status"].as_str(), Some("error"));
+        assert_eq!(value["answer"].as_str(), Some(""));
+        assert_eq!(value["rounds"].as_u64(), Some(7));
+        assert_eq!(value["tool_calls"].as_u64(), Some(9));
+        let text = value["error"].as_str().expect("error must be a string");
+        assert!(text.starts_with("api_key=[REDACTED]"), "got `{text}`");
+    }
+
+    #[test]
+    fn success_answers_are_not_secret_scanned() {
+        let answer = "sk-this-is-part-of-the-answer";
+        let outcome = ChildOutcome::Success {
+            rounds: 0,
+            tool_calls: 0,
+            answer: answer.to_owned(),
+            child_session_hash: "deadbeef".to_owned(),
+        };
+
+        let result = render_child_outcome(outcome, 1024);
+
+        assert!(!result.is_error);
+        assert_eq!(result_json(&result)["answer"].as_str(), Some(answer));
+    }
+
+    #[test]
+    fn child_session_hash_is_deterministic_lowercase_hex_and_task_sensitive() {
+        let tools = narrowed(&["read_file", "bash"]);
+
+        let hash = child_session_hash("task", &tools);
+
+        assert_eq!(hash.len(), 8);
+        assert!(
+            hash.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(hash, child_session_hash("task", &tools));
+        assert_eq!(hash, child_session_hash("  task  ", &tools));
+        assert_ne!(hash, child_session_hash("other task", &tools));
+    }
+
+    #[test]
+    fn child_session_hash_is_tool_order_independent_but_separates_names() {
+        let first = child_session_hash("task", &narrowed(&["read_file", "bash"]));
+        let second = child_session_hash("task", &narrowed(&["bash", "read_file"]));
+        assert_eq!(first, second);
+
+        let split_one = child_session_hash("task", &narrowed(&["ab", "c"]));
+        let split_two = child_session_hash("task", &narrowed(&["a", "bc"]));
+        assert_ne!(split_one, split_two);
+    }
+
+    #[test]
+    fn best_effort_hash_matches_the_narrowed_encoding_for_parseable_parts() {
+        let args = json!({
+            "task": "  task  ",
+            "tools": ["read_file", "bash", "read_file"]
+        });
+        assert_eq!(
+            best_effort_child_session_hash(&args),
+            child_session_hash("task", &narrowed(&["bash", "read_file"]))
+        );
+
+        let partial = json!({"task": 7, "tools": ["bash", 9, "read_file"]});
+        assert_eq!(
+            best_effort_child_session_hash(&partial),
+            child_session_hash("", &narrowed(&["read_file", "bash"]))
+        );
+    }
+
+    #[test]
+    fn redaction_handles_json_and_colon_assignments() {
+        let redacted = redact_secrets(
+            r#"{"api_key": "json-secret", "token": "token-secret", "Authorization": "Bearer bearer-secret"}"#,
+        );
+
+        for secret in ["json-secret", "token-secret", "bearer-secret"] {
+            assert!(
+                !redacted.contains(secret),
+                "`{secret}` leaked in `{redacted}`"
+            );
+        }
+        assert!(redacted.contains(REDACTED));
     }
 }
