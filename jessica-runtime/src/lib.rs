@@ -8,7 +8,12 @@
 #![deny(missing_docs)]
 
 mod agent;
+mod delegation;
 mod recovery;
 
 pub use agent::AgentLoop;
+pub use delegation::{
+    CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationError, DelegationLimits,
+    MIN_RESULT_BYTES, NarrowedTools, ParentCapabilities, narrow_tools,
+};
 pub use recovery::{RecordedEvent, RecoveryError, SessionCheckpoint, recover_session};

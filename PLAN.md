@@ -275,7 +275,7 @@ Phase 5：能力扩展与加固（按需拆 Task）
 
 · Task 5.1 分层记忆：短期（会话近期）/中期（FTS5 关键词）/长期（向量）三层召回，MemoryStore 的完整实现，Guide 注入真实记忆。拆分为 5.1.1–5.1.6，详见本节之后的“Task 5.1 拆分”。
 · Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。拆分为 5.2.1–5.2.6，其中 5.2.2 再拆为 5.2.2a / 5.2.2b，详见本节之后的“Task 5.2 拆分”。
-· Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。
+· Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。拆分为 5.3.1–5.3.5，其中 5.3.3 再拆为 5.3.3a / 5.3.3b，详见本节之后的“Task 5.3 拆分”。
 · Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。
 · Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。
 
@@ -803,6 +803,224 @@ cargo clippy --workspace --all-targets -- -D warnings
 6. 重复 activate：5.2.1 必须锁定“幂等成功”或“结构化错误”之一并测试，避免 CLI 子命令行为漂移。
 7. turn_index 稳定性：方案 B 的入队幂等键包含 turn_index，必须从会话/checkpoint 稳定推导，不得使用进程内 AtomicU64；resume 必须复用或按确定规则递增，并测试跨进程重启后的重复入队。
 
+Task 5.3 拆分：子 Agent 委派
+
+5.3 全局约束（适用于 5.3.1–5.3.5，违反任一条即验收失败）：
+
+A. 子 Agent 轨迹不持久化。父事件流只保存 `delegate_task` 的 `ToolCallStarted` / `ToolCallFinished`（即调用的 args 与最终 JSON `ToolResult`）；子 Agent 的模型增量、子工具调用、子 `SessionEnded` 一律只进入子 Agent 私有通道并在结束后丢弃。因此子轨迹不可 replay；replay/resume 只读取父事件流中的 `ToolResult`，绝不重新执行子 Agent。v1 明确接受该折中，子会话 EventStore 列为 Deferred（5.3.6 候选）。
+B. 权限必须结构性构造。`NarrowedTools` 是唯一允许的子工具集合；`ChildToolFactory` 返回的工具名集合必须与 `NarrowedTools` 完全相等（多一个或少一个都是集成错误）。不得依赖 `Policy`、提示词、模型自述或运行期名称检查来“保证”权限。
+C. 终止语义必须区分：子工具超时/失败、子 Agent rounds 耗尽、`max_child_tool_calls` 耗尽 → 子结果是 `ToolResult::error`，父 Agent 继续，父 `SessionEndReason` 保持 `Completed`（或父自身原因）；只有子 Agent 消耗导致父 token 预算耗尽 → 父 `BudgetExceeded`，父 Ctrl-C → `Cancelled`。子 Agent 的失败不得改变父退出码。
+D. 超时嵌套：子内部单工具超时 5000ms < `delegation.timeout_ms`（默认 8000ms）< 父 `budget.tool_timeout_ms`（默认 10000ms）。5.3.4 必须在配置加载期验证；运行时不得依赖父 `GovernedTool` 兜底子 Agent 超时。
+E. WASM 默认排除：v1 子工具集只允许 native 工具；`narrow_tools` 无条件过滤 WASM（即使父 allowlist 已授权），`ChildToolFactory` / CLI 也不得构造 WASM 子实例。原因：`WasmTool` 有每工具 Mutex 与共享 guest 状态，子 Agent 间不共享可变状态无法保证。
+F. 子 Agent 不继承父历史：子初始 messages 必须恰好是 `[system_prompt, user(task)]`，`system_prompt` 是固定常量并声明“独立执行单元、没有外部上下文、只能依据 task 与提供的工具”。不得注入父 transcript、memory guide、skill guide、父任务或父工具结果。
+G. 结果必须是合法 JSON：成功/错误/截断三种结构见 5.3.2；成功 answer 超限时不得截断已序列化 JSON，必须重新构造固定结构的 `status=truncated` 对象；错误结果在序列化前先把已脱敏 error 文本缩短到预算内，因此不得出现超限的错误 JSON，也不得把错误伪装成 truncated；`max_result_bytes` 按最终序列化字节计算。错误信息必须有界脱敏，不得包含密钥、provider 原始响应或完整子 transcript。
+H. v1 只允许单层委派：`narrow_tools` 无条件排除 `delegate_task`，即使父 allowlist 包含它且模型显式申请；子 Agent 的 registry 永远没有 `delegate_task`。不得实现嵌套、深度参数或子 Agent 再委派。
+
+补充全局约束：
+
+· 不修改 jessica-core。不新增 crate。5.3.2 将 workspace 已批准的 serde_json 从 jessica-runtime 的 dev-dependencies 提升为 dependencies（无新第三方 crate）；不新增其他依赖。
+· 子 Agent 使用裸 `AgentLoop`，不接入 Harness、memory、skills、sensors、acceptance、CLI EventPump；子 Agent 的 provider 仍使用父级 `TokenCountingProvider`（共享 token 预算），但子事件写入独立有界 broadcast 通道且无人持久化。
+· “不共享可变状态”指：每次委派新建子 transcript、子 registry、子工具实例、子 CancellationToken、子事件通道；父 provider 的 token 计数与取消是唯一有意共享的状态。不得复用子 transcript、子工具实例或子事件通道。
+· 子 Agent 与父 Agent 工作目录/文件系统相同；v1 不提供子级 sandbox 或额外隔离，文件工具仍受父级 root 边界约束（子工具由 CLI 以同一 root 构造）。该限制必须写入 5.3.4 的模块文档。
+· 所有权限/触发/计数/排序均为确定性集合运算或整数计数，不得调用 LLM 判断。
+· 每个子 Task 必须运行自身验收命令；5.3 整体完成后再运行 workspace 全量验收。测试必须是行为测试：用脚本化 provider/tool 构造真实边界，禁止“调用返回 Ok”式自证。
+· 若实现发现 5.3.1–5.3.5 之外的问题，记录到 Deferred，不在本 Task 顺手重构。
+
+依赖顺序：5.3.1 → 5.3.2 → 5.3.3a → 5.3.3b → 5.3.4 → 5.3.5。
+
+Task 5.3.1：委派权限收窄与参数边界（jessica-runtime，45–60 分钟）
+
+目标：只实现委派权限模型、限制类型与输入边界，不执行子 Agent、不接 CLI。
+
+操作：
+
+1. 在 jessica-runtime 新增 delegation 模块，导出 `DELEGATE_TASK_TOOL_NAME`、`ParentCapabilities`、`NarrowedTools`、`narrow_tools`、`DelegationLimits` 与结构化 `DelegationError`。
+2. `ParentCapabilities` 至少包含两个 `BTreeSet<String>`：父级 allowlist，以及父级可用的 native 工具名集合；构造函数接收并去重。WASM 工具名不在 native 集合中。`DELEGATE_TASK_TOOL_NAME` 即使出现在两个集合中也必须被排除。
+3. `NarrowedTools` 内部只保存排序去重后的工具名；提供只读迭代/`names()`，不得暴露可变集合。
+4. `narrow_tools(parent, requested) -> Result<NarrowedTools, DelegationError>` 固定规则：
+   - `requested` 中有重复名称 → `DuplicateTool`；
+   - 任一名称不在父 allowlist → `ToolNotPermitted`（申请父级未授权工具必须是本地验证错误）；
+   - 结果 = `requested ∩ parent.native`，再无条件删除 `delegate_task`；
+   - WASM 或其他非 native 名称即使父级已授权也静默排除；
+   - 空请求合法，返回空集合；空 narrowed 集合也合法（子 Agent 无工具）。
+5. `DelegationLimits` 含 `max_rounds: u32`、`timeout: Duration`、`max_task_bytes: usize`、`max_result_bytes: usize`、`max_child_tool_calls: u32`；默认值固定为 4、8000ms、8192、32768、20。定义固定常量 `CHILD_TOOL_TIMEOUT = 5000ms` 与 `MIN_RESULT_BYTES = 128`，不得把子工具超时做成配置项。`max_result_bytes >= 128` 是在“字节上限为正”之上新增的必要下界：空 answer 的 truncated 骨架与空 error 的 error 骨架都必须能放下，否则无法同时满足固定 JSON 结构与字节上限；`max_task_bytes` 只要求 >=1。
+6. `DelegationLimits::validate` 拒绝：`max_rounds == 0`、`max_child_tool_calls == 0`、`max_task_bytes == 0`、`max_result_bytes < MIN_RESULT_BYTES`、`timeout <= CHILD_TOOL_TIMEOUT`。父 `budget.tool_timeout` 的嵌套校验放在 5.3.4（runtime 不知道 CLI budget）。
+7. 所有公共 API 有 doc comment；错误用 thiserror；不得 unwrap/expect。
+
+行为测试至少覆盖：请求是父 allowlist 子集时原样保留；申请未授权工具返回 `ToolNotPermitted`；重复名称返回 `DuplicateTool`；父 allowlist 同时含 `delegate_task` 与 WASM 且模型显式申请时两者都被过滤，仅 native 保留；仅申请 WASM / 仅申请 `delegate_task` 得到空集合；空请求得到空集合；输出排序确定；`DelegationLimits` 默认值与每个非法边界。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-runtime --all-targets -- -D warnings
+cargo test -p jessica-runtime
+```
+
+禁止：在本 Task 执行子 Agent、注册工具、接 CLI、修改 jessica-core、新增依赖；不得把 WASM 名称当作 native 放行；不得用提示词或 Policy 代替 `narrow_tools`。
+
+Task 5.3.2：delegate_task 参数、JSON 结果与截断契约（jessica-runtime，60–75 分钟）
+
+目标：锁定 `delegate_task` 的 schema、参数校验、结果 JSON、错误脱敏和超限截断；仍不执行子 Agent。
+
+操作：
+
+1. 将 workspace 已批准的 `serde_json` 加入 jessica-runtime 的 `[dependencies]`（原来只在 dev-dependencies；无新第三方 crate），用于构造和校验 JSON。
+2. 定义 `delegate_task` 的固定 `ToolSchema`：`type=function`、`name=delegate_task`、`additionalProperties=false`、`required=["task","tools"]`、`task` 为 string、`tools` 为 string 数组且 `uniqueItems=true`。description 必须写明：子 Agent 是独立执行单元、无父历史、只能使用请求的 native 工具子集、不能委派。
+3. 定义 `DelegateTaskArgs` 的纯解析/校验函数：只接受 JSON object；未知字段、缺失字段、类型错误、空 task（trim 后）→ 结构化错误；task 按 UTF-8 字节计不得超过 `max_task_bytes`；tools 中的重复由 `narrow_tools` 拒绝；解析不调用 LLM、不读时钟。
+4. 定义成功/错误 outcome 的内部结构和渲染函数，输出严格为：
+   - 成功：`{"status":"ok","rounds":<u32>,"tool_calls":<u32>,"answer":"...","child_session_hash":"<8 hex>"}`；
+   - 错误：字段同上，`"status":"error"`，`"answer":""`，额外 `"error":"<有界脱敏文本>"`；
+   - 截断：固定且仅含 `{"status":"truncated","answer":"<answer 的 UTF-8 前缀>","original_bytes":<原完整 JSON 字节数>}`。
+   三种结构不得增加可选字段；`error` 只在 `status=error` 时存在；成功/截断不得有 `error`。
+5. `child_session_hash` 为 FNV-1a 32 位（8 位小写十六进制），输入为 trim 后 task + `\0` + 排序后的 narrowed 工具名。参数校验或收窄失败时，使用可解析的 trim task 与排序去重后的 requested 名称做 best-effort hash；只保证格式与确定性，不保证身份含义。它只是 trace 标识：不持久化、不作幂等键、不作安全凭证，且不包含父 session id。原因必须写入文档：fresh turn 的 `build_turn()` 早于 `next_session_id()`，且同一工具跨 acceptance attempts 复用，无法绑定唯一父 session；父/子关联留给子会话 EventStore Deferred。
+6. 结果渲染必须按最终序列化字节执行 `max_result_bytes`：
+   - 先序列化成功或错误结果；
+   - 成功结果超限时，在 answer 的 UTF-8 char boundary 上取最长前缀，重新序列化为固定 truncated 结构，保证 `<= max_result_bytes`；不得对已序列化 JSON 做字节截断；
+   - `original_bytes` 是截断前完整成功 JSON 的字节数；truncated 的 answer 前缀必须仍是原 answer 的前缀；
+   - 错误结果不转成 truncated：先对 error 文本脱敏（至少覆盖 `sk-`、`Bearer`、`api_key=`/`token=` 等键值形式），再按 UTF-8 边界缩短 error，使完整 error JSON 仍 `<= max_result_bytes` 且保持合法；若连空 error 的骨架都放不下，构造期已由 `MIN_RESULT_BYTES=128` 拒绝；
+   - `max_result_bytes` 恰好等于完整 JSON 长度时不截断。
+7. `ToolResult.is_error` 固定为：`ok` 和 `truncated` 为 false，`error` 为 true；`truncated` 的 JSON 仍可被父模型直接解析。成功 answer 不做密钥扫描/改写（由子 system prompt 禁止输出凭据），但 error 必须脱敏。
+8. 行为测试至少覆盖：三种 JSON 的精确 key 集合与字段类型；8 位 hex 且工具顺序无关、task 不同则 hash 不同；成功 JSON 的 `max_result_bytes` 恰好够时保持 ok、少 1 字节时变 truncated 且 JSON 可解析、长度不超限、answer 是 UTF-8 前缀（含中文/emoji 边界）、`original_bytes` 精确；truncated 恰为 3 个 key；error 的 `sk-`/Bearer/键值凭据被替换且长度有界，且极小的 `max_result_bytes` 下仍是合法 error 而非 truncated；`is_error` 映射；schema 的 required/additionalProperties；task 超长、未知字段、空 task、错误类型全部拒绝。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-runtime --all-targets -- -D warnings
+cargo test -p jessica-runtime
+```
+
+禁止：在本 Task 执行子 Agent、注册 `delegate_task`、接 CLI；不得用字符串拼接生成 JSON；不得截断已序列化 JSON；不得让 truncated 夹带 error/rounds/hash 等额外字段；不得把完整 provider 原始响应写入 error。
+
+Task 5.3.3a：子 Agent 执行器与 run_with_transcript（jessica-runtime，90–120 分钟）
+
+目标：实现真正的单层子 Agent 执行、工具工厂、精确结果计数与 `delegate_task` Tool。
+
+操作：
+
+1. 给 `AgentLoop` 增加 `run_with_transcript(session_id, messages, max_tool_calls: Option<u32>, cancel) -> TranscriptRun`。`TranscriptRun` 至少含 `reason: SessionEndReason`、最终 messages、`rounds: u32`、`tool_calls: u32`、`tool_errors: u32`、`first_tool_error: Option<String>`、`error: Option<String>`（provider/stream/loop 的终止错误，来自循环结构化返回而非事件字符串）、`tool_call_limit_hit: bool`。`run`/`resume` 的签名和行为保持不变，内部复用同一循环并丢弃 transcript。错误/取消/tool-call-limit 路径的 messages 允许停在未完成的工具批次；文档必须声明 executor 只在 `Completed` 且 `tool_errors==0` 时读取 answer，其他路径只使用计数与错误摘要。
+2. 子 Agent 的 rounds 精确计为已完成的模型回合数；`tool_calls` 计为模型请求的工具调用总数（含未知工具）；`tool_errors` 计为 `ToolResult.is_error=true` 的调用数（含子工具超时与未知工具），`first_tool_error` 记录第一个失败工具名与最多 512 字节的非空错误摘要。`max_tool_calls` 在执行每个请求前递增并检查：第 N+1 个请求不得执行，返回 `tool_call_limit_hit=true`，reason 为 `Error`，并只在子私有通道发 Error/SessionEnded；父事件流不可见。没有该限制时 `tool_call_limit_hit=false`。
+3. 定义 `ChildToolFactory: Send + Sync`，同步方法 `build(names: &[String]) -> Result<Vec<Arc<dyn Tool>>, DelegationError>`。每次委派都必须重新调用（不得缓存子工具实例）。构造子 `ToolRegistry` 后校验 `registry.names()` 与 `NarrowedTools` 完全相等；额外或缺失工具都返回 error JSON，且不得开始子模型调用。
+4. 定义 `AgentChildExecutor`：持有父级 `Arc<dyn LlmProvider>`（即 CLI 的 TokenCountingProvider）、`Arc<dyn ChildToolFactory>`、`ParentCapabilities`、`DelegationLimits`。构造时验证 limits 与 `max_result_bytes >= MIN_RESULT_BYTES`。
+5. `AgentChildExecutor::execute(args) -> ToolResult` 固定流程：解析参数 → `narrow_tools` → factory.build → 子 registry 精确校验 → 用固定 `CHILD_TOOL_TIMEOUT=5000ms` 包装每个子工具（超时返回子模型可见的 `ToolResult::error`，不取消父；native 三件套必须可安全 drop）→ 构造 `AgentLoop`（`Budget.max_rounds=delegation.max_rounds`，其余 budget 字段不被 loop 使用）→ 初始 messages 恰为固定 `CHILD_AGENT_SYSTEM_PROMPT` + `Message::user(task)` → 子 session id 使用 `child_session_hash` → 在 `delegation.timeout` 内调用 `run_with_transcript(..., Some(max_child_tool_calls), 子 CancellationToken)` → 从最终 transcript 取最后一个 assistant 文本作为候选 answer → 按 5.3.2 渲染。
+6. 固定 `CHILD_AGENT_SYSTEM_PROMPT` 必须声明：你是独立执行单元；没有父对话/记忆/历史；只依据 current task 与提供的工具；不要请求更多工具；直接给出最终答案；不得再委派。不得将父任务、父消息或任何动态内容插入该常量。
+7. 结果映射（与全局约束 C 一致）：
+   - `Completed`、未触发 tool call limit、且 `tool_errors == 0` → `status=ok`；
+   - 任意子工具超时/失败（`tool_errors > 0`，含未知工具）→ `status=error`，即使子 Agent 后续仍 `Completed`；父继续；
+   - rounds 耗尽、`max_tool_calls` 触发、provider/stream 错误、子 Agent 非 Completed → `status=error`；
+   - delegation 超时 → `status=error`，丢弃子 future 并返回，不得等父 GovernedTool 的 10s 超时；
+   - 所有子失败都包装为 `ToolResult`，不得 panic、不得向父传播 Err；错误结果不得使用 truncated 结构。
+8. 定义 `DelegateTaskTool` 实现 core `Tool`：`name=DELEGATE_TASK_TOOL_NAME`，schema 来自 5.3.2，`execute` 调用 executor，并按 `status` 设置 `ToolResult.is_error`（ok/truncated=false，error=true）。call id 仍由 AgentLoop 回填。
+9. 子事件通道使用独立有界 broadcast（建议容量 256），不订阅、不转发、不落库；子 Agent 的 SessionStarted/SessionEnded 只存在于该通道。
+10. 行为测试至少覆盖：单工具成功（rounds/tool_calls/answer/hash 精确）；子工具报错但模型随后回答 → 仍为 error（tool_errors 计数）；子工具超时 → tool_errors 计数且最终 error；rounds 耗尽 → error 且父不 panic；`max_child_tool_calls` 恰好边界与第 N+1 个不执行；child factory 多/少一个工具 → error 且子 provider 零调用；参数非法 → error 且子 provider 零调用；provider/stream 错误 → error 且错误摘要非空；delegation 超时用 `tokio::test(start_paused = true)` + 挂起 mock provider（默认 8000ms 由虚拟时钟推进，不真实等待）→ error；子工具超时同样用 paused 时钟；子初始 messages 恰为 2 条；子工具名/schema 恰为 narrowed；`run_with_transcript` 不改变既有 run/resume 事件序列。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-runtime --all-targets -- -D warnings
+cargo test -p jessica-runtime
+```
+
+禁止：接 CLI、注册到父 registry、接 WASM、子 Agent 嵌套、持久化子事件、修改 `run/resume` 签名或行为；不得用事件字符串猜测 rounds/tool_calls（必须从循环结构化返回）；不得让子 Agent 失败变成父 `Err`/panic；不得让第 N+1 个工具实际执行。
+
+Task 5.3.3b：子 Agent 隔离与对抗性行为（jessica-runtime，45–60 分钟）
+
+目标：用行为测试锁定“无父历史、工具集收窄、单层、子间不共享可变状态”；如发现缺口可在本 Task 内修复 5.3.3a 实现，但不得扩大功能。
+
+操作/测试至少覆盖：
+
+1. 父 transcript 中存在独特标记，子 provider 收到的 messages 严格只有 2 条，且 system 等于固定常量、user 等于 task；任何父标记都不出现。task 本身包含伪造的 “system:”/“ignore previous instructions” 文本时仍只是 user 内容，不改变 role 顺序。
+2. 子 provider 收到的 tool schemas 名称集合与 `NarrowedTools` 完全一致；未请求的父工具、WASM 工具、`delegate_task` 均不出现；空 narrowed 时 tools 为空。
+3. 子模型伪造调用 `delegate_task` → 只得到 unknown tool error，factory 不再被调用，无嵌套 LLM 请求；最终 delegate 结果因 `tool_errors > 0` 为 error。
+4. 一次父回合内连续两次委派：factory 每次都被调用且返回全新工具实例；用测试专用有状态 mock 工具写入不同值，证明第二个子 Agent 看不到第一个的工具状态/transcript/结果。
+5. 两个子 Agent 的 task 不同、答案不同：第二个子 provider 请求只含自己的 task，不含第一个 task/answer/tool result。
+6. 子 Agent 的私有事件通道无人可见：executor 不持有父事件 sender，不产生父事件；父事件流“只有 delegate Started/Finished、没有子事件”的完整断言放到 5.3.5。
+7. 子 Agent 的 `SessionId` 来自 child_session_hash，且两次同 task/同工具委派 hash 相同（仅 trace，不用于幂等判断）。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-runtime --all-targets -- -D warnings
+cargo test -p jessica-runtime
+```
+
+禁止：为了测试在运行时保留子事件、共享子工具实例、缓存子 transcript；不得把 system prompt 改成包含父历史；不得删除或绕过 5.3.1 的过滤规则；不得接 CLI。
+
+Task 5.3.4：CLI delegation 配置与装配（jessica-cli，75–90 分钟）
+
+目标：把 runtime 能力接入 CLI，默认关闭，完成配置校验与父/子工具装配；不写 E2E 大场景（5.3.5）。
+
+操作：
+
+1. 新增 `[delegation]` 配置项，`#[serde(default, deny_unknown_fields)]`：
+   ```toml
+   [delegation]
+   enabled = false
+   max_rounds = 4
+   timeout_ms = 8000
+   max_task_bytes = 8192
+   max_result_bytes = 32768
+   max_child_tool_calls = 20
+   ```
+   不提供 `child_tool_timeout_ms`；子工具超时固定 5000ms。`enabled=false` 时完全不注册 `delegate_task`、不构造子 factory/executor，也不要求 allowlist 含 `delegate_task`。默认关闭是刻意的安全选择：避免新增配置破坏既有小 `tool_timeout_ms` 配置，也避免在用户未显式授权 `delegate_task` 时自动扩权。
+2. 配置校验：
+   - `max_rounds >= 1`、`max_child_tool_calls >= 1`、`max_task_bytes >= 1`、`max_result_bytes >= 128`；
+   - 仅当 `enabled=true`：`policy.allowed_tools` 必须包含 `"delegate_task"`，否则配置加载期结构化错误；
+   - 仅当 `enabled=true`：`CHILD_TOOL_TIMEOUT(5000ms) < delegation.timeout_ms < budget.tool_timeout_ms`；默认 5000 < 8000 < 10000；
+   - 仅当 `enabled=true`：`delegation.max_result_bytes <= budget.max_result_bytes`；
+   - 非法值给出字段级错误信息；不得在运行期 panic 或静默截断。
+3. 实现 CLI 侧 `NativeChildToolFactory`：按 narrowed 名称每次新建 `ReadFileTool`/`WriteFileTool`/`BashTool`（同一 workspace root）；只支持这三个 native 名称，其他名称返回结构化错误；绝不构造 `WasmTool`，绝不返回 `delegate_task`。
+4. 在 `build_turn` 中：provider（TokenCountingProvider）先构建，然后把同一个 `Arc<dyn LlmProvider>` 传给 `AgentChildExecutor`；`ParentCapabilities` 的 allowlist 来自 `config.policy.allowed_tools`，native 集合固定为 `["bash","read_file","write_file"]`。子 Agent 的 token 消耗必须计入父预算并触发父取消。
+5. 当 `enabled=true` 时构造 `DelegateTaskTool`，用现有 `GovernedTool` 包装（父 policy、`budget.tool_timeout`、`budget.max_result_bytes`），以固定名 `delegate_task` 注册到父 registry；父 allowlist 必须已包含该名。子工具不走 CLI `GovernedTool`，只走 runtime 的 5000ms 超时包装。
+6. 保持装配单向：CLI 依赖 runtime；runtime 不依赖 CLI/harness/memory/sandbox。`delegation.enabled=false` 的既有配置行为、schema 列表与退出码不得变化。
+7. 模块文档写明：子 Agent 与父共享文件系统/root 边界；不提供子 sandbox；只有 provider token 预算是有意共享的可变状态；子事件不持久化。
+8. 行为测试至少覆盖：配置默认值；每个非法基础边界；enabled 但 allowlist 缺 `delegate_task`；三条超时/结果大小嵌套违规；disabled 时仍校验基础字段，但不做跨字段（超时嵌套/result 大小/allowlist）校验；registry 仅 enabled 时含 `delegate_task`；父 schema 数量变化；factory 只构造三个 native 工具、未知名称报错、永不返回 WASM/delegate；provider 计数包装被传给 executor（可用测试 provider 观察子调用扣减父 token）。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-cli --all-targets -- -D warnings
+cargo test -p jessica-cli
+```
+
+禁止：默认启用委派；在 allowlist 缺 `delegate_task` 时静默注册；子 Agent 使用 WASM；让子工具经过父 `GovernedTool` 或以子失败触发父预算；修改 jessica-core；新增第三方 crate；在 replay/resume 路径构造 executor 或执行子 Agent。
+
+Task 5.3.5：委派端到端验收（jessica-cli，90–120 分钟）
+
+目标：用脚本化 SSE（不依赖真实 API key）证明父/子边界、失败语义、超时嵌套、token 预算、truncation、replay/resume 与不持久化。
+
+E2E 场景至少覆盖：
+
+1. 正常委派：父模型调用 `delegate_task(task, ["read_file"])`；子请求恰有 2 条 messages、tools 只有 `read_file`；子调用 read_file 后回答；父收到 `status=ok` JSON；父事件流只出现一次 `delegate_task` 的 Started/Finished，子 read_file 事件不在父流；exit 0。
+2. 子 rounds 耗尽：子每轮都请求工具直到 `delegation.max_rounds`；父收到 `status=error`；父随后正常回答并 Completed/exit 0。
+3. `max_child_tool_calls`：子连续请求超过上限；第 N+1 个工具未执行（用只读 marker 或 mock 计数断言）；父收到 `status=error` 且 Completed。
+4. 子工具失败/超时：子工具返回错误后子模型正常回答 → 父仍收到 `status=error`（tool_errors 语义），父继续 Completed/exit 0；子 provider 挂起 → `delegation.timeout_ms=5001`（父 tool timeout 使用默认 10000ms）下约 5s 返回 `status=error`，父继续 Completed/exit 0。若该用例耗时明显，可只保留一个真实超时用例。
+5. 父 token 预算被子 Agent 耗尽：子响应 usage 使父 `max_tokens` 越界；父最终 `SessionEndReason=BudgetExceeded`、exit 1；断言存在 token-limit BudgetExceeded、无子事件写入父库。
+6. 结果截断：配置 `delegation.max_result_bytes=256`，子回答含中文/emoji 且超限；父收到合法 JSON `status=truncated`，只含 answer/original_bytes/status，answer 是 UTF-8 前缀且总字节 ≤256。
+7. 权限：父 allowlist 无 `bash` 时模型请求 `["bash"]`；本地返回 `status=error`（父级未授权），子 provider 零请求，父继续 Completed。
+8. 单层与隔离：父一次响应请求两个 `delegate_task`（不同 task/tools）；两个子请求各自只有自己的 task，互不包含对方结果；子工具集不含 `delegate_task`；子模型伪造委派只得到 unknown tool error。
+9. disabled：未启用 delegation 时父 provider 收到的 tools 不含 `delegate_task`，模型即使请求也只得到 unknown tool。
+10. replay/resume：完成一个有委派的 session 后 replay 两次逐字节一致，replay 不调用 provider、不执行子 Agent；resume 已完成 session 零模型/子调用；若父事件流停在 delegate ToolCallStarted 而无 Finished，resume 按既有 `IncompleteRound` 拒绝，绝不重新执行子 Agent。
+11. 两个子 Agent 不共享可变状态：用不同 task 证明第二个子请求不包含第一个的答案/工具结果；父事件流中的两次 delegate 结果分别对应各自 task。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-runtime
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+并执行上述脚本化 E2E（测试内自动执行）。
+
+禁止：让子事件进入父事件库；让子 Agent 失败改变父退出码；让父 token 预算耗尽被吞掉；在 replay/resume 中执行子 Agent；依赖真实 API key/网络；WASM 子实例；嵌套委派；修改 jessica-core。
+
 ---
 
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
@@ -849,6 +1067,12 @@ Task 5.2.3 ☑ 约 30 分钟 jessica-harness 新增 skill_distiller 模块，导
 Task 5.2.4 ☑ 约 40 分钟 jessica-harness 新增 skill_worker 模块，导出 `SkillJobQueue`（claim/complete/fail）、`SkillSink`（write）、`WorkerClock`（now）、`SkillJob`/`SkillJobId`/`WorkerTimestamp`、`SkillWorker`、`SkillWorkerConfig`、`WorkerOutcome` 与三个错误 enum。`SkillWorker::new` 校验 `max_attempts >= 1`（默认 2，含首次尝试）与 `idle_interval > 0`（默认 100ms，`drain_timeout` 默认 30s），否则返回 `InvalidConfig`；`run_once` 是确定性入口，执行 claim → distill → sink.write → complete。一次 attempt = 一次 distill + 一次 write；`DistillError::Retryable` 与 `SkillSinkError::Retryable` 都重启整个 attempt（包括重新 distill），直到用完 `max_attempts`；`Permanent` 立即 failed；终态只调用一次 `queue.fail`，错误按 5.2.2b 同一组模式（sk-/Bearer/authorization/api_key/access_token/secret/password/token 等 key=value）脱敏后按 UTF-8 边界截断到 512 字节。只有 sink 写入成功后才调用 `complete`；`complete` 自身失败以 `SkillWorkerError::Queue` 返回，不静默改成 fail，sink 已落盘的内容由 stale claim 重投 + sink 幂等吸收。`run(shutdown)` 在每次新 claim 前检查取消；取消到达时已在途的 claim 允许返回并作为 drain 目标，最多等待 `drain_timeout`，超时返回结构化 `DrainTimeout { millis }` 且不 panic、不 complete/fail，job 留给 queue 的 stale-claim 恢复；空队列按 `idle_interval` 轮询。模块文档明确单 worker 假设：不协调多个消费者，重复投递由 sink 幂等兜底。时间戳只来自注入的 `WorkerClock`，仅在终态转换读取；worker 不持有 EventStore、不写事件流，harness 也不依赖 jessica-memory。Cargo.toml 仅为 CancellationToken 增加已在 workspace 中获批的 tokio-util（Task 1.2 引入，无新第三方 crate）。18 个行为测试覆盖：成功路径的 claim→distill→write→complete 顺序与 clock 只读一次；空队列 Idle 零副作用；Retryable 首次失败后成功且 retry 重新 distill；默认 max_attempts 耗尽后 failed 且记录最后一次错误；Permanent distill 不重试；Retryable sink 重启 attempt；Permanent sink 不重试；sink 重试耗尽记录最后错误；同一 job 重复投递经 provenance 幂等只存一个技能；不同来源相同内容经 content hash 幂等只存一个；complete 失败向上返回且不写 fail；预取消零 claim；空闲 shutdown 停止循环；drain 在超时内完成且取消后不再 claim；drain 超时返回 `DrainTimeout` 且零 complete/fail/sink；非法配置在 claim 前拒绝；失败错误脱敏且 ≤512 字节；结构性测试锁定 worker 源码不引用 EventStore/AgentEvent/SystemTime/Instant::now/Utc::now，Cargo.toml 不依赖 jessica-memory。偏离/说明：1) `SkillJob` 直接携带 `DistillSource`，harness 不解析 `source_json`；5.2.6 的 SQLite 适配器必须在不二次转义的前提下从持久化 source 重建 DistillSource（见 Deferred）；2) 幂等是 `SkillSink` 契约，worker 本身不去重投递，测试用按 provenance/content hash 去重的 mock sink 锁定语义，真实唯一约束来自 5.2.1 的两个部分唯一索引；3) 取消时已在途的 claim 不中止而是作为 drain 目标；4) drain 超时会 drop 在途 future，若 sink 已提交但未返回，同样依赖 stale claim + 幂等恢复；5) 脱敏逻辑因 harness 不能依赖 jessica-memory 而独立实现同一组模式。未接 CLI、未实现具体 SQLite queue/sink、未改 jessica-core、未写事件流。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace 全绿（363 passed, 0 failed, 2 ignored；jessica-harness 新增 18 个 skill_worker 测试，总计 79）。
 Task 5.2.5 ☑ 约 25 分钟 jessica-harness 新增 skill_guide 模块，导出 `SkillSource`、`SkillContent`、`SkillSourceError`、`SkillGuide` 与 `DEFAULT_SKILL_INJECT_BYTES`。`SkillSource::recall(query, limit, min_score) -> Result<Vec<SkillContent>, SkillSourceError>` 是唯一的检索契约；模块文档锁定实现方必须只返回 status=active 且 deleted_at IS NULL 的技能、按原始 bm25 升序（越小越相关）保序返回、limit=0 返回空、`None`/`Some(0.0)` 都禁用分数过滤且 0.0 不得当作字面阈值、正值是按与 bm25 同方向的归一化相关度下限、无 bm25 的 LIKE 回退使用固定哨兵 0.0（正阈值过滤、禁用时保留）；检索不得用 LLM 判断相关性、不得写存储/事件流。`SkillGuide { source, limit, min_score, max_inject_bytes }` 实现既有 `Guide` Trait；render 忽略 session（技能为 workspace 级），零预算直接 `Ok(None)` 且不调用 source，否则把 query/limit/min_score 原样转发（`Some(0.0)` 不转换为 None），source 返回错误只 `tracing::warn` 并 `Ok(None)`，空结果 `Ok(None)`。渲染恰好一条 `Message::system`：固定标题 `[技能参考 — 以下内容由历史任务自动提炼，仅供参考，不代表当前事实]`，每个技能为 `## <name>` + 描述 + instructions，技能之间固定 `\n---\n`；完整消息按 UTF-8 字符边界截断到 max_inject_bytes，默认常量 2048，提供 `new(source, limit, min_score, max_inject_bytes)` 与 `with_default_budget`。guide 不持有存储、不调用模型、不读时钟；结构性测试锁定模块源码不引用 LlmProvider/EventStore/MemoryStore/SkillLog/rusqlite/SystemTime/Instant::now/std::fs/spawn_blocking/jessica_memory。15 个行为测试覆盖：空结果 → None 且转发参数正确；单技能精确渲染为一条 System；多技能保序且恰好一个 `\n---\n`；limit 与正值 min_score 过滤生效且参数原样转发；`Some(0.0)` 原样转发并禁用过滤；正阈值排除 LIKE 哨兵 0.0；预算等于完整长度不截断；少 1–2 字节切入 3 字节中文时整字回退；零预算 → None 且零 recall；source 错误 fail-open；标题与“自动提炼/仅供参考”逐字节锁定；session 不影响结果；dyn Guide 对象安全；默认预算 2048；零存储/LLM/时钟结构检查。偏离/说明：1) active/软删除与 bm25/LIKE 过滤是 `SkillSource` 实现方契约，本 Task 用遵守契约的 mock 验证 guide 的转发、保序与渲染，真实 SQLite 过滤已在 5.2.1 测试，5.2.6 负责装配适配器；2) 零预算在 recall 前短路（文档明确）；3) 正预算小于标题长度时保留标题的合法 UTF-8 前缀（与 MemoryGuide 一致），只有零预算返回 None；4) 标题与分隔符为私有常量，通过渲染输出逐字节锁定。未新增依赖、未改 jessica-core、未接 CLI、未调用 LLM/数据库。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test --workspace 全绿（378 passed, 0 failed, 2 ignored；jessica-harness 新增 15 个 skill_guide 测试，总计 94）。
 Task 5.2.6 ☑ 约 150 分钟 jessica-cli 新增 `[skills]` 配置（13 项文档默认值；相对路径按 CLI root 解析；`enabled=false` 不创建/打开 skills.db；非法值加载期返回结构化错误）、`skills.rs` 装配模块与 `jessica skills` 子命令。装配位于 replay 早退之后：SqliteSkillStore + StoreSkillSource/StoreSkillQueue/StoreSkillSink 适配器 + LlmSkillDistiller + SkillWorker + SkillGuide；打开失败只 `tracing::warn` 并 fail-open，不改变退出码。fresh turn 固定 `system_prompt → memory guide（若有）→ skill guide（若有）→ user`，只注入 active 且未软删除技能，draft 永不注入；resume 复用 checkpoint 不重新注入。最终 Completed 后从最终 attempt 的 messages 计算 tool_call_count/assistant_rounds/acceptance_failures（`attempts.saturating_sub(1)`），`turn_index` 由会话 user message 数稳定推导而非进程内计数器；命中阈值按 `(workspace_scope, session_id, turn_index)` 幂等入队并 notify worker，不 await 提炼、不写 AgentEvent，job 状态仅在 skills.db。`auto_activate` 仅影响新写入技能的初始状态。shutdown 先取消再 drain 队列至 Idle，最多 `drain_timeout_ms`，超时只 warn。replay 在打开 skills.db 与 provider 之前返回；resume 可入队但不注入，幂等依赖 skills.db 唯一索引。子命令 `list [--status draft|active] [--limit N]`、`show/activate/delete <id>`（软删除）走独立路径，不初始化 provider、不加载 wasm、不触网、不打开事件库；失败结构化错误 + 非零退出；不打印 source JSON 或密钥。为落实 5.2.4 Deferred，jessica-harness 的 `DistillSource` 增加 `to_persisted_json`/`from_persisted_json`（原样复制已转义/已预算内容，不二次转义），skills.rs 经此重建 job source。11 个脚本化 SSE E2E 覆盖：低于阈值零 job；达阈值写 draft、下一 fresh turn 不注入、事件流无 skill 事件；人工 activate 后 memory→skill 顺序、固定标题与“仅供参考”；非法 JSON → job failed、无技能、turn Completed/exit 0；resume 不注入且同 turn 重复入队幂等（source/created_at 不变）；连续 replay 不触库不调 provider；打开失败 fail-open；drain 超时 job 可恢复且 exit 0；重复 sink 写入不重复技能；auto_activate=true 无需人工命令即可注入。另有配置默认值/非法值、参数解析、注入顺序、最终 attempt 计数、稳定 turn_index、软删除、禁用子命令等单元测试。偏离/说明：1) 5.2.4 要求适配器在不二次转义前提下重建 DistillSource，为此在 harness 增加持久化 JSON 方法（未改 core）；2) 工具结果状态沿用事件泵 `content.starts_with("tool error: ")` 约定，因 `Message` 无 is_error 字段；3) FTS 长 token 全部 AND，E2E 用短 token 触发召回；4) worker 取消时先 drain 至 Idle，避免 shutdown 丢掉已入队 job；5) `skills` 子命令模式同时跳过事件记录器；6) 计数、入队、drain 全程 fail-open，不改变 SessionEndReason 与退出码。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test -p jessica-cli、cargo test --workspace 全绿（418 passed, 0 failed, 2 ignored；jessica-cli 新增 11 个 E2E 及配置/装配/解析测试）。未提交、未改 jessica-core、未新增第三方 crate。
+Task 5.3.1 ☑ 约 2 分钟 jessica-runtime 新增 delegation 模块并导出 DELEGATE_TASK_TOOL_NAME/CHILD_TOOL_TIMEOUT/MIN_RESULT_BYTES/ParentCapabilities/NarrowedTools/narrow_tools/DelegationLimits/DelegationError。ParentCapabilities 用两个 BTreeSet 去重保存父 allowlist 与 native 工具；narrow_tools 先全量拒绝重复名称，再拒绝未授权名称，结果取 requested ∩ native 并无条件移除 delegate_task，已授权但非 native 的 WASM 名称静默排除；NarrowedTools 只读、按名称排序。DelegationLimits 默认 4/8000ms/8192/32768/20；validate 拒绝零 max_rounds/max_child_tool_calls/max_task_bytes、max_result_bytes<128、timeout<=5000ms。12 个行为测试覆盖子集保留与排序、重复/未授权错误、重复检测优先于权限、未授权非 native 不被静默过滤、delegate_task/WASM 过滤、仅过滤项与空请求、父集合去重、默认值与全部非法边界、最小合法边界。偏离：显式锁定“重复检测先于权限检查”的错误优先级（计划未规定两种错误同时出现时的顺序）；错误文案中的 128/5000ms 为固定值。未新增依赖、未改 jessica-core、未执行子 Agent、未接 CLI。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test -p jessica-runtime、cargo test --workspace 全绿（430 passed, 0 failed, 2 ignored；jessica-runtime 新增 12 个 delegation 测试）。
+Task 5.3.2 ☐ 未开始 待执行
+Task 5.3.3a ☐ 未开始 待执行
+Task 5.3.3b ☐ 未开始 待执行
+Task 5.3.4 ☐ 未开始 待执行
+Task 5.3.5 ☐ 未开始 待执行
 
 ---
 
@@ -898,6 +1122,10 @@ Deferred（待办，由用户决定是否单开 Task）
 · Allowlist 拒绝会以错误 ToolResult 返回并继续会话，而不是终止；Task 2.4 的“越权工具被拒”通过 PolicyDenied 事件 + tool error 观察。若要求拒绝即终止，需调整 Policy 语义。
 · README.md 首句故意保留拼写错误 `determinstic`，作为 examples/harness.toml 的验收夹具；修正它会使示例 acceptance 首次即通过，无法演示重试。真实 API key 联调仍待进行。
 · Task 5.2.4 的 `SkillJob` 直接携带 `DistillSource`，而 5.2.2b 的 `skill_jobs.source_json` 保存的是已转义/已预算的内容字段。5.2.6 的 CLI 适配器需要一条从 `source_json` 重建 `DistillSource` 的路径（例如新增 `DistillSource::from_persisted` 或等价构造函数），且不得再次执行 `escape_untrusted` 或预算截断，否则会二次转义并破坏 `to_untrusted_block` 的字节稳定性；该 API 若加入 5.2.3 模块应由 5.2.6 显式实现并测试。
+· 子 Agent 轨迹目前不持久化（5.3 的 v1 折中）：父事件流只有 `delegate_task` 的调用与结果，子会话的模型增量、工具调用与终止原因均丢弃，因此子轨迹不可 replay、不可审计、也无法从 checkpoint 恢复。若要保存子会话，需新增子 EventStore、父子 session 关联（含父/子 trace 关联；当前 `child_session_hash` 只由 task + narrowed tools 派生，不含父 session id）以及 replay/resume 的边界规则；5.3.6 候选，必须先定义事件模型与存储 schema，不得把子事件混入父事件流。
+· 5.3 v1 只支持单层委派；嵌套委派被 `narrow_tools` 结构性禁止。若未来允许嵌套，需单开 Task 定义深度上限、权限链传递（每层只能收窄）、父 token/工具调用预算切分、循环检测、子会话 EventStore 与失败语义；不得仅删除 `delegate_task` 过滤就放开。
+· 5.3 v1 子 Agent 不加载 WASM 工具；`narrow_tools` 与 CLI factory 双重排除。未来若允许子 WASM 实例，需单开 Task 验证每子实例独立 guest 状态/fuel/epoch、模块重复加载的性能与失败隔离、以及不得复用带 Mutex 的 `WasmTool`；当前共享实例会破坏“子 Agent 间不共享可变状态”。
+· 5.3 将子工具超时固定为 5000ms，未提供配置项。若未来需要独立配置，需单开 Task 增加 `delegation.child_tool_timeout_ms`，并在配置加载期验证 `child_tool_timeout_ms < delegation.timeout_ms < budget.tool_timeout_ms`，同时保留默认值不变；不得在运行期按模型输入动态调整。
 
 ---
 
