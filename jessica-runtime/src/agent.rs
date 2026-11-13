@@ -17,6 +17,36 @@ use tokio_util::sync::CancellationToken;
 
 use crate::recovery::SessionCheckpoint;
 
+/// Result of a transcript-preserving agent-loop run.
+///
+/// The counters come from structured loop state, not from event text or from
+/// parsing the transcript. `error` carries a provider, stream, or loop error;
+/// cancellation and budget exhaustion are represented by `reason` alone.
+///
+/// On error, cancellation, or tool-call-limit paths the final `messages` may
+/// stop at an incomplete tool batch. Callers must consult `reason`,
+/// `tool_errors`, and `tool_call_limit_hit` before treating the transcript as a
+/// completed conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptRun {
+    /// Why the loop stopped.
+    pub reason: SessionEndReason,
+    /// Messages accumulated through the final completed step.
+    pub messages: Vec<Message>,
+    /// Model rounds completed during this run.
+    pub rounds: u32,
+    /// Tool calls requested by the model, including unknown tools.
+    pub tool_calls: u32,
+    /// Executed tool calls whose [`ToolResult::is_error`] was true.
+    pub tool_errors: u32,
+    /// First failed tool summary, at most 512 UTF-8 bytes.
+    pub first_tool_error: Option<String>,
+    /// Provider, stream, or loop termination error.
+    pub error: Option<String>,
+    /// Whether the loop stopped at its tool-call limit.
+    pub tool_call_limit_hit: bool,
+}
+
 /// Drives model/tool rounds for a single session.
 ///
 /// The loop owns its dependencies and can be reused for multiple sessions.
@@ -86,7 +116,31 @@ impl AgentLoop {
         messages: Vec<Message>,
         cancel: CancellationToken,
     ) -> SessionEndReason {
-        self.run_loop(session_id, messages, 0, true, cancel).await
+        self.run_loop(session_id, messages, 0, true, cancel, None)
+            .await
+            .reason
+    }
+
+    /// Runs the loop and returns the final transcript together with structured
+    /// counters.
+    ///
+    /// `max_tool_calls` bounds the number of tool calls the model may request.
+    /// The counter is incremented before each requested call is executed; the
+    /// `(limit + 1)`-th request is not executed, sets
+    /// [`TranscriptRun::tool_call_limit_hit`], and ends the run with
+    /// [`SessionEndReason::Error`]. Remaining calls in that assistant message
+    /// are left without tool results. Passing `None` disables the limit.
+    ///
+    /// The emitted event sequence is the same as [`AgentLoop::run`].
+    pub async fn run_with_transcript(
+        &self,
+        session_id: SessionId,
+        messages: Vec<Message>,
+        max_tool_calls: Option<u32>,
+        cancel: CancellationToken,
+    ) -> TranscriptRun {
+        self.run_loop(session_id, messages, 0, true, cancel, max_tool_calls)
+            .await
     }
 
     /// Continues an interrupted session from a recovered [`SessionCheckpoint`].
@@ -109,8 +163,9 @@ impl AgentLoop {
         if let Some(reason) = end_reason {
             return reason;
         }
-        self.run_loop(session_id, messages, rounds_completed, false, cancel)
+        self.run_loop(session_id, messages, rounds_completed, false, cancel, None)
             .await
+            .reason
     }
 
     /// Runs rounds until completion, cancellation, error, or budget exhaustion.
@@ -126,7 +181,10 @@ impl AgentLoop {
         rounds_used: u32,
         emit_started: bool,
         cancel: CancellationToken,
-    ) -> SessionEndReason {
+        max_tool_calls: Option<u32>,
+    ) -> TranscriptRun {
+        let mut state = RunState::default();
+
         if emit_started {
             self.emit(AgentEvent::SessionStarted {
                 session_id: session_id.clone(),
@@ -138,28 +196,42 @@ impl AgentLoop {
 
         for _ in 0..remaining_rounds {
             if cancel.is_cancelled() {
-                return self.end(session_id, SessionEndReason::Cancelled);
+                return self.finish(session_id, SessionEndReason::Cancelled, messages, state);
             }
 
-            let (content, tool_calls) =
-                match self.model_turn(&messages, &tool_schemas, &cancel).await {
-                    ModelTurn::Completed {
-                        content,
-                        tool_calls,
-                    } => (content, tool_calls),
-                    ModelTurn::Cancelled => {
-                        return self.end(session_id, SessionEndReason::Cancelled);
-                    }
-                    ModelTurn::Failed(message) => return self.fail(session_id, message),
-                };
+            let (content, tool_calls) = match self
+                .model_turn(&messages, &tool_schemas, &cancel)
+                .await
+            {
+                ModelTurn::Completed {
+                    content,
+                    tool_calls,
+                } => (content, tool_calls),
+                ModelTurn::Cancelled => {
+                    return self.finish(session_id, SessionEndReason::Cancelled, messages, state);
+                }
+                ModelTurn::Failed(message) => {
+                    return self.fail_run(session_id, message, messages, state);
+                }
+            };
 
+            state.rounds += 1;
             messages.push(assistant_message(content, &tool_calls));
 
             if tool_calls.is_empty() {
-                return self.end(session_id, SessionEndReason::Completed);
+                return self.finish(session_id, SessionEndReason::Completed, messages, state);
             }
 
             for call in tool_calls {
+                state.tool_calls += 1;
+                if let Some(max) = max_tool_calls
+                    && state.tool_calls > max
+                {
+                    state.tool_call_limit_hit = true;
+                    let message = format!("maximum tool calls ({max}) exceeded");
+                    return self.fail_run(session_id, message, messages, state);
+                }
+
                 self.emit(AgentEvent::ToolCallStarted { call: call.clone() });
 
                 let result = match self.tools.get(&call.name) {
@@ -167,7 +239,12 @@ impl AgentLoop {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
-                                return self.end(session_id, SessionEndReason::Cancelled);
+                                return self.finish(
+                                    session_id,
+                                    SessionEndReason::Cancelled,
+                                    messages,
+                                    state,
+                                );
                             }
                             result = tool.execute(call.arguments.clone()) => result,
                         }
@@ -182,6 +259,14 @@ impl AgentLoop {
                     ..result
                 };
 
+                if result.is_error {
+                    state.tool_errors += 1;
+                    if state.first_tool_error.is_none() {
+                        state.first_tool_error =
+                            Some(summarize_tool_error(&call.name, &result.content));
+                    }
+                }
+
                 self.emit(AgentEvent::ToolCallFinished {
                     result: result.clone(),
                 });
@@ -193,7 +278,12 @@ impl AgentLoop {
             kind: BudgetKind::MaxRounds,
             message: format!("maximum rounds ({}) exceeded", self.budget.max_rounds),
         });
-        self.end(session_id, SessionEndReason::BudgetExceeded)
+        self.finish(
+            session_id,
+            SessionEndReason::BudgetExceeded,
+            messages,
+            state,
+        )
     }
 
     /// Consumes one model response, emitting deltas as they arrive.
@@ -248,16 +338,85 @@ impl AgentLoop {
     }
 
     /// Emits an error and the terminal event for that error.
-    fn fail(&self, session_id: SessionId, message: String) -> SessionEndReason {
-        self.emit(AgentEvent::Error { message });
-        self.end(session_id, SessionEndReason::Error)
+    fn fail_run(
+        &self,
+        session_id: SessionId,
+        message: String,
+        messages: Vec<Message>,
+        mut state: RunState,
+    ) -> TranscriptRun {
+        self.emit(AgentEvent::Error {
+            message: message.clone(),
+        });
+        state.error = Some(message);
+        self.finish(session_id, SessionEndReason::Error, messages, state)
     }
 
-    /// Emits the terminal event and returns its reason.
-    fn end(&self, session_id: SessionId, reason: SessionEndReason) -> SessionEndReason {
+    /// Emits the terminal event and assembles the transcript result.
+    fn finish(
+        &self,
+        session_id: SessionId,
+        reason: SessionEndReason,
+        messages: Vec<Message>,
+        state: RunState,
+    ) -> TranscriptRun {
         self.emit(AgentEvent::SessionEnded { session_id, reason });
-        reason
+        TranscriptRun {
+            reason,
+            messages,
+            rounds: state.rounds,
+            tool_calls: state.tool_calls,
+            tool_errors: state.tool_errors,
+            first_tool_error: state.first_tool_error,
+            error: state.error,
+            tool_call_limit_hit: state.tool_call_limit_hit,
+        }
     }
+}
+
+/// Counters accumulated while a loop runs.
+#[derive(Debug, Default)]
+struct RunState {
+    /// Completed model rounds.
+    rounds: u32,
+    /// Requested tool calls, including unknown tools and a refused limit-plus-one call.
+    tool_calls: u32,
+    /// Executed tool calls that returned an error.
+    tool_errors: u32,
+    /// First failed tool summary.
+    first_tool_error: Option<String>,
+    /// Structured termination error.
+    error: Option<String>,
+    /// Whether the tool-call limit stopped the loop.
+    tool_call_limit_hit: bool,
+}
+
+/// Maximum UTF-8 bytes retained in [`TranscriptRun::first_tool_error`].
+const TOOL_ERROR_SUMMARY_BYTES: usize = 512;
+
+/// Summarizes a failed tool call with its name and a bounded error excerpt.
+fn summarize_tool_error(name: &str, content: &str) -> String {
+    let detail = content.trim();
+    let detail = if detail.is_empty() {
+        "tool returned an error without details"
+    } else {
+        detail
+    };
+    let mut summary = format!("tool `{name}`: {detail}");
+    truncate_utf8(&mut summary, TOOL_ERROR_SUMMARY_BYTES);
+    summary
+}
+
+/// Truncates `text` to at most `max_bytes` on a UTF-8 character boundary.
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// Outcome of one model turn.
