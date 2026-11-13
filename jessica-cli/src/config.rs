@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
+use jessica_runtime::{
+    CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
 /// Tools registered by the CLI and allowed when no policy section is given.
 const NATIVE_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
+/// Native tools a delegated child may be granted.
+pub(crate) const NATIVE_CHILD_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
 
 /// Default token budget for a session (prompt plus completion tokens).
 const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
@@ -53,6 +58,16 @@ const DEFAULT_SKILL_DISTILL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_SKILL_DRAIN_TIMEOUT_MS: u64 = 30_000;
 /// Default attempts per distillation job, including the first.
 const DEFAULT_SKILL_MAX_ATTEMPTS: usize = 2;
+/// Default number of model rounds for one delegated child agent.
+const DEFAULT_DELEGATION_MAX_ROUNDS: u32 = 4;
+/// Default wall-clock limit for one delegated child agent.
+const DEFAULT_DELEGATION_TIMEOUT_MS: u64 = 8_000;
+/// Default maximum UTF-8 byte length of a delegated task.
+const DEFAULT_DELEGATION_MAX_TASK_BYTES: usize = 8_192;
+/// Default maximum byte length of a delegated result.
+const DEFAULT_DELEGATION_MAX_RESULT_BYTES: usize = 32_768;
+/// Default maximum number of tool calls a delegated child may request.
+const DEFAULT_DELEGATION_MAX_CHILD_TOOL_CALLS: u32 = 20;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -62,6 +77,8 @@ pub struct HarnessConfig {
     pub budget: BudgetConfig,
     /// Tool allowlist.
     pub policy: PolicyConfig,
+    /// Optional child-agent delegation.
+    pub delegation: DelegationConfig,
     /// Optional WebAssembly tool plugins registered next to native tools.
     pub wasm: WasmConfig,
     /// Optional command run after every tool result.
@@ -113,6 +130,35 @@ impl HarnessConfig {
         }
         if self.budget.max_stuck_rounds == 0 {
             return Err(invalid("budget.max_stuck_rounds must be at least 1"));
+        }
+        self.delegation.validate()?;
+        if self.delegation.enabled {
+            if !self
+                .policy
+                .allowed_tools
+                .iter()
+                .any(|name| name == DELEGATE_TASK_TOOL_NAME)
+            {
+                return Err(invalid(format!(
+                    "policy.allowed_tools must include `{DELEGATE_TASK_TOOL_NAME}` when delegation.enabled is true"
+                )));
+            }
+            if self.delegation.timeout() <= CHILD_TOOL_TIMEOUT {
+                return Err(invalid(format!(
+                    "delegation.timeout_ms must be greater than {} (the fixed child tool timeout)",
+                    CHILD_TOOL_TIMEOUT.as_millis()
+                )));
+            }
+            if self.delegation.timeout() >= self.budget.tool_timeout() {
+                return Err(invalid(
+                    "delegation.timeout_ms must be less than budget.tool_timeout_ms",
+                ));
+            }
+            if self.delegation.max_result_bytes > self.budget.max_result_bytes {
+                return Err(invalid(
+                    "delegation.max_result_bytes must not exceed budget.max_result_bytes",
+                ));
+            }
         }
         if let Some(sensor) = &self.sensor {
             validate_command("sensor", &sensor.name, &sensor.command)?;
@@ -199,6 +245,90 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             allowed_tools: NATIVE_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+}
+
+/// Child-agent delegation settings.
+///
+/// Delegation is disabled by default. When disabled, the CLI neither registers
+/// `delegate_task` nor constructs a child factory or executor, and the parent
+/// allowlist does not need to mention the tool. When enabled, the parent
+/// allowlist must contain `delegate_task` and the child timeout is fixed at
+/// [`CHILD_TOOL_TIMEOUT`]; there is no per-child timeout setting.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DelegationConfig {
+    /// Whether `delegate_task` is registered and child agents may run.
+    pub enabled: bool,
+    /// Maximum number of model rounds for one child agent.
+    pub max_rounds: u32,
+    /// Wall-clock limit for one child agent, in milliseconds.
+    ///
+    /// When enabled this must be greater than [`CHILD_TOOL_TIMEOUT`] and
+    /// strictly less than `budget.tool_timeout_ms`.
+    pub timeout_ms: u64,
+    /// Maximum UTF-8 byte length of the delegated task.
+    pub max_task_bytes: usize,
+    /// Maximum byte length of the serialized delegation result.
+    ///
+    /// When enabled this must not exceed `budget.max_result_bytes`.
+    pub max_result_bytes: usize,
+    /// Maximum number of tool calls one child agent may request.
+    pub max_child_tool_calls: u32,
+}
+
+impl Default for DelegationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_rounds: DEFAULT_DELEGATION_MAX_ROUNDS,
+            timeout_ms: DEFAULT_DELEGATION_TIMEOUT_MS,
+            max_task_bytes: DEFAULT_DELEGATION_MAX_TASK_BYTES,
+            max_result_bytes: DEFAULT_DELEGATION_MAX_RESULT_BYTES,
+            max_child_tool_calls: DEFAULT_DELEGATION_MAX_CHILD_TOOL_CALLS,
+        }
+    }
+}
+
+impl DelegationConfig {
+    /// Rejects values that are invalid even when delegation is disabled.
+    ///
+    /// The allowlist, parent timeout, and parent result-size checks are
+    /// cross-field constraints applied only when delegation is enabled.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_rounds == 0 {
+            return Err(invalid("delegation.max_rounds must be at least 1"));
+        }
+        if self.max_child_tool_calls == 0 {
+            return Err(invalid(
+                "delegation.max_child_tool_calls must be at least 1",
+            ));
+        }
+        if self.max_task_bytes == 0 {
+            return Err(invalid("delegation.max_task_bytes must be at least 1"));
+        }
+        if self.max_result_bytes < MIN_RESULT_BYTES {
+            return Err(invalid(format!(
+                "delegation.max_result_bytes must be at least {MIN_RESULT_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the child wall-clock limit as a duration.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Converts the settings into runtime delegation limits.
+    pub fn to_limits(&self) -> DelegationLimits {
+        DelegationLimits {
+            max_rounds: self.max_rounds,
+            timeout: self.timeout(),
+            max_task_bytes: self.max_task_bytes,
+            max_result_bytes: self.max_result_bytes,
+            max_child_tool_calls: self.max_child_tool_calls,
         }
     }
 }
@@ -755,6 +885,191 @@ mod tests {
         let unknown = HarnessConfig::from_toml_str("[skills]\ndatabase = \"skills.db\"\n")
             .expect_err("unknown skills fields must fail");
         assert!(unknown.to_string().contains("database"));
+    }
+
+    #[test]
+    fn delegation_defaults_are_disabled_with_the_documented_values() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        let delegation = &config.delegation;
+
+        assert!(!delegation.enabled);
+        assert_eq!(delegation.max_rounds, 4);
+        assert_eq!(delegation.timeout_ms, 8_000);
+        assert_eq!(delegation.max_task_bytes, 8_192);
+        assert_eq!(delegation.max_result_bytes, 32_768);
+        assert_eq!(delegation.max_child_tool_calls, 20);
+    }
+
+    #[test]
+    fn delegation_section_parses_every_documented_setting() {
+        let config = HarnessConfig::from_toml_str(
+            "[delegation]\n\
+             enabled = true\n\
+             max_rounds = 2\n\
+             timeout_ms = 6000\n\
+             max_task_bytes = 1024\n\
+             max_result_bytes = 128\n\
+             max_child_tool_calls = 3\n\
+             [policy]\n\
+             allowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect("delegation section must parse");
+
+        assert!(config.delegation.enabled);
+        assert_eq!(config.delegation.max_rounds, 2);
+        assert_eq!(config.delegation.timeout_ms, 6_000);
+        assert_eq!(config.delegation.max_task_bytes, 1_024);
+        assert_eq!(config.delegation.max_result_bytes, 128);
+        assert_eq!(config.delegation.max_child_tool_calls, 3);
+        assert_eq!(
+            config.delegation.to_limits(),
+            DelegationLimits {
+                max_rounds: 2,
+                timeout: Duration::from_millis(6_000),
+                max_task_bytes: 1_024,
+                max_result_bytes: 128,
+                max_child_tool_calls: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_basic_boundaries_are_rejected_even_when_disabled() {
+        for (field, document) in [
+            ("delegation.max_rounds", "[delegation]\nmax_rounds = 0\n"),
+            (
+                "delegation.max_child_tool_calls",
+                "[delegation]\nmax_child_tool_calls = 0\n",
+            ),
+            (
+                "delegation.max_task_bytes",
+                "[delegation]\nmax_task_bytes = 0\n",
+            ),
+            (
+                "delegation.max_result_bytes",
+                "[delegation]\nmax_result_bytes = 127\n",
+            ),
+        ] {
+            let error = HarnessConfig::from_toml_str(document)
+                .expect_err("invalid delegation boundary must fail at load time");
+            assert!(
+                error.to_string().contains(field),
+                "error for {document:?} should name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabling_delegation_requires_the_tool_in_the_allowlist() {
+        let error = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [policy]\nallowed_tools = [\"bash\"]\n",
+        )
+        .expect_err("enabled delegation without the tool must fail");
+
+        assert!(
+            error.to_string().contains("policy.allowed_tools"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("delegate_task"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn delegation_timeout_must_exceed_the_fixed_child_tool_timeout() {
+        let error = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\ntimeout_ms = 5000\n\
+             [policy]\nallowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect_err("timeout equal to the child tool timeout must fail");
+
+        assert!(
+            error.to_string().contains("delegation.timeout_ms"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("5000"),
+            "unexpected error: {error}"
+        );
+
+        HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\ntimeout_ms = 5001\n\
+             [policy]\nallowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect("one millisecond above the child tool timeout must be valid");
+    }
+
+    #[test]
+    fn delegation_timeout_must_stay_below_the_parent_tool_timeout() {
+        let error = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 8000\n\
+             [delegation]\nenabled = true\ntimeout_ms = 8000\n\
+             [policy]\nallowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect_err("timeout equal to the parent tool timeout must fail");
+
+        assert!(
+            error.to_string().contains("delegation.timeout_ms"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("budget.tool_timeout_ms"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn delegation_result_budget_must_not_exceed_the_parent_budget() {
+        let error = HarnessConfig::from_toml_str(
+            "[budget]\nmax_result_bytes = 1000\n\
+             [delegation]\nenabled = true\nmax_result_bytes = 1001\n\
+             [policy]\nallowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect_err("delegation result budget above the parent budget must fail");
+
+        assert!(
+            error.to_string().contains("delegation.max_result_bytes"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("budget.max_result_bytes"),
+            "unexpected error: {error}"
+        );
+
+        HarnessConfig::from_toml_str(
+            "[budget]\nmax_result_bytes = 1000\n\
+             [delegation]\nenabled = true\nmax_result_bytes = 1000\n\
+             [policy]\nallowed_tools = [\"delegate_task\"]\n",
+        )
+        .expect("equal result budgets must be valid");
+    }
+
+    #[test]
+    fn disabled_delegation_skips_cross_field_checks_but_keeps_basic_ones() {
+        let config = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 1\nmax_result_bytes = 128\n\
+             [policy]\nallowed_tools = []\n\
+             [delegation]\nenabled = false\ntimeout_ms = 8000\nmax_result_bytes = 32768\n",
+        )
+        .expect("disabled delegation must not enforce cross-field constraints");
+
+        assert!(!config.delegation.enabled);
+        assert_eq!(config.budget.tool_timeout_ms, 1);
+        assert_eq!(config.delegation.timeout_ms, 8_000);
+        assert_eq!(config.delegation.max_result_bytes, 32_768);
+    }
+
+    #[test]
+    fn delegation_rejects_the_unprovided_child_tool_timeout_field() {
+        let error = HarnessConfig::from_toml_str("[delegation]\nchild_tool_timeout_ms = 5000\n")
+            .expect_err("child tool timeout is fixed and has no config field");
+
+        assert!(
+            error.to_string().contains("child_tool_timeout_ms"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

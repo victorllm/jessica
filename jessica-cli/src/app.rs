@@ -18,14 +18,18 @@ use jessica_harness::{
     Harness, ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard,
     ToolTimeoutGuard, TurnSignals,
 };
-use jessica_runtime::{AgentLoop, SessionCheckpoint, recover_session};
+use jessica_runtime::{
+    AgentChildExecutor, AgentLoop, ChildToolFactory, DELEGATE_TASK_TOOL_NAME, DelegateTaskTool,
+    DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
+};
 use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
-use crate::config::{ConfigError, HarnessConfig};
+use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
+use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::memory::MemoryAssembly;
@@ -176,7 +180,7 @@ impl CliRuntime {
     /// that finally completes is written to memory according to the configured
     /// write policy.
     pub(crate) async fn run_turn(&self, input: String) -> Result<SessionEndReason, CliError> {
-        let setup = self.build_turn()?;
+        let setup = self.build_turn(true)?;
         let first_session = next_session_id();
         let initial = self.initial_messages(&first_session, input.as_str()).await;
 
@@ -401,7 +405,7 @@ impl CliRuntime {
             .map(|message| message.content.clone())
             .unwrap_or_default();
 
-        let setup = self.build_turn()?;
+        let setup = self.build_turn(false)?;
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }).await;
         let reason = attempt.reason;
@@ -441,7 +445,11 @@ impl CliRuntime {
 
     /// Builds the harness, governance wrappers, agent, and event pump for one
     /// turn.
-    fn build_turn(&self) -> Result<TurnSetup, CliError> {
+    ///
+    /// `allow_delegation` is false on the resume path. Resume continues a
+    /// recorded loop but never constructs a child factory or executor; a fresh
+    /// turn constructs them only when `[delegation]` is enabled.
+    fn build_turn(&self, allow_delegation: bool) -> Result<TurnSetup, CliError> {
         let timeout = self.config.budget.tool_timeout();
         let token_guard = Arc::new(TokenBudgetGuard::new(self.config.budget.max_tokens));
         let timeout_guard = Arc::new(ToolTimeoutGuard::new(timeout));
@@ -475,6 +483,9 @@ impl CliRuntime {
             Arc::clone(&governance),
             Arc::clone(&token_guard),
         ));
+        // The child executor receives the same counting provider, so every
+        // child call charges the parent token guard and can cancel the turn.
+        let delegation = self.build_child_executor(allow_delegation, Arc::clone(&provider))?;
 
         let registry = self.build_tool_registry(
             Arc::clone(&harness),
@@ -482,6 +493,7 @@ impl CliRuntime {
             timeout,
             Arc::clone(&timeout_guard),
             Arc::clone(&result_guard),
+            delegation,
         )?;
         let agent = Arc::new(AgentLoop::new(
             provider,
@@ -520,6 +532,34 @@ impl CliRuntime {
         vec![Arc::new(command) as Arc<dyn Sensor>]
     }
 
+    /// Builds the child executor when delegation is enabled for this path.
+    ///
+    /// Returns `None` when delegation is disabled or when `allow_delegation`
+    /// is false, and in that case does not construct the factory or executor.
+    fn build_child_executor(
+        &self,
+        allow_delegation: bool,
+        provider: Arc<dyn LlmProvider>,
+    ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
+        if !allow_delegation || !self.config.delegation.enabled {
+            return Ok(None);
+        }
+
+        let factory: Arc<dyn ChildToolFactory> =
+            Arc::new(NativeChildToolFactory::new(self.root.clone()));
+        let parent = ParentCapabilities::new(
+            self.config.policy.allowed_tools.clone(),
+            NATIVE_CHILD_TOOLS.iter().map(|name| (*name).to_owned()),
+        );
+        let executor = AgentChildExecutor::new(
+            provider,
+            factory,
+            parent,
+            self.config.delegation.to_limits(),
+        )?;
+        Ok(Some(Arc::new(executor)))
+    }
+
     fn build_tool_registry(
         &self,
         harness: Arc<Harness>,
@@ -527,6 +567,7 @@ impl CliRuntime {
         timeout: Duration,
         timeout_guard: Arc<ToolTimeoutGuard>,
         result_guard: Arc<ResultSizeGuard>,
+        delegation: Option<Arc<AgentChildExecutor>>,
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
 
@@ -580,11 +621,11 @@ impl CliRuntime {
         let bash: Arc<dyn Tool> = Arc::new(BashTool::new());
         let bash = GovernedTool::new(
             bash,
-            harness,
-            governance,
+            Arc::clone(&harness),
+            Arc::clone(&governance),
             timeout,
-            timeout_guard,
-            result_guard,
+            Arc::clone(&timeout_guard),
+            Arc::clone(&result_guard),
         );
         registry
             .register(Arc::new(bash))
@@ -592,6 +633,24 @@ impl CliRuntime {
                 name: "bash".to_owned(),
                 source,
             })?;
+
+        if let Some(executor) = delegation {
+            let delegate: Arc<dyn Tool> = Arc::new(DelegateTaskTool::new(executor));
+            let delegate = GovernedTool::new(
+                delegate,
+                harness,
+                governance,
+                timeout,
+                timeout_guard,
+                result_guard,
+            );
+            registry
+                .register(Arc::new(delegate))
+                .map_err(|source| CliError::RegisterTool {
+                    name: DELEGATE_TASK_TOOL_NAME.to_owned(),
+                    source,
+                })?;
+        }
 
         Ok(registry)
     }
@@ -966,14 +1025,265 @@ pub(crate) enum CliError {
     /// A `skills` subcommand failed.
     #[error("skill command failed: {0}")]
     SkillsCommand(#[from] SkillCommandError),
+    /// The delegation executor could not be assembled.
+    #[error("delegation setup failed: {0}")]
+    Delegation(#[from] DelegationError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use jessica_core::types::ToolCall;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use jessica_core::llm::{LlmEvent, LlmStream};
+    use jessica_core::tool::ToolSchema;
+    use jessica_core::types::{TokenUsage, ToolCall};
+    use jessica_runtime::CHILD_AGENT_SYSTEM_PROMPT;
     use serde_json::json;
+
+    /// One captured provider call.
+    #[derive(Clone)]
+    struct ProviderCall {
+        /// Messages the loop or executor sent.
+        messages: Vec<Message>,
+        /// Schemas the provider exposed.
+        tools: Vec<ToolSchema>,
+    }
+
+    /// Provider that replays scripted event batches and records every call.
+    struct ScriptedProvider {
+        /// Responses in call order.
+        responses: Mutex<VecDeque<Vec<LlmEvent>>>,
+        /// Calls observed so far.
+        calls: Mutex<Vec<ProviderCall>>,
+    }
+
+    impl ScriptedProvider {
+        /// Creates a provider from response batches.
+        fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Returns a snapshot of the calls observed so far.
+        fn calls(&self) -> Vec<ProviderCall> {
+            self.calls
+                .lock()
+                .expect("provider calls mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn stream_chat(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            self.calls
+                .lock()
+                .expect("provider calls mutex poisoned")
+                .push(ProviderCall {
+                    messages: messages.to_vec(),
+                    tools: tools.to_vec(),
+                });
+            let events = self
+                .responses
+                .lock()
+                .expect("provider responses mutex poisoned")
+                .pop_front()
+                .expect("scripted provider ran out of responses");
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    /// Builds a text response that reports `tokens` total usage.
+    fn done_text(text: &str, tokens: u64) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::TextDelta {
+                text: text.to_owned(),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(tokens / 2, tokens - tokens / 2)),
+            },
+        ]
+    }
+
+    /// Builds a parent response that requests one delegation.
+    fn delegate_request() -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(
+                    "parent-call",
+                    DELEGATE_TASK_TOOL_NAME,
+                    json!({"task": "child task", "tools": ["read_file"]}),
+                ),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(5, 5)),
+            },
+        ]
+    }
+
+    /// Extracts schema names in registry order.
+    fn schema_names(tools: &[ToolSchema]) -> Vec<&str> {
+        tools
+            .iter()
+            .map(|schema| {
+                schema["function"]["name"]
+                    .as_str()
+                    .expect("tool schema must have a name")
+            })
+            .collect()
+    }
+
+    /// Builds an enabled delegation config with the required allowlist.
+    fn enabled_config() -> HarnessConfig {
+        HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [policy]\n\
+             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n",
+        )
+        .expect("enabled delegation config must parse")
+    }
+
+    /// Builds a runtime over the given provider and config.
+    fn runtime_with(provider: Arc<ScriptedProvider>, config: HarnessConfig) -> CliRuntime {
+        CliRuntime::new(
+            provider,
+            config,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_is_present_only_on_enabled_fresh_turns() {
+        let enabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
+        let enabled_runtime = runtime_with(Arc::clone(&enabled_provider), enabled_config());
+        let setup = enabled_runtime.build_turn(true).expect("turn should build");
+        let reason = setup
+            .agent
+            .run(
+                SessionId::new("enabled"),
+                vec![Message::user("hi")],
+                setup.cancel.clone(),
+            )
+            .await;
+        assert_eq!(reason, SessionEndReason::Completed);
+        setup.shutdown();
+
+        let enabled_calls = enabled_provider.calls();
+        let enabled_names = schema_names(&enabled_calls[0].tools);
+        assert_eq!(
+            enabled_names,
+            vec!["bash", "delegate_task", "read_file", "write_file"]
+        );
+
+        let disabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
+        let disabled_runtime =
+            runtime_with(Arc::clone(&disabled_provider), HarnessConfig::default());
+        let setup = disabled_runtime
+            .build_turn(true)
+            .expect("turn should build");
+        setup
+            .agent
+            .run(
+                SessionId::new("disabled"),
+                vec![Message::user("hi")],
+                setup.cancel.clone(),
+            )
+            .await;
+        setup.shutdown();
+
+        let disabled_calls = disabled_provider.calls();
+        let disabled_names = schema_names(&disabled_calls[0].tools);
+        assert_eq!(disabled_names, vec!["bash", "read_file", "write_file"]);
+
+        let resume_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
+        let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
+        let setup = resume_runtime.build_turn(false).expect("turn should build");
+        setup
+            .agent
+            .run(
+                SessionId::new("resume"),
+                vec![Message::user("hi")],
+                setup.cancel.clone(),
+            )
+            .await;
+        setup.shutdown();
+
+        let resume_calls = resume_provider.calls();
+        let resume_names = schema_names(&resume_calls[0].tools);
+        assert_eq!(
+            resume_names,
+            vec!["bash", "read_file", "write_file"],
+            "the resume path must not register delegate_task"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_calls_charge_the_parent_token_budget_through_the_shared_wrapper() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            delegate_request(),
+            done_text("child answer", 10),
+            done_text("parent done", 10),
+        ]));
+        let runtime = runtime_with(Arc::clone(&provider), enabled_config());
+        let setup = runtime.build_turn(true).expect("turn should build");
+
+        let reason = setup
+            .agent
+            .run(
+                SessionId::new("shared-provider"),
+                vec![Message::user("parent task")],
+                setup.cancel.clone(),
+            )
+            .await;
+
+        assert_eq!(reason, SessionEndReason::Completed);
+        assert_eq!(
+            setup.governance.tokens_used(),
+            30,
+            "parent and child usage must both be charged"
+        );
+        setup.shutdown();
+
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "one parent call, one child call, one parent answer"
+        );
+        assert!(
+            schema_names(&calls[0].tools).contains(&DELEGATE_TASK_TOOL_NAME),
+            "the parent must see delegate_task"
+        );
+        assert_eq!(calls[1].messages.len(), 2);
+        assert_eq!(
+            calls[1].messages[0],
+            Message::system(CHILD_AGENT_SYSTEM_PROMPT)
+        );
+        assert_eq!(calls[1].messages[1], Message::user("child task"));
+        assert_eq!(schema_names(&calls[1].tools), vec!["read_file"]);
+
+        let tool_message = calls[2].messages.last().expect("delegate result message");
+        assert_eq!(tool_message.role, Role::Tool);
+        let result: serde_json::Value =
+            serde_json::from_str(&tool_message.content).expect("delegate result must be JSON");
+        assert_eq!(result["status"], json!("ok"));
+        assert_eq!(result["answer"], json!("child answer"));
+    }
 
     #[test]
     fn guides_are_injected_in_system_memory_skill_user_order() {
