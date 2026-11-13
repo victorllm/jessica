@@ -13,7 +13,8 @@ mod recovery;
 
 pub use agent::AgentLoop;
 pub use delegation::{
-    CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationError, DelegationLimits,
-    MIN_RESULT_BYTES, NarrowedTools, ParentCapabilities, narrow_tools,
+    CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegateTaskArgs, DelegationError,
+    DelegationLimits, MIN_RESULT_BYTES, NarrowedTools, ParentCapabilities, child_session_hash,
+    delegate_task_schema, narrow_tools, parse_delegate_task_args,
 };
 pub use recovery::{RecordedEvent, RecoveryError, SessionCheckpoint, recover_session};
