@@ -19,16 +19,30 @@
 //! [`NarrowedTools`] is the structural input of the child tool factory; later
 //! stages must build exactly these names and nothing else.
 //!
-//! It also owns the `delegate_task` schema, argument parsing, trace hash, and
-//! the exact JSON result contract returned to the parent model.
+//! It also owns the `delegate_task` schema, argument parsing, trace hash, the
+//! exact JSON result contract returned to the parent model, and the single-level
+//! child executor.
+//!
+//! [`AgentChildExecutor`] builds a fresh tool registry and transcript for every
+//! delegation. It shares only the parent provider (and therefore the parent's
+//! token budget); child events go to a private bounded broadcast channel that is
+//! never forwarded or persisted. The child is a bare [`crate::AgentLoop`], so it
+//! has no harness, memory, skills, sensors, or acceptance checks.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
-use jessica_core::tool::ToolSchema;
-use jessica_core::types::ToolResult;
+use async_trait::async_trait;
+use jessica_core::llm::LlmProvider;
+use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
+use jessica_core::types::{Budget, Message, Role, SessionEndReason, SessionId, ToolResult};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::{AgentLoop, TranscriptRun};
 
 /// Name of the tool that delegates work to a child agent.
 ///
@@ -49,6 +63,17 @@ pub const CHILD_TOOL_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// skeleton and the empty-error skeleton must both fit, so a positive limit
 /// alone is not sufficient.
 pub const MIN_RESULT_BYTES: usize = 128;
+
+/// Fixed system prompt for every delegated child agent.
+///
+/// The prompt is a constant with no parent content interpolated. It establishes
+/// the isolation boundary the runtime enforces structurally: the child has no
+/// parent history, may use only the tools it was given, must answer directly,
+/// and cannot delegate further.
+pub const CHILD_AGENT_SYSTEM_PROMPT: &str = "You are an independent execution unit. You have no parent conversation, memory, or history; rely only on the current task and the tools you were given. Do not request additional tools. When you have finished, return the final answer directly. You cannot delegate work to another agent.";
+
+/// Capacity of the private broadcast channel used for child events.
+const CHILD_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Tool names the parent agent is allowed to use.
 ///
@@ -329,7 +354,6 @@ fn hash_byte(hash: u32, byte: u8) -> u32 {
 /// `tools` array, then sorted and de-duplicated. The encoding matches
 /// [`child_session_hash`], but the input may be incomplete, so the result has no
 /// identity meaning beyond determinism.
-#[allow(dead_code)] // Wired into the child executor by Task 5.3.3; tested here.
 pub(crate) fn best_effort_child_session_hash(args: &Value) -> String {
     let object = args.as_object();
     let task = object
@@ -489,10 +513,15 @@ pub enum DelegationError {
         /// Configured child-run timeout.
         timeout: Duration,
     },
+    /// The child tool factory could not construct the requested tools.
+    #[error("child tool factory failed: {message}")]
+    ToolFactory {
+        /// Factory-supplied failure description.
+        message: String,
+    },
 }
 
 /// Terminal child outcome ready to render as `delegate_task` JSON.
-#[allow(dead_code)] // Constructed by the child executor in Task 5.3.3; tested here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChildOutcome {
     /// The child completed without any failed tool call.
@@ -526,7 +555,6 @@ pub(crate) enum ChildOutcome {
 /// limit becomes a fixed truncated object. An error keeps `status=error` and
 /// shortens the redacted error text instead, so an oversized error can never be
 /// mistaken for a truncated success.
-#[allow(dead_code)] // Called by the child executor in Task 5.3.3; tested here.
 pub(crate) fn render_child_outcome(outcome: ChildOutcome, max_result_bytes: usize) -> ToolResult {
     match outcome {
         ChildOutcome::Success {
@@ -860,6 +888,371 @@ fn is_word_byte(byte: u8) -> bool {
 /// Returns whether `byte` can continue an `sk-` style token.
 fn is_secret_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+/// Builds the tools a child agent may use.
+///
+/// The executor calls this for every delegation with the sorted names from
+/// [`NarrowedTools`]. Implementations must return a fresh tool instance for
+/// exactly those names: tools are never cached across children, and WASM tools
+/// are not permitted in v1.
+pub trait ChildToolFactory: Send + Sync {
+    /// Builds fresh tool instances for exactly `names`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegationError`] when construction fails. The executor turns
+    /// the error into a child error result without calling the child model.
+    fn build(&self, names: &[String]) -> Result<Vec<Arc<dyn Tool>>, DelegationError>;
+}
+
+/// Executes one delegated child agent.
+///
+/// The executor owns the parent provider, the tool factory, the parent
+/// capabilities, and the delegation limits. Each [`execute`](Self::execute)
+/// call builds a fresh registry, transcript, cancellation token, and private
+/// event channel. Only the provider is shared, so the child consumes the
+/// parent's token budget while sharing no mutable child state.
+pub struct AgentChildExecutor {
+    /// Parent provider, shared to preserve token accounting and cancellation.
+    provider: Arc<dyn LlmProvider>,
+    /// Factory for the narrowed tool set.
+    factory: Arc<dyn ChildToolFactory>,
+    /// Parent allowlist and native tool set.
+    parent: ParentCapabilities,
+    /// Limits for every child run.
+    limits: DelegationLimits,
+}
+
+impl AgentChildExecutor {
+    /// Creates an executor after validating `limits`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured errors from [`DelegationLimits::validate`].
+    pub fn new(
+        provider: Arc<dyn LlmProvider>,
+        factory: Arc<dyn ChildToolFactory>,
+        parent: ParentCapabilities,
+        limits: DelegationLimits,
+    ) -> Result<Self, DelegationError> {
+        limits.validate()?;
+        Ok(Self {
+            provider,
+            factory,
+            parent,
+            limits,
+        })
+    }
+
+    /// Runs one child agent and renders its outcome as `delegate_task` JSON.
+    ///
+    /// Every failure becomes a `status=error` [`ToolResult`]; this method never
+    /// panics or propagates an error to the parent loop. The result's
+    /// `tool_call_id` is left empty because the parent loop stamps the
+    /// originating call id.
+    ///
+    /// A delegation timeout drops the child future. Because no final transcript
+    /// exists, that result reports zero rounds and zero tool calls.
+    pub async fn execute(&self, args: Value) -> ToolResult {
+        let fallback_hash = best_effort_child_session_hash(&args);
+        let parsed = match parse_delegate_task_args(&args, self.limits.max_task_bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.error_result(0, 0, error.to_string(), fallback_hash),
+        };
+        let narrowed = match narrow_tools(&self.parent, parsed.tools()) {
+            Ok(narrowed) => narrowed,
+            Err(error) => return self.error_result(0, 0, error.to_string(), fallback_hash),
+        };
+        let child_session_hash = child_session_hash(parsed.task(), &narrowed);
+        let names: Vec<String> = narrowed.names().map(str::to_owned).collect();
+
+        let tools = match self.factory.build(&names) {
+            Ok(tools) => tools,
+            Err(error) => return self.error_result(0, 0, error.to_string(), child_session_hash),
+        };
+        let registry = match build_child_registry(wrap_child_tools(tools), &narrowed) {
+            Ok(registry) => registry,
+            Err(error) => return self.error_result(0, 0, error, child_session_hash),
+        };
+
+        let messages = vec![
+            Message::system(CHILD_AGENT_SYSTEM_PROMPT),
+            Message::user(parsed.task()),
+        ];
+        let (events, _receiver) = broadcast::channel(CHILD_EVENT_CHANNEL_CAPACITY);
+        let child = AgentLoop::new(
+            Arc::clone(&self.provider),
+            Arc::new(registry),
+            Budget::new(0, CHILD_TOOL_TIMEOUT, self.limits.max_rounds),
+            events,
+        );
+        let cancel = CancellationToken::new();
+        let child_session_id = SessionId::new(child_session_hash.clone());
+        let run = tokio::time::timeout(
+            self.limits.timeout,
+            child.run_with_transcript(
+                child_session_id,
+                messages,
+                Some(self.limits.max_child_tool_calls),
+                cancel.clone(),
+            ),
+        )
+        .await;
+
+        let transcript = match run {
+            Ok(transcript) => transcript,
+            Err(_) => {
+                cancel.cancel();
+                return self.error_result(
+                    0,
+                    0,
+                    format!(
+                        "child agent timed out after {}ms",
+                        self.limits.timeout.as_millis()
+                    ),
+                    child_session_hash,
+                );
+            }
+        };
+
+        render_child_outcome(
+            self.outcome(transcript, child_session_hash),
+            self.limits.max_result_bytes,
+        )
+    }
+
+    /// Maps a finished child transcript to the fixed outcome contract.
+    fn outcome(&self, transcript: TranscriptRun, child_session_hash: String) -> ChildOutcome {
+        let TranscriptRun {
+            reason,
+            messages,
+            rounds,
+            tool_calls,
+            tool_errors,
+            first_tool_error,
+            error,
+            tool_call_limit_hit,
+        } = transcript;
+
+        if tool_call_limit_hit {
+            return ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: format!(
+                    "child agent exceeded the tool call limit of {}",
+                    self.limits.max_child_tool_calls
+                ),
+                child_session_hash,
+            };
+        }
+
+        if tool_errors > 0 {
+            let detail =
+                first_tool_error.unwrap_or_else(|| "child tool returned an error".to_owned());
+            return ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: format!("child tool failure: {detail}"),
+                child_session_hash,
+            };
+        }
+
+        match reason {
+            SessionEndReason::Completed => ChildOutcome::Success {
+                rounds,
+                tool_calls,
+                answer: last_assistant_text(&messages).to_owned(),
+                child_session_hash,
+            },
+            SessionEndReason::BudgetExceeded => ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: format!(
+                    "child agent exhausted its {} round limit",
+                    self.limits.max_rounds
+                ),
+                child_session_hash,
+            },
+            SessionEndReason::Cancelled => ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: "child agent was cancelled".to_owned(),
+                child_session_hash,
+            },
+            SessionEndReason::Error => ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: error.unwrap_or_else(|| "child agent failed".to_owned()),
+                child_session_hash,
+            },
+            SessionEndReason::AcceptanceFailed => ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error: "child agent ended with an acceptance failure".to_owned(),
+                child_session_hash,
+            },
+        }
+    }
+
+    /// Renders a pre-run or timeout failure.
+    fn error_result(
+        &self,
+        rounds: u32,
+        tool_calls: u32,
+        error: String,
+        child_session_hash: String,
+    ) -> ToolResult {
+        render_child_outcome(
+            ChildOutcome::Error {
+                rounds,
+                tool_calls,
+                error,
+                child_session_hash,
+            },
+            self.limits.max_result_bytes,
+        )
+    }
+}
+
+/// Builds a registry containing exactly the narrowed tools.
+///
+/// Duplicate names, extra tools, and missing tools are integration errors. They
+/// are returned as a message so the executor can render them without starting
+/// the child model.
+fn build_child_registry(
+    tools: Vec<Arc<dyn Tool>>,
+    narrowed: &NarrowedTools,
+) -> Result<ToolRegistry, String> {
+    let mut seen = BTreeSet::new();
+    for tool in &tools {
+        if !seen.insert(tool.name().to_owned()) {
+            return Err(format!(
+                "child tool factory returned duplicate tool `{}`",
+                tool.name()
+            ));
+        }
+    }
+
+    let expected: BTreeSet<String> = narrowed.names().map(str::to_owned).collect();
+    if seen != expected {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|name| !seen.contains(name.as_str()))
+            .map(String::as_str)
+            .collect();
+        let extra: Vec<&str> = seen
+            .iter()
+            .filter(|name| !expected.contains(name.as_str()))
+            .map(String::as_str)
+            .collect();
+        return Err(format!(
+            "child tool factory returned a mismatched tool set (missing: [{}], extra: [{}])",
+            missing.join(", "),
+            extra.join(", ")
+        ));
+    }
+
+    let mut registry = ToolRegistry::new();
+    for tool in tools {
+        registry
+            .register(tool)
+            .map_err(|error| format!("failed to register child tools: {error}"))?;
+    }
+    Ok(registry)
+}
+
+/// Wraps every child tool with the fixed per-call timeout.
+fn wrap_child_tools(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .map(|inner| {
+            Arc::new(TimeoutTool {
+                inner,
+                timeout: CHILD_TOOL_TIMEOUT,
+            }) as Arc<dyn Tool>
+        })
+        .collect()
+}
+
+/// Child tool wrapper that enforces [`CHILD_TOOL_TIMEOUT`].
+struct TimeoutTool {
+    /// Wrapped tool.
+    inner: Arc<dyn Tool>,
+    /// Per-call wall-clock limit.
+    timeout: Duration,
+}
+
+#[async_trait]
+impl Tool for TimeoutTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn schema(&self) -> ToolSchema {
+        self.inner.schema()
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult {
+        let name = self.inner.name().to_owned();
+        match tokio::time::timeout(self.timeout, self.inner.execute(args)).await {
+            Ok(result) => result,
+            Err(_) => ToolResult::error(
+                String::new(),
+                format!(
+                    "tool `{name}` timed out after {}ms",
+                    self.timeout.as_millis()
+                ),
+            ),
+        }
+    }
+}
+
+/// Returns the last assistant text in `messages`, or an empty string.
+fn last_assistant_text(messages: &[Message]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .map_or("", |message| message.content.as_str())
+}
+
+/// [`Tool`] implementation exposing [`AgentChildExecutor`] as `delegate_task`.
+pub struct DelegateTaskTool {
+    /// Executor shared by every invocation.
+    executor: Arc<AgentChildExecutor>,
+}
+
+impl DelegateTaskTool {
+    /// Creates the tool from an executor.
+    pub fn new(executor: Arc<AgentChildExecutor>) -> Self {
+        Self { executor }
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateTaskTool {
+    fn name(&self) -> &str {
+        DELEGATE_TASK_TOOL_NAME
+    }
+
+    fn schema(&self) -> ToolSchema {
+        delegate_task_schema()
+    }
+
+    async fn execute(&self, args: Value) -> ToolResult {
+        let mut result = self.executor.execute(args).await;
+        let status = serde_json::from_str::<Value>(&result.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        result.is_error = !matches!(status.as_deref(), Some("ok" | "truncated"));
+        result
+    }
 }
 
 #[cfg(test)]

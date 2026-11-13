@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }
+async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -12,4 +13,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
+# Task 5.3.3a: paused-clock tests need tokio's test-util feature.
+tokio = { workspace = true, features = ["test-util"] }
