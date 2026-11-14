@@ -216,8 +216,35 @@ impl HarnessConfig {
     }
 }
 
+/// Returns the first non-reloadable section that differs between two configs.
+///
+/// The REPL may hot-reload `budget`, `policy`, `delegation`, `sensor`, and
+/// `acceptance` because each turn rebuilds those components from its snapshot.
+/// The remaining sections own long-lived resources created once at startup
+/// (the event recorder, memory and skill databases, wasm modules, and the
+/// provider reliability wrapper), so any change to them rejects the whole
+/// reload. The returned name is used verbatim in the rejection log.
+pub(crate) fn changed_immutable_section(
+    current: &HarnessConfig,
+    next: &HarnessConfig,
+) -> Option<&'static str> {
+    if current.events != next.events {
+        Some("events")
+    } else if current.memory != next.memory {
+        Some("memory")
+    } else if current.skills != next.skills {
+        Some("skills")
+    } else if current.wasm != next.wasm {
+        Some("wasm")
+    } else if current.reliability != next.reliability {
+        Some("reliability")
+    } else {
+        None
+    }
+}
+
 /// Session budget settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     /// Maximum prompt plus completion tokens across the session.
@@ -261,7 +288,7 @@ impl BudgetConfig {
 }
 
 /// Tool policy settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Tool names the model may execute. An empty list denies every call.
@@ -283,7 +310,7 @@ impl Default for PolicyConfig {
 /// allowlist does not need to mention the tool. When enabled, the parent
 /// allowlist must contain `delegate_task` and the child timeout is fixed at
 /// [`CHILD_TOOL_TIMEOUT`]; there is no per-child timeout setting.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DelegationConfig {
     /// Whether `delegate_task` is registered and child agents may run.
@@ -366,7 +393,7 @@ impl DelegationConfig {
 /// selected base provider without a retry wrapper. The section is still
 /// validated so a malformed configuration cannot be enabled accidentally by
 /// flipping only `enabled`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReliabilityConfig {
     /// Whether the CLI wraps the base provider with retries and timeouts.
@@ -501,7 +528,7 @@ impl ReliabilityConfig {
 }
 
 /// Persistent event log settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
     /// SQLite database path. Relative paths resolve against the workspace root.
@@ -514,7 +541,7 @@ pub struct EventsConfig {
 ///
 /// Memory is disabled by default. When disabled, the CLI neither creates nor
 /// opens the configured database file, and no memory is injected or written.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Whether layered memory is enabled for this run.
@@ -570,7 +597,7 @@ pub enum MemoryWritePolicy {
 ///
 /// Skills are disabled by default. When disabled, the CLI neither creates nor
 /// opens the configured database, and no skill job is enqueued or injected.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Whether skill triggering, distillation, retrieval, and review are enabled.
@@ -656,7 +683,7 @@ impl SkillsConfig {
 }
 
 /// WebAssembly tool plugin settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
     /// Manifest paths. Relative paths resolve against the workspace root.
@@ -668,7 +695,7 @@ pub struct WasmConfig {
 }
 
 /// One command sensor run after a tool result.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SensorConfig {
     /// Name shown in sensor diagnostics.
@@ -684,7 +711,7 @@ pub struct SensorConfig {
 }
 
 /// External acceptance check with retry orchestration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceConfig {
     /// Name shown in acceptance diagnostics.
