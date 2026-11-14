@@ -11,9 +11,12 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Task 5.4.1: request and stream-idle timeouts use tokio::time::timeout. No new
+# third-party crate: tokio is already a workspace dependency and provides the
+# runtime used by reqwest.
+tokio = { workspace = true }
 
 [dev-dependencies]
-# Task 1.1b: loopback mock HTTP tests drive AnthropicProvider through reqwest's
-# Tokio reactor. No new third-party crate: tokio is already a workspace
-# dependency.
-tokio = { workspace = true }
+# Task 5.4.1: paused-clock timeout tests. This only adds a tokio feature; tokio
+# is already a workspace dependency and is not a new third-party crate.
+tokio = { workspace = true, features = ["test-util"] }

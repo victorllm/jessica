@@ -276,7 +276,7 @@ Phase 5：能力扩展与加固（按需拆 Task）
 · Task 5.1 分层记忆：短期（会话近期）/中期（FTS5 关键词）/长期（向量）三层召回，MemoryStore 的完整实现，Guide 注入真实记忆。拆分为 5.1.1–5.1.6，详见本节之后的“Task 5.1 拆分”。
 · Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。拆分为 5.2.1–5.2.6，其中 5.2.2 再拆为 5.2.2a / 5.2.2b，详见本节之后的“Task 5.2 拆分”。
 · Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。拆分为 5.3.1–5.3.5，其中 5.3.3 再拆为 5.3.3a / 5.3.3b，详见本节之后的“Task 5.3 拆分”。
-· Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。
+· Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。拆分为 5.4.1–5.4.5，其中 5.4.3 再拆为 5.4.3a / 5.4.3b，详见本节之后的“Task 5.4 拆分”。
 · Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。
 
 每个 Task 的验收都要求：cargo test --workspace 全绿 + cargo clippy --workspace -- -D warnings + 一个端到端场景。
@@ -1021,6 +1021,307 @@ cargo test --workspace
 
 禁止：让子事件进入父事件库；让子 Agent 失败改变父退出码；让父 token 预算耗尽被吞掉；在 replay/resume 中执行子 Agent；依赖真实 API key/网络；WASM 子实例；嵌套委派；修改 jessica-core。
 
+Task 5.4 拆分：生产化加固
+
+5.4 全局约束（适用于 5.4.1–5.4.5，违反任一条即验收失败）：
+
+A. 不修改 jessica-core 已冻结的公共 API。所有能力通过实现 `jessica_core::llm::LlmProvider` 的包装层完成；`ClassifiedProvider`、`ClassifiedStream`、`ProviderFailure`、`ReliableProvider` 只放在 jessica-providers，不进入 core。
+B. 不新增第三方 crate。重试、熔断、令牌桶、配置轮询、信号处理复用现有 tokio/std/reqwest/serde；新增依赖必须先修改 workspace Cargo.toml 并在对应 Task 说明理由。
+C. `[reliability].enabled` 默认 false。默认行为、错误文案、事件序列、退出码不变；只有 enabled=true 才构造 `ReliableProvider`。
+D. 调用链固定为：base provider → `ReliableProvider`（进程级共享）→ `TokenCountingProvider`（每 turn）→ AgentLoop / 子 Agent；技能提炼器直接使用 `ReliableProvider`。父、子、技能共享同一熔断与限流状态，不得各自新建可靠性实例。
+E. 重试只发生在 Provider 层。不得重试工具调用、acceptance、AgentLoop 轮次或技能 JSON 解析错误；工具与 acceptance 的既有语义不变。
+F. 流式提交点固定为第一个 `TextDelta`。首个 `TextDelta` 之前可重试；`ToolCallRequested` 必须缓冲到 `Done` 才交付；首个 `TextDelta` 之后绝不重试，错误原样以 `LlmEvent::Error` 结束。
+G. 所有等待（退避、限流令牌、半开冷却）必须可被取消；不得在 async 上下文阻塞。测试用 `tokio::time::pause` 或注入时钟，不真实 sleep。
+H. 日志只用 tracing，字段只含 attempt、failure kind、status、backoff、circuit state、reload/shutdown 事件；不得记录 prompt、完整响应、密钥或工具输出。
+I. 热加载只作用于 REPL 的下一个 turn。one-shot、resume、replay、skills 子命令不启动热加载；每个 turn 取一份 `Arc<HarnessConfig>` 快照，`initial_messages` 与 `build_turn` 共用同一快照。
+J. 热加载不改变消息构造流程：顺序固定为 `[system prompt, memory_guide_message, skill_guide_message, user]`；只替换 system prompt 内容与工具 schema；memory/skills 仍每 turn 独立召回一次，热加载不得触发额外召回，也不得重建 memory/skills。
+K. 信号语义：SIGINT=130、SIGTERM=143；第一次信号停止接收新 turn、取消当前 turn、等待终态事件落库并 drain 技能队列；第二次信号立即退出。现有 Ctrl+C=0 断言必须同步改为 130。
+L. 可靠性配置 schema 随 Task 增量增长：5.4.2 引入 enabled/max_attempts/backoff/timeouts；5.4.3a 引入 circuit_*；5.4.3b 引入 rate limit 字段。最终完整 `[reliability]` 示例在 5.4.3b 后才全部可用。
+M. 每个子 Task 必须运行自身验收命令；5.4 整体完成后再运行 workspace 全量验收。测试必须是行为测试：脚本化 SSE server、故障注入、paused clock；不得只断言 Ok，不得依赖真实 API key/网络。
+N. 若发现 5.4.1–5.4.5 之外的问题，记录到 Deferred，不在本 Task 顺手重构。
+
+依赖顺序：5.4.1 → 5.4.2 → 5.4.3a → 5.4.3b → 5.4.4 → 5.4.5。5.4.3a/5.4.3b 逻辑独立，但共享 reliability 模块与 CLI 配置，串行执行避免冲突。
+
+已确认决策（实现不得推翻）：
+
+1. reliability 默认关闭。
+2. SIGINT=130、SIGTERM=143。
+3. 热加载五段：budget / policy / delegation / sensor / acceptance；其余重启生效。
+4. 重试边界：首个 TextDelta 前可重试；ToolCallRequested 缓冲到 Done。
+5. 5.4.3 拆为 5.4.3a 熔断、5.4.3b 限流。
+
+Task 5.4.1：Provider 错误分类与请求/流空闲超时（jessica-providers，60–90 分钟）
+
+目标：把 HTTP/网络/解析/流中断错误映射为结构化分类，并为 Provider 请求与流事件间隔增加可配置超时；本 Task 不实现重试、熔断、限流，不接 CLI。
+
+操作：
+
+1. 在 jessica-providers 新增 reliability 模块，导出 `ProviderFailureKind`、`ProviderFailure`、`ClassifiedStream`、`ClassifiedProvider`、`ReliabilityConfig`、`ReliableProvider` 与结构化 `ReliabilityConfigError`。
+2. `ProviderFailureKind` 固定为：`Transport`、`Timeout`、`RateLimited`、`Server`、`Client`、`InvalidResponse`、`StreamInterrupted`。`ProviderFailure` 至少含 `kind`、`message`、`retry_after: Option<Duration>`；提供 `is_retryable()`：Transport/Timeout/RateLimited/Server 为 true，StreamInterrupted 由 5.4.2 按提交点决定，Client/InvalidResponse 为 false。
+3. `ClassifiedStream` 固定为 `BoxStream<'static, Result<LlmEvent, ProviderFailure>>`；`ClassifiedProvider` 的 `stream_chat_classified` 返回 `Result<ClassifiedStream, ProviderFailure>`。这是 provider crate 内部扩展，core 的 `LlmProvider`/`LlmStream` 不变：`OpenAiProvider`/`AnthropicProvider` 的既有 `stream_chat` 把分类错误映射回 `LlmError` 或 `LlmEvent::Error`，错误文案保持现有测试断言。
+4. HTTP 分类：408/425/429 为可重试 `Client`/`RateLimited`（429 使用 `RateLimited` 并解析 `Retry-After` 整数秒）；500/502/503/504 为 `Server`；其他 4xx 为不可重试 `Client`；reqwest 的 timeout 为 `Timeout`，连接失败/重置为 `Transport`；JSON/SSE 结构错误为 `InvalidResponse`；流提前结束为 `StreamInterrupted`。
+5. `ReliabilityConfig` 本 Task 只含 `request_timeout_ms: u64`、`stream_idle_timeout_ms: u64`；0 表示禁用；校验上限与溢出，拒绝不可用值。`ReliableProvider::new(inner: Arc<dyn ClassifiedProvider>, config: ReliabilityConfig)`。
+6. 请求超时覆盖 `inner.stream_chat_classified(...)` 的完整 setup 阶段，超时返回 `ProviderFailureKind::Timeout`；流空闲超时覆盖相邻两个 `ClassifiedStream` 事件之间的等待，超时产生 `ProviderFailureKind::Timeout`。本 Task 中该失败最终映射为 `LlmError::Request` 或 `LlmEvent::Error`，不做重试。
+7. 不得修改 base provider 的请求体、SSE 聚合或既有错误文案；不得把分类依赖建立在字符串匹配上。
+8. 所有公共 API 有 doc comment；错误用 thiserror；库代码不得 unwrap/expect。
+
+行为测试（至少）：
+
+· 两个 Provider 的 HTTP 状态分类表逐项覆盖 400/401/403/404/408/409/422/425/429/500/502/503/504，断言 kind 与 retry_after。
+· `Retry-After` 缺失、整数秒、非法值分别得到 None、正确 Duration、None；不得 panic。
+· 连接失败、请求超时、流空闲超时（首个事件前、首个事件后）分别得到 Transport/Timeout；使用 loopback server 或故障 `ClassifiedProvider`，不依赖真实网络。
+· 两个 timeout 为 0 时禁用；用 paused clock 推进超过默认时间仍不产生超时。
+· 既有 `LlmProvider` 的 HTTP 500/非 2xx 错误文案与事件序列不回归。
+· `ProviderFailure` 的 `is_retryable` 表与 5.4.2 的预期一致。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy -p jessica-providers --all-targets -- -D warnings
+cargo test -p jessica-providers
+cargo test --workspace
+```
+
+禁止：实现重试/熔断/限流；修改 jessica-core；新增第三方 crate；改变默认 Provider 错误文案；把分类逻辑放进 CLI 或 runtime。
+
+Task 5.4.2：重试状态机 + `[reliability]` 配置 + CLI 装配（jessica-providers + jessica-cli，90–120 分钟）
+
+目标：实现首个 TextDelta 前重试、确定性退避、`Retry-After` 处理与 CLI 配置/装配；默认关闭，不改变既有行为。
+
+操作：
+
+1. 扩展 provider 的 `ReliabilityConfig`：`max_attempts`（含首次，默认 3）、`initial_backoff_ms`（默认 250）、`max_backoff_ms`（默认 4000）；校验 `max_attempts >= 1`、`initial_backoff_ms >= 1`、`max_backoff_ms >= initial_backoff_ms`，建议 `max_attempts <= 10`。
+2. `ReliableProvider::stream_chat` 的 setup 阶段：对 `is_retryable()` 的失败重试；退避为 `min(initial * 2^(attempt-1), max)`，确定性、无 jitter；`Retry-After` 大于 `max_backoff` 时停止重试并返回该错误，否则等待 `max(backoff, retry_after)`。
+3. 流式重试状态机：
+   - `committed=false`，`tool_calls` 缓冲，不向上游交付；
+   - 收到 `TextDelta`：立即向上游交付并置 `committed=true`；
+   - 收到 `ToolCallRequested`：只缓冲，不交付；
+   - 收到 `Done`：先按到达顺序交付缓冲的 tool calls，再交付 `Done`；
+   - 收到 `Err(ProviderFailure)` 或流提前结束：若 `committed=false` 且还有 attempt，丢弃缓冲并重试完整请求；若 `committed=true`，交付 `LlmEvent::Error` 并结束，绝不重试；
+   - 若 `ClassifiedStream` 仍产生 `LlmEvent::Error`（实现错误），按终止错误处理，不重试；
+   - 成功只交付最终 attempt 的事件，禁止重复 TextDelta/tool calls。
+4. 最终错误保留最后一次失败的原始 message；若 total attempts > 1，前缀为 `provider request failed after N attempts: ...`。所有退避等待与流等待可被 drop 取消；取消后不得继续发起请求。
+5. CLI 新增 `[reliability]` 配置段（`#[serde(default, deny_unknown_fields)]`）：
+
+```toml
+[reliability]
+enabled = false
+max_attempts = 3
+initial_backoff_ms = 250
+max_backoff_ms = 4000
+request_timeout_ms = 30000
+stream_idle_timeout_ms = 120000
+```
+
+相对路径无关；`enabled=false` 时不构造 `ReliableProvider`，完全走现有 base provider。校验失败返回字段级 `ConfigError`。
+
+6. CLI 的 reliability 配置结构与 providers 的 `ReliabilityConfig` 分离：CLI 负责 serde 解析与 `enabled`，校验后转换为 provider 配置。`build_provider` 在 enabled=true 时构造 base `Arc<dyn ClassifiedProvider>` 并包装为 `ReliableProvider`，返回 `Arc<dyn LlmProvider>`；enabled=false 时直接返回 base。
+7. 该实例必须同时用于：`SkillsAssembly` 的提炼器、`CliRuntime` 每 turn 的 `TokenCountingProvider`、子 Agent 的共享 provider。不得在 `build_turn` 或子 executor 内重新构造可靠性包装。
+8. 模块文档写明：重试可能在首个 TextDelta 前造成 provider 侧重复计费；客户端不重复输出文本、不重复执行工具；首个 TextDelta 后不重试。
+
+行为测试（至少）：
+
+· 500 → 500 → 200：底层恰好 3 次请求，最终事件只含第三次的 TextDelta/tool calls/Done，无重复。
+· 401/400：只 1 次请求，原错误文案；429 带 `Retry-After` 时等待/停止规则正确。
+· attempts 耗尽：错误含尝试次数与最后 message；`max_attempts=1` 不重试。
+· TextDelta 后流 Error/EOF：只 1 次请求，已输出文本不重复，最终 `LlmEvent::Error`。
+· 仅 ToolCallRequested 后、Done 前 EOF：允许重试；最终只交付成功 attempt 的工具调用；失败 attempt 的工具调用不泄漏。
+· 流在 TextDelta 前空闲超时：重试；TextDelta 后空闲超时：不重试并产生 Error。
+· 退避序列精确（250/500/1000/... cap）；`Retry-After > max_backoff` 停止；paused clock 无真实等待。
+· 取消/丢弃 future 后不再发起新请求；重试中的 tool calls 缓冲不会提前进入 AgentLoop。
+· CLI 配置默认值、每个非法边界、`enabled=false` 不包装且行为不变。
+· CLI E2E（脚本化 SSE）：500/500/200 产生 3 次请求、1 个 Completed session、无重复文本；401 只 1 次请求并以 Error/exit 1 结束；[reliability] 缺省时现有 E2E 全部不回归。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-providers
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+禁止：默认启用可靠性包装；在 TokenCountingProvider/CLI 内实现重试；首个 TextDelta 后重试；把 tool calls 提前交付；新增第三方 crate；修改 jessica-core；重试工具或 acceptance。
+
+Task 5.4.3a：熔断器（jessica-providers + jessica-cli，60–90 分钟）
+
+目标：实现进程级、内存态、闭/开/半开三态熔断；只统计重试耗尽的逻辑调用失败，不涉及限流。
+
+操作：
+
+1. provider 的 `ReliabilityConfig` 增加 `circuit_failure_threshold`（默认 5）与 `circuit_cooldown_ms`（默认 30000）；校验 threshold >= 1、cooldown > 0。
+2. 在 `ReliableProvider` 内持有 `Arc<CircuitBreaker>`，与 5.4.2 的重试状态机组合；状态用 `std::sync::Mutex` 保护，不跨 await 持锁。
+3. 状态机：
+   - Closed：允许调用；一次逻辑调用在重试耗尽后仍失败且 failure kind 可重试 → failure_count += 1；达到 threshold → Open；
+   - Open：立即返回 `LlmError::Request`，文案含 `circuit breaker open` 与剩余冷却；不得调用底层 Provider；
+   - 冷却到期 → HalfOpen；
+   - HalfOpen：只允许一个探测；探测成功（最终 Done）→ Closed 并清零；探测失败 → Open；
+   - 取消/drop 且未产生终态 → 中性，不计数也不释放为成功；HalfOpen 探测占位必须释放。
+4. 计数单位是逻辑调用，不是单次 attempt；一次调用重试 3 次仍失败只记 1 次。不可重试的 4xx 说明端点可达，按中性/成功处理，不得打开熔断。
+5. 流式调用的 permit 必须随 `ClassifiedStream` 生命周期移动：`Done`/终止错误时显式记录结果；流被 drop 时走中性释放；不得在 `stream_chat` 返回后丢失状态。
+6. CLI 配置增加 `circuit_failure_threshold`、`circuit_cooldown_ms`，校验并转换到 provider 配置；`enabled=false` 时不构造熔断器。
+7. 模块文档写明：熔断状态只在内存、进程重启重置；不持久化、不进入事件流；Open 是快速失败而非重试。
+
+行为测试（至少）：
+
+· Closed → threshold 次逻辑失败 → Open；Open 时底层 provider 零调用且返回明确错误。
+· 冷却前 Open、冷却后 HalfOpen；HalfOpen 单探测，其他并发调用快速失败；探测成功 → Closed；探测失败 → Open。
+· 一次调用重试 3 次后失败只计 1 次；可重试失败计数，401/400 不计数；成功调用清零。
+· 取消/drop 不改变计数；HalfOpen 探测 drop 后可再次探测。
+· 流式 Done 记成功、流式终止失败记失败、流式 drop 记中性。
+· 配置默认值、threshold/cooldown 非法边界。
+· CLI E2E：`max_attempts=1`、threshold=2，连续两个 503 的 turn 后第三个 turn 零 HTTP 请求并快速失败；4xx turn 不打开熔断。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-providers
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+禁止：把单次 attempt 计为一次失败；Open 时仍调用底层；HalfOpen 放行多个探测；持久化熔断状态；用熔断开改变工具/acceptance 语义；修改 jessica-core；新增第三方 crate。
+
+Task 5.4.3b：速率限制（jessica-providers + jessica-cli，60–90 分钟）
+
+目标：实现进程级请求速率令牌桶与并发上限；只限制 Provider 请求，不影响工具执行；不实现 TPM。
+
+操作：
+
+1. provider 的 `ReliabilityConfig` 增加 `requests_per_minute`（默认 0 = 不限）、`burst`（默认 1）、`max_concurrent`（默认 0 = 不限）；校验 rpm/burst/max_concurrent 的边界与上限，避免 Semaphore 过大。
+2. 令牌桶：
+   - 按每次物理请求 attempt 扣 1 个令牌；重试也占额度；
+   - 桶容量 = burst；按 rpm 线性补充；核心为纯状态函数，接收注入的 `Instant`，返回“可立即获取/需等待的时长”；
+   - 使用整数微令牌或等价的整数累计，避免浮点误差；等待用 `tokio::time::sleep`，可被 drop 取消；
+   - `requests_per_minute=0` 时不等待。
+3. 并发上限使用 `tokio::sync::Semaphore`：每个物理请求 attempt 在发出前获取 permit，持有到该 attempt 的流结束/失败/drop；重试时释放后重新获取；`max_concurrent=0` 时不构造 Semaphore。
+4. 获取顺序固定为：先等待令牌，再获取并发 permit，再调用底层 Provider；避免持有 permit 等待令牌。令牌与 permit 必须在所有成功、错误、取消、drop 路径释放。
+5. 同一个 `ReliableProvider` 实例共享令牌桶与 Semaphore，因此父、子、技能提炼器共用额度；不得每 turn 新建。
+6. CLI 配置增加 `requests_per_minute`、`burst`、`max_concurrent`，校验并转换；`enabled=false` 时不构造限流器。
+7. 模块文档写明：v1 只做 RPM 与并发，不做 TPM；usage 仅在 Done 可见，精确 TPM 需单独设计。
+
+行为测试（至少）：
+
+· 令牌桶：burst 内立即通过；超出后按 rpm 计算等待；paused clock 推进后恢复；rpm=0 永不等待。
+· 非法 rpm/burst/max_concurrent 边界报配置错误；burst=0 在 rpm>0 时拒绝。
+· 并发上限：max_concurrent=2 时第三个请求等待；两个完成后第三个进入；成功/失败/取消/drop 都释放 permit。
+· 重试每次 attempt 都消耗一个令牌；重试不会绕过并发上限。
+· 父、子、技能共享同一限流器（用计数型 mock 观察总请求数）。
+· CLI E2E：请求间隔/并发峰值符合配置（使用宽松时间边界）；rpm=0 时行为与未启用一致。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-providers
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+禁止：实现 TPM；每 turn 新建限流器；持有 permit 等待令牌；用真实 sleep 写易抖动的精确时间断言；修改 jessica-core；新增第三方 crate。
+
+Task 5.4.4：配置热加载（jessica-cli，90–120 分钟）
+
+目标：REPL 模式下修改配置文件后，下一个 turn 使用新配置；不改变消息构造、Guide 注入或记忆/技能召回逻辑。
+
+操作：
+
+1. `CliRuntime` 从固定 `Arc<HarnessConfig>` 改为持有 `tokio::sync::watch::Receiver<Arc<HarnessConfig>>`；启动时仍加载一次配置并校验。
+2. 仅 REPL 模式启动后台配置监听任务：每 1 秒检查配置文件的 `(mtime, len)` 指纹；不使用 `notify` 等新 crate。one-shot、resume、replay、skills 子命令不启动。
+3. 指纹变化时重新加载并完整校验：
+   - 只修改可热加载段（budget/policy/delegation/sensor/acceptance）→ 通过 `watch::Sender` 发布新 `Arc<HarnessConfig>`，日志 `[config] reloaded`；
+   - 修改不可热加载段（events/memory/skills/wasm/reliability）→ 整体拒绝，日志指出字段，旧配置继续生效；
+   - 解析/校验失败 → 日志 `config reload failed`，旧配置继续生效；
+   - 无论成功与否更新指纹，同一份坏文件不重复刷屏。
+4. 每个 turn 开始时 clone 一份 `Arc<HarnessConfig>` 快照；`initial_messages` 与 `build_turn` 必须接收同一快照，禁止一个用新配置、一个用旧配置。
+5. `system_prompt` 不再缓存在 `CliRuntime`，改为每 turn 从快照调用 `system_prompt(root, config)`；工具 schema、policy、guards、delegation、sensor、acceptance 均从同一快照构造。
+6. 消息构造保持现有实现：仍调用 `fresh_conversation`，顺序严格为 `[system prompt, memory_guide_message, skill_guide_message, user]`；memory/skills 仍每 turn 独立召回一次。热加载只改变 system prompt 内容与工具 schema，不得触发额外召回、不得重建 memory/skills 连接。
+7. 后台监听任务在关闭时停止；监听任务本身不得阻塞 REPL 或 turn。
+8. 若需要比较配置段，给相关结构补 `PartialEq` 或实现显式的 `ReloadableConfig`/`ImmutableConfig` 比较；不得用字符串序列化比较。
+
+行为测试（至少）：
+
+· 两轮 REPL 之间修改 `policy.allowed_tools`：第二轮 system prompt 与 provider tools schema 立即变化；memory/skills recall 次数仍各为每 turn 1 次。
+· 修改 `budget.max_rounds`/`tool_timeout_ms`：第二轮按新值生效。
+· 修改 `delegation.enabled` 且 allowlist 合法：第二轮注册 `delegate_task`；allowlist 缺失时整体拒绝并保留旧配置。
+· 修改不可热加载段：旧配置继续生效，日志含字段名。
+· 非法 TOML/非法边界：旧配置继续生效，REPL 不退出。
+· turn 执行中修改文件：当前 turn 使用旧快照，下一个 turn 才生效。
+· one-shot/resume/replay/skills 不启动监听、不读第二次配置。
+· 消息顺序与 Guide 注入逻辑的既有测试保持通过。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+并执行一个脚本化 REPL E2E：启动 REPL、修改配置文件、输入第二个请求，断言第二次 provider 请求的 system prompt/tools schema 已变化且消息顺序不变。
+
+禁止：热加载 events/memory/skills/wasm/reliability；在 turn 中途替换快照；额外召回 memory/skills；重建后台 worker；新增第三方 crate；修改 jessica-core。
+
+Task 5.4.5：优雅关闭与端到端验收（jessica-cli，90–120 分钟）
+
+目标：统一处理 SIGINT/SIGTERM，停止新 turn、取消当前 turn、等待事件落库与技能 drain，并按 130/143 退出。
+
+操作：
+
+1. 新增 jessica-cli 的 shutdown 模块与 `ShutdownController`：进程级 `CancellationToken`，每个 turn 使用 `child_token()`；提供 `request_shutdown`、`is_shutting_down`、`force` 等最小 API。
+2. 启动时安装 SIGINT 与 Unix SIGTERM 监听；移除 `app.rs` 中每 turn 重复创建的 Ctrl+C 监听任务。REPL 的 `read_line` 在关闭信号到达时必须被唤醒并停止接受新输入。
+3. 第一次信号：设置 shutdown 标志、取消当前 turn 的 child token、停止 REPL、开始 drain。第二次信号：立即退出，不再等待，记录 stderr 警告。
+4. drain 顺序固定：
+   - 停止创建新 turn；
+   - 取消当前 turn；
+   - 等待当前 turn 的终态事件由 EventPump 持久化（复用 `PUMP_TIMEOUT=30s`）；
+   - 调用 `SkillsAssembly::drain()`，受 `skills.drain_timeout_ms` 限制；
+   - flush stdout，返回退出码。
+5. 退出码：正常完成 0；SIGINT 130；SIGTERM 143；第二次信号立即返回对应信号码；技能 drain 超时只 warn，不改变信号退出码。现有 `Cancelled => 0` 的断言与实现同步调整。
+6. 模块文档写明已知限制：
+   - 取消产生的 `SessionEnded(Cancelled)` 在当前恢复语义下是终态，不能 `--resume`；可恢复关闭需单开 Task；
+   - CommandSensor/CommandAcceptanceCheck 无超时，挂起时只能靠第二次信号强制退出；命令超时另开 Task；
+   - 不处理 SIGHUP 等其他信号。
+7. 关闭期间不得写入未经脱敏的日志；不得 panic；不得在 async 上下文阻塞等待。
+
+行为测试（至少）：
+
+· 单元测试用注入的信号通道驱动 `ShutdownController`：第一次信号取消 child token、第二次信号 force、重复信号幂等。
+· 两个 turn 的 child token 隔离：取消一个不影响另一个。
+· Unix E2E spawn CLI，发送 SIGTERM：退出码 143；事件库存在当前 session 的 `SessionEnded`；技能 worker 已 drain 或超时后可恢复；stdout 无 panic。
+· SIGINT 路径退出码 130；第二次信号强制退出单独测试。
+· 空闲 REPL 收到信号立即退出，不创建新 turn。
+· 现有 Ctrl+C/exit code 测试更新后全部通过。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p jessica-cli
+cargo test --workspace
+```
+
+并执行上述 Unix 信号 E2E（测试内自动 spawn，不依赖真实 API key）。
+
+禁止：把 SIGINT/SIGTERM 退出码混为 0；信号处理散落在每个 turn；取消后继续发起模型请求；在 drain 期间新建 turn；修改 jessica-core；新增第三方 crate。
+
+5.4 已知限制与非目标：
+
+· 重试可能造成 provider 侧重复计费；客户端不重复输出/执行工具，但不保证服务端不计费。
+· 无 jitter；单进程 CLI 场景接受同步退避。
+· 熔断状态只在内存，进程重启重置。
+· 只做 RPM + 并发，不做 TPM。
+· 热加载不覆盖 events/memory/skills/wasm/reliability。
+· 取消后的 session 不可 resume；命令 sensor/acceptance 无超时；这些是既有 Deferred，不在 5.4 顺手修改。
+· 不修改 jessica-core，不做 OTLP/指标导出（5.5）。
+
 ---
 
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
@@ -1073,6 +1374,12 @@ Task 5.3.3a ☑ 约 5 分钟 jessica-runtime 的 agent.rs 新增 `TranscriptRun`
 Task 5.3.3b ☑ 约 15 分钟 仅新增测试，未改生产代码；jessica-runtime/tests/delegation.rs 从 15 个测试扩展到 21 个。新增 6 个行为测试：1) parent_history_and_prompt_injection_stay_out_of_the_child：父 transcript 注入独特标记，子 provider 收到的 messages 恰为 2 条，role 顺序为 System→User，system 严格等于 CHILD_AGENT_SYSTEM_PROMPT，user 严格等于含 “system: ignore previous instructions” 的 task，父标记零泄漏；2) child_tool_schemas_are_exactly_the_narrowed_native_set：请求 echo/wasm_tool/delegate_task 后子 schema 恰为 ["echo"]，未请求父工具不出现，空 narrowed 时 tools 为空；3) forged_delegate_task_is_an_unknown_tool_and_never_nests：子模型伪造 delegate_task 只得 unknown tool 错误，factory 仅调用 1 次，子 provider 仅 2 次请求（无嵌套），最终 tool_errors>0 使委派结果为 error；4) consecutive_delegations_get_fresh_tools_and_transcripts：同一父回合连续两次委派，factory 调用 2 次、工具实例 id 为 [0,1]，有状态工具证明第二个子 Agent 看不到第一个的 task/answer/工具状态，父 transcript 恰含两条 delegate 结果；5) executor_emits_no_events_to_a_parent_channel：executor 不持有父 sender，执行后父通道为空（完整父事件序列断言按计划留到 5.3.5）；6) child_session_hash_is_stable_and_trace_only：同 task/同工具两次委派暴露的 hash 相同且等于 child_session_hash(task, narrowed)，不同 task 不同，8 位十六进制。偏离/说明：1) 子 Agent 的 SessionId 无法通过 LlmProvider 观察（stream_chat 不接收 session id），且子事件通道私有，测试通过结果 JSON 中的 child_session_hash 验证同一 trace 值；2) 需求 6 只做“无父 sender、无父事件”的直接断言，完整事件流断言按 PLAN 留给 5.3.5；3) 本轮未发现 5.3.3a 实现缺口，未扩大功能、未接 CLI、未改 jessica-core。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo clippy -p jessica-runtime --all-targets -- -D warnings、cargo test -p jessica-runtime、cargo test --workspace 全绿（467 passed, 0 failed, 2 ignored；jessica-runtime：28 模块单测 + agent_loop 11 + delegation 21 + recovery 6）。
 Task 5.3.4 ☑ 约 30 分钟 jessica-cli 新增 `[delegation]` 配置（`serde(default, deny_unknown_fields)`；默认 enabled=false、max_rounds=4、timeout_ms=8000、max_task_bytes=8192、max_result_bytes=32768、max_child_tool_calls=20；不提供 child_tool_timeout_ms）。配置校验：基础边界（max_rounds/max_child_tool_calls/max_task_bytes≥1、max_result_bytes≥128）始终执行；仅 enabled=true 时校验 policy.allowed_tools 含 `delegate_task`、`CHILD_TOOL_TIMEOUT(5000ms) < timeout_ms < budget.tool_timeout_ms`、`max_result_bytes <= budget.max_result_bytes`，均返回字段级 ConfigError。新增 jessica-cli/src/delegation.rs：`NativeChildToolFactory` 按 narrowed 名称每次新建 `ReadFileTool`/`WriteFileTool`/`BashTool`（同一 workspace root），其他名称返回结构化 ToolFactory 错误，绝不构造 WASM 或返回 delegate_task；模块文档写明共享文件系统/root、无子 sandbox、仅 provider token 预算共享、子事件不持久化。app.rs 的 `build_turn(allow_delegation)` 先构建 TokenCountingProvider，再把同一 `Arc<dyn LlmProvider>` 传给 `AgentChildExecutor`；ParentCapabilities 的 allowlist 来自 config.policy.allowed_tools，native 固定为 ["bash","read_file","write_file"]；enabled 且允许委派时用 GovernedTool 按父 policy/timeout/max_result_bytes 包装 `DelegateTaskTool` 并注册为 `delegate_task`；子工具不经过 GovernedTool。15 个新单测：9 个配置（默认值、全字段解析、4 个基础边界、allowlist 缺失、3 条嵌套违规与边界合法性、disabled 跳过跨字段、拒绝 child_tool_timeout_ms）、4 个 factory（恰三个 native、每次新实例、未知/WASM/delegate 拒绝、空请求）、2 个 app 行为测试（fresh enabled 父 schema 为 4 个且含 delegate_task，disabled 与 resume 路径为 3 个；父+子共享 provider 使 3 次调用共 30 token 全部计入父治理，子请求恰 2 条 messages、system 为固定常量、tools 仅 read_file，父收到 status=ok）。偏离/说明：1) 为满足“不在 resume 路径构造 executor”，`build_turn(false)` 在 resume 时跳过 factory/executor 与 delegate_task 注册；配置校验仍按 enabled 规则执行；2) 子工具超时不提供配置项，固定使用 runtime 的 CHILD_TOOL_TIMEOUT；3) 未写 E2E 大场景（留给 5.3.5）；4) disabled 时既有 schema 数量与行为不变，现有 CLI E2E 全部通过。未改 jessica-core、未新增第三方 crate、replay 不构造 executor、resume 不重放子 Agent。验收：cargo fmt --check、cargo clippy -p jessica-cli --all-targets -- -D warnings、cargo clippy --workspace --all-targets -- -D warnings、cargo test -p jessica-cli（106 passed：87 单测 + 5 memory_e2e + 1 replay_e2e + 1 resume_e2e + 11 skills_e2e + 1 wasm_tool_e2e）、cargo test --workspace（482 passed, 0 failed, 2 ignored）全绿。
 Task 5.3.5 ☑ 约 25 分钟 仅新增端到端测试，未改生产代码；新增 `jessica-cli/tests/delegation_e2e.rs`（13 个脚本化 SSE E2E，无真实 API key/网络，覆盖计划 11 个场景）：1) 正常委派：父请求 `delegate_task(task, ["read_file"])`，子请求恰 2 条 messages（system 严格等于固定常量、user 为 task）且 tools 仅 `read_file`，父历史标记零泄漏；子 read_file 后回答；父收到 status=ok/rounds=2/tool_calls=1 与匹配的 child_session_hash；父事件流恰一次 delegate Started/Finished，无 read_file 事件，子 session 无事件/元数据；exit 0。2) 子 rounds 耗尽（max_rounds=2）：子连续两轮请求 read_file，父收到 status=error 且 error 含“2 round limit”，父继续 Completed/exit 0，事件结果 is_error=true。3) max_child_tool_calls=1：子一轮请求两个 write_file，first.txt 已写而 second.txt 不存在（第 N+1 个未执行），父 results 为 status=error 且含“tool call limit of 1”，父事件流无 write_file。4) 子工具失败：read_file 缺失文件后子仍回答，父仍收到 status=error“child tool failure”并 Completed/exit 0；子 provider 挂起 5400ms：delegation.timeout_ms=5001、父 tool_timeout=10000，父收到 status=error“timed out after 5001ms”后正常完成/exit 0（仅保留一个真实超时用例）。5) 子 usage=8+8 超过父 max_tokens=10：父 exit 1，父事件库存在 BudgetExceeded(TokenLimit)，外层 session 的 SessionEnded=BudgetExceeded，子 session 无事件写入。6) max_result_bytes=256：子回答为超长中文/emoji，父收到恰 3 字段的 status=truncated、answer 为 UTF-8 前缀、序列化总字节 ≤256，is_error=false。7) 父 allowlist 缺 bash：子请求 `["bash"]` 在本地被拒，父 status=error“not permitted by the parent allowlist”，子 provider 零请求，父 Completed/exit 0。8) 一轮两个 delegate：四个子请求分别只含自己的 task/工具结果（ALPHA 不含 BETA，BETA 不含 ALPHA），父事件两个 Started/Finished 按 call id 配对，两个子 session 均无持久化；子伪造 delegate_task 只得 unknown tool error，子工具集仅 read_file，无孙 Agent provider 调用，父 status=error 且 Completed。9) disabled：父 tools 恰为 bash/read_file/write_file（无 delegate_task），模型请求只得到 unknown tool，无子请求，exit 0。10) replay/resume：正常委派落库后连续两次 replay 逐字节一致且等于记录的父事件流（无 provider 环境、无 server，子事件不在输出中）；已完成 session 的 resume 在零计划 server 上零请求、输出 already ended、事件不追加；父流停在 delegate ToolCallStarted 无 Finished 时 resume 以 IncompleteRound 拒绝（exit 1，stderr 含“leaves tool call … without a result”），零请求且 seq 不变。11) 两个子 Agent 不共享可变状态与父事件结果按 task 分别对应，已由场景 8 覆盖。偏离/说明：1) 事件泵把失败工具结果重建为 `tool error: <content>`，测试解析委托 JSON 时仅剥除此固定前缀，生产代码未改；2) replay/resume“零调用”通过在无计划脚本 server 上断言零请求来行为化，而非仅依赖未配置 provider；3) 超时用例真实等待约 5.4s 以验证 5001ms 边界；4) 未接 WASM 子工具、未嵌套委派、未改 jessica-core、未新增第三方 crate、未改生产代码。验收：cargo fmt --check、cargo clippy --workspace --all-targets -- -D warnings、cargo test -p jessica-runtime（66 passed：28 单测 + 11 agent_loop + 21 delegation + 6 recovery）、cargo test -p jessica-cli（119 passed：87 单测 + 13 delegation_e2e + 5 memory_e2e + 1 replay_e2e + 1 resume_e2e + 11 skills_e2e + 1 wasm_tool_e2e）、cargo test --workspace（495 passed, 0 failed, 2 ignored）全绿。
+Task 5.4.1 ☑ 约 70 分钟 jessica-providers 新增 reliability 模块，导出 `ProviderFailureKind`、`ProviderFailure`、`ClassifiedStream`、`ClassifiedProvider`、`ReliabilityConfig`、`ReliabilityConfigError`、`ReliableProvider` 与 `MAX_TIMEOUT_MS`。`ProviderFailureKind` 固定为 Transport/Timeout/RateLimited/Server/Client/InvalidResponse/StreamInterrupted；`ProviderFailure` 含 kind/message/retry_after/is_retryable，408/425 为可重试 Client，429 为 RateLimited 并解析 `Retry-After` 整数秒，5xx 为 Server，其他 4xx 为永久 Client；`is_retryable` 对 Transport/Timeout/RateLimited/Server/StreamInterrupted 为 true，Client/InvalidResponse 为 false。`ClassifiedStream` 为 `BoxStream<'static, Result<LlmEvent, ProviderFailure>>`；两个 Provider 均实现 `ClassifiedProvider`，HTTP 状态、reqwest timeout/transport、SSE/JSON 结构错误与流提前结束均类型化分类；`ReliableProvider` 同时实现 `ClassifiedProvider`（暴露类型化 Timeout）与 `LlmProvider`（映射为 frozen 的 `LlmError` / `LlmEvent::Error`）。既有 `LlmProvider::stream_chat` 行为保持不变：OpenAI 非 2xx 仍返回 `LlmError::Request`，Anthropic 非 2xx 仍返回 `Ok(error_stream)`，legacy 解析器仍保留 OpenAI EOF 无 `[DONE]` 合成 Done、Anthropic 缺 `message_stop` 产生 `LlmEvent::Error`。`ReliabilityConfig` 仅含 `request_timeout_ms`、`stream_idle_timeout_ms`，0 禁用，超过 24h 拒绝；`ReliableProvider` 用 `tokio::time::timeout` 覆盖 setup 与相邻流事件间隔，超时以 `ProviderFailureKind::Timeout` 产生，并在 `LlmProvider` 路径映射为 `LlmError::Request` / `LlmEvent::Error`，本 Task 不做重试。classified 模式更严格：OpenAI EOF 无 `[DONE]`、Anthropic 缺 `message_stop` 均返回 StreamInterrupted；Anthropic error event 按 `error_type` 分类（rate_limit_error → RateLimited；authentication/permission/invalid_request/not_found → Client；其余 → Server）。行为测试覆盖：两个 Provider 逐项覆盖 400/401/403/404/408/409/422/425/429/500/502/503/504 的 kind 与 retryability；`Retry-After` 缺失/整数秒/非法值分别为 None/Duration/None；loopback 连接拒绝为 Transport；paused clock 下请求超时、首事件前与首事件后的流空闲超时；两个 timeout=0 时延迟 setup/stream 不超时；既有 OpenAI/Anthropic HTTP 500 文案与事件序列不回归；`is_retryable` 全表。偏离/说明：1) `tokio` 从 dev-dependencies 提升为 dependencies 以使用 `tokio::time::timeout`，dev 额外启用 `test-util` feature；tokio 已是 workspace 依赖，无新第三方 crate；2) `ProviderFailure` 增加私有 retryable 标记，表达 408/425 可重试但 kind 仍为 Client；3) StreamInterrupted 在分类层标记可重试，5.4.2 必须再按首个 TextDelta 提交点 gate；4) classified 模式比 legacy 严格，legacy 错误文案与事件序列保持不变；5) 未接 CLI、未实现重试/熔断/限流、未改 jessica-core。验收：cargo fmt --check、cargo clippy -p jessica-providers --all-targets -- -D warnings、cargo clippy --workspace --all-targets -- -D warnings、cargo test -p jessica-providers（81 单测 + 7 集成 + 2 ignored live）、cargo test --workspace（526 passed, 0 failed, 2 ignored）全绿。
+Task 5.4.2 ☐ — 未开始
+Task 5.4.3a ☐ — 未开始
+Task 5.4.3b ☐ — 未开始
+Task 5.4.4 ☐ — 未开始
+Task 5.4.5 ☐ — 未开始
 
 ---
 

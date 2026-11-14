@@ -7,8 +7,12 @@ use jessica_core::types::Message;
 
 use crate::anthropic::config::AnthropicConfig;
 use crate::anthropic::request::build_anthropic_request;
-use crate::anthropic::stream::anthropic_event_stream;
+use crate::anthropic::stream::{anthropic_event_stream, classified_anthropic_event_stream};
 use crate::config::ApiConfigError;
+use crate::reliability::{
+    ClassifiedProvider, ClassifiedStream, ProviderFailure, classify_http_status,
+    classify_reqwest_error, local_failure, parse_retry_after,
+};
 
 /// Version header required by the Anthropic Messages API.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -99,6 +103,46 @@ impl LlmProvider for AnthropicProvider {
         }
 
         Ok(anthropic_event_stream(response.bytes_stream()))
+    }
+}
+
+#[async_trait]
+impl ClassifiedProvider for AnthropicProvider {
+    async fn stream_chat_classified(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<ClassifiedStream, ProviderFailure> {
+        let body =
+            build_anthropic_request(self.config.model(), messages, tools).map_err(local_failure)?;
+        let url = messages_url(self.config.base_url());
+
+        let response = self
+            .client
+            .post(url)
+            .header("x-api-key", self.config.api_key())
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| classify_reqwest_error(&error))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let detail = match response.text().await {
+                Ok(text) => text,
+                Err(error) => format!("<failed to read error body: {error}>"),
+            };
+            return Err(classify_http_status(
+                status.as_u16(),
+                format!("Anthropic API returned HTTP {status}: {detail}"),
+                retry_after,
+            ));
+        }
+
+        Ok(classified_anthropic_event_stream(response.bytes_stream()))
     }
 }
 

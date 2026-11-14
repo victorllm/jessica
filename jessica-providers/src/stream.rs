@@ -10,33 +10,61 @@ use jessica_core::types::{TokenUsage, ToolCall};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::reliability::{ClassifiedStream, ProviderFailure};
 use crate::sse::SseDecoder;
 
-/// Turns raw byte chunks into a stream of [`LlmEvent`]s.
+/// Turns raw byte chunks into a legacy stream of [`LlmEvent`]s.
 ///
-/// The chunk type and error type are generic so tests can drive the exact
-/// parsing pipeline used in production with an in-memory SSE stream.
+/// This preserves the pre-5.4 behavior: a stream that ends without `[DONE]` is
+/// treated as a successful end. [`classified_event_stream`] is the strict
+/// variant used by the reliability layer.
 pub(crate) fn event_stream<S, B, E>(chunks: S) -> LlmStream
 where
     S: Stream<Item = Result<B, E>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
     E: fmt::Display + Send + 'static,
 {
+    Box::pin(
+        classified_event_stream(chunks, true).map(|item| match item {
+            Ok(event) => event,
+            Err(failure) => LlmEvent::Error {
+                message: failure.message().to_owned(),
+            },
+        }),
+    )
+}
+
+/// Turns raw byte chunks into a classified stream of [`LlmEvent`]s.
+///
+/// When `eof_is_done` is false, EOF without a `[DONE]` sentinel is reported as
+/// an interrupted-stream failure so the retry layer can decide whether the
+/// turn is still retryable.
+pub(crate) fn classified_event_stream<S, B, E>(chunks: S, eof_is_done: bool) -> ClassifiedStream
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: fmt::Display + Send + 'static,
+{
     let chunks = Box::pin(chunks);
-    let state = StreamState::default();
+    let state = StreamState {
+        eof_is_done,
+        ..StreamState::default()
+    };
     Box::pin(futures::stream::unfold(
         (chunks, state),
         |(mut chunks, mut state)| async move {
             loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Some((event, (chunks, state)));
+                if let Some(item) = state.pending.pop_front() {
+                    return Some((item, (chunks, state)));
                 }
                 if state.done {
                     return None;
                 }
                 match chunks.next().await {
                     Some(Ok(chunk)) => state.push_bytes(chunk.as_ref()),
-                    Some(Err(error)) => state.fail(error.to_string()),
+                    Some(Err(error)) => {
+                        state.fail(ProviderFailure::transport(error.to_string()));
+                    }
                     None => state.finish_stream(),
                 }
             }
@@ -49,7 +77,8 @@ struct StreamState {
     decoder: SseDecoder,
     assembler: ToolCallAssembler,
     usage: Option<TokenUsage>,
-    pending: VecDeque<LlmEvent>,
+    pending: VecDeque<Result<LlmEvent, ProviderFailure>>,
+    eof_is_done: bool,
     done: bool,
 }
 
@@ -64,7 +93,7 @@ impl StreamState {
                     }
                 }
             }
-            Err(error) => self.fail(error.to_string()),
+            Err(error) => self.fail(ProviderFailure::invalid_response(error.to_string())),
         }
     }
 
@@ -81,7 +110,9 @@ impl StreamState {
         let chunk: ChatChunk = match serde_json::from_str(payload) {
             Ok(chunk) => chunk,
             Err(error) => {
-                self.fail(format!("invalid SSE payload: {error}"));
+                self.fail(ProviderFailure::invalid_response(format!(
+                    "invalid SSE payload: {error}"
+                )));
                 return;
             }
         };
@@ -98,7 +129,7 @@ impl StreamState {
                 && !content.is_empty()
             {
                 self.pending
-                    .push_back(LlmEvent::TextDelta { text: content });
+                    .push_back(Ok(LlmEvent::TextDelta { text: content }));
             }
 
             if !choice.delta.tool_calls.is_empty() {
@@ -118,10 +149,11 @@ impl StreamState {
         match self.assembler.finish() {
             Ok(calls) => {
                 for call in calls {
-                    self.pending.push_back(LlmEvent::ToolCallRequested { call });
+                    self.pending
+                        .push_back(Ok(LlmEvent::ToolCallRequested { call }));
                 }
             }
-            Err(error) => self.fail(error.to_string()),
+            Err(error) => self.fail(ProviderFailure::invalid_response(error.to_string())),
         }
     }
 
@@ -133,9 +165,9 @@ impl StreamState {
         if self.done {
             return;
         }
-        self.pending.push_back(LlmEvent::Done {
+        self.pending.push_back(Ok(LlmEvent::Done {
             usage: self.usage.take(),
-        });
+        }));
         self.done = true;
     }
 
@@ -153,18 +185,24 @@ impl StreamState {
                 }
             }
             Err(error) => {
-                self.fail(error.to_string());
+                self.fail(ProviderFailure::invalid_response(error.to_string()));
                 return;
             }
         }
-        self.finish_successfully();
+        if self.eof_is_done {
+            self.finish_successfully();
+        } else {
+            self.fail(ProviderFailure::stream_interrupted(
+                "provider stream ended before [DONE]",
+            ));
+        }
     }
 
-    fn fail(&mut self, message: String) {
+    fn fail(&mut self, failure: ProviderFailure) {
         if self.done {
             return;
         }
-        self.pending.push_back(LlmEvent::Error { message });
+        self.pending.push_back(Err(failure));
         self.done = true;
     }
 }
@@ -315,6 +353,19 @@ mod tests {
         let stream = event_stream(futures::stream::iter(
             chunks.into_iter().map(Ok::<_, String>),
         ));
+        futures::executor::block_on(stream.collect())
+    }
+
+    fn collect_classified(sse: &str, chunk_size: usize) -> Vec<Result<LlmEvent, ProviderFailure>> {
+        let chunks: Vec<Vec<u8>> = sse
+            .as_bytes()
+            .chunks(chunk_size)
+            .map(|bytes| bytes.to_vec())
+            .collect();
+        let stream = classified_event_stream(
+            futures::stream::iter(chunks.into_iter().map(Ok::<_, String>)),
+            false,
+        );
         futures::executor::block_on(stream.collect())
     }
 
@@ -500,6 +551,113 @@ mod tests {
         match &events[0] {
             LlmEvent::Error { message } => assert!(message.contains("connection reset")),
             other => panic!("expected an error event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_stream_without_done_sentinel_is_interrupted() {
+        let sse = chunk(json!({"content": "hi"}), None);
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(
+            items.first(),
+            Some(&Ok(LlmEvent::TextDelta {
+                text: "hi".to_owned()
+            }))
+        );
+        match items.last() {
+            Some(Err(failure)) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::StreamInterrupted
+                );
+                assert!(failure.message().contains("[DONE]"));
+                assert!(failure.is_retryable());
+            }
+            other => panic!("expected an interrupted-stream failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_stream_with_done_sentinel_completes() {
+        let sse = format!(
+            "{}{}",
+            chunk(json!({"content": "hi"}), None),
+            "data: [DONE]\n\n"
+        );
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(
+            items,
+            vec![
+                Ok(LlmEvent::TextDelta {
+                    text: "hi".to_owned()
+                }),
+                Ok(LlmEvent::Done { usage: None }),
+            ]
+        );
+    }
+
+    #[test]
+    fn classified_invalid_payload_is_non_retryable() {
+        let items = collect_classified("data: {not-json}\n\n", 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::InvalidResponse
+                );
+                assert!(!failure.is_retryable());
+                assert!(failure.message().contains("invalid SSE payload"));
+            }
+            other => panic!("expected an invalid-response failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_transport_error_is_retryable() {
+        let chunks = vec![Err::<Vec<u8>, String>("connection reset".to_owned())];
+        let stream = classified_event_stream(futures::stream::iter(chunks), false);
+        let items = futures::executor::block_on(stream.collect::<Vec<_>>());
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::Transport
+                );
+                assert!(failure.is_retryable());
+                assert!(failure.message().contains("connection reset"));
+            }
+            other => panic!("expected a transport failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_malformed_tool_call_is_invalid_response() {
+        let sse = [
+            chunk(
+                json!({"tool_calls": [{"index": 0, "function": {"name": "x", "arguments": "{}"}}]}),
+                Some("tool_calls"),
+            ),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat();
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::InvalidResponse
+                );
+                assert!(failure.message().contains("missing an id"));
+            }
+            other => panic!("expected an invalid-response failure, got {other:?}"),
         }
     }
 }
