@@ -1,13 +1,23 @@
-//! Typed provider failures, timeouts, and the reliability wrapper.
+//! Typed provider failures, timeouts, retries, and the reliability wrapper.
 //!
 //! [`ClassifiedProvider`] is an internal extension of the frozen
 //! [`jessica_core::llm::LlmProvider`] contract. It keeps the failure category
-//! alongside the failure message so later retry and circuit-breaker layers do
-//! not have to parse provider error strings.
+//! alongside the failure message so retry, circuit-breaker, and rate-limit
+//! layers do not have to parse provider error strings.
 //!
-//! Task 5.4.1 implements timeouts only. Retry, circuit breaking, and rate
-//! limiting are added by later tasks in the same module.
+//! [`ReliableProvider`] retries only before the first
+//! [`jessica_core::llm::LlmEvent::TextDelta`] is delivered. Because a retry
+//! issues a complete new provider request, the provider may bill the same
+//! prompt more than once; clients never receive duplicated text or execute
+//! duplicated tool calls, and no retry happens after the first text delta.
+//! Tool calls requested before a failed stream completes are buffered and
+//! discarded with that attempt, so only the successful attempt's tool calls
+//! reach the caller.
+//!
+//! Circuit breaking and rate limiting are added by later tasks in the same
+//! module.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +34,18 @@ use thiserror::Error;
 /// Values above this are rejected by [`ReliabilityConfig::validate`] so a
 /// configuration typo cannot create an effectively unbounded timer.
 pub const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Default total attempts per request, including the first.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+/// Default delay after the first failed attempt, in milliseconds.
+pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 250;
+/// Default upper bound for exponential backoff, in milliseconds.
+pub const DEFAULT_MAX_BACKOFF_MS: u64 = 4_000;
+/// Recommended upper bound for [`ReliabilityConfig::max_attempts`].
+///
+/// Larger values are accepted, but callers should treat ten attempts as the
+/// point where retries stop being useful for an interactive agent.
+pub const RECOMMENDED_MAX_ATTEMPTS: u32 = 10;
 
 /// Category of a provider failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,10 +147,24 @@ impl ProviderFailure {
     /// committed.
     ///
     /// [`ProviderFailureKind::StreamInterrupted`] is marked retryable here;
-    /// Task 5.4.2 additionally requires that no [`LlmEvent::TextDelta`] has
-    /// been delivered before it retries.
+    /// [`ReliableProvider`] additionally requires that no
+    /// [`LlmEvent::TextDelta`] has been delivered before it retries.
     pub fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// Adds the total-attempt prefix used by the final error of a retried
+    /// request.
+    ///
+    /// A single attempt keeps the provider's original message unchanged.
+    fn after_attempts(mut self, attempts: u32) -> Self {
+        if attempts > 1 {
+            self.message = format!(
+                "provider request failed after {attempts} attempts: {}",
+                self.message
+            );
+        }
+        self
     }
 
     fn new(
@@ -165,21 +201,53 @@ pub trait ClassifiedProvider: Send + Sync {
     ) -> Result<ClassifiedStream, ProviderFailure>;
 }
 
-/// Timeout configuration for [`ReliableProvider`].
+/// Reliability configuration for [`ReliableProvider`].
 ///
-/// A zero timeout disables that limit. Later tasks extend this type with retry,
-/// circuit-breaker, and rate-limit fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A zero timeout disables that limit. Retries use deterministic, jitter-free
+/// exponential backoff. The recommended upper bound for `max_attempts` is
+/// [`RECOMMENDED_MAX_ATTEMPTS`]; larger values are accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReliabilityConfig {
+    /// Total attempts per request, including the first. Must be at least one.
+    pub max_attempts: u32,
+    /// Delay after the first failed attempt, in milliseconds.
+    ///
+    /// Later retries double this value up to `max_backoff_ms`.
+    pub initial_backoff_ms: u64,
+    /// Upper bound for the exponential backoff, in milliseconds.
+    ///
+    /// A provider `Retry-After` larger than this stops retrying and returns
+    /// the failure instead of waiting.
+    pub max_backoff_ms: u64,
     /// Maximum time allowed for the provider request setup phase.
     pub request_timeout_ms: u64,
     /// Maximum time allowed between two provider stream events.
     pub stream_idle_timeout_ms: u64,
 }
 
+impl Default for ReliabilityConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            initial_backoff_ms: DEFAULT_INITIAL_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
+            request_timeout_ms: 0,
+            stream_idle_timeout_ms: 0,
+        }
+    }
+}
+
 impl ReliabilityConfig {
-    /// Validates all timeout values.
+    /// Validates every retry and timeout value.
     pub fn validate(&self) -> Result<(), ReliabilityConfigError> {
+        validate_minimum("max_attempts", u64::from(self.max_attempts), 1)?;
+        validate_minimum("initial_backoff_ms", self.initial_backoff_ms, 1)?;
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(ReliabilityConfigError::MaxBackoffBelowInitial {
+                initial_backoff_ms: self.initial_backoff_ms,
+                max_backoff_ms: self.max_backoff_ms,
+            });
+        }
         validate_timeout(
             "request_timeout_ms",
             self.request_timeout_ms,
@@ -201,11 +269,36 @@ impl ReliabilityConfig {
     fn stream_idle_timeout(&self) -> Option<Duration> {
         timeout_duration(self.stream_idle_timeout_ms)
     }
+
+    /// Returns the configured maximum backoff as a duration.
+    fn max_backoff(&self) -> Duration {
+        Duration::from_millis(self.max_backoff_ms)
+    }
 }
 
 /// Invalid reliability configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ReliabilityConfigError {
+    /// A retry value is below its accepted minimum.
+    #[error("{field} = {value} must be at least {min}")]
+    ValueTooSmall {
+        /// Configuration field name.
+        field: &'static str,
+        /// Configured value.
+        value: u64,
+        /// Minimum accepted value.
+        min: u64,
+    },
+    /// The backoff cap is below the initial delay.
+    #[error(
+        "max_backoff_ms = {max_backoff_ms} must be at least initial_backoff_ms = {initial_backoff_ms}"
+    )]
+    MaxBackoffBelowInitial {
+        /// Configured initial delay in milliseconds.
+        initial_backoff_ms: u64,
+        /// Configured maximum delay in milliseconds.
+        max_backoff_ms: u64,
+    },
     /// A timeout exceeds the accepted maximum.
     #[error("{field} = {value}ms exceeds the maximum of {max}ms")]
     TimeoutTooLarge {
@@ -218,11 +311,16 @@ pub enum ReliabilityConfigError {
     },
 }
 
-/// Wraps a [`ClassifiedProvider`] with request and stream-idle timeouts.
+/// Wraps a [`ClassifiedProvider`] with timeouts and pre-commit retries.
 ///
-/// It implements [`ClassifiedProvider`] so callers can observe typed timeout
-/// failures, and [`jessica_core::llm::LlmProvider`] so it can be used wherever
-/// the frozen contract is expected.
+/// It implements [`ClassifiedProvider`] so callers can observe typed failures,
+/// and [`jessica_core::llm::LlmProvider`] so it can be used wherever the frozen
+/// contract is expected. Both paths share the same retry state machine.
+///
+/// A retry issues a complete new provider request and can therefore cause
+/// provider-side duplicate billing. The wrapper never delivers text or tool
+/// calls from a failed attempt, and it never retries after the first
+/// [`LlmEvent::TextDelta`].
 pub struct ReliableProvider {
     inner: Arc<dyn ClassifiedProvider>,
     config: ReliabilityConfig,
@@ -231,7 +329,7 @@ pub struct ReliableProvider {
 impl ReliableProvider {
     /// Creates a reliability wrapper around `inner`.
     ///
-    /// Returns an error when the timeout configuration is invalid.
+    /// Returns an error when the retry or timeout configuration is invalid.
     pub fn new(
         inner: Arc<dyn ClassifiedProvider>,
         config: ReliabilityConfig,
@@ -240,49 +338,9 @@ impl ReliableProvider {
         Ok(Self { inner, config })
     }
 
-    /// Returns the timeout configuration in use.
+    /// Returns the reliability configuration in use.
     pub fn config(&self) -> ReliabilityConfig {
         self.config
-    }
-
-    /// Wraps a classified stream with an idle timeout.
-    fn with_idle_timeout(&self, stream: ClassifiedStream) -> ClassifiedStream {
-        let Some(limit) = self.config.stream_idle_timeout() else {
-            return stream;
-        };
-
-        struct IdleState {
-            stream: ClassifiedStream,
-            done: bool,
-            limit: Duration,
-            timeout_ms: u64,
-        }
-
-        let state = IdleState {
-            stream,
-            done: false,
-            limit,
-            timeout_ms: self.config.stream_idle_timeout_ms,
-        };
-        Box::pin(futures::stream::unfold(state, |mut state| async move {
-            if state.done {
-                return None;
-            }
-            match tokio::time::timeout(state.limit, state.stream.next()).await {
-                Ok(Some(item)) => Some((item, state)),
-                Ok(None) => None,
-                Err(_) => {
-                    state.done = true;
-                    Some((
-                        Err(ProviderFailure::timeout(format!(
-                            "provider stream idle for {}ms",
-                            state.timeout_ms
-                        ))),
-                        state,
-                    ))
-                }
-            }
-        }))
     }
 }
 
@@ -293,19 +351,27 @@ impl ClassifiedProvider for ReliableProvider {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<ClassifiedStream, ProviderFailure> {
-        let request = self.inner.stream_chat_classified(messages, tools);
-        let result = match self.config.request_timeout() {
-            Some(limit) => match tokio::time::timeout(limit, request).await {
-                Ok(result) => result,
-                Err(_) => Err(ProviderFailure::timeout(format!(
-                    "provider request timed out after {}ms",
-                    self.config.request_timeout_ms
-                ))),
-            },
-            None => request.await,
-        };
-
-        Ok(self.with_idle_timeout(result?))
+        let messages: Arc<[Message]> = messages.to_vec().into();
+        let tools: Arc<[ToolSchema]> = tools.to_vec().into();
+        match open_until(
+            Arc::clone(&self.inner),
+            self.config,
+            Arc::clone(&messages),
+            Arc::clone(&tools),
+            1,
+        )
+        .await
+        {
+            OpenOutcome::Opened { stream, attempt } => Ok(retrying_stream(
+                Arc::clone(&self.inner),
+                self.config,
+                messages,
+                tools,
+                stream,
+                attempt,
+            )),
+            OpenOutcome::Failed(failure) => Err(failure),
+        }
     }
 }
 
@@ -321,6 +387,300 @@ impl LlmProvider for ReliableProvider {
             .await
             .map_err(setup_failure_to_llm_error)?;
         Ok(legacy_stream(stream))
+    }
+}
+
+/// Result of one setup retry loop.
+enum OpenOutcome {
+    /// A provider stream was opened on the given attempt.
+    Opened {
+        /// Fresh classified stream.
+        stream: ClassifiedStream,
+        /// One-based attempt number that succeeded.
+        attempt: u32,
+    },
+    /// The request failed permanently or exhausted its attempts.
+    Failed(ProviderFailure),
+}
+
+/// Opens a request, retrying retryable setup failures with deterministic
+/// backoff until `max_attempts` is reached.
+async fn open_until(
+    inner: Arc<dyn ClassifiedProvider>,
+    config: ReliabilityConfig,
+    messages: Arc<[Message]>,
+    tools: Arc<[ToolSchema]>,
+    start_attempt: u32,
+) -> OpenOutcome {
+    let mut attempt = start_attempt;
+
+    loop {
+        match open_attempt(inner.as_ref(), config, &messages, &tools).await {
+            Ok(stream) => return OpenOutcome::Opened { stream, attempt },
+            Err(failure) => {
+                let retry = failure.is_retryable() && attempt < config.max_attempts;
+                let delay = if retry {
+                    retry_delay(config, attempt, &failure)
+                } else {
+                    None
+                };
+                match delay {
+                    Some(delay) => {
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                    }
+                    None => return OpenOutcome::Failed(failure.after_attempts(attempt)),
+                }
+            }
+        }
+    }
+}
+
+/// Performs one provider request setup with the configured request timeout and
+/// wraps a successful stream with the configured idle timeout.
+async fn open_attempt(
+    inner: &dyn ClassifiedProvider,
+    config: ReliabilityConfig,
+    messages: &[Message],
+    tools: &[ToolSchema],
+) -> Result<ClassifiedStream, ProviderFailure> {
+    let request = inner.stream_chat_classified(messages, tools);
+    let result = match config.request_timeout() {
+        Some(limit) => match tokio::time::timeout(limit, request).await {
+            Ok(result) => result,
+            Err(_) => Err(ProviderFailure::timeout(format!(
+                "provider request timed out after {}ms",
+                config.request_timeout_ms
+            ))),
+        },
+        None => request.await,
+    };
+
+    Ok(with_idle_timeout(result?, config))
+}
+
+/// Wraps a classified stream with the configured idle timeout.
+fn with_idle_timeout(stream: ClassifiedStream, config: ReliabilityConfig) -> ClassifiedStream {
+    let Some(limit) = config.stream_idle_timeout() else {
+        return stream;
+    };
+
+    struct IdleState {
+        stream: ClassifiedStream,
+        done: bool,
+        limit: Duration,
+        timeout_ms: u64,
+    }
+
+    let state = IdleState {
+        stream,
+        done: false,
+        limit,
+        timeout_ms: config.stream_idle_timeout_ms,
+    };
+    Box::pin(futures::stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+        match tokio::time::timeout(state.limit, state.stream.next()).await {
+            Ok(Some(item)) => Some((item, state)),
+            Ok(None) => None,
+            Err(_) => {
+                state.done = true;
+                Some((
+                    Err(ProviderFailure::timeout(format!(
+                        "provider stream idle for {}ms",
+                        state.timeout_ms
+                    ))),
+                    state,
+                ))
+            }
+        }
+    }))
+}
+
+/// Computes the delay before the next attempt after `attempt` failed.
+///
+/// Returns `None` when the provider's `Retry-After` exceeds `max_backoff_ms`,
+/// which means the caller should stop retrying instead of waiting.
+fn retry_delay(
+    config: ReliabilityConfig,
+    attempt: u32,
+    failure: &ProviderFailure,
+) -> Option<Duration> {
+    let backoff = backoff_duration(config, attempt);
+    match failure.retry_after() {
+        Some(retry_after) if retry_after > config.max_backoff() => None,
+        Some(retry_after) => Some(backoff.max(retry_after)),
+        None => Some(backoff),
+    }
+}
+
+/// Deterministic exponential backoff: `initial * 2^(attempt - 1)`, capped.
+fn backoff_duration(config: ReliabilityConfig, attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(63);
+    let factor = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let millis = config
+        .initial_backoff_ms
+        .saturating_mul(factor)
+        .min(config.max_backoff_ms);
+    Duration::from_millis(millis)
+}
+
+/// Retry-aware stream state shared by successful attempts.
+struct RetryStreamState {
+    /// Provider used to open a replacement attempt.
+    inner: Arc<dyn ClassifiedProvider>,
+    /// Retry and timeout configuration.
+    config: ReliabilityConfig,
+    /// Original request messages, retained for replacement attempts.
+    messages: Arc<[Message]>,
+    /// Original tool schemas, retained for replacement attempts.
+    tools: Arc<[ToolSchema]>,
+    /// One-based attempt number currently open.
+    attempt: u32,
+    /// Current attempt's stream, absent while retrying or after completion.
+    stream: Option<ClassifiedStream>,
+    /// Tool calls received by the current attempt but not yet safe to deliver.
+    tool_calls: Vec<jessica_core::types::ToolCall>,
+    /// Whether a text delta has been delivered.
+    committed: bool,
+    /// Events ready to be yielded before reading the stream again.
+    pending: VecDeque<LlmEvent>,
+    /// Whether the stream has delivered its terminal event.
+    finished: bool,
+}
+
+/// Builds a stream that buffers tool calls until `Done` and retries failures
+/// only while no text delta has been delivered.
+fn retrying_stream(
+    inner: Arc<dyn ClassifiedProvider>,
+    config: ReliabilityConfig,
+    messages: Arc<[Message]>,
+    tools: Arc<[ToolSchema]>,
+    stream: ClassifiedStream,
+    attempt: u32,
+) -> ClassifiedStream {
+    let state = RetryStreamState {
+        inner,
+        config,
+        messages,
+        tools,
+        attempt,
+        stream: Some(stream),
+        tool_calls: Vec::new(),
+        committed: false,
+        pending: VecDeque::new(),
+        finished: false,
+    };
+
+    Box::pin(futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if state.finished {
+                return None;
+            }
+
+            if let Some(event) = state.pending.pop_front() {
+                if matches!(event, LlmEvent::Done { .. }) {
+                    state.finished = true;
+                    state.stream = None;
+                }
+                return Some((Ok(event), state));
+            }
+
+            let stream = state.stream.as_mut()?;
+            let next = stream.next().await;
+
+            match next {
+                Some(Ok(LlmEvent::TextDelta { text })) => {
+                    state.committed = true;
+                    return Some((Ok(LlmEvent::TextDelta { text }), state));
+                }
+                Some(Ok(LlmEvent::ToolCallRequested { call })) => {
+                    state.tool_calls.push(call);
+                }
+                Some(Ok(LlmEvent::Done { usage })) => {
+                    state.stream = None;
+                    for call in state.tool_calls.drain(..) {
+                        state
+                            .pending
+                            .push_back(LlmEvent::ToolCallRequested { call });
+                    }
+                    state.pending.push_back(LlmEvent::Done { usage });
+                }
+                Some(Ok(LlmEvent::Error { message })) => {
+                    // A classified stream should report failures as `Err`.
+                    // An `Error` event is an implementation error, not a
+                    // provider failure, so it is terminal and never retried.
+                    state.finished = true;
+                    state.stream = None;
+                    state.tool_calls.clear();
+                    return Some((Ok(LlmEvent::Error { message }), state));
+                }
+                Some(Err(failure)) => match recover_stream_failure(&mut state, failure).await {
+                    Ok(()) => {}
+                    Err(failure) => return Some((Err(failure), state)),
+                },
+                None => {
+                    let failure =
+                        ProviderFailure::stream_interrupted("provider stream ended before Done");
+                    match recover_stream_failure(&mut state, failure).await {
+                        Ok(()) => {}
+                        Err(failure) => return Some((Err(failure), state)),
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// Applies the pre-commit retry rule to a stream failure.
+///
+/// On success the state has a replacement stream and the caller should keep
+/// reading. On failure the returned error is already final and prefixed with
+/// the attempt count when more than one attempt was made.
+async fn recover_stream_failure(
+    state: &mut RetryStreamState,
+    failure: ProviderFailure,
+) -> Result<(), ProviderFailure> {
+    let delay = if !state.committed
+        && failure.is_retryable()
+        && state.attempt < state.config.max_attempts
+    {
+        retry_delay(state.config, state.attempt, &failure)
+    } else {
+        None
+    };
+
+    let Some(delay) = delay else {
+        state.finished = true;
+        state.stream = None;
+        state.tool_calls.clear();
+        return Err(failure.after_attempts(state.attempt));
+    };
+
+    state.stream = None;
+    state.tool_calls.clear();
+    tokio::time::sleep(delay).await;
+
+    match open_until(
+        Arc::clone(&state.inner),
+        state.config,
+        Arc::clone(&state.messages),
+        Arc::clone(&state.tools),
+        state.attempt + 1,
+    )
+    .await
+    {
+        OpenOutcome::Opened { stream, attempt } => {
+            state.stream = Some(stream);
+            state.attempt = attempt;
+            Ok(())
+        }
+        OpenOutcome::Failed(failure) => {
+            state.finished = true;
+            Err(failure)
+        }
     }
 }
 
@@ -341,6 +701,18 @@ fn setup_failure_to_llm_error(failure: ProviderFailure) -> LlmError {
         ProviderFailureKind::InvalidResponse => LlmError::InvalidResponse { message },
         _ => LlmError::Request { message },
     }
+}
+
+/// Validates that one value is at least `min`.
+fn validate_minimum(
+    field: &'static str,
+    value: u64,
+    min: u64,
+) -> Result<(), ReliabilityConfigError> {
+    if value < min {
+        return Err(ReliabilityConfigError::ValueTooSmall { field, value, min });
+    }
+    Ok(())
 }
 
 /// Validates one timeout field.
@@ -407,10 +779,12 @@ pub(crate) fn local_failure(error: LlmError) -> ProviderFailure {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use futures::stream;
-    use jessica_core::types::TokenUsage;
+    use jessica_core::types::{TokenUsage, ToolCall};
 
+    /// One scripted attempt returned by [`MockClassifiedProvider`].
     #[derive(Clone)]
     enum Behavior {
         Setup(ProviderFailure),
@@ -422,14 +796,29 @@ mod tests {
     }
 
     struct MockClassifiedProvider {
-        behavior: Mutex<Behavior>,
+        behaviors: Mutex<VecDeque<Behavior>>,
+        calls: AtomicU32,
+        call_times: Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl MockClassifiedProvider {
-        fn new(behavior: Behavior) -> Self {
+        fn new(behaviors: Vec<Behavior>) -> Self {
             Self {
-                behavior: Mutex::new(behavior),
+                behaviors: Mutex::new(behaviors.into()),
+                calls: AtomicU32::new(0),
+                call_times: Mutex::new(Vec::new()),
             }
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn call_times(&self) -> Vec<tokio::time::Instant> {
+            self.call_times
+                .lock()
+                .expect("mock call-time lock should not be poisoned")
+                .clone()
         }
     }
 
@@ -440,43 +829,70 @@ mod tests {
             _messages: &[Message],
             _tools: &[ToolSchema],
         ) -> Result<ClassifiedStream, ProviderFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.call_times
+                .lock()
+                .expect("mock call-time lock should not be poisoned")
+                .push(tokio::time::Instant::now());
             let behavior = self
-                .behavior
+                .behaviors
                 .lock()
                 .expect("mock behavior lock should not be poisoned")
-                .clone();
+                .pop_front();
             match behavior {
-                Behavior::Setup(failure) => Err(failure),
-                Behavior::Stream(items) => Ok(Box::pin(stream::iter(items))),
-                Behavior::StreamThenPending => Ok(Box::pin(
+                Some(Behavior::Setup(failure)) => Err(failure),
+                Some(Behavior::Stream(items)) => Ok(Box::pin(stream::iter(items))),
+                Some(Behavior::StreamThenPending) => Ok(Box::pin(
                     stream::iter(stream_then_pending()).chain(stream::pending()),
                 )),
-                Behavior::PendingStream => Ok(Box::pin(stream::pending::<
+                Some(Behavior::PendingStream) => Ok(Box::pin(stream::pending::<
                     Result<LlmEvent, ProviderFailure>,
                 >())),
-                Behavior::DelayedSetupAndStream => {
+                Some(Behavior::DelayedSetupAndStream) => {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                     Ok(Box::pin(stream::once(async {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                         Ok::<_, ProviderFailure>(LlmEvent::Done { usage: None })
                     })))
                 }
-                Behavior::PendingSetup => {
+                Some(Behavior::PendingSetup) => {
                     std::future::pending::<Result<ClassifiedStream, ProviderFailure>>().await
                 }
+                None => Err(ProviderFailure::client("unexpected extra provider request")),
             }
         }
     }
 
+    fn scripted(
+        behaviors: Vec<Behavior>,
+        config: ReliabilityConfig,
+    ) -> (ReliableProvider, Arc<MockClassifiedProvider>) {
+        let mock = Arc::new(MockClassifiedProvider::new(behaviors));
+        let provider =
+            ReliableProvider::new(Arc::clone(&mock) as Arc<dyn ClassifiedProvider>, config)
+                .expect("test configuration should be valid");
+        (provider, mock)
+    }
+
     fn provider(behavior: Behavior, config: ReliabilityConfig) -> ReliableProvider {
-        ReliableProvider::new(Arc::new(MockClassifiedProvider::new(behavior)), config)
-            .expect("test configuration should be valid")
+        scripted(vec![behavior], config).0
+    }
+
+    fn retry_config(max_attempts: u32) -> ReliabilityConfig {
+        ReliabilityConfig {
+            max_attempts,
+            ..ReliabilityConfig::default()
+        }
     }
 
     fn stream_then_pending() -> Vec<Result<LlmEvent, ProviderFailure>> {
         vec![Ok(LlmEvent::TextDelta {
             text: "partial".to_owned(),
         })]
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall::new(id, "read_file", serde_json::json!({"path": "x"}))
     }
 
     #[test]
@@ -551,6 +967,7 @@ mod tests {
         let config = ReliabilityConfig {
             request_timeout_ms: MAX_TIMEOUT_MS + 1,
             stream_idle_timeout_ms: 0,
+            ..ReliabilityConfig::default()
         };
         let error = config.validate().expect_err("timeout should be rejected");
         assert!(matches!(
@@ -564,8 +981,10 @@ mod tests {
         let provider = provider(
             Behavior::PendingSetup,
             ReliabilityConfig {
+                max_attempts: 1,
                 request_timeout_ms: 25,
                 stream_idle_timeout_ms: 0,
+                ..ReliabilityConfig::default()
             },
         );
 
@@ -581,8 +1000,10 @@ mod tests {
         let provider = provider(
             Behavior::PendingSetup,
             ReliabilityConfig {
+                max_attempts: 1,
                 request_timeout_ms: 25,
                 stream_idle_timeout_ms: 0,
+                ..ReliabilityConfig::default()
             },
         );
 
@@ -601,8 +1022,10 @@ mod tests {
         let provider = provider(
             Behavior::StreamThenPending,
             ReliabilityConfig {
+                max_attempts: 1,
                 request_timeout_ms: 0,
                 stream_idle_timeout_ms: 20,
+                ..ReliabilityConfig::default()
             },
         );
         let stream = provider
@@ -632,8 +1055,10 @@ mod tests {
         let provider = provider(
             Behavior::StreamThenPending,
             ReliabilityConfig {
+                max_attempts: 1,
                 request_timeout_ms: 0,
                 stream_idle_timeout_ms: 20,
+                ..ReliabilityConfig::default()
             },
         );
         let stream = provider
@@ -659,8 +1084,10 @@ mod tests {
         let provider = provider(
             Behavior::PendingStream,
             ReliabilityConfig {
+                max_attempts: 1,
                 request_timeout_ms: 0,
                 stream_idle_timeout_ms: 20,
+                ..ReliabilityConfig::default()
             },
         );
         let stream = provider
@@ -695,7 +1122,10 @@ mod tests {
     async fn stream_failure_becomes_an_error_event() {
         let provider = provider(
             Behavior::Stream(vec![Err(ProviderFailure::server("boom"))]),
-            ReliabilityConfig::default(),
+            ReliabilityConfig {
+                max_attempts: 1,
+                ..ReliabilityConfig::default()
+            },
         );
         let stream = provider
             .stream_chat(&[Message::user("hello")], &[])
@@ -715,7 +1145,10 @@ mod tests {
     async fn setup_failures_map_to_the_frozen_error_contract() {
         let request_provider = provider(
             Behavior::Setup(ProviderFailure::server("server down")),
-            ReliabilityConfig::default(),
+            ReliabilityConfig {
+                max_attempts: 1,
+                ..ReliabilityConfig::default()
+            },
         );
         let Err(error) = request_provider
             .stream_chat(&[Message::user("hello")], &[])
@@ -759,5 +1192,521 @@ mod tests {
                 usage: Some(TokenUsage::new(3, 4))
             }]
         );
+    }
+
+    #[test]
+    fn default_config_keeps_timeouts_disabled_and_enables_three_attempts() {
+        let config = ReliabilityConfig::default();
+        assert_eq!(config.max_attempts, 3);
+        assert_eq!(config.initial_backoff_ms, 250);
+        assert_eq!(config.max_backoff_ms, 4_000);
+        assert_eq!(config.request_timeout_ms, 0);
+        assert_eq!(config.stream_idle_timeout_ms, 0);
+        assert_eq!(config.request_timeout(), None);
+        assert_eq!(config.stream_idle_timeout(), None);
+        assert_eq!(RECOMMENDED_MAX_ATTEMPTS, 10);
+    }
+
+    #[test]
+    fn invalid_retry_configuration_is_rejected_with_the_field_name() {
+        let zero_attempts = ReliabilityConfig {
+            max_attempts: 0,
+            ..ReliabilityConfig::default()
+        };
+        let error = zero_attempts
+            .validate()
+            .expect_err("zero attempts must be rejected");
+        assert!(matches!(
+            error,
+            ReliabilityConfigError::ValueTooSmall {
+                field: "max_attempts",
+                value: 0,
+                min: 1
+            }
+        ));
+
+        let zero_backoff = ReliabilityConfig {
+            initial_backoff_ms: 0,
+            ..ReliabilityConfig::default()
+        };
+        let error = zero_backoff
+            .validate()
+            .expect_err("zero initial backoff must be rejected");
+        assert!(error.to_string().contains("initial_backoff_ms"));
+
+        let inverted_backoff = ReliabilityConfig {
+            initial_backoff_ms: 500,
+            max_backoff_ms: 499,
+            ..ReliabilityConfig::default()
+        };
+        let error = inverted_backoff
+            .validate()
+            .expect_err("cap below initial delay must be rejected");
+        assert!(matches!(
+            error,
+            ReliabilityConfigError::MaxBackoffBelowInitial { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_errors_retry_until_success_and_only_final_events_are_delivered() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("HTTP 500 first")),
+                Behavior::Setup(ProviderFailure::server("HTTP 500 second")),
+                Behavior::Stream(vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "recovered".to_owned(),
+                    }),
+                    Ok(LlmEvent::ToolCallRequested {
+                        call: tool_call("call-final"),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]),
+            ],
+            retry_config(3),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("third attempt should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 3);
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "recovered".to_owned()
+                },
+                LlmEvent::ToolCallRequested {
+                    call: tool_call("call-final")
+                },
+                LlmEvent::Done { usage: None },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_setup_failures_use_exact_capped_backoff() {
+        let mut behaviors = vec![
+            Behavior::Setup(ProviderFailure::server("one")),
+            Behavior::Setup(ProviderFailure::server("two")),
+            Behavior::Setup(ProviderFailure::server("three")),
+            Behavior::Setup(ProviderFailure::server("four")),
+            Behavior::Setup(ProviderFailure::server("five")),
+        ];
+        behaviors.push(Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]));
+        let (provider, mock) = scripted(
+            behaviors,
+            ReliabilityConfig {
+                max_attempts: 6,
+                initial_backoff_ms: 250,
+                max_backoff_ms: 1_000,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("sixth attempt should succeed");
+        assert_eq!(stream.collect::<Vec<_>>().await.len(), 1);
+        assert_eq!(mock.calls(), 6);
+
+        let times = mock.call_times();
+        let deltas: Vec<u128> = times
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
+            .collect();
+        assert_eq!(deltas, vec![250, 500, 1_000, 1_000, 1_000]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_http_client_status_is_not_retried() {
+        for status in [400, 401] {
+            let expected = format!("provider returned HTTP {status}");
+            let (provider, mock) = scripted(
+                vec![
+                    Behavior::Setup(ProviderFailure::client(expected.clone())),
+                    Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                ],
+                retry_config(3),
+            );
+
+            let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+                panic!("{status} must not be retried");
+            };
+
+            match error {
+                LlmError::Request { message } => assert_eq!(message, expected),
+                other => panic!("expected a request error, got {other:?}"),
+            }
+            assert_eq!(mock.calls(), 1, "{status} must issue exactly one request");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_attempts_report_the_count_and_the_last_message() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::Setup(ProviderFailure::server("second")),
+                Behavior::Setup(ProviderFailure::server("last")),
+            ],
+            retry_config(3),
+        );
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("all attempts should fail");
+        };
+
+        match error {
+            LlmError::Request { message } => {
+                assert_eq!(message, "provider request failed after 3 attempts: last");
+            }
+            other => panic!("expected a request error, got {other:?}"),
+        }
+        assert_eq!(mock.calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_single_attempt_never_retries_and_has_no_prefix() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("only")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            retry_config(1),
+        );
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the only attempt should fail");
+        };
+
+        assert_eq!(error.to_string(), "LLM request failed: only");
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_waits_for_the_larger_of_backoff_and_header() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(
+                    ProviderFailure::rate_limited("slow down")
+                        .with_retry_after(Some(Duration::from_millis(700))),
+                ),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            retry_config(2),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("second attempt should succeed");
+        assert_eq!(stream.collect::<Vec<_>>().await.len(), 1);
+        assert_eq!(mock.calls(), 2);
+
+        let times = mock.call_times();
+        assert_eq!(
+            times[1].duration_since(times[0]).as_millis(),
+            700,
+            "Retry-After must extend the 250ms base backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_above_the_cap_stops_retrying() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(
+                    ProviderFailure::rate_limited("slow down")
+                        .with_retry_after(Some(Duration::from_millis(1_001))),
+                ),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                max_backoff_ms: 1_000,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("oversized Retry-After must stop retrying");
+        };
+
+        match error {
+            LlmError::Request { message } => assert_eq!(message, "slow down"),
+            other => panic!("expected a request error, got {other:?}"),
+        }
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_after_text_is_terminal_even_with_attempts_left() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "partial".to_owned(),
+                    }),
+                    Err(ProviderFailure::server("stream boom")),
+                ]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            retry_config(3),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 1, "committed text must not be retried");
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "partial".to_owned()
+                },
+                LlmEvent::Error {
+                    message: "stream boom".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_after_text_is_terminal_even_with_attempts_left() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::TextDelta {
+                    text: "partial".to_owned(),
+                })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            retry_config(3),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 1);
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "partial".to_owned()
+                },
+                LlmEvent::Error {
+                    message: "provider stream ended before Done".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_after_text_is_terminal_even_with_attempts_left() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::StreamThenPending,
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 3,
+                stream_idle_timeout_ms: 20,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            LlmEvent::TextDelta {
+                text: "partial".to_owned()
+            }
+        );
+        assert!(matches!(
+            &events[1],
+            LlmEvent::Error { message } if message.contains("idle for 20ms")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_before_text_retries_the_full_request() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::PendingStream,
+                Behavior::Stream(vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "recovered".to_owned(),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 2,
+                stream_idle_timeout_ms: 20,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 2);
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "recovered".to_owned()
+                },
+                LlmEvent::Done { usage: None },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_calls_before_done_are_buffered_and_failed_attempts_do_not_leak() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::ToolCallRequested {
+                    call: tool_call("leaked"),
+                })]),
+                Behavior::Stream(vec![
+                    Ok(LlmEvent::ToolCallRequested {
+                        call: tool_call("final"),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]),
+            ],
+            retry_config(2),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 2);
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::ToolCallRequested {
+                    call: tool_call("final")
+                },
+                LlmEvent::Done { usage: None },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn classified_error_event_is_terminal_and_not_retried() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::Error {
+                    message: "classified contract violated".to_owned(),
+                })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            retry_config(3),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 1);
+        assert_eq!(
+            events,
+            vec![LlmEvent::Error {
+                message: "classified contract violated".to_owned()
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_setup_future_during_backoff_prevents_another_request() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 2,
+                initial_backoff_ms: 10_000,
+                max_backoff_ms: 10_000,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            provider.stream_chat(&[Message::user("hello")], &[]),
+        )
+        .await;
+        assert!(result.is_err(), "the retry wait should be cancelled");
+        assert_eq!(mock.calls(), 1);
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(
+            mock.calls(),
+            1,
+            "dropping the future must cancel its backoff and request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_stream_during_backoff_prevents_another_request() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![
+                    Ok(LlmEvent::ToolCallRequested {
+                        call: tool_call("buffered"),
+                    }),
+                    Err(ProviderFailure::server("first")),
+                ]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 2,
+                initial_backoff_ms: 10_000,
+                max_backoff_ms: 10_000,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let mut stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup should succeed");
+        let next = tokio::time::timeout(Duration::from_millis(1), stream.next()).await;
+        assert!(next.is_err(), "the retry wait should be cancelled");
+        drop(stream);
+        assert_eq!(mock.calls(), 1);
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(mock.calls(), 1, "dropping the stream must cancel its retry");
     }
 }

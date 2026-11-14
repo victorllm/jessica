@@ -19,11 +19,11 @@ use std::sync::Arc;
 use jessica_core::llm::LlmProvider;
 use jessica_core::types::{SessionEndReason, SessionId};
 use jessica_memory::{SkillId, SkillStatus};
-use jessica_providers::{AnthropicProvider, OpenAiProvider};
+use jessica_providers::{AnthropicProvider, ClassifiedProvider, OpenAiProvider, ReliableProvider};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 
 use crate::app::{CliError, CliRuntime, load_wasm_tools};
-use crate::config::HarnessConfig;
+use crate::config::{HarnessConfig, ReliabilityConfig as CliReliabilityConfig};
 use crate::events::EventRecorder;
 use crate::memory::MemoryAssembly;
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
@@ -85,7 +85,7 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         }
         Mode::Turn { resume, prompt } => {
             let recorder = open_recorder(&config, &root).await?;
-            let provider = build_provider()?;
+            let provider = build_provider(&config.reliability)?;
             let wasm_tools = load_wasm_tools(&config, &root).await?;
             // Memory and skills are assembled only on the turn path. Replay
             // returns above and therefore never opens, creates, or reads
@@ -158,7 +158,11 @@ impl ProviderKind {
 }
 
 /// Builds the provider selected by `JESSICA_PROVIDER`.
-fn build_provider() -> Result<Arc<dyn LlmProvider>, CliError> {
+///
+/// The same returned instance is used by the skill distiller, every turn, and
+/// any delegated child agent. When `[reliability]` is enabled, the base
+/// provider is wrapped exactly once here; callers must not wrap it again.
+fn build_provider(reliability: &CliReliabilityConfig) -> Result<Arc<dyn LlmProvider>, CliError> {
     let selection = match std::env::var(PROVIDER_ENV) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -170,9 +174,33 @@ fn build_provider() -> Result<Arc<dyn LlmProvider>, CliError> {
     };
 
     match ProviderKind::from_env_value(selection.as_deref())? {
-        ProviderKind::OpenAi => Ok(Arc::new(OpenAiProvider::from_env()?)),
-        ProviderKind::Anthropic => Ok(Arc::new(AnthropicProvider::from_env()?)),
+        ProviderKind::OpenAi => {
+            assemble_provider(Arc::new(OpenAiProvider::from_env()?), reliability)
+        }
+        ProviderKind::Anthropic => {
+            assemble_provider(Arc::new(AnthropicProvider::from_env()?), reliability)
+        }
     }
+}
+
+/// Optionally wraps a concrete base provider with the reliability layer.
+///
+/// Keeping this generic lets the disabled path return the base `Arc` directly
+/// instead of constructing a pass-through wrapper. The enabled path coerces
+/// the same `Arc` into `Arc<dyn ClassifiedProvider>` for [`ReliableProvider`].
+fn assemble_provider<T>(
+    base: Arc<T>,
+    reliability: &CliReliabilityConfig,
+) -> Result<Arc<dyn LlmProvider>, CliError>
+where
+    T: LlmProvider + ClassifiedProvider + 'static,
+{
+    if !reliability.enabled {
+        return Ok(base);
+    }
+
+    let wrapped = ReliableProvider::new(base, reliability.to_provider_config())?;
+    Ok(Arc::new(wrapped))
 }
 
 /// Parsed command line.
@@ -591,6 +619,56 @@ fn exit_code(reason: SessionEndReason) -> ExitCode {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use jessica_core::llm::{LlmError, LlmEvent, LlmStream};
+    use jessica_core::tool::ToolSchema;
+    use jessica_core::types::Message;
+    use jessica_providers::{ClassifiedStream, ProviderFailure};
+
+    /// Concrete provider that distinguishes the legacy and classified paths.
+    #[derive(Default)]
+    struct DualProvider {
+        legacy_calls: AtomicU32,
+        classified_calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LlmProvider for DualProvider {
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "legacy".to_owned(),
+                },
+                LlmEvent::Done { usage: None },
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl ClassifiedProvider for DualProvider {
+        async fn stream_chat_classified(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<ClassifiedStream, ProviderFailure> {
+            self.classified_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    text: "classified".to_owned(),
+                }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
+        }
+    }
+
     fn skill_args(arguments: &[&str]) -> std::vec::IntoIter<String> {
         arguments
             .iter()
@@ -731,5 +809,70 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("JESSICA_PROVIDER"));
         assert!(message.contains("gemini"));
+    }
+
+    #[tokio::test]
+    async fn disabled_reliability_returns_the_base_provider_without_wrapping() {
+        let base = Arc::new(DualProvider::default());
+        let observer = Arc::clone(&base);
+        let reliability = CliReliabilityConfig {
+            enabled: false,
+            ..CliReliabilityConfig::default()
+        };
+
+        let provider = assemble_provider(base, &reliability).expect("assembly should succeed");
+        let events = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("base provider should stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "legacy".to_owned()
+                },
+                LlmEvent::Done { usage: None },
+            ]
+        );
+        assert_eq!(observer.legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observer.classified_calls.load(Ordering::SeqCst),
+            0,
+            "disabled reliability must not route through ClassifiedProvider"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_reliability_wraps_the_base_provider_once() {
+        let base = Arc::new(DualProvider::default());
+        let observer = Arc::clone(&base);
+        let reliability = CliReliabilityConfig {
+            enabled: true,
+            max_attempts: 1,
+            ..CliReliabilityConfig::default()
+        };
+
+        let provider = assemble_provider(base, &reliability).expect("assembly should succeed");
+        let events = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("wrapped provider should stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta {
+                    text: "classified".to_owned()
+                },
+                LlmEvent::Done { usage: None },
+            ]
+        );
+        assert_eq!(observer.classified_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.legacy_calls.load(Ordering::SeqCst), 0);
     }
 }

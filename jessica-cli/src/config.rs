@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
+use jessica_providers::{MAX_TIMEOUT_MS, ReliabilityConfig as ProviderReliabilityConfig};
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
@@ -68,6 +69,16 @@ const DEFAULT_DELEGATION_MAX_TASK_BYTES: usize = 8_192;
 const DEFAULT_DELEGATION_MAX_RESULT_BYTES: usize = 32_768;
 /// Default maximum number of tool calls a delegated child may request.
 const DEFAULT_DELEGATION_MAX_CHILD_TOOL_CALLS: u32 = 20;
+/// Default total provider attempts, including the first.
+const DEFAULT_RELIABILITY_MAX_ATTEMPTS: u32 = 3;
+/// Default delay after the first failed provider attempt, in milliseconds.
+const DEFAULT_RELIABILITY_INITIAL_BACKOFF_MS: u64 = 250;
+/// Default cap for provider retry backoff, in milliseconds.
+const DEFAULT_RELIABILITY_MAX_BACKOFF_MS: u64 = 4_000;
+/// Default provider request setup timeout, in milliseconds.
+const DEFAULT_RELIABILITY_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Default provider stream idle timeout, in milliseconds.
+const DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -79,6 +90,8 @@ pub struct HarnessConfig {
     pub policy: PolicyConfig,
     /// Optional child-agent delegation.
     pub delegation: DelegationConfig,
+    /// Provider retry and timeout settings. Disabled by default.
+    pub reliability: ReliabilityConfig,
     /// Optional WebAssembly tool plugins registered next to native tools.
     pub wasm: WasmConfig,
     /// Optional command run after every tool result.
@@ -132,6 +145,7 @@ impl HarnessConfig {
             return Err(invalid("budget.max_stuck_rounds must be at least 1"));
         }
         self.delegation.validate()?;
+        self.reliability.validate()?;
         if self.delegation.enabled {
             if !self
                 .policy
@@ -329,6 +343,89 @@ impl DelegationConfig {
             max_task_bytes: self.max_task_bytes,
             max_result_bytes: self.max_result_bytes,
             max_child_tool_calls: self.max_child_tool_calls,
+        }
+    }
+}
+
+/// Provider retry and timeout settings.
+///
+/// Reliability is disabled by default. When disabled, the CLI constructs the
+/// selected base provider without a retry wrapper. The section is still
+/// validated so a malformed configuration cannot be enabled accidentally by
+/// flipping only `enabled`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReliabilityConfig {
+    /// Whether the CLI wraps the base provider with retries and timeouts.
+    pub enabled: bool,
+    /// Total provider attempts per request, including the first.
+    pub max_attempts: u32,
+    /// Delay after the first failed attempt, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Upper bound for exponential retry backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+    /// Provider request setup timeout, in milliseconds. Zero disables it.
+    pub request_timeout_ms: u64,
+    /// Provider stream idle timeout, in milliseconds. Zero disables it.
+    pub stream_idle_timeout_ms: u64,
+}
+
+impl Default for ReliabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_attempts: DEFAULT_RELIABILITY_MAX_ATTEMPTS,
+            initial_backoff_ms: DEFAULT_RELIABILITY_INITIAL_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_RELIABILITY_MAX_BACKOFF_MS,
+            request_timeout_ms: DEFAULT_RELIABILITY_REQUEST_TIMEOUT_MS,
+            stream_idle_timeout_ms: DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS,
+        }
+    }
+}
+
+impl ReliabilityConfig {
+    /// Rejects retry and timeout values that cannot produce a usable wrapper.
+    ///
+    /// The recommended upper bound for `max_attempts` is ten, but larger
+    /// values are accepted.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_attempts == 0 {
+            return Err(invalid("reliability.max_attempts must be at least 1"));
+        }
+        if self.initial_backoff_ms == 0 {
+            return Err(invalid("reliability.initial_backoff_ms must be at least 1"));
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(invalid(
+                "reliability.max_backoff_ms must be at least reliability.initial_backoff_ms",
+            ));
+        }
+        if self.request_timeout_ms > MAX_TIMEOUT_MS {
+            return Err(invalid(format!(
+                "reliability.request_timeout_ms = {}ms exceeds the maximum of {MAX_TIMEOUT_MS}ms",
+                self.request_timeout_ms
+            )));
+        }
+        if self.stream_idle_timeout_ms > MAX_TIMEOUT_MS {
+            return Err(invalid(format!(
+                "reliability.stream_idle_timeout_ms = {}ms exceeds the maximum of {MAX_TIMEOUT_MS}ms",
+                self.stream_idle_timeout_ms
+            )));
+        }
+        Ok(())
+    }
+
+    /// Converts the CLI settings into the provider wrapper configuration.
+    ///
+    /// `enabled` is intentionally not part of the provider configuration; it
+    /// only controls whether the wrapper is constructed.
+    pub fn to_provider_config(&self) -> ProviderReliabilityConfig {
+        ProviderReliabilityConfig {
+            max_attempts: self.max_attempts,
+            initial_backoff_ms: self.initial_backoff_ms,
+            max_backoff_ms: self.max_backoff_ms,
+            request_timeout_ms: self.request_timeout_ms,
+            stream_idle_timeout_ms: self.stream_idle_timeout_ms,
         }
     }
 }
@@ -1070,6 +1167,108 @@ mod tests {
             error.to_string().contains("child_tool_timeout_ms"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn reliability_defaults_are_disabled_with_the_documented_values() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        let reliability = &config.reliability;
+
+        assert!(!reliability.enabled);
+        assert_eq!(reliability.max_attempts, 3);
+        assert_eq!(reliability.initial_backoff_ms, 250);
+        assert_eq!(reliability.max_backoff_ms, 4_000);
+        assert_eq!(reliability.request_timeout_ms, 30_000);
+        assert_eq!(reliability.stream_idle_timeout_ms, 120_000);
+        assert_eq!(
+            reliability.to_provider_config(),
+            jessica_providers::ReliabilityConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                max_backoff_ms: 4_000,
+                request_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 120_000,
+            }
+        );
+    }
+
+    #[test]
+    fn reliability_section_parses_every_documented_setting() {
+        let config = HarnessConfig::from_toml_str(
+            "[reliability]\n\
+             enabled = true\n\
+             max_attempts = 4\n\
+             initial_backoff_ms = 100\n\
+             max_backoff_ms = 800\n\
+             request_timeout_ms = 1_500\n\
+             stream_idle_timeout_ms = 2_500\n",
+        )
+        .expect("reliability section must parse");
+
+        let reliability = &config.reliability;
+        assert!(reliability.enabled);
+        assert_eq!(reliability.max_attempts, 4);
+        assert_eq!(reliability.initial_backoff_ms, 100);
+        assert_eq!(reliability.max_backoff_ms, 800);
+        assert_eq!(reliability.request_timeout_ms, 1_500);
+        assert_eq!(reliability.stream_idle_timeout_ms, 2_500);
+    }
+
+    #[test]
+    fn reliability_rejects_each_invalid_boundary_with_the_field_name() {
+        for (document, field) in [
+            (
+                "[reliability]\nmax_attempts = 0\n",
+                "reliability.max_attempts",
+            ),
+            (
+                "[reliability]\ninitial_backoff_ms = 0\n",
+                "reliability.initial_backoff_ms",
+            ),
+            (
+                "[reliability]\ninitial_backoff_ms = 501\nmax_backoff_ms = 500\n",
+                "reliability.max_backoff_ms",
+            ),
+            (
+                "[reliability]\nrequest_timeout_ms = 86400001\n",
+                "reliability.request_timeout_ms",
+            ),
+            (
+                "[reliability]\nstream_idle_timeout_ms = 86400001\n",
+                "reliability.stream_idle_timeout_ms",
+            ),
+        ] {
+            let error = HarnessConfig::from_toml_str(document)
+                .expect_err("invalid reliability values must fail at load time");
+            assert!(
+                error.to_string().contains(field),
+                "error for {document:?} should name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reliability_accepts_zero_timeouts_and_more_than_ten_attempts() {
+        let config = HarnessConfig::from_toml_str(
+            "[reliability]\n\
+             max_attempts = 11\n\
+             initial_backoff_ms = 1\n\
+             max_backoff_ms = 1\n\
+             request_timeout_ms = 0\n\
+             stream_idle_timeout_ms = 0\n",
+        )
+        .expect("zero timeouts and eleven attempts are explicitly valid");
+
+        assert_eq!(config.reliability.max_attempts, 11);
+        assert_eq!(config.reliability.request_timeout_ms, 0);
+        assert_eq!(config.reliability.stream_idle_timeout_ms, 0);
+    }
+
+    #[test]
+    fn unknown_reliability_fields_are_rejected() {
+        let error = HarnessConfig::from_toml_str("[reliability]\nretries = 3\n")
+            .expect_err("unknown reliability fields must fail");
+        assert!(error.to_string().contains("retries"));
     }
 
     #[test]

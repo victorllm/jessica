@@ -1028,6 +1028,9 @@ pub(crate) enum CliError {
     /// The delegation executor could not be assembled.
     #[error("delegation setup failed: {0}")]
     Delegation(#[from] DelegationError),
+    /// The provider reliability wrapper could not be assembled.
+    #[error("provider reliability setup failed: {0}")]
+    Reliability(#[from] jessica_providers::ReliabilityConfigError),
 }
 
 #[cfg(test)]
