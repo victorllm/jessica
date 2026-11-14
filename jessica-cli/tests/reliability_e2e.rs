@@ -62,11 +62,20 @@ enum Plan {
     Sse(String),
 }
 
-/// Scripted HTTP server that records every request body.
+/// One HTTP request observed by the scripted server.
+struct ObservedRequest {
+    /// Time the server finished reading the request.
+    at: Instant,
+    /// Raw request body, retained for boundary assertions.
+    #[allow(dead_code)]
+    body: String,
+}
+
+/// Scripted HTTP server that records every request and its arrival time.
 struct ScriptedServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
-    handle: thread::JoinHandle<Vec<String>>,
+    handle: thread::JoinHandle<Vec<ObservedRequest>>,
 }
 
 impl ScriptedServer {
@@ -87,20 +96,20 @@ impl ScriptedServer {
         self.address
     }
 
-    fn finish(self) -> Vec<String> {
+    fn finish(self) -> Vec<ObservedRequest> {
         self.stop.store(true, Ordering::SeqCst);
         self.handle.join().expect("mock server should finish")
     }
 }
 
 /// Accepts requests until stopped, answering from the plan queue.
-fn serve(listener: TcpListener, stop: Arc<AtomicBool>, plans: Vec<Plan>) -> Vec<String> {
+fn serve(listener: TcpListener, stop: Arc<AtomicBool>, plans: Vec<Plan>) -> Vec<ObservedRequest> {
     listener
         .set_nonblocking(true)
         .expect("listener should become non-blocking");
     let deadline = Instant::now() + SERVER_TIMEOUT;
     let mut plans: VecDeque<Plan> = plans.into();
-    let mut bodies = Vec::new();
+    let mut requests = Vec::new();
 
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         match listener.accept() {
@@ -112,7 +121,10 @@ fn serve(listener: TcpListener, stop: Arc<AtomicBool>, plans: Vec<Plan>) -> Vec<
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("read timeout should be set");
                 if let Some(body) = read_request(&mut stream) {
-                    bodies.push(body);
+                    requests.push(ObservedRequest {
+                        at: Instant::now(),
+                        body,
+                    });
                     let response = match plans.pop_front() {
                         Some(Plan::Status { code, reason }) => {
                             format!(
@@ -136,7 +148,7 @@ fn serve(listener: TcpListener, stop: Arc<AtomicBool>, plans: Vec<Plan>) -> Vec<
         }
     }
 
-    bodies
+    requests
 }
 
 /// Reads one HTTP request and returns its body.
@@ -177,14 +189,19 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
 /// One CLI run and the requests the mock server observed.
 struct CliRun {
     output: Output,
-    requests: Vec<String>,
+    requests: Vec<ObservedRequest>,
     pid: u32,
 }
 
 impl CliRun {
     /// Session id allocated by the CLI for its first one-shot turn.
     fn session(&self) -> SessionId {
-        SessionId::new(format!("cli-{}-0", self.pid))
+        self.session_at(0)
+    }
+
+    /// Session id allocated for the given zero-based REPL turn.
+    fn session_at(&self, turn: usize) -> SessionId {
+        SessionId::new(format!("cli-{}-{turn}", self.pid))
     }
 }
 
@@ -208,6 +225,45 @@ fn run_cli(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> C
         .expect("CLI should start");
 
     let pid = child.id();
+    let status = wait_with_timeout(&mut child);
+    let mut output = child
+        .wait_with_output()
+        .expect("CLI output should be collected");
+    output.status = status;
+    let requests = server.finish();
+    CliRun {
+        output,
+        requests,
+        pid,
+    }
+}
+
+/// Runs the CLI REPL with scripted stdin against a scripted server.
+fn run_cli_repl(workspace: &Path, config: &Path, lines: &[&str], plans: Vec<Plan>) -> CliRun {
+    let server = ScriptedServer::start(plans);
+    let address = server.address();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+        .current_dir(workspace)
+        .env_remove("JESSICA_PROVIDER")
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://{address}/v1"))
+        .env("OPENAI_MODEL", "test-model")
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start");
+
+    let pid = child.id();
+    {
+        let stdin = child.stdin.take().expect("stdin should be piped");
+        let mut stdin = stdin;
+        for line in lines {
+            writeln!(stdin, "{line}").expect("REPL input should be written");
+        }
+    }
     let status = wait_with_timeout(&mut child);
     let mut output = child
         .wait_with_output()
@@ -265,6 +321,38 @@ fn enabled_config() -> &'static str {
 
 fn disabled_config() -> &'static str {
     "[events]\npath = \"events.sqlite\"\n"
+}
+
+/// Reliability config with one attempt and a circuit that stays open.
+fn circuit_config(max_attempts: u32, threshold: u32) -> String {
+    format!(
+        "[events]\npath = \"events.sqlite\"\n\n\
+         [reliability]\n\
+         enabled = true\n\
+         max_attempts = {max_attempts}\n\
+         initial_backoff_ms = 1\n\
+         max_backoff_ms = 4\n\
+         request_timeout_ms = 5000\n\
+         stream_idle_timeout_ms = 5000\n\
+         circuit_failure_threshold = {threshold}\n\
+         circuit_cooldown_ms = 60000\n"
+    )
+}
+
+/// Reliability config with one attempt and an explicit request rate.
+fn rate_limit_config(requests_per_minute: u32, burst: u32) -> String {
+    format!(
+        "[events]\npath = \"events.sqlite\"\n\n\
+         [reliability]\n\
+         enabled = true\n\
+         max_attempts = 1\n\
+         initial_backoff_ms = 1\n\
+         max_backoff_ms = 4\n\
+         request_timeout_ms = 5000\n\
+         stream_idle_timeout_ms = 5000\n\
+         requests_per_minute = {requests_per_minute}\n\
+         burst = {burst}\n"
+    )
 }
 
 /// Returns one SSE response carrying `content` and a stop finish reason.
@@ -447,6 +535,237 @@ fn omitted_reliability_section_keeps_single_request_behavior() {
         run.requests.len(),
         1,
         "omitting [reliability] must keep the single-request behavior\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn open_circuit_rejects_the_next_turn_without_an_http_request() {
+    let temp = TempDir::new("circuit-open");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &circuit_config(1, 2));
+
+    let run = run_cli_repl(
+        &temp.path,
+        &config,
+        &[
+            "first failure",
+            "second failure",
+            "third must fail fast",
+            "exit",
+        ],
+        vec![
+            Plan::Status {
+                code: 503,
+                reason: "Service Unavailable",
+            },
+            Plan::Status {
+                code: 503,
+                reason: "Service Unavailable",
+            },
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        run.output.status.success(),
+        "the REPL itself should exit cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        2,
+        "the third turn must not reach the provider\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("circuit breaker open"),
+        "the fast failure must be visible:\n{stderr}"
+    );
+
+    let events = read_events(&temp.path.join("events.sqlite"), &run.session_at(2));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionEnded {
+                reason: SessionEndReason::Error,
+                ..
+            }
+        )),
+        "the third turn must end as Error: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ModelDelta { .. })),
+        "an open circuit must not emit model output: {events:?}"
+    );
+}
+
+#[test]
+fn client_errors_do_not_open_the_circuit_between_turns() {
+    let temp = TempDir::new("circuit-4xx");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &circuit_config(1, 2));
+
+    let run = run_cli_repl(
+        &temp.path,
+        &config,
+        &[
+            "first unauthorized",
+            "second unauthorized",
+            "this one should succeed",
+            "exit",
+        ],
+        vec![
+            Plan::Status {
+                code: 401,
+                reason: "Unauthorized",
+            },
+            Plan::Status {
+                code: 401,
+                reason: "Unauthorized",
+            },
+            Plan::Sse(text_response("client errors do not open the circuit")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        run.output.status.success(),
+        "the REPL itself should exit cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        3,
+        "two 401 turns must not open the circuit\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let events = read_events(&temp.path.join("events.sqlite"), &run.session_at(2));
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["client errors do not open the circuit"]);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionEnded {
+                reason: SessionEndReason::Completed,
+                ..
+            }
+        )),
+        "the third turn must complete: {events:?}"
+    );
+}
+
+#[test]
+fn requests_per_minute_spaces_repl_turns_by_the_refill_rate() {
+    let temp = TempDir::new("rate-limit");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &rate_limit_config(60, 1));
+
+    let run = run_cli_repl(
+        &temp.path,
+        &config,
+        &["first turn", "second turn", "exit"],
+        vec![
+            Plan::Sse(text_response("first reply")),
+            Plan::Sse(text_response("second reply")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        run.output.status.success(),
+        "the REPL itself should exit cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        2,
+        "both turns must reach the provider\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // 60 requests per minute with a burst of one means the second turn needs
+    // a refilled token. The lower bound is deliberately loose.
+    let gap = run.requests[1].at.duration_since(run.requests[0].at);
+    assert!(
+        gap >= Duration::from_millis(800),
+        "the second turn must wait for a refilled token, but the gap was {gap:?}"
+    );
+
+    for (turn, expected) in [(0, "first reply"), (1, "second reply")] {
+        let events = read_events(&temp.path.join("events.sqlite"), &run.session_at(turn));
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ModelDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec![expected], "turn {turn}: {events:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::SessionEnded {
+                    reason: SessionEndReason::Completed,
+                    ..
+                }
+            )),
+            "turn {turn} must complete: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn zero_requests_per_minute_behaves_like_disabled_reliability() {
+    let temp = TempDir::new("rate-limit-disabled");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &rate_limit_config(0, 0));
+
+    let run = run_cli_repl(
+        &temp.path,
+        &config,
+        &["first turn", "second turn", "exit"],
+        vec![
+            Plan::Sse(text_response("first reply")),
+            Plan::Sse(text_response("second reply")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        run.output.status.success(),
+        "the REPL itself should exit cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        2,
+        "a zero rpm must not reject requests\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // A zero rate constructs no bucket, so the turns are not spaced by one
+    // refill interval. The upper bound is deliberately loose.
+    let gap = run.requests[1].at.duration_since(run.requests[0].at);
+    assert!(
+        gap < Duration::from_millis(800),
+        "a zero rpm must not delay requests, but the gap was {gap:?}"
+    );
+
+    let events = read_events(&temp.path.join("events.sqlite"), &run.session_at(1));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionEnded {
+                reason: SessionEndReason::Completed,
+                ..
+            }
+        )),
+        "the second turn must complete: {events:?}"
     );
 }
 

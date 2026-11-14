@@ -14,12 +14,29 @@
 //! discarded with that attempt, so only the successful attempt's tool calls
 //! reach the caller.
 //!
-//! Circuit breaking and rate limiting are added by later tasks in the same
-//! module.
+//! A per-wrapper circuit breaker counts failed logical calls, not individual
+//! attempts. After `circuit_failure_threshold` retryable logical failures the
+//! breaker opens, rejects calls without touching the underlying provider until
+//! `circuit_cooldown_ms` elapses, then allows one half-open probe. The state is
+//! held only in memory: it is not persisted, not written to the event stream,
+//! and resets whenever the process rebuilds the wrapper. An open breaker is a
+//! fast failure, not another retry.
+//!
+//! A per-wrapper rate limiter combines a token bucket for request starts with
+//! a concurrency limit. Every physical attempt, including a retry, consumes one
+//! token and holds one concurrency permit for the lifetime of that attempt's
+//! stream. The limiter is shared by every caller of the wrapper, so parent
+//! turns, delegated children, and the skill distiller draw from one quota. This
+//! version limits requests per minute and concurrency only; it does not limit
+//! tokens per minute because usage is only visible in the terminal `Done`
+//! event, and precise TPM accounting needs a separate design.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -46,6 +63,28 @@ pub const DEFAULT_MAX_BACKOFF_MS: u64 = 4_000;
 /// Larger values are accepted, but callers should treat ten attempts as the
 /// point where retries stop being useful for an interactive agent.
 pub const RECOMMENDED_MAX_ATTEMPTS: u32 = 10;
+/// Default number of failed logical calls that opens the circuit.
+pub const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+/// Default time the circuit stays open before allowing a probe, in
+/// milliseconds.
+pub const DEFAULT_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
+/// Default provider requests per minute; zero disables rate limiting.
+pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 0;
+/// Default token-bucket capacity.
+pub const DEFAULT_BURST: u32 = 1;
+/// Default concurrent provider requests; zero disables the limit.
+pub const DEFAULT_MAX_CONCURRENT: u32 = 0;
+/// Maximum accepted [`ReliabilityConfig::requests_per_minute`].
+pub const MAX_REQUESTS_PER_MINUTE: u32 = 1_000_000;
+/// Maximum accepted [`ReliabilityConfig::burst`].
+pub const MAX_BURST: u32 = 1_000_000;
+/// Maximum accepted [`ReliabilityConfig::max_concurrent`].
+pub const MAX_CONCURRENT: u32 = 1_024;
+
+/// One token expressed in integer microtokens.
+const MICROTOKENS_PER_TOKEN: u64 = 1_000_000;
+/// Nanoseconds in one minute, used by the integer token refill.
+const NANOS_PER_MINUTE: u128 = 60_000_000_000;
 
 /// Category of a provider failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +262,26 @@ pub struct ReliabilityConfig {
     pub request_timeout_ms: u64,
     /// Maximum time allowed between two provider stream events.
     pub stream_idle_timeout_ms: u64,
+    /// Failed logical calls that open the circuit. Must be at least one.
+    ///
+    /// One logical call may issue several attempts; only its final outcome
+    /// counts.
+    pub circuit_failure_threshold: u32,
+    /// Time the circuit stays open before a probe is allowed, in
+    /// milliseconds. Must be positive.
+    pub circuit_cooldown_ms: u64,
+    /// Provider request starts allowed per minute. Zero disables the token
+    /// bucket.
+    ///
+    /// Every physical attempt, including a retry, consumes one token.
+    pub requests_per_minute: u32,
+    /// Token-bucket capacity. Must be positive when `requests_per_minute` is
+    /// greater than zero.
+    pub burst: u32,
+    /// Maximum concurrent provider attempts. Zero disables the limit.
+    ///
+    /// Each attempt holds one permit until its stream ends or is dropped.
+    pub max_concurrent: u32,
 }
 
 impl Default for ReliabilityConfig {
@@ -233,6 +292,11 @@ impl Default for ReliabilityConfig {
             max_backoff_ms: DEFAULT_MAX_BACKOFF_MS,
             request_timeout_ms: 0,
             stream_idle_timeout_ms: 0,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
+            requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
+            burst: DEFAULT_BURST,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
         }
     }
 }
@@ -257,7 +321,32 @@ impl ReliabilityConfig {
             "stream_idle_timeout_ms",
             self.stream_idle_timeout_ms,
             MAX_TIMEOUT_MS,
-        )
+        )?;
+        validate_minimum(
+            "circuit_failure_threshold",
+            u64::from(self.circuit_failure_threshold),
+            1,
+        )?;
+        validate_minimum("circuit_cooldown_ms", self.circuit_cooldown_ms, 1)?;
+        validate_maximum(
+            "requests_per_minute",
+            u64::from(self.requests_per_minute),
+            u64::from(MAX_REQUESTS_PER_MINUTE),
+        )?;
+        validate_maximum("burst", u64::from(self.burst), u64::from(MAX_BURST))?;
+        validate_maximum(
+            "max_concurrent",
+            u64::from(self.max_concurrent),
+            u64::from(MAX_CONCURRENT),
+        )?;
+        if self.requests_per_minute > 0 && self.burst == 0 {
+            return Err(ReliabilityConfigError::ValueTooSmall {
+                field: "burst",
+                value: 0,
+                min: 1,
+            });
+        }
+        Ok(())
     }
 
     /// Returns the request timeout when enabled.
@@ -309,13 +398,418 @@ pub enum ReliabilityConfigError {
         /// Maximum accepted value in milliseconds.
         max: u64,
     },
+    /// A rate-limit value exceeds its accepted maximum.
+    #[error("{field} = {value} exceeds the maximum of {max}")]
+    ValueTooLarge {
+        /// Configuration field name.
+        field: &'static str,
+        /// Configured value.
+        value: u64,
+        /// Maximum accepted value.
+        max: u64,
+    },
 }
 
-/// Wraps a [`ClassifiedProvider`] with timeouts and pre-commit retries.
+/// Circuit states for one [`ReliableProvider`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitState {
+    /// Calls are admitted; `failures` counts consecutive failed logical calls.
+    Closed {
+        /// Failed logical calls since the last success.
+        failures: u32,
+    },
+    /// Calls fail fast until the cooldown elapses.
+    Open {
+        /// When the circuit opened.
+        opened_at: Instant,
+    },
+    /// One probe is allowed; other calls fail fast.
+    HalfOpen {
+        /// Whether the single probe slot is occupied.
+        probe_in_flight: bool,
+    },
+}
+
+/// Why a call was rejected before reaching the provider.
+enum CircuitRejection {
+    /// The circuit is open for the given remaining cooldown.
+    Open {
+        /// Time left before a probe is allowed.
+        remaining: Duration,
+    },
+    /// The circuit is half-open and its single probe is already running.
+    ProbeInFlight,
+}
+
+impl CircuitRejection {
+    /// Builds the classified failure returned to the caller.
+    fn into_failure(self) -> ProviderFailure {
+        let message = match self {
+            Self::Open { remaining } => format!(
+                "circuit breaker open: retry after {}ms",
+                remaining.as_millis()
+            ),
+            Self::ProbeInFlight => {
+                "circuit breaker open: half-open probe already in progress".to_owned()
+            }
+        };
+        ProviderFailure::new(ProviderFailureKind::Server, message, None, false)
+    }
+}
+
+/// Outcome of one logical provider call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitOutcome {
+    /// The call delivered its terminal `Done`.
+    Success,
+    /// The call failed after retries were exhausted and the failure kind is
+    /// retryable.
+    RetryableFailure,
+    /// The call was cancelled, dropped, or failed for a non-retryable reason.
+    Neutral,
+}
+
+/// In-memory closed/open/half-open circuit breaker.
+///
+/// The mutex is never held across an await: [`CircuitBreaker::try_acquire`] and
+/// [`CircuitAdmission::settle`] are synchronous.
+struct CircuitBreaker {
+    threshold: u32,
+    cooldown: Duration,
+    state: Mutex<CircuitState>,
+}
+
+impl CircuitBreaker {
+    /// Creates a closed breaker from the reliability configuration.
+    fn new(config: ReliabilityConfig) -> Self {
+        Self {
+            threshold: config.circuit_failure_threshold,
+            cooldown: Duration::from_millis(config.circuit_cooldown_ms),
+            state: Mutex::new(CircuitState::Closed { failures: 0 }),
+        }
+    }
+
+    /// Locks the state, recovering from a poisoned mutex.
+    fn lock(&self) -> MutexGuard<'_, CircuitState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Admits a call or rejects it without touching the provider.
+    fn try_acquire(self: &Arc<Self>) -> Result<CircuitAdmission, CircuitRejection> {
+        let mut state = self.lock();
+        match &mut *state {
+            CircuitState::Closed { .. } => Ok(CircuitAdmission::new(Arc::clone(self), false)),
+            CircuitState::Open { opened_at } => {
+                let elapsed = Instant::now().saturating_duration_since(*opened_at);
+                if elapsed < self.cooldown {
+                    return Err(CircuitRejection::Open {
+                        remaining: self.cooldown - elapsed,
+                    });
+                }
+                *state = CircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                Ok(CircuitAdmission::new(Arc::clone(self), true))
+            }
+            CircuitState::HalfOpen { probe_in_flight } => {
+                if *probe_in_flight {
+                    return Err(CircuitRejection::ProbeInFlight);
+                }
+                *probe_in_flight = true;
+                Ok(CircuitAdmission::new(Arc::clone(self), true))
+            }
+        }
+    }
+}
+
+/// Admission ticket for one logical call.
+///
+/// Dropping an unsettled admission records a neutral outcome, which releases a
+/// half-open probe slot without counting a success or a failure.
+struct CircuitAdmission {
+    breaker: Arc<CircuitBreaker>,
+    probe: bool,
+    settled: bool,
+}
+
+impl CircuitAdmission {
+    /// Creates an unsettled admission.
+    fn new(breaker: Arc<CircuitBreaker>, probe: bool) -> Self {
+        Self {
+            breaker,
+            probe,
+            settled: false,
+        }
+    }
+
+    /// Records that the logical call completed with `Done`.
+    fn record_success(&mut self) {
+        self.settle(CircuitOutcome::Success);
+    }
+
+    /// Records that the logical call failed retryably after retries.
+    fn record_failure(&mut self) {
+        self.settle(CircuitOutcome::RetryableFailure);
+    }
+
+    /// Records that the logical call ended without a conclusive result.
+    fn record_neutral(&mut self) {
+        self.settle(CircuitOutcome::Neutral);
+    }
+
+    /// Applies one outcome exactly once.
+    fn settle(&mut self, outcome: CircuitOutcome) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+
+        let mut state = self.breaker.lock();
+        match outcome {
+            CircuitOutcome::Success => {
+                let closes = match &*state {
+                    CircuitState::Closed { .. } => true,
+                    CircuitState::HalfOpen { .. } => self.probe,
+                    CircuitState::Open { .. } => false,
+                };
+                if closes {
+                    *state = CircuitState::Closed { failures: 0 };
+                }
+            }
+            CircuitOutcome::RetryableFailure if self.probe => {
+                *state = CircuitState::Open {
+                    opened_at: Instant::now(),
+                };
+            }
+            CircuitOutcome::RetryableFailure => {
+                let mut opens = false;
+                if let CircuitState::Closed { failures } = &mut *state {
+                    *failures = failures.saturating_add(1);
+                    opens = *failures >= self.breaker.threshold;
+                }
+                if opens {
+                    *state = CircuitState::Open {
+                        opened_at: Instant::now(),
+                    };
+                }
+            }
+            CircuitOutcome::Neutral => {
+                if self.probe
+                    && let CircuitState::HalfOpen { probe_in_flight } = &mut *state
+                {
+                    *probe_in_flight = false;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CircuitAdmission {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(CircuitOutcome::Neutral);
+        }
+    }
+}
+
+/// Records a final stream or setup failure with the breaker.
+fn settle_failure(admission: &mut CircuitAdmission, failure: &ProviderFailure) {
+    if failure.is_retryable() {
+        admission.record_failure();
+    } else {
+        admission.record_neutral();
+    }
+}
+
+/// Outcome of one token-bucket check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenDecision {
+    /// A token was consumed and the caller may proceed.
+    Ready,
+    /// No token is available; wait this long before checking again.
+    Wait(Duration),
+}
+
+/// Integer token bucket using microtokens.
+///
+/// `try_consume` is a pure state transition given an injected [`Instant`], so
+/// tests can drive it without sleeping. Fractional refill is carried in
+/// `remainder` and never accumulated as floating point.
+struct TokenBucket {
+    /// Capacity in microtokens.
+    capacity: u64,
+    /// Current tokens in microtokens.
+    available: u64,
+    /// Refill rate in microtokens per minute.
+    refill_per_minute: u64,
+    /// Sub-microtoken refill remainder in numerator units.
+    remainder: u128,
+    /// Time of the last refill.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// Creates a full bucket.
+    fn new(requests_per_minute: u32, burst: u32) -> Self {
+        let capacity = u64::from(burst) * MICROTOKENS_PER_TOKEN;
+        Self {
+            capacity,
+            available: capacity,
+            refill_per_minute: u64::from(requests_per_minute) * MICROTOKENS_PER_TOKEN,
+            remainder: 0,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Adds tokens earned since the last refill.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        if elapsed.is_zero() {
+            return;
+        }
+        self.last_refill = now;
+        if self.refill_per_minute == 0 {
+            return;
+        }
+
+        let numerator = elapsed.as_nanos() * u128::from(self.refill_per_minute) + self.remainder;
+        let whole = numerator / NANOS_PER_MINUTE;
+        self.remainder = numerator % NANOS_PER_MINUTE;
+        let added = whole.min(u128::from(u64::MAX)) as u64;
+        self.available = self.available.saturating_add(added).min(self.capacity);
+    }
+
+    /// Consumes one token or reports how long the caller should wait.
+    fn try_consume(&mut self, now: Instant) -> TokenDecision {
+        self.refill(now);
+        if self.available >= MICROTOKENS_PER_TOKEN {
+            self.available -= MICROTOKENS_PER_TOKEN;
+            return TokenDecision::Ready;
+        }
+        if self.refill_per_minute == 0 {
+            return TokenDecision::Ready;
+        }
+
+        let deficit = u128::from(MICROTOKENS_PER_TOKEN - self.available);
+        let wait_ns = (deficit * NANOS_PER_MINUTE).div_ceil(u128::from(self.refill_per_minute));
+        TokenDecision::Wait(Duration::from_nanos(
+            wait_ns.min(u128::from(u64::MAX)) as u64
+        ))
+    }
+
+    /// Returns one unconsumed token, capped at the bucket capacity.
+    fn refund(&mut self) {
+        self.available = self
+            .available
+            .saturating_add(MICROTOKENS_PER_TOKEN)
+            .min(self.capacity);
+    }
+}
+
+/// Locks a token bucket, recovering from a poisoned mutex.
+fn lock_bucket(bucket: &Mutex<TokenBucket>) -> MutexGuard<'_, TokenBucket> {
+    match bucket.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Token consumed for one attempt, refunded if the attempt never starts.
+struct TokenGuard {
+    bucket: Arc<Mutex<TokenBucket>>,
+    committed: bool,
+}
+
+impl TokenGuard {
+    /// Creates an uncommitted guard for an already-consumed token.
+    fn new(bucket: Arc<Mutex<TokenBucket>>) -> Self {
+        Self {
+            bucket,
+            committed: false,
+        }
+    }
+
+    /// Marks the token as spent because the physical request is starting.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock_bucket(&self.bucket).refund();
+        }
+    }
+}
+
+/// Process-wide request rate and concurrency limiter.
+///
+/// The token bucket and semaphore live inside the wrapper, so every caller of
+/// the same [`ReliableProvider`] shares one quota.
+struct RateLimiter {
+    /// Token bucket; `None` when `requests_per_minute` is zero.
+    tokens: Option<Arc<Mutex<TokenBucket>>>,
+    /// Concurrency semaphore; `None` when `max_concurrent` is zero.
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+impl RateLimiter {
+    /// Creates the enabled limiters from configuration.
+    fn new(config: ReliabilityConfig) -> Self {
+        Self {
+            tokens: (config.requests_per_minute > 0).then(|| {
+                Arc::new(Mutex::new(TokenBucket::new(
+                    config.requests_per_minute,
+                    config.burst,
+                )))
+            }),
+            semaphore: (config.max_concurrent > 0)
+                .then(|| Arc::new(Semaphore::new(config.max_concurrent as usize))),
+        }
+    }
+
+    /// Waits until a token is available and consumes it.
+    ///
+    /// Returns `None` when the token bucket is disabled. The lock is released
+    /// before every sleep, and dropping the future during a sleep consumes no
+    /// token.
+    async fn wait_for_token(&self) -> Option<TokenGuard> {
+        let bucket = self.tokens.as_ref()?;
+        loop {
+            let decision = lock_bucket(bucket).try_consume(Instant::now());
+            match decision {
+                TokenDecision::Ready => return Some(TokenGuard::new(Arc::clone(bucket))),
+                TokenDecision::Wait(delay) => tokio::time::sleep(delay).await,
+            }
+        }
+    }
+
+    /// Acquires one concurrency permit, waiting until a slot is free.
+    ///
+    /// Returns `None` when the concurrency limit is disabled.
+    async fn acquire_permit(&self) -> Result<Option<OwnedSemaphorePermit>, ProviderFailure> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(None);
+        };
+        Arc::clone(semaphore)
+            .acquire_owned()
+            .await
+            .map(Some)
+            .map_err(|_| ProviderFailure::client("provider concurrency limiter is closed"))
+    }
+}
+
+/// Wraps a [`ClassifiedProvider`] with timeouts, pre-commit retries, a circuit
+/// breaker, and request rate limiting.
 ///
 /// It implements [`ClassifiedProvider`] so callers can observe typed failures,
 /// and [`jessica_core::llm::LlmProvider`] so it can be used wherever the frozen
-/// contract is expected. Both paths share the same retry state machine.
+/// contract is expected. Both paths share the same retry state machine, the
+/// same circuit breaker, and the same rate limiter.
 ///
 /// A retry issues a complete new provider request and can therefore cause
 /// provider-side duplicate billing. The wrapper never delivers text or tool
@@ -324,6 +818,8 @@ pub enum ReliabilityConfigError {
 pub struct ReliableProvider {
     inner: Arc<dyn ClassifiedProvider>,
     config: ReliabilityConfig,
+    circuit: Arc<CircuitBreaker>,
+    limiter: Arc<RateLimiter>,
 }
 
 impl ReliableProvider {
@@ -335,7 +831,12 @@ impl ReliableProvider {
         config: ReliabilityConfig,
     ) -> Result<Self, ReliabilityConfigError> {
         config.validate()?;
-        Ok(Self { inner, config })
+        Ok(Self {
+            inner,
+            config,
+            circuit: Arc::new(CircuitBreaker::new(config)),
+            limiter: Arc::new(RateLimiter::new(config)),
+        })
     }
 
     /// Returns the reliability configuration in use.
@@ -351,26 +852,27 @@ impl ClassifiedProvider for ReliableProvider {
         messages: &[Message],
         tools: &[ToolSchema],
     ) -> Result<ClassifiedStream, ProviderFailure> {
-        let messages: Arc<[Message]> = messages.to_vec().into();
-        let tools: Arc<[ToolSchema]> = tools.to_vec().into();
-        match open_until(
-            Arc::clone(&self.inner),
-            self.config,
-            Arc::clone(&messages),
-            Arc::clone(&tools),
-            1,
-        )
-        .await
-        {
-            OpenOutcome::Opened { stream, attempt } => Ok(retrying_stream(
-                Arc::clone(&self.inner),
-                self.config,
-                messages,
-                tools,
+        let mut admission = self
+            .circuit
+            .try_acquire()
+            .map_err(|rejection| rejection.into_failure())?;
+        let context = RetryContext {
+            inner: Arc::clone(&self.inner),
+            config: self.config,
+            limiter: Arc::clone(&self.limiter),
+            messages: messages.to_vec().into(),
+            tools: tools.to_vec().into(),
+        };
+        match open_until(&context, 1).await {
+            OpenOutcome::Opened {
                 stream,
                 attempt,
-            )),
-            OpenOutcome::Failed(failure) => Err(failure),
+                permit,
+            } => Ok(retrying_stream(context, stream, attempt, permit, admission)),
+            OpenOutcome::Failed(failure) => {
+                settle_failure(&mut admission, &failure);
+                Err(failure)
+            }
         }
     }
 }
@@ -398,29 +900,56 @@ enum OpenOutcome {
         stream: ClassifiedStream,
         /// One-based attempt number that succeeded.
         attempt: u32,
+        /// Concurrency permit held for the lifetime of this attempt.
+        permit: Option<OwnedSemaphorePermit>,
     },
     /// The request failed permanently or exhausted its attempts.
     Failed(ProviderFailure),
 }
 
+/// Everything a logical call needs to open new attempts.
+struct RetryContext {
+    /// Provider used to open attempts.
+    inner: Arc<dyn ClassifiedProvider>,
+    /// Retry and timeout configuration.
+    config: ReliabilityConfig,
+    /// Shared rate limiter.
+    limiter: Arc<RateLimiter>,
+    /// Original request messages.
+    messages: Arc<[Message]>,
+    /// Original tool schemas.
+    tools: Arc<[ToolSchema]>,
+}
+
 /// Opens a request, retrying retryable setup failures with deterministic
 /// backoff until `max_attempts` is reached.
-async fn open_until(
-    inner: Arc<dyn ClassifiedProvider>,
-    config: ReliabilityConfig,
-    messages: Arc<[Message]>,
-    tools: Arc<[ToolSchema]>,
-    start_attempt: u32,
-) -> OpenOutcome {
+///
+/// Every attempt passes through the shared rate limiter before the request is
+/// dispatched.
+async fn open_until(context: &RetryContext, start_attempt: u32) -> OpenOutcome {
     let mut attempt = start_attempt;
 
     loop {
-        match open_attempt(inner.as_ref(), config, &messages, &tools).await {
-            Ok(stream) => return OpenOutcome::Opened { stream, attempt },
+        match open_attempt(
+            context.inner.as_ref(),
+            context.config,
+            context.limiter.as_ref(),
+            &context.messages,
+            &context.tools,
+        )
+        .await
+        {
+            Ok((stream, permit)) => {
+                return OpenOutcome::Opened {
+                    stream,
+                    attempt,
+                    permit,
+                };
+            }
             Err(failure) => {
-                let retry = failure.is_retryable() && attempt < config.max_attempts;
+                let retry = failure.is_retryable() && attempt < context.config.max_attempts;
                 let delay = if retry {
-                    retry_delay(config, attempt, &failure)
+                    retry_delay(context.config, attempt, &failure)
                 } else {
                     None
                 };
@@ -438,12 +967,23 @@ async fn open_until(
 
 /// Performs one provider request setup with the configured request timeout and
 /// wraps a successful stream with the configured idle timeout.
+///
+/// Ordering is fixed: wait for a token, acquire a concurrency permit, then
+/// dispatch. The permit is never held while a token is awaited. The token is
+/// refunded if the attempt is cancelled before dispatch.
 async fn open_attempt(
     inner: &dyn ClassifiedProvider,
     config: ReliabilityConfig,
+    limiter: &RateLimiter,
     messages: &[Message],
     tools: &[ToolSchema],
-) -> Result<ClassifiedStream, ProviderFailure> {
+) -> Result<(ClassifiedStream, Option<OwnedSemaphorePermit>), ProviderFailure> {
+    let token = limiter.wait_for_token().await;
+    let permit = limiter.acquire_permit().await?;
+    if let Some(token) = token {
+        token.commit();
+    }
+
     let request = inner.stream_chat_classified(messages, tools);
     let result = match config.request_timeout() {
         Some(limit) => match tokio::time::timeout(limit, request).await {
@@ -456,7 +996,7 @@ async fn open_attempt(
         None => request.await,
     };
 
-    Ok(with_idle_timeout(result?, config))
+    Ok((with_idle_timeout(result?, config), permit))
 }
 
 /// Wraps a classified stream with the configured idle timeout.
@@ -529,18 +1069,14 @@ fn backoff_duration(config: ReliabilityConfig, attempt: u32) -> Duration {
 
 /// Retry-aware stream state shared by successful attempts.
 struct RetryStreamState {
-    /// Provider used to open a replacement attempt.
-    inner: Arc<dyn ClassifiedProvider>,
-    /// Retry and timeout configuration.
-    config: ReliabilityConfig,
-    /// Original request messages, retained for replacement attempts.
-    messages: Arc<[Message]>,
-    /// Original tool schemas, retained for replacement attempts.
-    tools: Arc<[ToolSchema]>,
+    /// Everything needed to open replacement attempts.
+    context: RetryContext,
     /// One-based attempt number currently open.
     attempt: u32,
     /// Current attempt's stream, absent while retrying or after completion.
     stream: Option<ClassifiedStream>,
+    /// Concurrency permit held by the current attempt.
+    permit: Option<OwnedSemaphorePermit>,
     /// Tool calls received by the current attempt but not yet safe to deliver.
     tool_calls: Vec<jessica_core::types::ToolCall>,
     /// Whether a text delta has been delivered.
@@ -549,29 +1085,29 @@ struct RetryStreamState {
     pending: VecDeque<LlmEvent>,
     /// Whether the stream has delivered its terminal event.
     finished: bool,
+    /// Circuit admission for this logical call.
+    admission: CircuitAdmission,
 }
 
 /// Builds a stream that buffers tool calls until `Done` and retries failures
 /// only while no text delta has been delivered.
 fn retrying_stream(
-    inner: Arc<dyn ClassifiedProvider>,
-    config: ReliabilityConfig,
-    messages: Arc<[Message]>,
-    tools: Arc<[ToolSchema]>,
+    context: RetryContext,
     stream: ClassifiedStream,
     attempt: u32,
+    permit: Option<OwnedSemaphorePermit>,
+    admission: CircuitAdmission,
 ) -> ClassifiedStream {
     let state = RetryStreamState {
-        inner,
-        config,
-        messages,
-        tools,
+        context,
         attempt,
         stream: Some(stream),
+        permit,
         tool_calls: Vec::new(),
         committed: false,
         pending: VecDeque::new(),
         finished: false,
+        admission,
     };
 
     Box::pin(futures::stream::unfold(state, |mut state| async move {
@@ -600,7 +1136,9 @@ fn retrying_stream(
                     state.tool_calls.push(call);
                 }
                 Some(Ok(LlmEvent::Done { usage })) => {
+                    state.admission.record_success();
                     state.stream = None;
+                    state.permit = None;
                     for call in state.tool_calls.drain(..) {
                         state
                             .pending
@@ -612,21 +1150,29 @@ fn retrying_stream(
                     // A classified stream should report failures as `Err`.
                     // An `Error` event is an implementation error, not a
                     // provider failure, so it is terminal and never retried.
+                    state.admission.record_neutral();
                     state.finished = true;
                     state.stream = None;
+                    state.permit = None;
                     state.tool_calls.clear();
                     return Some((Ok(LlmEvent::Error { message }), state));
                 }
                 Some(Err(failure)) => match recover_stream_failure(&mut state, failure).await {
                     Ok(()) => {}
-                    Err(failure) => return Some((Err(failure), state)),
+                    Err(failure) => {
+                        settle_failure(&mut state.admission, &failure);
+                        return Some((Err(failure), state));
+                    }
                 },
                 None => {
                     let failure =
                         ProviderFailure::stream_interrupted("provider stream ended before Done");
                     match recover_stream_failure(&mut state, failure).await {
                         Ok(()) => {}
-                        Err(failure) => return Some((Err(failure), state)),
+                        Err(failure) => {
+                            settle_failure(&mut state.admission, &failure);
+                            return Some((Err(failure), state));
+                        }
                     }
                 }
             }
@@ -645,9 +1191,9 @@ async fn recover_stream_failure(
 ) -> Result<(), ProviderFailure> {
     let delay = if !state.committed
         && failure.is_retryable()
-        && state.attempt < state.config.max_attempts
+        && state.attempt < state.context.config.max_attempts
     {
-        retry_delay(state.config, state.attempt, &failure)
+        retry_delay(state.context.config, state.attempt, &failure)
     } else {
         None
     };
@@ -655,26 +1201,25 @@ async fn recover_stream_failure(
     let Some(delay) = delay else {
         state.finished = true;
         state.stream = None;
+        state.permit = None;
         state.tool_calls.clear();
         return Err(failure.after_attempts(state.attempt));
     };
 
     state.stream = None;
+    state.permit = None;
     state.tool_calls.clear();
     tokio::time::sleep(delay).await;
 
-    match open_until(
-        Arc::clone(&state.inner),
-        state.config,
-        Arc::clone(&state.messages),
-        Arc::clone(&state.tools),
-        state.attempt + 1,
-    )
-    .await
-    {
-        OpenOutcome::Opened { stream, attempt } => {
+    match open_until(&state.context, state.attempt + 1).await {
+        OpenOutcome::Opened {
+            stream,
+            attempt,
+            permit,
+        } => {
             state.stream = Some(stream);
             state.attempt = attempt;
+            state.permit = permit;
             Ok(())
         }
         OpenOutcome::Failed(failure) => {
@@ -711,6 +1256,18 @@ fn validate_minimum(
 ) -> Result<(), ReliabilityConfigError> {
     if value < min {
         return Err(ReliabilityConfigError::ValueTooSmall { field, value, min });
+    }
+    Ok(())
+}
+
+/// Validates that one value is at most `max`.
+fn validate_maximum(
+    field: &'static str,
+    value: u64,
+    max: u64,
+) -> Result<(), ReliabilityConfigError> {
+    if value > max {
+        return Err(ReliabilityConfigError::ValueTooLarge { field, value, max });
     }
     Ok(())
 }
@@ -1202,6 +1759,8 @@ mod tests {
         assert_eq!(config.max_backoff_ms, 4_000);
         assert_eq!(config.request_timeout_ms, 0);
         assert_eq!(config.stream_idle_timeout_ms, 0);
+        assert_eq!(config.circuit_failure_threshold, 5);
+        assert_eq!(config.circuit_cooldown_ms, 30_000);
         assert_eq!(config.request_timeout(), None);
         assert_eq!(config.stream_idle_timeout(), None);
         assert_eq!(RECOMMENDED_MAX_ATTEMPTS, 10);
@@ -1245,6 +1804,38 @@ mod tests {
         assert!(matches!(
             error,
             ReliabilityConfigError::MaxBackoffBelowInitial { .. }
+        ));
+
+        let zero_threshold = ReliabilityConfig {
+            circuit_failure_threshold: 0,
+            ..ReliabilityConfig::default()
+        };
+        let error = zero_threshold
+            .validate()
+            .expect_err("zero circuit threshold must be rejected");
+        assert!(matches!(
+            error,
+            ReliabilityConfigError::ValueTooSmall {
+                field: "circuit_failure_threshold",
+                value: 0,
+                min: 1
+            }
+        ));
+
+        let zero_cooldown = ReliabilityConfig {
+            circuit_cooldown_ms: 0,
+            ..ReliabilityConfig::default()
+        };
+        let error = zero_cooldown
+            .validate()
+            .expect_err("zero circuit cooldown must be rejected");
+        assert!(matches!(
+            error,
+            ReliabilityConfigError::ValueTooSmall {
+                field: "circuit_cooldown_ms",
+                value: 0,
+                min: 1
+            }
         ));
     }
 
@@ -1708,5 +2299,901 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(20)).await;
         assert_eq!(mock.calls(), 1, "dropping the stream must cancel its retry");
+    }
+
+    fn circuit_config(threshold: u32, cooldown_ms: u64) -> ReliabilityConfig {
+        ReliabilityConfig {
+            max_attempts: 1,
+            circuit_failure_threshold: threshold,
+            circuit_cooldown_ms: cooldown_ms,
+            ..ReliabilityConfig::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn circuit_opens_after_threshold_logical_failures_and_rejects_without_calling() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::Setup(ProviderFailure::server("second")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(2, 30_000),
+        );
+
+        for expected in ["first", "second"] {
+            let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+                panic!("retryable setup failures must fail the logical call");
+            };
+            assert_eq!(error.to_string(), format!("LLM request failed: {expected}"));
+        }
+        assert_eq!(mock.calls(), 2);
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("an open circuit must reject the call");
+        };
+        match error {
+            LlmError::Request { message } => {
+                assert!(message.contains("circuit breaker open"), "{message}");
+                assert!(message.contains("retry after"), "{message}");
+            }
+            other => panic!("expected a request error, got {other:?}"),
+        }
+
+        let Err(failure) = provider
+            .stream_chat_classified(&[Message::user("hello")], &[])
+            .await
+        else {
+            panic!("an open circuit must reject the call");
+        };
+        assert_eq!(failure.kind(), ProviderFailureKind::Server);
+        assert!(
+            !failure.is_retryable(),
+            "an open circuit must not be retried by a caller"
+        );
+        let message = failure.message();
+        assert!(message.contains("circuit breaker open"), "{message}");
+        assert!(message.contains("retry after"), "{message}");
+        assert_eq!(
+            mock.calls(),
+            2,
+            "an open circuit must not touch the underlying provider"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_logical_call_with_three_attempts_counts_once() {
+        let failures = || {
+            vec![
+                Behavior::Setup(ProviderFailure::server("attempt 1")),
+                Behavior::Setup(ProviderFailure::server("attempt 2")),
+                Behavior::Setup(ProviderFailure::server("attempt 3")),
+            ]
+        };
+        let mut behaviors = failures();
+        behaviors.extend(failures());
+        behaviors.push(Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]));
+        let (provider, mock) = scripted(
+            behaviors,
+            ReliabilityConfig {
+                max_attempts: 3,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                circuit_failure_threshold: 2,
+                circuit_cooldown_ms: 30_000,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        for expected in [
+            "provider request failed after 3 attempts: attempt 3",
+            "provider request failed after 3 attempts: attempt 3",
+        ] {
+            let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+                panic!("all attempts must fail");
+            };
+            assert_eq!(error.to_string(), format!("LLM request failed: {expected}"));
+        }
+        assert_eq!(mock.calls(), 6, "each logical call issued three attempts");
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the circuit should now be open");
+        };
+        assert!(error.to_string().contains("circuit breaker open"));
+        assert_eq!(
+            mock.calls(),
+            6,
+            "two logical failures opened the circuit after six attempts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_client_failures_do_not_open_the_circuit() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::client("HTTP 401")),
+                Behavior::Setup(ProviderFailure::client("HTTP 400")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(1, 30_000),
+        );
+
+        for expected in ["HTTP 401", "HTTP 400"] {
+            let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+                panic!("client failures must still fail the call");
+            };
+            assert_eq!(error.to_string(), format!("LLM request failed: {expected}"));
+        }
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("a reachable endpoint must still be admitted");
+        assert_eq!(stream.collect::<Vec<_>>().await.len(), 1);
+        assert_eq!(
+            mock.calls(),
+            3,
+            "non-retryable 4xx failures must never open the circuit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_resets_the_failure_count() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Setup(ProviderFailure::server("second")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(2, 30_000),
+        );
+
+        let Err(_) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the first failure should fail the call");
+        };
+        let first = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("a success after one failure must be admitted");
+        first.collect::<Vec<_>>().await;
+
+        let Err(_) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the post-success failure should fail the call");
+        };
+        let second = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("success must have reset the failure count");
+        second.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_terminal_failure_counts_as_one_logical_failure() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Err(ProviderFailure::server("stream down"))]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(1, 30_000),
+        );
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("setup succeeds; the stream itself fails");
+        assert_eq!(
+            stream.collect::<Vec<_>>().await,
+            vec![LlmEvent::Error {
+                message: "stream down".to_owned()
+            }]
+        );
+        assert_eq!(mock.calls(), 1);
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("a terminal stream failure must count toward the circuit");
+        };
+        assert!(error.to_string().contains("circuit breaker open"));
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_calls_do_not_change_the_circuit() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::PendingSetup,
+                Behavior::PendingStream,
+                Behavior::Setup(ProviderFailure::server("counted")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(1, 30_000),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            provider.stream_chat(&[Message::user("hello")], &[]),
+        )
+        .await;
+        assert!(result.is_err(), "the pending setup should be cancelled");
+
+        let stream = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("the pending stream setup should succeed");
+        drop(stream);
+        assert_eq!(mock.calls(), 2);
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the next failure should be counted");
+        };
+        assert_eq!(error.to_string(), "LLM request failed: counted");
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("one counted failure must open a threshold-one circuit");
+        };
+        assert!(error.to_string().contains("circuit breaker open"));
+        assert_eq!(
+            mock.calls(),
+            3,
+            "dropped calls must neither count nor close the circuit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_open_allows_one_probe_and_drop_releases_the_slot() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("down")),
+                Behavior::PendingStream,
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(1, 1_000),
+        );
+
+        let Err(_) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the first failure should open the circuit");
+        };
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the circuit must reject while open");
+        };
+        assert!(error.to_string().contains("circuit breaker open"));
+        assert_eq!(mock.calls(), 1);
+
+        tokio::time::advance(Duration::from_millis(1_000)).await;
+        let probe = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("the half-open probe must be admitted");
+        assert_eq!(mock.calls(), 2);
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("a second half-open call must fail fast");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("half-open probe already in progress"),
+            "{error}"
+        );
+        assert_eq!(mock.calls(), 2);
+
+        drop(probe);
+        let replacement = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("dropping the probe must release its slot");
+        assert_eq!(
+            replacement.collect::<Vec<_>>().await,
+            vec![LlmEvent::Done { usage: None }]
+        );
+        assert_eq!(mock.calls(), 3);
+
+        let after_success = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("a successful probe must close the circuit");
+        after_success.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_open_probe_failure_reopens_the_circuit() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("down")),
+                Behavior::Setup(ProviderFailure::server("probe failed")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            circuit_config(1, 1_000),
+        );
+
+        let Err(_) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the first failure should open the circuit");
+        };
+        tokio::time::advance(Duration::from_millis(1_000)).await;
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("the probe should fail");
+        };
+        assert_eq!(error.to_string(), "LLM request failed: probe failed");
+        assert_eq!(mock.calls(), 2);
+
+        let Err(error) = provider.stream_chat(&[Message::user("hello")], &[]).await else {
+            panic!("a failed probe must reopen the circuit");
+        };
+        assert!(error.to_string().contains("circuit breaker open"));
+        assert_eq!(mock.calls(), 2);
+
+        tokio::time::advance(Duration::from_millis(1_000)).await;
+        let recovery = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("the next probe should succeed");
+        recovery.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 3);
+
+        let closed = provider
+            .stream_chat(&[Message::user("hello")], &[])
+            .await
+            .expect("a successful probe must close the circuit");
+        closed.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 4);
+    }
+
+    #[test]
+    fn default_config_disables_rate_limiting() {
+        let config = ReliabilityConfig::default();
+        assert_eq!(config.requests_per_minute, 0);
+        assert_eq!(config.burst, 1);
+        assert_eq!(config.max_concurrent, 0);
+    }
+
+    #[test]
+    fn rate_limit_boundaries_are_validated() {
+        let cases = [
+            (
+                ReliabilityConfig {
+                    requests_per_minute: MAX_REQUESTS_PER_MINUTE + 1,
+                    ..ReliabilityConfig::default()
+                },
+                "requests_per_minute",
+            ),
+            (
+                ReliabilityConfig {
+                    burst: MAX_BURST + 1,
+                    ..ReliabilityConfig::default()
+                },
+                "burst",
+            ),
+            (
+                ReliabilityConfig {
+                    max_concurrent: MAX_CONCURRENT + 1,
+                    ..ReliabilityConfig::default()
+                },
+                "max_concurrent",
+            ),
+        ];
+        for (config, field) in cases {
+            let error = config
+                .validate()
+                .expect_err("an out-of-range rate limit must be rejected");
+            assert!(
+                matches!(
+                    error,
+                    ReliabilityConfigError::ValueTooLarge {
+                        field: actual,
+                        ..
+                    } if actual == field
+                ),
+                "unexpected error for {field}: {error}"
+            );
+        }
+
+        let zero_burst = ReliabilityConfig {
+            requests_per_minute: 60,
+            burst: 0,
+            ..ReliabilityConfig::default()
+        };
+        let error = zero_burst
+            .validate()
+            .expect_err("an enabled token bucket needs capacity");
+        assert!(matches!(
+            error,
+            ReliabilityConfigError::ValueTooSmall {
+                field: "burst",
+                value: 0,
+                min: 1
+            }
+        ));
+
+        ReliabilityConfig {
+            requests_per_minute: MAX_REQUESTS_PER_MINUTE,
+            burst: MAX_BURST,
+            max_concurrent: MAX_CONCURRENT,
+            ..ReliabilityConfig::default()
+        }
+        .validate()
+        .expect("documented maximums must be accepted");
+
+        ReliabilityConfig {
+            requests_per_minute: 0,
+            burst: 0,
+            ..ReliabilityConfig::default()
+        }
+        .validate()
+        .expect("a disabled token bucket ignores burst");
+    }
+
+    #[test]
+    fn token_bucket_grants_burst_then_waits_for_the_refill() {
+        let mut bucket = TokenBucket::new(60, 3);
+        let start = bucket.last_refill;
+
+        for _ in 0..3 {
+            assert_eq!(bucket.try_consume(start), TokenDecision::Ready);
+        }
+        assert_eq!(
+            bucket.try_consume(start),
+            TokenDecision::Wait(Duration::from_secs(1))
+        );
+        assert_eq!(
+            bucket.try_consume(start + Duration::from_millis(500)),
+            TokenDecision::Wait(Duration::from_millis(500))
+        );
+        assert_eq!(
+            bucket.try_consume(start + Duration::from_secs(1)),
+            TokenDecision::Ready
+        );
+        assert_eq!(
+            bucket.try_consume(start + Duration::from_secs(1)),
+            TokenDecision::Wait(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn token_bucket_never_banks_more_than_the_burst_capacity() {
+        let mut bucket = TokenBucket::new(60, 2);
+        let start = bucket.last_refill;
+
+        assert_eq!(bucket.try_consume(start), TokenDecision::Ready);
+        assert_eq!(bucket.try_consume(start), TokenDecision::Ready);
+        assert!(matches!(bucket.try_consume(start), TokenDecision::Wait(_)));
+
+        let much_later = start + Duration::from_secs(3_600);
+        assert_eq!(bucket.try_consume(much_later), TokenDecision::Ready);
+        assert_eq!(bucket.try_consume(much_later), TokenDecision::Ready);
+        assert!(matches!(
+            bucket.try_consume(much_later),
+            TokenDecision::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn fractional_refill_is_preserved_across_small_intervals() {
+        let mut bucket = TokenBucket::new(7, 100);
+        let start = bucket.last_refill;
+        bucket.available = 0;
+
+        for second in 1..=60 {
+            bucket.refill(start + Duration::from_secs(second));
+        }
+
+        assert_eq!(bucket.available, 7 * MICROTOKENS_PER_TOKEN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_requests_per_minute_never_waits() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                requests_per_minute: 0,
+                burst: 0,
+                max_concurrent: 0,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        for _ in 0..2 {
+            let stream = provider
+                .stream_chat_classified(&[Message::user("hello")], &[])
+                .await
+                .expect("a disabled bucket must not block");
+            stream.collect::<Vec<_>>().await;
+        }
+
+        let times = mock.call_times();
+        assert_eq!(mock.calls(), 2);
+        assert_eq!(
+            times[1].duration_since(times[0]),
+            Duration::ZERO,
+            "requests must not be delayed when the bucket is disabled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn calls_to_one_wrapper_share_the_token_bucket() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                requests_per_minute: 60,
+                burst: 1,
+                ..ReliabilityConfig::default()
+            },
+        );
+        let provider = Arc::new(provider);
+
+        let first = provider
+            .stream_chat_classified(&[Message::user("parent")], &[])
+            .await
+            .expect("the first caller consumes the only token");
+        first.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 1);
+
+        let second_provider = Arc::clone(&provider);
+        let second = tokio::spawn(async move {
+            second_provider
+                .stream_chat_classified(&[Message::user("child")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a second caller must wait for the shared bucket to refill"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second = second
+            .await
+            .expect("task should join")
+            .expect("the refilled token should admit the second caller");
+        second.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 2);
+
+        // The skill distiller is another caller of the same wrapper and draws
+        // from the same quota: parent, child, and distiller share one bucket.
+        let third_provider = Arc::clone(&provider);
+        let third = tokio::spawn(async move {
+            third_provider
+                .stream_chat_classified(&[Message::user("distiller")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the distiller must share the parent/child quota"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let third = third
+            .await
+            .expect("task should join")
+            .expect("the refilled token should admit the distiller");
+        third.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 3);
+
+        let times = mock.call_times();
+        assert_eq!(times[1].duration_since(times[0]), Duration::from_secs(1));
+        assert_eq!(times[2].duration_since(times[1]), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_requests_start_immediately_and_excess_waits_for_a_token() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                requests_per_minute: 60,
+                burst: 2,
+                ..ReliabilityConfig::default()
+            },
+        );
+        let provider = Arc::new(provider);
+
+        for _ in 0..2 {
+            let stream = provider
+                .stream_chat_classified(&[Message::user("burst")], &[])
+                .await
+                .expect("burst requests should start immediately");
+            stream.collect::<Vec<_>>().await;
+        }
+        assert_eq!(mock.calls(), 2);
+
+        let third_provider = Arc::clone(&provider);
+        let third = tokio::spawn(async move {
+            third_provider
+                .stream_chat_classified(&[Message::user("excess")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(mock.calls(), 2, "the excess request must wait");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let third = third
+            .await
+            .expect("task should join")
+            .expect("one second of refill should admit the excess request");
+        third.collect::<Vec<_>>().await;
+        assert_eq!(mock.calls(), 3);
+
+        let times = mock.call_times();
+        assert_eq!(times[0], times[1], "burst requests share the start time");
+        assert_eq!(times[2].duration_since(times[1]), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_consume_tokens_and_are_spaced_by_the_refill_rate() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::Setup(ProviderFailure::server("second")),
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 3,
+                requests_per_minute: 60,
+                burst: 1,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let stream = provider
+            .stream_chat_classified(&[Message::user("hello")], &[])
+            .await
+            .expect("the third attempt should succeed");
+        stream.collect::<Vec<_>>().await;
+
+        assert_eq!(mock.calls(), 3);
+        let times = mock.call_times();
+        let deltas: Vec<u128> = times
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_millis())
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![1_000, 1_000],
+            "each retry must wait for its own token"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_reacquires_a_permit_instead_of_bypassing_the_limit() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Setup(ProviderFailure::server("first")),
+                Behavior::PendingStream,
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 2,
+                max_concurrent: 1,
+                ..ReliabilityConfig::default()
+            },
+        );
+        let provider = Arc::new(provider);
+
+        let retrying_provider = Arc::clone(&provider);
+        let retrying = tokio::spawn(async move {
+            retrying_provider
+                .stream_chat_classified(&[Message::user("retry")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the first attempt fails and releases its permit"
+        );
+
+        let holder = provider
+            .stream_chat_classified(&[Message::user("holder")], &[])
+            .await
+            .expect("another caller should take the free permit");
+        assert_eq!(mock.calls(), 2);
+
+        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the retry must wait for the permit instead of bypassing the limit"
+        );
+
+        drop(holder);
+        let retried = retrying
+            .await
+            .expect("task should join")
+            .expect("the retry should open once the permit is free");
+        assert_eq!(mock.calls(), 3);
+        retried.collect::<Vec<_>>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrency_limit_queues_the_third_attempt_until_a_permit_frees() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::PendingStream,
+                Behavior::PendingStream,
+                Behavior::PendingStream,
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                max_concurrent: 2,
+                ..ReliabilityConfig::default()
+            },
+        );
+        let provider = Arc::new(provider);
+
+        let first = provider
+            .stream_chat_classified(&[Message::user("first")], &[])
+            .await
+            .expect("the first attempt should hold a permit");
+        let second = provider
+            .stream_chat_classified(&[Message::user("second")], &[])
+            .await
+            .expect("the second attempt should hold a permit");
+        assert_eq!(mock.calls(), 2);
+
+        let third_provider = Arc::clone(&provider);
+        let third = tokio::spawn(async move {
+            third_provider
+                .stream_chat_classified(&[Message::user("third")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            2,
+            "the third attempt must wait while both permits are held"
+        );
+
+        drop(first);
+        let third = third
+            .await
+            .expect("task should join")
+            .expect("the third attempt should open after a permit is released");
+        assert_eq!(mock.calls(), 3);
+
+        drop(second);
+        drop(third);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permits_are_released_on_success_failure_and_drop() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+                Behavior::Setup(ProviderFailure::client("bad request")),
+                Behavior::Stream(vec![Err(ProviderFailure::server("stream died"))]),
+                Behavior::PendingStream,
+                Behavior::Stream(vec![Ok(LlmEvent::Done { usage: None })]),
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                max_concurrent: 1,
+                ..ReliabilityConfig::default()
+            },
+        );
+
+        let success = provider
+            .stream_chat_classified(&[Message::user("success")], &[])
+            .await
+            .expect("the first attempt should open");
+        assert_eq!(success.collect::<Vec<_>>().await.len(), 1);
+
+        let setup_failure = provider
+            .stream_chat_classified(&[Message::user("setup failure")], &[])
+            .await;
+        assert!(setup_failure.is_err());
+
+        let stream_failure = provider
+            .stream_chat_classified(&[Message::user("stream failure")], &[])
+            .await
+            .expect("the failing stream should still open");
+        let items = stream_failure.collect::<Vec<_>>().await;
+        assert!(matches!(items.as_slice(), [Err(_)]));
+
+        let cancelled = provider
+            .stream_chat_classified(&[Message::user("cancelled")], &[])
+            .await
+            .expect("the pending attempt should hold the permit");
+        drop(cancelled);
+
+        let recovered = provider
+            .stream_chat_classified(&[Message::user("recovered")], &[])
+            .await
+            .expect("every prior path must have released its permit");
+        assert_eq!(recovered.collect::<Vec<_>>().await.len(), 1);
+        assert_eq!(mock.calls(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_an_attempt_blocked_on_a_permit_refunds_its_token() {
+        let (provider, mock) = scripted(
+            vec![
+                Behavior::PendingStream,
+                Behavior::PendingStream,
+                Behavior::PendingStream,
+                Behavior::PendingStream,
+            ],
+            ReliabilityConfig {
+                max_attempts: 1,
+                requests_per_minute: 1,
+                burst: 2,
+                max_concurrent: 1,
+                ..ReliabilityConfig::default()
+            },
+        );
+        let provider = Arc::new(provider);
+
+        let holder = provider
+            .stream_chat_classified(&[Message::user("holder")], &[])
+            .await
+            .expect("the holder should open and keep the permit");
+        assert_eq!(mock.calls(), 1);
+
+        let blocked_provider = Arc::clone(&provider);
+        let blocked = tokio::spawn(async move {
+            blocked_provider
+                .stream_chat_classified(&[Message::user("blocked")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mock.calls(),
+            1,
+            "the blocked attempt consumed a token but cannot dispatch"
+        );
+        blocked.abort();
+        let _ = blocked.await;
+
+        drop(holder);
+        let refunded = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.stream_chat_classified(&[Message::user("refunded")], &[]),
+        )
+        .await
+        .expect("the cancelled attempt should refund its token, not force a 60s wait")
+        .expect("the refunded token should admit the next attempt");
+        assert_eq!(mock.calls(), 2);
+        drop(refunded);
+
+        let waiting_provider = Arc::clone(&provider);
+        let waiting = tokio::spawn(async move {
+            waiting_provider
+                .stream_chat_classified(&[Message::user("waiting")], &[])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(mock.calls(), 2);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(mock.calls(), 2, "59 seconds is not a full 1 rpm token");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let fourth = waiting
+            .await
+            .expect("task should join")
+            .expect("one refilled token should admit the fourth attempt");
+        assert_eq!(mock.calls(), 3);
+
+        drop(fourth);
     }
 }
