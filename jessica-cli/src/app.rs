@@ -35,6 +35,7 @@ use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, SessionSnapshot};
 use crate::replay::ReplayError;
+use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
@@ -72,16 +73,16 @@ struct TurnSetup {
     pump: Arc<EventPump>,
     /// Background task draining the event channel into the pump.
     pump_task: tokio::task::JoinHandle<()>,
-    /// Background task forwarding Ctrl+C to the cancellation token.
-    signal_task: tokio::task::JoinHandle<()>,
     /// Stateful stuck guard reset per attempt.
     stuck_guard: Arc<StuckDetectionGuard>,
 }
 
 impl TurnSetup {
     /// Stops the background tasks owned by this turn.
+    ///
+    /// The turn's cancellation token is a child of the process-level token, so
+    /// dropping this setup does not affect the shutdown controller.
     fn shutdown(self) {
-        self.signal_task.abort();
         self.pump_task.abort();
     }
 }
@@ -134,6 +135,8 @@ pub(crate) struct CliRuntime {
     recorder: Option<Arc<EventRecorder>>,
     memory: Option<MemoryAssembly>,
     skills: Option<SkillsAssembly>,
+    /// Process-level shutdown state shared by every turn and the REPL.
+    shutdown: Arc<ShutdownController>,
 }
 
 impl CliRuntime {
@@ -147,6 +150,13 @@ impl CliRuntime {
     /// `recorder` is present when the configuration enables event persistence.
     /// `memory` is present only when enabled and opened successfully.
     /// `skills` is present only when enabled and opened successfully.
+    /// `shutdown` is the process-level controller; every turn derives a child
+    /// token from it instead of installing its own signal listener.
+    ///
+    /// The constructor is the single assembly point for independently owned
+    /// handles; grouping them into another struct would only rename the same
+    /// fields.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: Arc<dyn LlmProvider>,
         config: watch::Receiver<Arc<HarnessConfig>>,
@@ -155,6 +165,7 @@ impl CliRuntime {
         recorder: Option<Arc<EventRecorder>>,
         memory: Option<MemoryAssembly>,
         skills: Option<SkillsAssembly>,
+        shutdown: Arc<ShutdownController>,
     ) -> Self {
         Self {
             provider,
@@ -164,6 +175,7 @@ impl CliRuntime {
             recorder,
             memory,
             skills,
+            shutdown,
         }
     }
 
@@ -201,6 +213,13 @@ impl CliRuntime {
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
         let setup = self.build_turn(true, &config)?;
+        // A signal may arrive between the REPL's last check and this point.
+        // The child token is already cancelled in that case: skip memory and
+        // skill recall, session recording, and every model request.
+        if setup.cancel.is_cancelled() {
+            setup.shutdown();
+            return Ok(SessionEndReason::Cancelled);
+        }
         let first_session = next_session_id();
         let initial = self
             .initial_messages(&first_session, input.as_str(), &config)
@@ -441,6 +460,10 @@ impl CliRuntime {
 
         let config = self.config_snapshot();
         let setup = self.build_turn(false, &config)?;
+        if setup.cancel.is_cancelled() {
+            setup.shutdown();
+            return Ok(SessionEndReason::Cancelled);
+        }
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }).await;
         let reason = attempt.reason;
@@ -512,7 +535,9 @@ impl CliRuntime {
         );
 
         let events = harness.events();
-        let cancel = CancellationToken::new();
+        // Every turn derives its own child token; only the process-level
+        // controller and this turn (through the loop) may cancel it.
+        let cancel = self.shutdown.child_token();
         let governance = Arc::new(GovernanceState::new(events.clone(), cancel.clone()));
         let provider: Arc<dyn LlmProvider> = Arc::new(TokenCountingProvider::new(
             Arc::clone(&self.provider),
@@ -544,7 +569,6 @@ impl CliRuntime {
             self.recorder.clone(),
         ));
         let pump_task = tokio::spawn(Arc::clone(&pump).run(harness.subscribe()));
-        let signal_task = spawn_ctrl_c_listener(cancel.clone());
 
         Ok(TurnSetup {
             harness,
@@ -554,7 +578,6 @@ impl CliRuntime {
             agent,
             pump,
             pump_task,
-            signal_task,
             stuck_guard,
         })
     }
@@ -857,17 +880,6 @@ async fn emit_outer_session(
     }
 }
 
-fn spawn_ctrl_c_listener(cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            cancel.cancel();
-        }
-    })
-}
-
 fn resolve_dir(root: &Path, configured: Option<&Path>) -> PathBuf {
     match configured {
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -1082,6 +1094,8 @@ mod tests {
     use jessica_runtime::CHILD_AGENT_SYSTEM_PROMPT;
     use serde_json::json;
 
+    use crate::shutdown::ShutdownSignal;
+
     /// One captured provider call.
     #[derive(Clone)]
     struct ProviderCall {
@@ -1252,6 +1266,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(ShutdownController::new()),
         )
     }
 
@@ -1406,6 +1421,7 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(ShutdownController::new()),
         );
         (runtime, sender)
     }
@@ -1701,5 +1717,77 @@ mod tests {
 
         assert_eq!(stable_turn_index(&first), 0);
         assert_eq!(stable_turn_index(&resumed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_before_a_turn_prevents_any_model_request() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let (_sender, receiver) = watch::channel(Arc::new(HarnessConfig::default()));
+        let shutdown = Arc::new(ShutdownController::new());
+        let runtime = CliRuntime::new(
+            llm,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Arc::clone(&shutdown),
+        );
+        assert!(shutdown.request_shutdown(ShutdownSignal::SigTerm));
+
+        let reason = runtime
+            .run_turn("must not run".to_owned())
+            .await
+            .expect("a shutdown must end the turn cleanly");
+
+        assert_eq!(reason, SessionEndReason::Cancelled);
+        assert!(
+            provider.calls().is_empty(),
+            "a turn whose child token is already cancelled must not call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_completing_does_not_cancel_the_process_or_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let (_sender, receiver) = watch::channel(Arc::new(HarnessConfig::default()));
+        let shutdown = Arc::new(ShutdownController::new());
+        let runtime = CliRuntime::new(
+            llm,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Arc::clone(&shutdown),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("first".to_owned())
+                .await
+                .expect("first turn must run"),
+            SessionEndReason::Completed
+        );
+        assert!(!shutdown.is_shutting_down());
+        assert_eq!(
+            runtime
+                .run_turn("second".to_owned())
+                .await
+                .expect("second turn must run"),
+            SessionEndReason::Completed
+        );
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "each turn must acquire an independent child token"
+        );
     }
 }
