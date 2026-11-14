@@ -1,0 +1,457 @@
+//! End-to-end acceptance for provider retries in the real CLI.
+//!
+//! The scenarios drive the compiled binary against a scripted HTTP server.
+//! They pin the observable retry boundary: enabling `[reliability]` retries a
+//! server failure before any text and then records exactly one completed
+//! session with one copy of the final text; a client error is not retried; and
+//! omitting the section leaves the previous single-request behavior unchanged.
+
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use jessica_core::types::{AgentEvent, SessionEndReason, SessionId};
+use jessica_memory::EventStore;
+use serde_json::{Value, json};
+
+/// Overall budget for one CLI child process.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall budget for the mock server to observe requests.
+const SERVER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Temporary directory removed when the test finishes.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jessica-cli-reliability-e2e-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temporary directory should be created");
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// One scripted server action.
+enum Plan {
+    /// An HTTP error response with no body.
+    Status {
+        /// HTTP status code.
+        code: u16,
+        /// HTTP reason phrase.
+        reason: &'static str,
+    },
+    /// A complete OpenAI-compatible SSE response.
+    Sse(String),
+}
+
+/// Scripted HTTP server that records every request body.
+struct ScriptedServer {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<Vec<String>>,
+}
+
+impl ScriptedServer {
+    fn start(plans: Vec<Plan>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || serve(listener, flag, plans));
+        Self {
+            address,
+            stop,
+            handle,
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn finish(self) -> Vec<String> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.handle.join().expect("mock server should finish")
+    }
+}
+
+/// Accepts requests until stopped, answering from the plan queue.
+fn serve(listener: TcpListener, stop: Arc<AtomicBool>, plans: Vec<Plan>) -> Vec<String> {
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become non-blocking");
+    let deadline = Instant::now() + SERVER_TIMEOUT;
+    let mut plans: VecDeque<Plan> = plans.into();
+    let mut bodies = Vec::new();
+
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("connection should become blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout should be set");
+                if let Some(body) = read_request(&mut stream) {
+                    bodies.push(body);
+                    let response = match plans.pop_front() {
+                        Some(Plan::Status { code, reason }) => {
+                            format!(
+                                "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\
+                                 Connection: close\r\n\r\n"
+                            )
+                        }
+                        Some(Plan::Sse(response)) => response,
+                        None => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                            .to_owned(),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("mock server accept failed: {error}"),
+        }
+    }
+
+    bodies
+}
+
+/// Reads one HTTP request and returns its body.
+fn read_request(stream: &mut TcpStream) -> Option<String> {
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 4096];
+
+    let header_end = loop {
+        if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            return None;
+        }
+        data.extend_from_slice(&buffer[..read]);
+    };
+
+    let headers = String::from_utf8_lossy(&data[..header_end]).to_ascii_lowercase();
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+
+    while data.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..read]);
+    }
+
+    let body_end = (header_end + content_length).min(data.len());
+    Some(String::from_utf8_lossy(&data[header_end..body_end]).into_owned())
+}
+
+/// One CLI run and the requests the mock server observed.
+struct CliRun {
+    output: Output,
+    requests: Vec<String>,
+    pid: u32,
+}
+
+impl CliRun {
+    /// Session id allocated by the CLI for its first one-shot turn.
+    fn session(&self) -> SessionId {
+        SessionId::new(format!("cli-{}-0", self.pid))
+    }
+}
+
+/// Runs one CLI prompt against a scripted server.
+fn run_cli(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> CliRun {
+    let server = ScriptedServer::start(plans);
+    let address = server.address();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+        .current_dir(workspace)
+        .env_remove("JESSICA_PROVIDER")
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://{address}/v1"))
+        .env("OPENAI_MODEL", "test-model")
+        .arg("--config")
+        .arg(config)
+        .arg(prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start");
+
+    let pid = child.id();
+    let status = wait_with_timeout(&mut child);
+    let mut output = child
+        .wait_with_output()
+        .expect("CLI output should be collected");
+    output.status = status;
+    let requests = server.finish();
+    CliRun {
+        output,
+        requests,
+        pid,
+    }
+}
+
+/// Waits for the child, killing it when the overall budget expires.
+fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().expect("CLI status should be readable") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLI exceeded {CHILD_TIMEOUT:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Reads all persisted events for one session.
+fn read_events(database: &Path, session: &SessionId) -> Vec<AgentEvent> {
+    let store = EventStore::open(database).expect("event store should open");
+    store
+        .events(session)
+        .expect("events should be readable")
+        .into_iter()
+        .map(|stored| stored.event().clone())
+        .collect()
+}
+
+fn write_config(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("configuration should be written");
+}
+
+fn enabled_config() -> &'static str {
+    "[events]\npath = \"events.sqlite\"\n\n\
+     [reliability]\n\
+     enabled = true\n\
+     max_attempts = 3\n\
+     initial_backoff_ms = 1\n\
+     max_backoff_ms = 4\n\
+     request_timeout_ms = 5000\n\
+     stream_idle_timeout_ms = 5000\n"
+}
+
+fn disabled_config() -> &'static str {
+    "[events]\npath = \"events.sqlite\"\n"
+}
+
+/// Returns one SSE response carrying `content` and a stop finish reason.
+fn text_response(content: &str) -> String {
+    let payloads = [content_chunk(content), finish_chunk("stop")];
+    let mut body = String::new();
+    for payload in payloads {
+        body.push_str("data: ");
+        body.push_str(&payload);
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn finish_chunk(reason: &str) -> String {
+    json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]
+    })
+    .to_string()
+}
+
+fn content_chunk(content: &str) -> String {
+    json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": null
+        }]
+    })
+    .to_string()
+}
+
+#[test]
+fn reliability_retries_two_server_errors_and_completes_once() {
+    let temp = TempDir::new("retry-success");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, enabled_config());
+
+    let run = run_cli(
+        &temp.path,
+        &config,
+        "recover from transient failures",
+        vec![
+            Plan::Status {
+                code: 500,
+                reason: "Internal Server Error",
+            },
+            Plan::Status {
+                code: 500,
+                reason: "Internal Server Error",
+            },
+            Plan::Sse(text_response("recovered after retries")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        run.output.status.success(),
+        "CLI failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        run.output.status
+    );
+    assert_eq!(
+        run.requests.len(),
+        3,
+        "expected exactly three provider requests\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let events = read_events(&temp.path.join("events.sqlite"), &run.session());
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec!["recovered after retries"],
+        "the failed attempts must not duplicate text"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionEnded {
+                reason: SessionEndReason::Completed,
+                ..
+            }
+        )),
+        "the session must end exactly once as Completed: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::SessionEnded { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn reliability_does_not_retry_a_client_error() {
+    let temp = TempDir::new("client-error");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, enabled_config());
+
+    let run = run_cli(
+        &temp.path,
+        &config,
+        "this request is unauthorized",
+        vec![
+            Plan::Status {
+                code: 401,
+                reason: "Unauthorized",
+            },
+            Plan::Sse(text_response("must not be reached")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        !run.output.status.success(),
+        "401 must fail the CLI\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        1,
+        "401 must not be retried\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("401"),
+        "the original status must be visible in stderr:\n{stderr}"
+    );
+
+    let events = read_events(&temp.path.join("events.sqlite"), &run.session());
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionEnded {
+                reason: SessionEndReason::Error,
+                ..
+            }
+        )),
+        "the session must end as Error: {events:?}"
+    );
+}
+
+#[test]
+fn omitted_reliability_section_keeps_single_request_behavior() {
+    let temp = TempDir::new("default-disabled");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, disabled_config());
+
+    let run = run_cli(
+        &temp.path,
+        &config,
+        "do not retry by default",
+        vec![
+            Plan::Status {
+                code: 500,
+                reason: "Internal Server Error",
+            },
+            Plan::Sse(text_response("must not be reached")),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&run.output.stdout);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        !run.output.status.success(),
+        "the first 500 must fail without retries\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        run.requests.len(),
+        1,
+        "omitting [reliability] must keep the single-request behavior\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Parses a request body only to prove it is valid JSON where assertions need it.
+#[allow(dead_code)]
+fn request_json(body: &str) -> Value {
+    serde_json::from_str(body).expect("request body should be JSON")
+}
