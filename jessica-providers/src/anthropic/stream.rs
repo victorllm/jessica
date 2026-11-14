@@ -10,14 +10,33 @@ use jessica_core::types::{TokenUsage, ToolCall};
 use serde_json::Value;
 
 use super::sse::{
-    AnthropicSseDecoder, AnthropicSseEvent, AnthropicUsage, ContentBlock, ContentBlockDelta,
+    AnthropicErrorBody, AnthropicSseDecoder, AnthropicSseEvent, AnthropicUsage, ContentBlock,
+    ContentBlockDelta,
 };
+use crate::reliability::{ClassifiedStream, ProviderFailure};
 
-/// Turns raw Anthropic SSE byte chunks into a stream of [`LlmEvent`]s.
+/// Turns raw Anthropic SSE byte chunks into a legacy stream of [`LlmEvent`]s.
 ///
 /// The chunk and error types are generic so tests can drive the production
 /// pipeline with an in-memory SSE stream.
 pub(crate) fn anthropic_event_stream<S, B, E>(chunks: S) -> LlmStream
+where
+    S: Stream<Item = Result<B, E>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: fmt::Display + Send + 'static,
+{
+    Box::pin(
+        classified_anthropic_event_stream(chunks).map(|item| match item {
+            Ok(event) => event,
+            Err(failure) => LlmEvent::Error {
+                message: failure.message().to_owned(),
+            },
+        }),
+    )
+}
+
+/// Turns raw Anthropic SSE byte chunks into classified [`LlmEvent`]s.
+pub(crate) fn classified_anthropic_event_stream<S, B, E>(chunks: S) -> ClassifiedStream
 where
     S: Stream<Item = Result<B, E>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
@@ -29,15 +48,17 @@ where
         (chunks, state),
         |(mut chunks, mut state)| async move {
             loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Some((event, (chunks, state)));
+                if let Some(item) = state.pending.pop_front() {
+                    return Some((item, (chunks, state)));
                 }
                 if state.done {
                     return None;
                 }
                 match chunks.next().await {
                     Some(Ok(chunk)) => state.push_bytes(chunk.as_ref()),
-                    Some(Err(error)) => state.fail(error.to_string()),
+                    Some(Err(error)) => {
+                        state.fail(ProviderFailure::transport(error.to_string()));
+                    }
                     None => state.finish_stream(),
                 }
             }
@@ -45,11 +66,20 @@ where
     ))
 }
 
+/// One classified item produced by the Anthropic stream assembler.
+#[derive(Debug)]
+pub(crate) enum AnthropicStreamItem {
+    /// A provider-neutral event.
+    Event(LlmEvent),
+    /// A classified stream failure.
+    Failure(ProviderFailure),
+}
+
 #[derive(Debug, Default)]
 struct AnthropicStreamState {
     decoder: AnthropicSseDecoder,
     assembler: AnthropicStreamAssembler,
-    pending: VecDeque<LlmEvent>,
+    pending: VecDeque<Result<LlmEvent, ProviderFailure>>,
     done: bool,
 }
 
@@ -64,19 +94,30 @@ impl AnthropicStreamState {
                     }
                 }
             }
-            Err(error) => self.fail(error.to_string()),
+            Err(error) => self.fail(ProviderFailure::invalid_response(error.to_string())),
         }
     }
 
     fn process_event(&mut self, event: AnthropicSseEvent) {
         match self.assembler.push(event) {
-            Ok(events) => {
-                self.pending.extend(events);
+            Ok(items) => {
+                for item in items {
+                    match item {
+                        AnthropicStreamItem::Event(event) => {
+                            self.pending.push_back(Ok(event));
+                        }
+                        AnthropicStreamItem::Failure(failure) => {
+                            self.pending.push_back(Err(failure));
+                            self.done = true;
+                            return;
+                        }
+                    }
+                }
                 if self.assembler.is_done() {
                     self.done = true;
                 }
             }
-            Err(error) => self.fail(error.to_string()),
+            Err(error) => self.fail(ProviderFailure::invalid_response(error.to_string())),
         }
     }
 
@@ -94,7 +135,7 @@ impl AnthropicStreamState {
                 }
             }
             Err(error) => {
-                self.fail(error.to_string());
+                self.fail(ProviderFailure::invalid_response(error.to_string()));
                 return;
             }
         }
@@ -102,15 +143,15 @@ impl AnthropicStreamState {
         if !self.done
             && let Err(error) = self.assembler.finish()
         {
-            self.fail(error.to_string());
+            self.fail(ProviderFailure::stream_interrupted(error.to_string()));
         }
     }
 
-    fn fail(&mut self, message: String) {
+    fn fail(&mut self, failure: ProviderFailure) {
         if self.done {
             return;
         }
-        self.pending.push_back(LlmEvent::Error { message });
+        self.pending.push_back(Err(failure));
         self.done = true;
     }
 }
@@ -124,13 +165,16 @@ pub(crate) struct AnthropicStreamAssembler {
 }
 
 impl AnthropicStreamAssembler {
-    /// Applies one SSE event, returning any completed provider-neutral events.
-    pub(crate) fn push(&mut self, event: AnthropicSseEvent) -> Result<Vec<LlmEvent>, LlmError> {
+    /// Applies one SSE event, returning any completed provider-neutral items.
+    pub(crate) fn push(
+        &mut self,
+        event: AnthropicSseEvent,
+    ) -> Result<Vec<AnthropicStreamItem>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
 
-        let mut events = Vec::new();
+        let mut items = Vec::new();
         match event {
             AnthropicSseEvent::MessageStart { message } => {
                 self.usage.merge(message.usage);
@@ -142,7 +186,9 @@ impl AnthropicStreamAssembler {
                 let state = match content_block {
                     ContentBlock::Text { text } => {
                         if !text.is_empty() {
-                            events.push(LlmEvent::TextDelta { text: text.clone() });
+                            items.push(AnthropicStreamItem::Event(LlmEvent::TextDelta {
+                                text: text.clone(),
+                            }));
                         }
                         BlockState::Text { text }
                     }
@@ -168,7 +214,8 @@ impl AnthropicStreamAssembler {
                         BlockState::Text { text: buffer } => {
                             buffer.push_str(&text);
                             if !text.is_empty() {
-                                events.push(LlmEvent::TextDelta { text });
+                                items
+                                    .push(AnthropicStreamItem::Event(LlmEvent::TextDelta { text }));
                             }
                         }
                         BlockState::Other => {}
@@ -213,9 +260,9 @@ impl AnthropicStreamAssembler {
                             }
                         })?
                     };
-                    events.push(LlmEvent::ToolCallRequested {
+                    items.push(AnthropicStreamItem::Event(LlmEvent::ToolCallRequested {
                         call: ToolCall::new(id, name, arguments),
-                    });
+                    }));
                 }
             }
             AnthropicSseEvent::MessageDelta { usage } => {
@@ -225,26 +272,20 @@ impl AnthropicStreamAssembler {
             }
             AnthropicSseEvent::MessageStop => {
                 self.done = true;
-                events.push(LlmEvent::Done {
+                items.push(AnthropicStreamItem::Event(LlmEvent::Done {
                     usage: self.usage.token_usage(),
-                });
+                }));
             }
             AnthropicSseEvent::Ping => {}
             AnthropicSseEvent::Error { error } => {
                 self.done = true;
-                let message = if error.error_type.is_empty() {
-                    format!("Anthropic stream error: {}", error.message)
-                } else {
-                    format!(
-                        "Anthropic stream error ({}): {}",
-                        error.error_type, error.message
-                    )
-                };
-                events.push(LlmEvent::Error { message });
+                items.push(AnthropicStreamItem::Failure(
+                    classify_anthropic_stream_error(&error),
+                ));
             }
         }
 
-        Ok(events)
+        Ok(items)
     }
 
     /// Returns whether a terminal event has been observed.
@@ -261,6 +302,26 @@ impl AnthropicStreamAssembler {
                 message: "Anthropic SSE stream ended before message_stop".to_owned(),
             })
         }
+    }
+}
+
+/// Classifies an Anthropic `error` SSE event.
+fn classify_anthropic_stream_error(error: &AnthropicErrorBody) -> ProviderFailure {
+    let message = if error.error_type.is_empty() {
+        format!("Anthropic stream error: {}", error.message)
+    } else {
+        format!(
+            "Anthropic stream error ({}): {}",
+            error.error_type, error.message
+        )
+    };
+    match error.error_type.as_str() {
+        "rate_limit_error" => ProviderFailure::rate_limited(message),
+        "authentication_error"
+        | "permission_error"
+        | "invalid_request_error"
+        | "not_found_error" => ProviderFailure::client(message),
+        _ => ProviderFailure::server(message),
     }
 }
 
@@ -337,6 +398,18 @@ mod tests {
             .map(<[u8]>::to_vec)
             .collect();
         let stream = anthropic_event_stream(futures::stream::iter(
+            chunks.into_iter().map(Ok::<_, String>),
+        ));
+        futures::executor::block_on(stream.collect())
+    }
+
+    fn collect_classified(sse: &str, chunk_size: usize) -> Vec<Result<LlmEvent, ProviderFailure>> {
+        let chunks: Vec<Vec<u8>> = sse
+            .as_bytes()
+            .chunks(chunk_size)
+            .map(<[u8]>::to_vec)
+            .collect();
+        let stream = classified_anthropic_event_stream(futures::stream::iter(
             chunks.into_iter().map(Ok::<_, String>),
         ));
         futures::executor::block_on(stream.collect())
@@ -688,5 +761,139 @@ mod tests {
         .concat();
 
         assert_eq!(collect(&sse, 4096), vec![LlmEvent::Done { usage: None }]);
+    }
+
+    #[test]
+    fn classified_overloaded_error_is_a_retryable_server_failure() {
+        let sse = fixture("anthropic_sse_error.txt");
+        let items = collect_classified(&sse, 1);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::Server
+                );
+                assert!(failure.is_retryable());
+                assert!(failure.message().contains("overloaded_error"));
+            }
+            other => panic!("expected a server failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_rate_limit_error_is_retryable() {
+        let sse = frame(
+            "error",
+            json!({
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "slow down"},
+            }),
+        );
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::RateLimited
+                );
+                assert!(failure.is_retryable());
+                assert!(failure.message().contains("slow down"));
+            }
+            other => panic!("expected a rate-limit failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_authentication_error_is_non_retryable() {
+        let sse = frame(
+            "error",
+            json!({
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "bad key"},
+            }),
+        );
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::Client
+                );
+                assert!(!failure.is_retryable());
+            }
+            other => panic!("expected a client failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_missing_message_stop_is_stream_interrupted() {
+        let sse = frame(
+            "message_start",
+            json!({"type": "message_start", "message": {"usage": {}}}),
+        );
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::StreamInterrupted
+                );
+                assert!(failure.is_retryable());
+                assert!(failure.message().contains("message_stop"));
+            }
+            other => panic!("expected an interrupted-stream failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classified_malformed_tool_arguments_is_invalid_response() {
+        let sse = [
+            frame(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {},
+                    },
+                }),
+            ),
+            frame(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"},
+                }),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            frame("message_stop", json!({"type": "message_stop"})),
+        ]
+        .concat();
+        let items = collect_classified(&sse, 4096);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Err(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    crate::reliability::ProviderFailureKind::InvalidResponse
+                );
+                assert!(!failure.is_retryable());
+                assert!(failure.message().contains("invalid JSON arguments"));
+            }
+            other => panic!("expected an invalid-response failure, got {other:?}"),
+        }
     }
 }

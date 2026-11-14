@@ -15,6 +15,7 @@
 mod anthropic;
 mod config;
 mod provider;
+mod reliability;
 mod request;
 mod sse;
 mod stream;
@@ -24,3 +25,7 @@ pub use anthropic::{
 };
 pub use config::{ApiConfigError, DEFAULT_BASE_URL, DEFAULT_MODEL, OpenAiConfig};
 pub use provider::OpenAiProvider;
+pub use reliability::{
+    ClassifiedProvider, ClassifiedStream, MAX_TIMEOUT_MS, ProviderFailure, ProviderFailureKind,
+    ReliabilityConfig, ReliabilityConfigError, ReliableProvider,
+};

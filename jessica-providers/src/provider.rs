@@ -6,8 +6,12 @@ use jessica_core::tool::ToolSchema;
 use jessica_core::types::Message;
 
 use crate::config::{ApiConfigError, OpenAiConfig};
+use crate::reliability::{
+    ClassifiedProvider, ClassifiedStream, ProviderFailure, classify_http_status,
+    classify_reqwest_error, local_failure, parse_retry_after,
+};
 use crate::request::build_chat_request;
-use crate::stream::event_stream;
+use crate::stream::{classified_event_stream, event_stream};
 
 /// Streaming provider for OpenAI-compatible chat-completions endpoints.
 pub struct OpenAiProvider {
@@ -79,6 +83,45 @@ impl LlmProvider for OpenAiProvider {
         }
 
         Ok(event_stream(response.bytes_stream()))
+    }
+}
+
+#[async_trait]
+impl ClassifiedProvider for OpenAiProvider {
+    async fn stream_chat_classified(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+    ) -> Result<ClassifiedStream, ProviderFailure> {
+        let body =
+            build_chat_request(self.config.model(), messages, tools).map_err(local_failure)?;
+        let url = completions_url(self.config.base_url());
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.config.api_key())
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| classify_reqwest_error(&error))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let detail = match response.text().await {
+                Ok(text) => text,
+                Err(error) => format!("<failed to read error body: {error}>"),
+            };
+            return Err(classify_http_status(
+                status.as_u16(),
+                format!("provider returned HTTP {status}: {detail}"),
+                retry_after,
+            ));
+        }
+
+        Ok(classified_event_stream(response.bytes_stream(), false))
     }
 }
 
