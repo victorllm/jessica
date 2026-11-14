@@ -79,6 +79,10 @@ const DEFAULT_RELIABILITY_MAX_BACKOFF_MS: u64 = 4_000;
 const DEFAULT_RELIABILITY_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Default provider stream idle timeout, in milliseconds.
 const DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
+/// Default failed logical calls before the circuit opens.
+const DEFAULT_RELIABILITY_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+/// Default circuit-breaker cooldown, in milliseconds.
+const DEFAULT_RELIABILITY_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -368,6 +372,13 @@ pub struct ReliabilityConfig {
     pub request_timeout_ms: u64,
     /// Provider stream idle timeout, in milliseconds. Zero disables it.
     pub stream_idle_timeout_ms: u64,
+    /// Failed logical calls that open the circuit.
+    ///
+    /// Only retryable failures after retries are exhausted count; one logical
+    /// call counts once regardless of how many attempts it used.
+    pub circuit_failure_threshold: u32,
+    /// Time the circuit stays open before a probe is allowed, in milliseconds.
+    pub circuit_cooldown_ms: u64,
 }
 
 impl Default for ReliabilityConfig {
@@ -379,6 +390,8 @@ impl Default for ReliabilityConfig {
             max_backoff_ms: DEFAULT_RELIABILITY_MAX_BACKOFF_MS,
             request_timeout_ms: DEFAULT_RELIABILITY_REQUEST_TIMEOUT_MS,
             stream_idle_timeout_ms: DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_RELIABILITY_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_RELIABILITY_CIRCUIT_COOLDOWN_MS,
         }
     }
 }
@@ -412,6 +425,16 @@ impl ReliabilityConfig {
                 self.stream_idle_timeout_ms
             )));
         }
+        if self.circuit_failure_threshold == 0 {
+            return Err(invalid(
+                "reliability.circuit_failure_threshold must be at least 1",
+            ));
+        }
+        if self.circuit_cooldown_ms == 0 {
+            return Err(invalid(
+                "reliability.circuit_cooldown_ms must be at least 1",
+            ));
+        }
         Ok(())
     }
 
@@ -426,6 +449,8 @@ impl ReliabilityConfig {
             max_backoff_ms: self.max_backoff_ms,
             request_timeout_ms: self.request_timeout_ms,
             stream_idle_timeout_ms: self.stream_idle_timeout_ms,
+            circuit_failure_threshold: self.circuit_failure_threshold,
+            circuit_cooldown_ms: self.circuit_cooldown_ms,
         }
     }
 }
@@ -1180,6 +1205,8 @@ mod tests {
         assert_eq!(reliability.max_backoff_ms, 4_000);
         assert_eq!(reliability.request_timeout_ms, 30_000);
         assert_eq!(reliability.stream_idle_timeout_ms, 120_000);
+        assert_eq!(reliability.circuit_failure_threshold, 5);
+        assert_eq!(reliability.circuit_cooldown_ms, 30_000);
         assert_eq!(
             reliability.to_provider_config(),
             jessica_providers::ReliabilityConfig {
@@ -1188,6 +1215,8 @@ mod tests {
                 max_backoff_ms: 4_000,
                 request_timeout_ms: 30_000,
                 stream_idle_timeout_ms: 120_000,
+                circuit_failure_threshold: 5,
+                circuit_cooldown_ms: 30_000,
             }
         );
     }
@@ -1201,7 +1230,9 @@ mod tests {
              initial_backoff_ms = 100\n\
              max_backoff_ms = 800\n\
              request_timeout_ms = 1_500\n\
-             stream_idle_timeout_ms = 2_500\n",
+             stream_idle_timeout_ms = 2_500\n\
+             circuit_failure_threshold = 2\n\
+             circuit_cooldown_ms = 60_000\n",
         )
         .expect("reliability section must parse");
 
@@ -1212,6 +1243,8 @@ mod tests {
         assert_eq!(reliability.max_backoff_ms, 800);
         assert_eq!(reliability.request_timeout_ms, 1_500);
         assert_eq!(reliability.stream_idle_timeout_ms, 2_500);
+        assert_eq!(reliability.circuit_failure_threshold, 2);
+        assert_eq!(reliability.circuit_cooldown_ms, 60_000);
     }
 
     #[test]
@@ -1236,6 +1269,14 @@ mod tests {
             (
                 "[reliability]\nstream_idle_timeout_ms = 86400001\n",
                 "reliability.stream_idle_timeout_ms",
+            ),
+            (
+                "[reliability]\ncircuit_failure_threshold = 0\n",
+                "reliability.circuit_failure_threshold",
+            ),
+            (
+                "[reliability]\ncircuit_cooldown_ms = 0\n",
+                "reliability.circuit_cooldown_ms",
             ),
         ] {
             let error = HarnessConfig::from_toml_str(document)

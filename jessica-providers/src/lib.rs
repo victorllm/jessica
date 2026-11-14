@@ -26,7 +26,8 @@ pub use anthropic::{
 pub use config::{ApiConfigError, DEFAULT_BASE_URL, DEFAULT_MODEL, OpenAiConfig};
 pub use provider::OpenAiProvider;
 pub use reliability::{
-    ClassifiedProvider, ClassifiedStream, DEFAULT_INITIAL_BACKOFF_MS, DEFAULT_MAX_ATTEMPTS,
+    ClassifiedProvider, ClassifiedStream, DEFAULT_CIRCUIT_COOLDOWN_MS,
+    DEFAULT_CIRCUIT_FAILURE_THRESHOLD, DEFAULT_INITIAL_BACKOFF_MS, DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_BACKOFF_MS, MAX_TIMEOUT_MS, ProviderFailure, ProviderFailureKind,
     RECOMMENDED_MAX_ATTEMPTS, ReliabilityConfig, ReliabilityConfigError, ReliableProvider,
 };
