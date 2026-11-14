@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
-use jessica_providers::{MAX_TIMEOUT_MS, ReliabilityConfig as ProviderReliabilityConfig};
+use jessica_providers::{
+    MAX_BURST, MAX_CONCURRENT, MAX_REQUESTS_PER_MINUTE, MAX_TIMEOUT_MS,
+    ReliabilityConfig as ProviderReliabilityConfig,
+};
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
@@ -83,6 +86,12 @@ const DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_RELIABILITY_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
 /// Default circuit-breaker cooldown, in milliseconds.
 const DEFAULT_RELIABILITY_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
+/// Default provider request starts per minute. Zero disables rate limiting.
+const DEFAULT_RELIABILITY_REQUESTS_PER_MINUTE: u32 = 0;
+/// Default token-bucket capacity.
+const DEFAULT_RELIABILITY_BURST: u32 = 1;
+/// Default concurrent provider attempts. Zero disables the limit.
+const DEFAULT_RELIABILITY_MAX_CONCURRENT: u32 = 0;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -379,6 +388,13 @@ pub struct ReliabilityConfig {
     pub circuit_failure_threshold: u32,
     /// Time the circuit stays open before a probe is allowed, in milliseconds.
     pub circuit_cooldown_ms: u64,
+    /// Provider request starts allowed per minute. Zero disables rate limiting.
+    pub requests_per_minute: u32,
+    /// Token-bucket capacity. Must be positive when `requests_per_minute` is
+    /// greater than zero.
+    pub burst: u32,
+    /// Maximum concurrent provider attempts. Zero disables the limit.
+    pub max_concurrent: u32,
 }
 
 impl Default for ReliabilityConfig {
@@ -392,6 +408,9 @@ impl Default for ReliabilityConfig {
             stream_idle_timeout_ms: DEFAULT_RELIABILITY_STREAM_IDLE_TIMEOUT_MS,
             circuit_failure_threshold: DEFAULT_RELIABILITY_CIRCUIT_FAILURE_THRESHOLD,
             circuit_cooldown_ms: DEFAULT_RELIABILITY_CIRCUIT_COOLDOWN_MS,
+            requests_per_minute: DEFAULT_RELIABILITY_REQUESTS_PER_MINUTE,
+            burst: DEFAULT_RELIABILITY_BURST,
+            max_concurrent: DEFAULT_RELIABILITY_MAX_CONCURRENT,
         }
     }
 }
@@ -435,6 +454,29 @@ impl ReliabilityConfig {
                 "reliability.circuit_cooldown_ms must be at least 1",
             ));
         }
+        if self.requests_per_minute > MAX_REQUESTS_PER_MINUTE {
+            return Err(invalid(format!(
+                "reliability.requests_per_minute = {} exceeds the maximum of {MAX_REQUESTS_PER_MINUTE}",
+                self.requests_per_minute
+            )));
+        }
+        if self.burst > MAX_BURST {
+            return Err(invalid(format!(
+                "reliability.burst = {} exceeds the maximum of {MAX_BURST}",
+                self.burst
+            )));
+        }
+        if self.max_concurrent > MAX_CONCURRENT {
+            return Err(invalid(format!(
+                "reliability.max_concurrent = {} exceeds the maximum of {MAX_CONCURRENT}",
+                self.max_concurrent
+            )));
+        }
+        if self.requests_per_minute > 0 && self.burst == 0 {
+            return Err(invalid(
+                "reliability.burst must be at least 1 when reliability.requests_per_minute is greater than 0",
+            ));
+        }
         Ok(())
     }
 
@@ -451,6 +493,9 @@ impl ReliabilityConfig {
             stream_idle_timeout_ms: self.stream_idle_timeout_ms,
             circuit_failure_threshold: self.circuit_failure_threshold,
             circuit_cooldown_ms: self.circuit_cooldown_ms,
+            requests_per_minute: self.requests_per_minute,
+            burst: self.burst,
+            max_concurrent: self.max_concurrent,
         }
     }
 }
@@ -1207,6 +1252,9 @@ mod tests {
         assert_eq!(reliability.stream_idle_timeout_ms, 120_000);
         assert_eq!(reliability.circuit_failure_threshold, 5);
         assert_eq!(reliability.circuit_cooldown_ms, 30_000);
+        assert_eq!(reliability.requests_per_minute, 0);
+        assert_eq!(reliability.burst, 1);
+        assert_eq!(reliability.max_concurrent, 0);
         assert_eq!(
             reliability.to_provider_config(),
             jessica_providers::ReliabilityConfig {
@@ -1217,6 +1265,9 @@ mod tests {
                 stream_idle_timeout_ms: 120_000,
                 circuit_failure_threshold: 5,
                 circuit_cooldown_ms: 30_000,
+                requests_per_minute: 0,
+                burst: 1,
+                max_concurrent: 0,
             }
         );
     }
@@ -1232,7 +1283,10 @@ mod tests {
              request_timeout_ms = 1_500\n\
              stream_idle_timeout_ms = 2_500\n\
              circuit_failure_threshold = 2\n\
-             circuit_cooldown_ms = 60_000\n",
+             circuit_cooldown_ms = 60_000\n\
+             requests_per_minute = 120\n\
+             burst = 5\n\
+             max_concurrent = 4\n",
         )
         .expect("reliability section must parse");
 
@@ -1245,6 +1299,12 @@ mod tests {
         assert_eq!(reliability.stream_idle_timeout_ms, 2_500);
         assert_eq!(reliability.circuit_failure_threshold, 2);
         assert_eq!(reliability.circuit_cooldown_ms, 60_000);
+        assert_eq!(reliability.requests_per_minute, 120);
+        assert_eq!(reliability.burst, 5);
+        assert_eq!(reliability.max_concurrent, 4);
+        assert_eq!(reliability.to_provider_config().requests_per_minute, 120);
+        assert_eq!(reliability.to_provider_config().burst, 5);
+        assert_eq!(reliability.to_provider_config().max_concurrent, 4);
     }
 
     #[test]
@@ -1278,6 +1338,19 @@ mod tests {
                 "[reliability]\ncircuit_cooldown_ms = 0\n",
                 "reliability.circuit_cooldown_ms",
             ),
+            (
+                "[reliability]\nrequests_per_minute = 1000001\n",
+                "reliability.requests_per_minute",
+            ),
+            ("[reliability]\nburst = 1000001\n", "reliability.burst"),
+            (
+                "[reliability]\nmax_concurrent = 1025\n",
+                "reliability.max_concurrent",
+            ),
+            (
+                "[reliability]\nrequests_per_minute = 60\nburst = 0\n",
+                "reliability.burst",
+            ),
         ] {
             let error = HarnessConfig::from_toml_str(document)
                 .expect_err("invalid reliability values must fail at load time");
@@ -1296,13 +1369,29 @@ mod tests {
              initial_backoff_ms = 1\n\
              max_backoff_ms = 1\n\
              request_timeout_ms = 0\n\
-             stream_idle_timeout_ms = 0\n",
+             stream_idle_timeout_ms = 0\n\
+             requests_per_minute = 0\n\
+             burst = 0\n",
         )
-        .expect("zero timeouts and eleven attempts are explicitly valid");
+        .expect(
+            "zero timeouts, zero burst with the bucket disabled, and eleven attempts are valid",
+        );
 
         assert_eq!(config.reliability.max_attempts, 11);
         assert_eq!(config.reliability.request_timeout_ms, 0);
         assert_eq!(config.reliability.stream_idle_timeout_ms, 0);
+        assert_eq!(config.reliability.burst, 0);
+
+        let maximums = HarnessConfig::from_toml_str(
+            "[reliability]\n\
+             requests_per_minute = 1000000\n\
+             burst = 1000000\n\
+             max_concurrent = 1024\n",
+        )
+        .expect("documented maximums are accepted");
+        assert_eq!(maximums.reliability.requests_per_minute, 1_000_000);
+        assert_eq!(maximums.reliability.burst, 1_000_000);
+        assert_eq!(maximums.reliability.max_concurrent, 1_024);
     }
 
     #[test]
