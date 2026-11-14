@@ -24,7 +24,7 @@ use jessica_runtime::{
 };
 use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
@@ -120,12 +120,16 @@ impl AttemptContext {
     }
 }
 
-/// Owns the provider, configuration, and workspace shared by every turn.
+/// Owns the provider, configuration snapshot source, and workspace.
 pub(crate) struct CliRuntime {
     provider: Arc<dyn LlmProvider>,
-    config: Arc<HarnessConfig>,
+    /// Source of the configuration snapshot used by the next turn.
+    ///
+    /// A REPL-only watcher publishes a new snapshot after a valid reload. A
+    /// one-shot or resume run has no watcher, so the receiver keeps returning
+    /// the startup configuration.
+    config: watch::Receiver<Arc<HarnessConfig>>,
     root: PathBuf,
-    system_prompt: String,
     wasm_tools: Vec<Arc<dyn Tool>>,
     recorder: Option<Arc<EventRecorder>>,
     memory: Option<MemoryAssembly>,
@@ -135,6 +139,9 @@ pub(crate) struct CliRuntime {
 impl CliRuntime {
     /// Creates a runtime for the current workspace.
     ///
+    /// `config` must already contain the fully validated startup configuration;
+    /// the same value is cloned at the start of every turn so `initial_messages`
+    /// and `build_turn` cannot observe different snapshots.
     /// `wasm_tools` contains plugins already loaded by [`load_wasm_tools`].
     /// Compilation happens once at startup rather than on every turn.
     /// `recorder` is present when the configuration enables event persistence.
@@ -142,24 +149,33 @@ impl CliRuntime {
     /// `skills` is present only when enabled and opened successfully.
     pub(crate) fn new(
         provider: Arc<dyn LlmProvider>,
-        config: HarnessConfig,
+        config: watch::Receiver<Arc<HarnessConfig>>,
         root: PathBuf,
         wasm_tools: Vec<Arc<dyn Tool>>,
         recorder: Option<Arc<EventRecorder>>,
         memory: Option<MemoryAssembly>,
         skills: Option<SkillsAssembly>,
     ) -> Self {
-        let system_prompt = system_prompt(&root, &config);
         Self {
             provider,
-            config: Arc::new(config),
+            config,
             root,
-            system_prompt,
             wasm_tools,
             recorder,
             memory,
             skills,
         }
+    }
+
+    /// Returns the immutable configuration snapshot for the next turn.
+    ///
+    /// Each turn clones exactly one `Arc`. Components rebuilt inside that turn
+    /// (system prompt, tool schema, guards, policy, delegation, sensors, and
+    /// acceptance) all read from this same snapshot. The watcher may publish a
+    /// newer snapshot while the turn runs; that value is observed only by the
+    /// next turn.
+    fn config_snapshot(&self) -> Arc<HarnessConfig> {
+        self.config.borrow().clone()
     }
 
     /// Drains the skill worker before the process exits.
@@ -180,9 +196,15 @@ impl CliRuntime {
     /// that finally completes is written to memory according to the configured
     /// write policy.
     pub(crate) async fn run_turn(&self, input: String) -> Result<SessionEndReason, CliError> {
-        let setup = self.build_turn(true)?;
+        // One snapshot for the whole turn. `build_turn` and
+        // `initial_messages` must never mix a newer published config with an
+        // older one, even if the watcher fires mid-turn.
+        let config = self.config_snapshot();
+        let setup = self.build_turn(true, &config)?;
         let first_session = next_session_id();
-        let initial = self.initial_messages(&first_session, input.as_str()).await;
+        let initial = self
+            .initial_messages(&first_session, input.as_str(), &config)
+            .await;
 
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let (
@@ -193,7 +215,7 @@ impl CliRuntime {
             final_messages,
             signals,
             attempt_start,
-        ) = if let Some(acceptance) = &self.config.acceptance {
+        ) = if let Some(acceptance) = &config.acceptance {
             let check = CommandAcceptanceCheck::new(
                 acceptance.name.clone(),
                 acceptance.command.clone(),
@@ -294,8 +316,15 @@ impl CliRuntime {
     /// Builds the initial conversation for a fresh turn.
     ///
     /// The order is fixed: system prompt, optional guide message, user input.
-    /// A disabled or failed guide simply omits the middle message.
-    async fn initial_messages(&self, session: &SessionId, input: &str) -> Vec<Message> {
+    /// A disabled or failed guide simply omits the middle message. Memory and
+    /// skills are each recalled exactly once here; the system prompt is
+    /// rendered from the same configuration snapshot as the rest of the turn.
+    async fn initial_messages(
+        &self,
+        session: &SessionId,
+        input: &str,
+        config: &HarnessConfig,
+    ) -> Vec<Message> {
         let memory_message = match &self.memory {
             Some(memory) => memory.recall(session, input).await,
             None => None,
@@ -304,7 +333,12 @@ impl CliRuntime {
             Some(skills) => skills.recall(session, input).await,
             None => None,
         };
-        fresh_conversation(&self.system_prompt, memory_message, skill_message, input)
+        fresh_conversation(
+            &system_prompt(&self.root, config),
+            memory_message,
+            skill_message,
+            input,
+        )
     }
 
     /// Writes the completed turn to memory when the policy allows it.
@@ -405,7 +439,8 @@ impl CliRuntime {
             .map(|message| message.content.clone())
             .unwrap_or_default();
 
-        let setup = self.build_turn(false)?;
+        let config = self.config_snapshot();
+        let setup = self.build_turn(false, &config)?;
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }).await;
         let reason = attempt.reason;
@@ -449,14 +484,16 @@ impl CliRuntime {
     /// `allow_delegation` is false on the resume path. Resume continues a
     /// recorded loop but never constructs a child factory or executor; a fresh
     /// turn constructs them only when `[delegation]` is enabled.
-    fn build_turn(&self, allow_delegation: bool) -> Result<TurnSetup, CliError> {
-        let timeout = self.config.budget.tool_timeout();
-        let token_guard = Arc::new(TokenBudgetGuard::new(self.config.budget.max_tokens));
+    fn build_turn(
+        &self,
+        allow_delegation: bool,
+        config: &HarnessConfig,
+    ) -> Result<TurnSetup, CliError> {
+        let timeout = config.budget.tool_timeout();
+        let token_guard = Arc::new(TokenBudgetGuard::new(config.budget.max_tokens));
         let timeout_guard = Arc::new(ToolTimeoutGuard::new(timeout));
-        let stuck_guard = Arc::new(StuckDetectionGuard::new(
-            self.config.budget.max_stuck_rounds,
-        ));
-        let result_guard = Arc::new(ResultSizeGuard::new(self.config.budget.max_result_bytes));
+        let stuck_guard = Arc::new(StuckDetectionGuard::new(config.budget.max_stuck_rounds));
+        let result_guard = Arc::new(ResultSizeGuard::new(config.budget.max_result_bytes));
 
         let guards: Vec<Arc<dyn Guard>> = vec![
             Arc::clone(&token_guard) as Arc<dyn Guard>,
@@ -464,10 +501,9 @@ impl CliRuntime {
             Arc::clone(&stuck_guard) as Arc<dyn Guard>,
             Arc::clone(&result_guard) as Arc<dyn Guard>,
         ];
-        let policy: Arc<dyn Policy> = Arc::new(AllowlistPolicy::new(
-            self.config.policy.allowed_tools.clone(),
-        ));
-        let sensors = self.build_sensors();
+        let policy: Arc<dyn Policy> =
+            Arc::new(AllowlistPolicy::new(config.policy.allowed_tools.clone()));
+        let sensors = self.build_sensors(config);
         let harness = Arc::new(
             Harness::with_event_capacity(Vec::new(), DEFAULT_EVENT_CAPACITY)
                 .with_guards(guards)
@@ -485,7 +521,8 @@ impl CliRuntime {
         ));
         // The child executor receives the same counting provider, so every
         // child call charges the parent token guard and can cancel the turn.
-        let delegation = self.build_child_executor(allow_delegation, Arc::clone(&provider))?;
+        let delegation =
+            self.build_child_executor(allow_delegation, Arc::clone(&provider), config)?;
 
         let registry = self.build_tool_registry(
             Arc::clone(&harness),
@@ -498,7 +535,7 @@ impl CliRuntime {
         let agent = Arc::new(AgentLoop::new(
             provider,
             Arc::new(registry),
-            self.config.budget.to_budget(),
+            config.budget.to_budget(),
             events.clone(),
         ));
         let pump = Arc::new(EventPump::new(
@@ -522,8 +559,8 @@ impl CliRuntime {
         })
     }
 
-    fn build_sensors(&self) -> Vec<Arc<dyn Sensor>> {
-        let Some(sensor) = &self.config.sensor else {
+    fn build_sensors(&self, config: &HarnessConfig) -> Vec<Arc<dyn Sensor>> {
+        let Some(sensor) = &config.sensor else {
             return Vec::new();
         };
         let command = CommandSensor::new(&sensor.name, &sensor.command)
@@ -540,23 +577,20 @@ impl CliRuntime {
         &self,
         allow_delegation: bool,
         provider: Arc<dyn LlmProvider>,
+        config: &HarnessConfig,
     ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
-        if !allow_delegation || !self.config.delegation.enabled {
+        if !allow_delegation || !config.delegation.enabled {
             return Ok(None);
         }
 
         let factory: Arc<dyn ChildToolFactory> =
             Arc::new(NativeChildToolFactory::new(self.root.clone()));
         let parent = ParentCapabilities::new(
-            self.config.policy.allowed_tools.clone(),
+            config.policy.allowed_tools.clone(),
             NATIVE_CHILD_TOOLS.iter().map(|name| (*name).to_owned()),
         );
-        let executor = AgentChildExecutor::new(
-            provider,
-            factory,
-            parent,
-            self.config.delegation.to_limits(),
-        )?;
+        let executor =
+            AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
         Ok(Some(Arc::new(executor)))
     }
 
@@ -1057,12 +1091,17 @@ mod tests {
         tools: Vec<ToolSchema>,
     }
 
+    /// A config publication deferred until the next provider call.
+    type PendingReload = Option<(watch::Sender<Arc<HarnessConfig>>, Arc<HarnessConfig>)>;
+
     /// Provider that replays scripted event batches and records every call.
     struct ScriptedProvider {
         /// Responses in call order.
         responses: Mutex<VecDeque<Vec<LlmEvent>>>,
         /// Calls observed so far.
         calls: Mutex<Vec<ProviderCall>>,
+        /// Config snapshot to publish during the next provider call.
+        reload: Mutex<PendingReload>,
     }
 
     impl ScriptedProvider {
@@ -1071,7 +1110,20 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 calls: Mutex::new(Vec::new()),
+                reload: Mutex::new(None),
             }
+        }
+
+        /// Publishes `config` while the next model call is in flight.
+        ///
+        /// This simulates the REPL watcher firing mid-turn: the turn already
+        /// cloned its snapshot, so only a later turn may observe the value.
+        fn reload_during_next_call(
+            &self,
+            sender: watch::Sender<Arc<HarnessConfig>>,
+            config: HarnessConfig,
+        ) {
+            *self.reload.lock().expect("reload mutex poisoned") = Some((sender, Arc::new(config)));
         }
 
         /// Returns a snapshot of the calls observed so far.
@@ -1097,6 +1149,11 @@ mod tests {
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
                 });
+            if let Some((sender, config)) =
+                self.reload.lock().expect("reload mutex poisoned").take()
+            {
+                let _ = sender.send(config);
+            }
             let events = self
                 .responses
                 .lock()
@@ -1135,6 +1192,33 @@ mod tests {
         ]
     }
 
+    /// Builds a parent response that requests one unknown tool.
+    ///
+    /// The loop reports the unknown tool as an error result and spends another
+    /// round; no real tool executes.
+    fn unknown_tool_request(id: &str) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(id, "unknown_tool", json!({})),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
+    /// Builds a parent response that requests one bash command.
+    fn bash_request(id: &str, command: &str) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(id, "bash", json!({"command": command})),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
     /// Extracts schema names in registry order.
     fn schema_names(tools: &[ToolSchema]) -> Vec<&str> {
         tools
@@ -1159,9 +1243,10 @@ mod tests {
 
     /// Builds a runtime over the given provider and config.
     fn runtime_with(provider: Arc<ScriptedProvider>, config: HarnessConfig) -> CliRuntime {
+        let (_sender, receiver) = watch::channel(Arc::new(config));
         CliRuntime::new(
             provider,
-            config,
+            receiver,
             PathBuf::from("."),
             Vec::new(),
             None,
@@ -1170,11 +1255,23 @@ mod tests {
         )
     }
 
+    /// Returns the system prompt the provider observed for one call.
+    fn system_prompt_of(call: &ProviderCall) -> &str {
+        call.messages
+            .first()
+            .expect("the call must include a system message")
+            .content
+            .as_str()
+    }
+
     #[tokio::test]
     async fn delegate_tool_is_present_only_on_enabled_fresh_turns() {
         let enabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let enabled_runtime = runtime_with(Arc::clone(&enabled_provider), enabled_config());
-        let setup = enabled_runtime.build_turn(true).expect("turn should build");
+        let enabled_config_snapshot = enabled_runtime.config_snapshot();
+        let setup = enabled_runtime
+            .build_turn(true, &enabled_config_snapshot)
+            .expect("turn should build");
         let reason = setup
             .agent
             .run(
@@ -1196,8 +1293,9 @@ mod tests {
         let disabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let disabled_runtime =
             runtime_with(Arc::clone(&disabled_provider), HarnessConfig::default());
+        let disabled_config_snapshot = disabled_runtime.config_snapshot();
         let setup = disabled_runtime
-            .build_turn(true)
+            .build_turn(true, &disabled_config_snapshot)
             .expect("turn should build");
         setup
             .agent
@@ -1215,7 +1313,10 @@ mod tests {
 
         let resume_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
-        let setup = resume_runtime.build_turn(false).expect("turn should build");
+        let resume_config_snapshot = resume_runtime.config_snapshot();
+        let setup = resume_runtime
+            .build_turn(false, &resume_config_snapshot)
+            .expect("turn should build");
         setup
             .agent
             .run(
@@ -1243,7 +1344,10 @@ mod tests {
             done_text("parent done", 10),
         ]));
         let runtime = runtime_with(Arc::clone(&provider), enabled_config());
-        let setup = runtime.build_turn(true).expect("turn should build");
+        let config = runtime.config_snapshot();
+        let setup = runtime
+            .build_turn(true, &config)
+            .expect("turn should build");
 
         let reason = setup
             .agent
@@ -1286,6 +1390,193 @@ mod tests {
             serde_json::from_str(&tool_message.content).expect("delegate result must be JSON");
         assert_eq!(result["status"], json!("ok"));
         assert_eq!(result["answer"], json!("child answer"));
+    }
+
+    /// Builds a runtime whose config can be reloaded by the test.
+    fn runtime_with_reload(
+        provider: Arc<ScriptedProvider>,
+        config: HarnessConfig,
+    ) -> (CliRuntime, watch::Sender<Arc<HarnessConfig>>) {
+        let (sender, receiver) = watch::channel(Arc::new(config));
+        let runtime = CliRuntime::new(
+            provider,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
+        (runtime, sender)
+    }
+
+    #[tokio::test]
+    async fn a_published_config_is_used_by_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+
+        runtime
+            .run_turn("first question".to_owned())
+            .await
+            .expect("first turn should complete");
+        sender
+            .send(Arc::new(enabled_config()))
+            .expect("runtime must keep the receiver open");
+        runtime
+            .run_turn("second question".to_owned())
+            .await
+            .expect("second turn should complete");
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !system_prompt_of(&calls[0]).contains("delegate_task"),
+            "the first turn must keep the startup snapshot"
+        );
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["bash", "read_file", "write_file"]
+        );
+        assert!(
+            system_prompt_of(&calls[1]).contains("delegate_task"),
+            "the second turn's system prompt must use the reloaded allowlist"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash", "delegate_task", "read_file", "write_file"],
+            "the second turn's tool schema must include the newly enabled tool"
+        );
+        assert_eq!(
+            calls[1]
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![Role::System, Role::User],
+            "hot reload must not add or reorder messages"
+        );
+        assert_eq!(calls[1].messages[1].content, "second question");
+    }
+
+    #[tokio::test]
+    async fn a_reload_during_a_turn_is_observed_only_by_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+        provider.reload_during_next_call(sender, enabled_config());
+
+        runtime
+            .run_turn("first question".to_owned())
+            .await
+            .expect("first turn should complete");
+        runtime
+            .run_turn("second question".to_owned())
+            .await
+            .expect("second turn should complete");
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !system_prompt_of(&calls[0]).contains("delegate_task"),
+            "the in-flight turn must finish with its original snapshot"
+        );
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["bash", "read_file", "write_file"]
+        );
+        assert!(
+            system_prompt_of(&calls[1]).contains("delegate_task"),
+            "the next turn must observe the value published mid-turn"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash", "delegate_task", "read_file", "write_file"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_round_budget_applies_to_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            unknown_tool_request("first-a"),
+            unknown_tool_request("first-b"),
+            done_text("first answer", 1),
+            unknown_tool_request("second-a"),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+
+        assert_eq!(
+            runtime
+                .run_turn("first question".to_owned())
+                .await
+                .expect("first turn should run"),
+            SessionEndReason::Completed,
+            "the default round budget allows both tool rounds"
+        );
+        let reloaded = HarnessConfig::from_toml_str("[budget]\nmax_rounds = 1\n")
+            .expect("budget should parse");
+        sender
+            .send(Arc::new(reloaded))
+            .expect("runtime must keep the receiver open");
+
+        assert_eq!(
+            runtime
+                .run_turn("second question".to_owned())
+                .await
+                .expect("second turn should run"),
+            SessionEndReason::BudgetExceeded,
+            "the reloaded max_rounds must stop the second turn after one model call"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            4,
+            "three calls for the first turn and exactly one for the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_tool_timeout_applies_to_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            bash_request("slow-command", "sleep 0.2"),
+            done_text("second answer", 1),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+
+        assert_eq!(
+            runtime
+                .run_turn("first question".to_owned())
+                .await
+                .expect("first turn should run"),
+            SessionEndReason::Completed
+        );
+        let reloaded = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 1\n")
+            .expect("budget should parse");
+        sender
+            .send(Arc::new(reloaded))
+            .expect("runtime must keep the receiver open");
+
+        assert_eq!(
+            runtime
+                .run_turn("second question".to_owned())
+                .await
+                .expect("second turn should run"),
+            SessionEndReason::BudgetExceeded,
+            "the reloaded 1ms tool timeout must abort the 200ms command"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "a timed-out tool cancels the second turn before another model call"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod config;
 mod delegation;
 mod events;
 mod governance;
+mod hot_reload;
 mod memory;
 mod pump;
 mod replay;
@@ -21,10 +22,12 @@ use jessica_core::types::{SessionEndReason, SessionId};
 use jessica_memory::{SkillId, SkillStatus};
 use jessica_providers::{AnthropicProvider, ClassifiedProvider, OpenAiProvider, ReliableProvider};
 use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
+use tokio::sync::watch;
 
 use crate::app::{CliError, CliRuntime, load_wasm_tools};
 use crate::config::{HarnessConfig, ReliabilityConfig as CliReliabilityConfig};
 use crate::events::EventRecorder;
+use crate::hot_reload::ConfigWatcher;
 use crate::memory::MemoryAssembly;
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
 
@@ -57,6 +60,7 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
         .await
         .map_err(CliError::CurrentDirTask)?
         .map_err(CliError::CurrentDir)?;
+    let watch_path = watched_config_path(&mode, &config_path);
 
     match mode {
         Mode::Replay { session, out } => {
@@ -92,18 +96,39 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
             // either database. Both assemblies are fail-open.
             let memory = MemoryAssembly::open(&config.memory, &root).await;
             let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
-            let runtime =
-                CliRuntime::new(provider, config, root, wasm_tools, recorder, memory, skills);
+            // The startup configuration is loaded and validated once. The
+            // receiver is the per-turn snapshot source; only the REPL branch
+            // installs a watcher capable of publishing a newer value.
+            let (config_sender, config_receiver) = watch::channel(Arc::new(config));
+            let runtime = CliRuntime::new(
+                provider,
+                config_receiver,
+                root,
+                wasm_tools,
+                recorder,
+                memory,
+                skills,
+            );
 
             let result = if let Some(session_id) = resume {
                 runtime.resume_turn(session_id).await.map(Some)
             } else {
                 match prompt {
                     Some(input) => runtime.run_turn(input).await.map(Some),
-                    None => match repl(&runtime).await {
-                        Ok(()) => Ok(None),
-                        Err(error) => Err(error),
-                    },
+                    None => {
+                        // One-shot, resume, replay, and skills never reach
+                        // this branch, so they never start a configuration
+                        // watcher or read the file a second time.
+                        let watcher = match watch_path {
+                            Some(path) => Some(ConfigWatcher::spawn(path, config_sender).await),
+                            None => None,
+                        };
+                        let outcome = repl(&runtime).await;
+                        // Dropping the watcher aborts its polling task before
+                        // the skill worker drain begins.
+                        drop(watcher);
+                        outcome.map(|()| None)
+                    }
                 }
             };
             // Drain once, after every turn or REPL line, without changing the
@@ -232,6 +257,21 @@ enum Mode {
         /// Review command to execute.
         command: SkillCommand,
     },
+}
+
+/// Returns the configuration path watched by this execution path.
+///
+/// Only an interactive REPL (a `Turn` with neither `--resume` nor a prompt)
+/// owns a long-lived config watcher. One-shot, resume, replay, and skills
+/// return `None`, so they load the startup configuration exactly once.
+fn watched_config_path(mode: &Mode, config_path: &Option<PathBuf>) -> Option<PathBuf> {
+    match mode {
+        Mode::Turn {
+            resume: None,
+            prompt: None,
+        } => config_path.clone(),
+        _ => None,
+    }
 }
 
 /// Parses arguments, returning `None` after printing help.
@@ -627,6 +667,43 @@ mod tests {
     use jessica_core::tool::ToolSchema;
     use jessica_core::types::Message;
     use jessica_providers::{ClassifiedStream, ProviderFailure};
+
+    #[test]
+    fn only_the_interactive_repl_watches_the_config_file() {
+        let config = Some(PathBuf::from("harness.toml"));
+        let repl = Mode::Turn {
+            resume: None,
+            prompt: None,
+        };
+        assert_eq!(watched_config_path(&repl, &config), config);
+        assert_eq!(watched_config_path(&repl, &None), None);
+
+        let one_shot = Mode::Turn {
+            resume: None,
+            prompt: Some("hi".to_owned()),
+        };
+        assert_eq!(watched_config_path(&one_shot, &config), None);
+
+        let resume = Mode::Turn {
+            resume: Some(SessionId::new("session")),
+            prompt: None,
+        };
+        assert_eq!(watched_config_path(&resume, &config), None);
+
+        let replay = Mode::Replay {
+            session: SessionId::new("session"),
+            out: PathBuf::from("out.jsonl"),
+        };
+        assert_eq!(watched_config_path(&replay, &config), None);
+
+        let skills = Mode::Skills {
+            command: SkillCommand::List {
+                status: None,
+                limit: 10,
+            },
+        };
+        assert_eq!(watched_config_path(&skills, &config), None);
+    }
 
     /// Concrete provider that distinguishes the legacy and classified paths.
     #[derive(Default)]
