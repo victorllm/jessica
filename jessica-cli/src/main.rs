@@ -10,11 +10,11 @@ mod hot_reload;
 mod memory;
 mod pump;
 mod replay;
+mod shutdown;
 mod skills;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use jessica_core::llm::LlmProvider;
@@ -29,23 +29,57 @@ use crate::config::{HarnessConfig, ReliabilityConfig as CliReliabilityConfig};
 use crate::events::EventRecorder;
 use crate::hot_reload::ConfigWatcher;
 use crate::memory::MemoryAssembly;
+use crate::shutdown::{ShutdownController, ShutdownSignal, SignalListener};
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
 
 #[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(Some(reason)) => exit_code(reason),
-        Ok(None) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("jessica: {error}");
-            ExitCode::FAILURE
+async fn main() {
+    let outcome = run().await;
+    if let Err(error) = &outcome.result {
+        eprintln!("jessica: {error}");
+    }
+    // Turns persist through the event pump and the skill worker is drained
+    // before `run` returns. Exit explicitly instead of returning from
+    // `#[tokio::main]`: while the REPL waits for a line, an interactive stdin
+    // has a blocking read pending on the blocking pool, and dropping the
+    // runtime would wait for that read until the terminal closes. Flush both
+    // streams first so no user-visible output is lost.
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(i32::from(exit_code(&outcome)));
+}
+
+/// Result of one CLI invocation.
+struct RunOutcome {
+    /// Result of the selected mode; `Ok(None)` means no turn was executed.
+    result: Result<Option<SessionEndReason>, CliError>,
+    /// First graceful-shutdown signal, if the turn path installed a listener.
+    signal: Option<ShutdownSignal>,
+}
+
+impl RunOutcome {
+    /// Successful invocation that did not run a turn.
+    fn success() -> Self {
+        Self {
+            result: Ok(None),
+            signal: None,
+        }
+    }
+
+    /// Failure raised before the turn path installed a signal listener.
+    fn error(error: CliError) -> Self {
+        Self {
+            result: Err(error),
+            signal: None,
         }
     }
 }
 
-async fn run() -> Result<Option<SessionEndReason>, CliError> {
-    let Some(options) = parse_args()? else {
-        return Ok(None);
+async fn run() -> RunOutcome {
+    let options = match parse_args() {
+        Ok(Some(options)) => options,
+        Ok(None) => return RunOutcome::success(),
+        Err(error) => return RunOutcome::error(error),
     };
     let Options {
         config: config_path,
@@ -53,90 +87,129 @@ async fn run() -> Result<Option<SessionEndReason>, CliError> {
     } = options;
 
     let config = match &config_path {
-        Some(path) => HarnessConfig::load(path).await?,
+        Some(path) => match HarnessConfig::load(path).await {
+            Ok(config) => config,
+            Err(error) => return RunOutcome::error(error.into()),
+        },
         None => HarnessConfig::default(),
     };
-    let root = tokio::task::spawn_blocking(std::env::current_dir)
-        .await
-        .map_err(CliError::CurrentDirTask)?
-        .map_err(CliError::CurrentDir)?;
+    let root = match tokio::task::spawn_blocking(std::env::current_dir).await {
+        Ok(Ok(root)) => root,
+        Ok(Err(error)) => return RunOutcome::error(CliError::CurrentDir(error)),
+        Err(error) => return RunOutcome::error(CliError::CurrentDirTask(error)),
+    };
     let watch_path = watched_config_path(&mode, &config_path);
 
     match mode {
         Mode::Replay { session, out } => {
-            let recorder = open_recorder(&config, &root)
-                .await?
-                .ok_or(CliError::ReplayRequiresEventStore)?;
-            let stored =
-                recorder
-                    .load(session.clone())
+            let result: Result<Option<SessionEndReason>, CliError> = async {
+                let recorder = open_recorder(&config, &root)
                     .await?
-                    .ok_or_else(|| CliError::UnknownSession {
+                    .ok_or(CliError::ReplayRequiresEventStore)?;
+                let stored = recorder.load(session.clone()).await?.ok_or_else(|| {
+                    CliError::UnknownSession {
                         session_id: session.to_string(),
-                    })?;
-            let events = replay::replay_session(&session, &stored).await?;
-            let count = events.len();
-            let output_path = out.display().to_string();
-            replay::write_jsonl(out, events).await?;
-            println!("[replay] wrote {count} events for session {session} to {output_path}");
-            Ok(None)
+                    }
+                })?;
+                let events = replay::replay_session(&session, &stored).await?;
+                let count = events.len();
+                let output_path = out.display().to_string();
+                replay::write_jsonl(out, events).await?;
+                println!("[replay] wrote {count} events for session {session} to {output_path}");
+                Ok(None)
+            }
+            .await;
+            RunOutcome {
+                result,
+                signal: None,
+            }
         }
         Mode::Skills { command } => {
             // Manual review never initializes a provider, loads wasm tools, or
             // opens the event store.
-            run_skill_command(&config.skills, &root, command).await?;
-            Ok(None)
+            let result: Result<Option<SessionEndReason>, CliError> = async {
+                run_skill_command(&config.skills, &root, command).await?;
+                Ok(None)
+            }
+            .await;
+            RunOutcome {
+                result,
+                signal: None,
+            }
         }
         Mode::Turn { resume, prompt } => {
-            let recorder = open_recorder(&config, &root).await?;
-            let provider = build_provider(&config.reliability)?;
-            let wasm_tools = load_wasm_tools(&config, &root).await?;
-            // Memory and skills are assembled only on the turn path. Replay
-            // returns above and therefore never opens, creates, or reads
-            // either database. Both assemblies are fail-open.
-            let memory = MemoryAssembly::open(&config.memory, &root).await;
-            let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
-            // The startup configuration is loaded and validated once. The
-            // receiver is the per-turn snapshot source; only the REPL branch
-            // installs a watcher capable of publishing a newer value.
-            let (config_sender, config_receiver) = watch::channel(Arc::new(config));
-            let runtime = CliRuntime::new(
-                provider,
-                config_receiver,
-                root,
-                wasm_tools,
-                recorder,
-                memory,
-                skills,
-            );
-
-            let result = if let Some(session_id) = resume {
-                runtime.resume_turn(session_id).await.map(Some)
-            } else {
-                match prompt {
-                    Some(input) => runtime.run_turn(input).await.map(Some),
-                    None => {
-                        // One-shot, resume, replay, and skills never reach
-                        // this branch, so they never start a configuration
-                        // watcher or read the file a second time.
-                        let watcher = match watch_path {
-                            Some(path) => Some(ConfigWatcher::spawn(path, config_sender).await),
-                            None => None,
-                        };
-                        let outcome = repl(&runtime).await;
-                        // Dropping the watcher aborts its polling task before
-                        // the skill worker drain begins.
-                        drop(watcher);
-                        outcome.map(|()| None)
-                    }
-                }
-            };
-            // Drain once, after every turn or REPL line, without changing the
-            // exit code on timeout.
-            runtime.shutdown().await;
-            result
+            // The listener is installed once at startup, before the event
+            // store is opened. Turns never install their own listener.
+            let shutdown = Arc::new(ShutdownController::new());
+            let listener = SignalListener::spawn(Arc::clone(&shutdown));
+            let result = run_turn_mode(config, root, watch_path, resume, prompt, &shutdown).await;
+            let signal = shutdown.signal();
+            // A forced exit happened inside the listener and never reaches
+            // this point. On the normal path the listener is now quiescent.
+            drop(listener);
+            RunOutcome { result, signal }
         }
     }
+}
+
+/// Runs every turn mode: one-shot, resume, or the interactive REPL.
+///
+/// The skill drain happens exactly once, after the last turn, without changing
+/// the exit code when it times out.
+async fn run_turn_mode(
+    config: HarnessConfig,
+    root: PathBuf,
+    watch_path: Option<PathBuf>,
+    resume: Option<SessionId>,
+    prompt: Option<String>,
+    shutdown: &Arc<ShutdownController>,
+) -> Result<Option<SessionEndReason>, CliError> {
+    let recorder = open_recorder(&config, &root).await?;
+    let provider = build_provider(&config.reliability)?;
+    let wasm_tools = load_wasm_tools(&config, &root).await?;
+    // Memory and skills are assembled only on the turn path. Replay returns
+    // above and therefore never opens, creates, or reads either database. Both
+    // assemblies are fail-open.
+    let memory = MemoryAssembly::open(&config.memory, &root).await;
+    let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
+    // The startup configuration is loaded and validated once. The receiver is
+    // the per-turn snapshot source; only the REPL branch installs a watcher
+    // capable of publishing a newer value.
+    let (config_sender, config_receiver) = watch::channel(Arc::new(config));
+    let runtime = CliRuntime::new(
+        provider,
+        config_receiver,
+        root,
+        wasm_tools,
+        recorder,
+        memory,
+        skills,
+        Arc::clone(shutdown),
+    );
+
+    let result = if let Some(session_id) = resume {
+        runtime.resume_turn(session_id).await.map(Some)
+    } else {
+        match prompt {
+            Some(input) => runtime.run_turn(input).await.map(Some),
+            None => {
+                // One-shot, resume, replay, and skills never reach this
+                // branch, so they never start a configuration watcher or read
+                // the file a second time.
+                let watcher = match watch_path {
+                    Some(path) => Some(ConfigWatcher::spawn(path, config_sender).await),
+                    None => None,
+                };
+                let outcome = repl(&runtime, shutdown).await;
+                // Dropping the watcher aborts its polling task before the
+                // skill worker drain begins.
+                drop(watcher);
+                outcome.map(|()| None)
+            }
+        }
+    };
+    runtime.shutdown().await;
+    result
 }
 
 /// Opens the configured event store, resolving relative paths against `root`.
@@ -596,13 +669,22 @@ fn print_usage() {
     );
 }
 
-/// Reads user requests until EOF, Ctrl+C, or an explicit exit command.
-async fn repl(runtime: &CliRuntime) -> Result<(), CliError> {
+/// Reads user requests until EOF, an explicit exit command, or shutdown.
+///
+/// Once the first signal is observed no new turn is started, even if the signal
+/// arrived while a line was being read.
+async fn repl(runtime: &CliRuntime, shutdown: &ShutdownController) -> Result<(), CliError> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let Some(line) = read_line(&mut stdin).await else {
+        if shutdown.is_shutting_down() {
+            break;
+        }
+        let Some(line) = read_line(&mut stdin, shutdown).await else {
             break;
         };
+        if shutdown.is_shutting_down() {
+            break;
+        }
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -617,8 +699,11 @@ async fn repl(runtime: &CliRuntime) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Reads one line from stdin, returning `None` on EOF or Ctrl+C.
-async fn read_line(stdin: &mut BufReader<Stdin>) -> Option<String> {
+/// Reads one line from stdin, returning `None` on EOF or shutdown.
+///
+/// A shutdown signal wakes the pending read immediately instead of waiting for
+/// the next newline or EOF.
+async fn read_line(stdin: &mut BufReader<Stdin>, shutdown: &ShutdownController) -> Option<String> {
     if io::stdin().is_terminal() {
         print!("> ");
         let _ = io::stdout().flush();
@@ -629,6 +714,13 @@ async fn read_line(stdin: &mut BufReader<Stdin>) -> Option<String> {
     tokio::pin!(read);
 
     tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            if io::stdin().is_terminal() {
+                println!();
+            }
+            None
+        }
         result = &mut read => match result {
             Ok(0) => None,
             Ok(_) => Some(line),
@@ -637,21 +729,28 @@ async fn read_line(stdin: &mut BufReader<Stdin>) -> Option<String> {
                 None
             }
         },
-        _ = tokio::signal::ctrl_c() => {
-            if io::stdin().is_terminal() {
-                println!();
-            }
-            None
-        }
     }
 }
 
-fn exit_code(reason: SessionEndReason) -> ExitCode {
-    match reason {
-        SessionEndReason::Completed | SessionEndReason::Cancelled => ExitCode::SUCCESS,
-        SessionEndReason::BudgetExceeded
-        | SessionEndReason::AcceptanceFailed
-        | SessionEndReason::Error => ExitCode::FAILURE,
+/// Maps a completed invocation to a process exit code.
+///
+/// A received signal always determines the exit code: SIGINT is 130 and
+/// SIGTERM is 143. A skill drain timeout never changes the code. Without a
+/// signal, completed and cancelled turns are success, while budget,
+/// acceptance, and internal failures are failure.
+fn exit_code(outcome: &RunOutcome) -> u8 {
+    if let Some(signal) = outcome.signal {
+        return signal.exit_code();
+    }
+    match &outcome.result {
+        Err(_) => 1,
+        Ok(None) => 0,
+        Ok(Some(SessionEndReason::Completed | SessionEndReason::Cancelled)) => 0,
+        Ok(Some(
+            SessionEndReason::BudgetExceeded
+            | SessionEndReason::AcceptanceFailed
+            | SessionEndReason::Error,
+        )) => 1,
     }
 }
 
@@ -667,6 +766,55 @@ mod tests {
     use jessica_core::tool::ToolSchema;
     use jessica_core::types::Message;
     use jessica_providers::{ClassifiedStream, ProviderFailure};
+
+    #[test]
+    fn a_received_signal_determines_the_exit_code() {
+        for (signal, expected) in [
+            (ShutdownSignal::SigInt, 130),
+            (ShutdownSignal::SigTerm, 143),
+        ] {
+            let completed = RunOutcome {
+                result: Ok(Some(SessionEndReason::Completed)),
+                signal: Some(signal),
+            };
+            assert_eq!(exit_code(&completed), expected);
+
+            let failed = RunOutcome {
+                result: Err(CliError::ResumeRequiresEventStore),
+                signal: Some(signal),
+            };
+            assert_eq!(
+                exit_code(&failed),
+                expected,
+                "an internal error must not hide the signal exit code"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_signal_cancelled_is_success_and_failures_are_not() {
+        assert_eq!(exit_code(&RunOutcome::success()), 0);
+        assert_eq!(
+            exit_code(&RunOutcome {
+                result: Ok(Some(SessionEndReason::Cancelled)),
+                signal: None,
+            }),
+            0
+        );
+        for reason in [
+            SessionEndReason::BudgetExceeded,
+            SessionEndReason::AcceptanceFailed,
+            SessionEndReason::Error,
+        ] {
+            assert_eq!(
+                exit_code(&RunOutcome {
+                    result: Ok(Some(reason)),
+                    signal: None,
+                }),
+                1
+            );
+        }
+    }
 
     #[test]
     fn only_the_interactive_repl_watches_the_config_file() {
