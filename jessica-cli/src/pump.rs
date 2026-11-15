@@ -262,7 +262,6 @@ impl EventPump {
     /// The human-console path keeps its original warn-and-continue behavior
     /// and never sets this flag. A protocol client can use this state to
     /// distinguish a lag failure from other pump failures.
-    #[allow(dead_code)]
     pub(crate) fn has_lagged(&self) -> bool {
         self.lagged.load(Ordering::SeqCst)
     }

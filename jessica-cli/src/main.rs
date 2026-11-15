@@ -2,6 +2,8 @@
 
 mod acceptance_check;
 mod acp;
+mod acp_events;
+mod acp_session;
 mod app;
 mod config;
 mod delegation;
@@ -157,7 +159,7 @@ async fn run() -> RunOutcome {
             // gracefully.
             let shutdown = Arc::new(ShutdownController::new());
             let listener = SignalListener::spawn(Arc::clone(&shutdown));
-            let result = acp::run(Arc::clone(&shutdown)).await;
+            let result = acp::run(config, root, Arc::clone(&shutdown)).await;
             let signal = shutdown.signal();
             drop(listener);
             RunOutcome {
@@ -180,28 +182,8 @@ async fn run_turn_mode(
     prompt: Option<String>,
     shutdown: &Arc<ShutdownController>,
 ) -> Result<Option<SessionEndReason>, CliError> {
-    let recorder = open_recorder(&config, &root).await?;
-    let provider = build_provider(&config.reliability)?;
-    let wasm_tools = load_wasm_tools(&config, &root).await?;
-    // Memory and skills are assembled only on the turn path. Replay returns
-    // above and therefore never opens, creates, or reads either database. Both
-    // assemblies are fail-open.
-    let memory = MemoryAssembly::open(&config.memory, &root).await;
-    let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
-    // The startup configuration is loaded and validated once. The receiver is
-    // the per-turn snapshot source; only the REPL branch installs a watcher
-    // capable of publishing a newer value.
-    let (config_sender, config_receiver) = watch::channel(Arc::new(config));
-    let runtime = CliRuntime::new(
-        provider,
-        config_receiver,
-        root,
-        wasm_tools,
-        recorder,
-        memory,
-        skills,
-        Arc::clone(shutdown),
-    );
+    let (runtime, config_sender) =
+        assemble_runtime(Arc::new(config), root, Arc::clone(shutdown)).await?;
 
     let result = if let Some(session_id) = resume {
         runtime.resume_turn(session_id).await.map(Some)
@@ -226,6 +208,41 @@ async fn run_turn_mode(
     };
     runtime.shutdown().await;
     result
+}
+
+/// Assembles the provider, recorder, wasm tools, memory, and skills once.
+///
+/// Turn modes and the ACP server share this assembly so they observe the same
+/// startup configuration. The returned sender keeps the configuration channel
+/// open for the REPL watcher; callers that never reload may drop it, leaving
+/// the receiver with the startup snapshot. Memory and skills are fail-open and
+/// may be absent. Replay and skills commands never call this function and
+/// therefore never open either database.
+pub(crate) async fn assemble_runtime(
+    config: Arc<HarnessConfig>,
+    root: PathBuf,
+    shutdown: Arc<ShutdownController>,
+) -> Result<(CliRuntime, watch::Sender<Arc<HarnessConfig>>), CliError> {
+    let recorder = open_recorder(&config, &root).await?;
+    let provider = build_provider(&config.reliability)?;
+    let wasm_tools = load_wasm_tools(&config, &root).await?;
+    let memory = MemoryAssembly::open(&config.memory, &root).await;
+    let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
+    // The startup configuration is loaded and validated once. The receiver is
+    // the per-turn snapshot source; only the REPL installs a watcher capable
+    // of publishing a newer value.
+    let (config_sender, config_receiver) = watch::channel(config);
+    let runtime = CliRuntime::new(
+        provider,
+        config_receiver,
+        root,
+        wasm_tools,
+        recorder,
+        memory,
+        skills,
+        shutdown,
+    );
+    Ok((runtime, config_sender))
 }
 
 /// Opens the configured event store, resolving relative paths against `root`.

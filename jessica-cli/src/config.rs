@@ -92,6 +92,14 @@ const DEFAULT_RELIABILITY_REQUESTS_PER_MINUTE: u32 = 0;
 const DEFAULT_RELIABILITY_BURST: u32 = 1;
 /// Default concurrent provider attempts. Zero disables the limit.
 const DEFAULT_RELIABILITY_MAX_CONCURRENT: u32 = 0;
+/// Default maximum number of live ACP sessions.
+const DEFAULT_ACP_MAX_SESSIONS: usize = 8;
+/// Default maximum UTF-8 byte length of one assembled ACP prompt.
+const DEFAULT_ACP_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+/// Default maximum number of messages retained in ACP session history.
+const DEFAULT_ACP_MAX_HISTORY_MESSAGES: usize = 200;
+/// Default maximum serialized byte length of ACP session history.
+const DEFAULT_ACP_MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -117,6 +125,8 @@ pub struct HarnessConfig {
     pub memory: MemoryConfig,
     /// Optional skill distillation, retrieval, and manual review.
     pub skills: SkillsConfig,
+    /// Session and prompt limits for the ACP server.
+    pub acp: AcpConfig,
 }
 
 impl HarnessConfig {
@@ -212,6 +222,7 @@ impl HarnessConfig {
             return Err(invalid("memory.path must not be empty"));
         }
         self.skills.validate()?;
+        self.acp.validate()?;
         Ok(())
     }
 }
@@ -220,10 +231,11 @@ impl HarnessConfig {
 ///
 /// The REPL may hot-reload `budget`, `policy`, `delegation`, `sensor`, and
 /// `acceptance` because each turn rebuilds those components from its snapshot.
-/// The remaining sections own long-lived resources created once at startup
-/// (the event recorder, memory and skill databases, wasm modules, and the
-/// provider reliability wrapper), so any change to them rejects the whole
-/// reload. The returned name is used verbatim in the rejection log.
+/// The remaining sections own long-lived resources or limits created once at
+/// startup (the event recorder, memory and skill databases, wasm modules, the
+/// provider reliability wrapper, and ACP session limits), so any change to
+/// them rejects the whole reload. The returned name is used verbatim in the
+/// rejection log.
 pub(crate) fn changed_immutable_section(
     current: &HarnessConfig,
     next: &HarnessConfig,
@@ -238,8 +250,62 @@ pub(crate) fn changed_immutable_section(
         Some("wasm")
     } else if current.reliability != next.reliability {
         Some("reliability")
+    } else if current.acp != next.acp {
+        Some("acp")
     } else {
         None
+    }
+}
+
+/// Limits enforced by the ACP server.
+///
+/// Every field must be positive. The ACP server applies the session limit when
+/// creating sessions and the remaining limits to each prompt and to the
+/// history retained for later prompts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AcpConfig {
+    /// Maximum number of sessions created in one ACP process.
+    pub max_sessions: usize,
+    /// Maximum UTF-8 byte length of one assembled prompt.
+    pub max_prompt_bytes: usize,
+    /// Maximum number of messages kept in one session's history.
+    pub max_history_messages: usize,
+    /// Maximum serialized byte length of one session's history.
+    pub max_history_bytes: usize,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: DEFAULT_ACP_MAX_SESSIONS,
+            max_prompt_bytes: DEFAULT_ACP_MAX_PROMPT_BYTES,
+            max_history_messages: DEFAULT_ACP_MAX_HISTORY_MESSAGES,
+            max_history_bytes: DEFAULT_ACP_MAX_HISTORY_BYTES,
+        }
+    }
+}
+
+impl AcpConfig {
+    /// Rejects zero-valued limits.
+    ///
+    /// A zero session limit would make `session/new` unusable, and zero prompt
+    /// or history limits would reject every prompt or every future turn. These
+    /// are configuration errors rather than silent fallbacks.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_sessions == 0 {
+            return Err(invalid("acp.max_sessions must be at least 1"));
+        }
+        if self.max_prompt_bytes == 0 {
+            return Err(invalid("acp.max_prompt_bytes must be at least 1"));
+        }
+        if self.max_history_messages == 0 {
+            return Err(invalid("acp.max_history_messages must be at least 1"));
+        }
+        if self.max_history_bytes == 0 {
+            return Err(invalid("acp.max_history_bytes must be at least 1"));
+        }
+        Ok(())
     }
 }
 
@@ -872,6 +938,40 @@ mod tests {
         let timeout = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 0\n")
             .expect_err("zero timeout must fail");
         assert!(timeout.to_string().contains("tool_timeout_ms"));
+    }
+
+    #[test]
+    fn acp_limits_use_the_phase_six_defaults() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(config.acp.max_sessions, 8);
+        assert_eq!(config.acp.max_prompt_bytes, 1024 * 1024);
+        assert_eq!(config.acp.max_history_messages, 200);
+        assert_eq!(config.acp.max_history_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn zero_acp_limits_fail_loading_instead_of_falling_back() {
+        for field in [
+            "max_sessions",
+            "max_prompt_bytes",
+            "max_history_messages",
+            "max_history_bytes",
+        ] {
+            let document = format!("[acp]\n{field} = 0\n");
+            let error = HarnessConfig::from_toml_str(&document)
+                .expect_err("zero ACP limits must fail configuration loading");
+            assert!(
+                error.to_string().contains(field),
+                "the error must name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_acp_fields_are_rejected() {
+        let error = HarnessConfig::from_toml_str("[acp]\nmax_session = 2\n")
+            .expect_err("misspelled ACP fields must fail");
+        assert!(error.to_string().contains("max_session"));
     }
 
     #[test]
