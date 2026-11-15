@@ -277,7 +277,7 @@ Phase 5：能力扩展与加固（按需拆 Task）
 · Task 5.2 技能沉淀：复杂任务完成后异步提炼，写入技能库，后续通过 Guide 注入。触发条件必须是确定性规则（如工具调用次数 ≥ N），不得用 LLM 判断。拆分为 5.2.1–5.2.6，其中 5.2.2 再拆为 5.2.2a / 5.2.2b，详见本节之后的“Task 5.2 拆分”。
 · Task 5.3 子 Agent 委派：delegate_task 工具，子 Agent 工具集只能收窄父级权限；子 Agent 间不共享可变状态。拆分为 5.3.1–5.3.5，其中 5.3.3 再拆为 5.3.3a / 5.3.3b，详见本节之后的“Task 5.3 拆分”。
 · Task 5.4 生产化加固：provider 层重试/熔断、速率限制、配置热加载、优雅关闭。拆分为 5.4.1–5.4.5，其中 5.4.3 再拆为 5.4.3a / 5.4.3b，详见本节之后的“Task 5.4 拆分”。
-· Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。
+· Task 5.5 可观测性：OTLP 导出、会话回放可视化工具。**暂缓，见文末 Deferred。**
 
 每个 Task 的验收都要求：cargo test --workspace 全绿 + cargo clippy --workspace -- -D warnings + 一个端到端场景。
 
@@ -1324,6 +1324,245 @@ cargo test --workspace
 
 ---
 
+Phase 6：ACP 支持（ACP-0 → ACP-4；ACP-5/6/7 可选）
+
+背景：ACP（Agent Client Protocol）是编辑器/客户端与 Agent 之间的 JSON-RPC 2.0 over stdio 协议。Jessica 目前没有长驻 Agent 服务和跨 prompt 会话状态；本 Phase 把 `jessica acp` 做成一个长驻 stdio 服务，让 ACP 客户端可以创建会话、发送 prompt、接收流式更新并取消执行，同时保持 jessica-core 冻结、现有事件持久化与治理链不变。Phase 6 为 2026-11-15 新增，不在最初的 17 个 Task 内。
+
+Phase 6 全局约束（适用于 ACP-0–ACP-4）：
+
+· 只做 ACP stable v1；不实现 v2 alpha，不启用 SDK 的 `unstable_protocol_v2`，不启用 `process` feature。
+· 依赖门禁：仅允许新增 `agent-client-protocol` 5.3.0（`default-features = false, features = ["stdio"]`）。ACP-0 开工前必须由用户显式批准该 crate；批准后在 workspace Cargo.toml 声明并记录理由（含 `cargo tree` 审查结果）。其余 Task 不得新增任何第三方 crate。（2026-11-15：用户以“请执行 Task ACP-0”指令批准该依赖，记录见进度表 ACP-0。）
+· 不修改 jessica-core 公共 API。允许的实现层改动：jessica-cli 内部装配、EventPump、配置；jessica-tools 仅为 BashTool 增加显式 cwd 的加法 API。jessica-runtime、jessica-harness、jessica-sandbox、jessica-providers、jessica-memory 原则上不改；确需改动必须停下询问用户并单开 Task。
+· ACP 模式下 stdout 只允许出现 JSON-RPC；禁止 `print!`/`println!` 业务输出；日志、警告、错误一律 stderr；不启用 ACP 传输层 TRACE 日志。
+· ACP session 的 `cwd` 必须为绝对路径、存在、是目录，canonicalize 后必须位于启动 workspace root 之内；memory、recorder、skills、wasm 仍按启动 root 作用域。多 workspace 服务不在本 Phase 范围。
+· ACP-0–ACP-4 不实现：MCP、`session/request_permission`、`session/load`/`list`/`delete`/`resume`/`close`、客户端 `fs/*` 与 `terminal/*`、图片/音频/embedded resource、session modes/config options/plan/usage update、ACP v2。
+· ACP 首期禁用 acceptance 重试（每个 prompt 只跑一次 attempt）；acceptance 失败返回 JSON-RPC error。原因：v1 客户端对多段 assistant 输出的 `messageId` 支持不一致，重试输出可能被拼接成一条消息。若 ACP-2 开工前用户决定启用重试，必须同时定义 `messageId` 与 notice 行为。
+· 历史上限默认：`max_history_messages = 200`、`max_history_bytes = 2 MiB`、`max_prompt_bytes = 1 MiB`、`max_sessions = 8`；全部可在 `[acp]` 配置中调整。
+· 每个 Task 完成前必须运行 `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`，并贴出结果。
+
+Task ACP-0：依赖门禁、传输骨架、initialize、stdout 纯净与优雅退出
+
+目标：建立 `jessica acp` 入口和 ACP v1 stdio 传输，只实现 `initialize`，证明协议可连通、stdout 不被污染、进程可优雅退出。本 Task 不实现任何 session 方法。
+
+操作：
+
+1. 依赖门禁：取得用户对 `agent-client-protocol` 5.3.0 的显式批准；在 workspace Cargo.toml 增加 `agent-client-protocol = { version = "5.3.0", default-features = false, features = ["stdio"] }`，jessica-cli 继承该依赖；用 `cargo tree -p agent-client-protocol` 审查新增传递依赖并记录。不得启用 `process`、`unstable_protocol_v2` 或任何默认 feature。
+2. 新增 CLI 模式 `Mode::Acp`：支持 `jessica acp` 与 `jessica acp --config <path>`；复用现有配置加载、root 解析、runtime 装配、`ShutdownController` 与 `SignalListener`。ACP 分支不得进入 REPL、replay、skills 的用户输出路径。
+3. 用官方 SDK 建立 `Agent.v1()` 连接（`Stdio::new()`），实现 `initialize` handler：
+   - 只支持协议版本 1；客户端传 1 时回 1；传其他版本时按 v1 schema 返回服务器最新支持版本 1，由客户端决定是否断开。
+   - 返回 `agentInfo`（name = `jessica`，version 取 crate 版本）。
+   - `agentCapabilities` 显式声明：`loadSession = false`、`promptCapabilities.image/audio/embeddedContext = false`、`mcpCapabilities.http/sse = false`、`sessionCapabilities = {}`；`authMethods = []`。
+4. stdout 纯净：ACP 路径禁用所有业务 `print!`/`println!`；EventPump 的人类可读输出在 ACP 模式下必须关闭（ACP-1 完成 EventPump 输出策略；ACP-0 至少保证 initialize 路径不打印）。不安装写 stdout 的 tracing subscriber。
+5. 优雅退出：stdin EOF、SIGINT、SIGTERM 都停止接受新请求，在限定时间内退出；本 Task 没有 active session，只需验证不会挂起。保留现有第二次信号强制退出的语义。
+6. 本 Task 只搭 transport/initialize；不要提前实现 session/new、session/prompt 或事件映射。
+
+行为测试（至少）：
+
+· 用内存 duplex 或脚本化 stdio 客户端发送 `initialize`，断言 `protocolVersion = 1`、capabilities 全为 false、agentInfo 名称正确。
+· 客户端发送非 1 版本，断言服务器仍返回 1（而不是 panic 或断开前崩溃）。
+· 捕获整个进程 stdout，断言只有合法 JSON-RPC 行；stderr 允许诊断输出。
+· stdin EOF 后进程在超时内退出；SIGTERM 路径退出码沿用现有 shutdown 语义。
+· 未实现的方法返回 `-32601 Method not found`，进程不崩溃。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p jessica-cli acp
+```
+
+并执行上述 initialize/stdout/EOF/SIGTERM 行为测试（测试内自动运行，不依赖真实网络）。
+
+禁止：未取得用户批准就修改 Cargo.toml；启用 v2/process/default features；实现 session/new 或 session/prompt；修改 jessica-core；用 stdout 打印任何非 JSON-RPC 内容；新增本 Task 之外的依赖。
+
+Task ACP-1：Turn 执行上下文重构（仅重构，不接 ACP 会话）
+
+目标：为 ACP 准备好 per-prompt 的 workspace root、取消父 token、静默事件输出和可复用的 turn 执行入口；本 Task 结束时现有 CLI 行为必须完全不变。
+
+操作：
+
+1. 引入 `TurnScope { root: PathBuf, cancel_parent: CancellationToken }`（名称可调整），贯穿 `build_turn`、`build_sensors`、`build_child_executor`、`build_tool_registry`、`initial_messages`、system prompt、acceptance working_dir 与 `resolve_dir`。
+2. 保留 `CliRuntime.root` 作为启动 workspace root，继续用于 memory、recorder、skills、wasm 的进程级打开；per-turn 的文件工具、bash、sensor、acceptance、delegation 子工具使用 `TurnScope.root`。`TurnScope.root` 必须 canonicalize。
+3. `BashTool` 增加显式 `with_current_dir(...)`（jessica-tools 加法 API），构建注册表时设置 per-turn cwd；现有 `BashTool::new()` 行为保持不变。
+4. EventPump 增加输出策略：`HumanConsole`（默认，现有 CLI）与 `Silent`（ACP）。Silent 模式不得写 stdout。为 ACP 增加“lag 视为错误”的可观察状态（现有 `Lagged` 只 warn 并继续的行为不得用于 ACP 路径）。
+5. 从 `CliRuntime::run_turn` 提取可复用入口（名称可调整）：输入 `TurnRequest { scope, history, user_input, update_sink, acceptance_retries }`，输出 `TurnOutcome { reason, messages }`；`run_turn` 用启动 root、空 history、现有 acceptance 行为委派，保持 REPL/one-shot/resume 行为不变。
+6. 初始消息顺序改为 `system prompt → memory guide（若有）→ skill guide（若有）→ history → user`；现有 CLI 的 history 为空，因此输出不变。acceptance 重试复用同一份初始消息。
+7. 计数与信号只统计“本次 turn 新增的消息切片”，不得把历史消息里的工具调用计入本 turn 的 structured_counts / skill 触发计数。
+8. 本 Task 不新增 ACP handler，不改变 `--resume`、replay、skills 子命令语义。
+
+行为测试（至少）：
+
+· 同一 runtime 用两个不同 turn root 执行 read_file/write_file，互不串目录；越界路径仍被拒绝。
+· `BashTool` 显式 cwd 生效；未设置 cwd 时保持旧行为。
+· 取消父 token 能取消子 turn；取消一个 turn 不影响另一个。
+· EventPump Silent 模式不产生 stdout；HumanConsole 模式输出与改造前一致。
+· 现有 CLI 的 one-shot/REPL/resume/acceptance 测试全绿；run_turn 返回的最终 messages 与事件库/原有快照一致。
+· history 非空时，structured_counts 只统计新增切片；把历史工具调用构造进 messages 也不会误触发 skill 阈值。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p jessica-cli
+```
+
+禁止：接 ACP session 方法；修改 jessica-core；改变现有 CLI 的可观察行为；把 EventPump 改成同步持久化；新增第三方 crate；顺手重构 Task 范围外的模块。
+
+Task ACP-2：session/new、session/prompt、事件映射与多轮历史
+
+目标：ACP 客户端可以创建 session、连续发送多个 prompt，收到流式文本与工具调用更新，并获得正确的 stopReason。本 Task 不做取消/并发/关闭（ACP-3）与限制打磨（ACP-4）。
+
+操作：
+
+1. `HarnessConfig` 增加可选 `[acp]` 配置段：`max_sessions`、`max_prompt_bytes`、`max_history_messages`、`max_history_bytes`；默认值按 Phase 6 全局约束；非法值在配置加载期返回结构化错误，不静默回退。
+2. 新增 AcpSessionRegistry 与 AcpSession：`session_id`、canonical `cwd`、`history: Vec<Message>`、当前 prompt 状态与取消 token（本 Task 创建 token，ACP-3 接管取消）。session id 使用 `acp-{pid}-{seq}`；内部 turn id 使用该 id 加 `-t{turn_seq}`。
+3. `session/new`：校验 `cwd` 绝对、存在、目录、位于启动 root 内；`mcpServers` 非空返回 `InvalidParams`（首期不做 MCP）；`additionalDirectories`/`systemPrompt` 非空返回 `InvalidParams`；超过 `max_sessions` 返回结构化错误；返回 `{ sessionId }`。
+4. prompt 内容：支持 `text` 与 `resource_link`（baseline），按顺序拼接；`resource_link` 转成一行 `[resource] name=... uri=...`；`image`/`audio`/`resource` 返回 `InvalidParams`；空文本或超过 `max_prompt_bytes` 返回 `InvalidParams`。
+5. `session/prompt`：查 session、原子检查 active prompt（同一 session 第二个 prompt 返回“session busy”）、创建 prompt token、在 spawned task 中执行后把 responder 移入 task；handler 不得阻塞 SDK 分发循环。
+6. prompt worker：取配置快照；构建 bootstrap（system/memory/skill）；组装 `bootstrap + history + user`；用 session root 与 prompt token 构建 turn；禁用 acceptance 重试（单次 attempt）；运行 AgentLoop；等待 EventPump 终态；按规则提交 history；发送 prompt response。
+7. 事件映射：
+   - `ModelDelta` → `agent_message_chunk`（text；过滤空串），使用本 prompt 唯一的 `messageId`。
+   - `ToolCallStarted` → `tool_call`，`status = in_progress`，带 title/kind/rawInput/locations。
+   - `ToolCallFinished` → `tool_call_update`，成功 completed、失败 failed，带截断后的文本 content/rawOutput。
+   - `PolicyDenied` 不重复产生 failed 更新（`ToolCallFinished` 已覆盖）。
+   - `SessionStarted`/`SessionEnded` 不直接映射；`Error`/`AcceptanceFailed` 通过 JSON-RPC error 返回。
+   - 不发 `agent_thought_chunk`（Jessica 无 reasoning 流）。
+   - tool kind：read_file → read、write_file → edit、bash → execute、wasm/delegate → execute/other；title 截断约 120 字符；rawInput/rawOutput 各截断 16 KiB。
+8. 顺序与屏障：所有 `session/update` 必须先于 prompt response；prompt worker 在响应前等待 update writer 的屏障确认。EventPump 出现 lag 时不得静默输出残缺文本，按内部错误处理并取消该 prompt。
+9. stopReason 与错误：`Completed → end_turn`；`Cancelled → cancelled`（ACP-3 完整接管）；token `BudgetExceeded → max_tokens`；rounds/其它预算 → `max_turn_requests`；provider/pump/内部错误 → `-32603`。错误响应不得泄露密钥。
+10. history 提交：成功提交本次新增消息；错误不提交；取消时保留部分输出但必须补齐未完成 tool call 的合成 tool result（不能留下 assistant tool_calls 无 tool result）。history 超过上限时丢弃最旧完整 turn，绝不拆开 tool call 与 result 对。
+11. 不得把完整 prompt、工具参数或密钥写入 stderr/tracing。ACP 模式不启用 TRACE。
+
+行为测试（至少）：
+
+· 脚本客户端创建 session 后连续发两个 prompt；用 ScriptedProvider 断言第二次 provider 请求包含第一次的 user/assistant 消息，且顺序为 bootstrap → history → 新 user。
+· read_file 调用产生 `tool_call`（kind=read、status=in_progress）与 `tool_call_update`（completed），id/title/rawInput 正确；失败工具产生 failed。
+· 所有 `agent_message_chunk` 在 prompt response 之前到达；空 delta 不发送。
+· `Completed`、token/rounds BudgetExceeded 的 stopReason 映射正确；provider 错误返回 JSON-RPC error 且 history 不变。
+· 图片/embedded resource 被拒绝且零 provider 调用；空 prompt、超长 prompt 被拒绝。
+· 同一 session 第二个并发 prompt 返回 busy；不同 session 可同时创建。
+· history 裁剪后不出现孤立 tool result；history 超限时丢弃最旧完整 turn。
+· cwd 为相对路径、不存在、文件、或启动 root 之外时返回 `InvalidParams`；非空 `mcpServers` 返回 `InvalidParams`。
+· 捕获 stdout，断言只有 JSON-RPC，且 update 与 response 的顺序正确。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p jessica-cli acp
+```
+
+禁止：实现 cancel/并发关闭（留给 ACP-3）；实现 MCP/权限/load；修改 jessica-core；在 handler 中同步执行模型或工具；静默忽略不支持的内容块；把 lag 当正常情况继续；新增第三方 crate。
+
+Task ACP-3：session/cancel、并发与关闭
+
+目标：取消只影响目标 session 的当前 prompt；多个 session 可并发运行；进程关闭/客户端断开时所有 prompt 被取消且进程可退出。
+
+操作：
+
+1. 取消 token 链：进程 shutdown → session lifetime token → 当前 prompt token → 本次 turn token。`session/cancel` 只 cancel 当前 prompt token；session 本身仍可接受下一个 prompt；没有 active prompt 时幂等忽略。
+2. 按 v1 schema：只要客户端发送过 `session/cancel`，该 prompt 的响应必须是 `stopReason: cancelled`，即使底层操作刚好完成或抛异常。不要返回 `end_turn` 掩盖取消。
+3. 取消/错误时补齐 in-flight 工具：对已发出 `ToolCallStarted` 但未收到 `ToolCallFinished` 的调用发送 `tool_call_update`，状态 failed，内容说明被取消；客户端不能留下永远 in_progress 的工具调用。
+4. 同一 session 的第二个 active prompt 返回错误；不同 session 的 prompt 可并发执行。所有共享服务（provider、recorder、memory、skills）必须保持线程安全；EventStore 写入仍通过 spawn_blocking 串行化，不新增阻塞调用。
+5. 进程关闭：停止接受新请求，取消所有 session lifetime token，等待 active prompt worker 收尾（限定超时），drain skills，退出。超时只 warn，不无限挂起；第二次信号沿用强制退出语义。
+6. stdin EOF / stdout 写失败：取消所有 session，停止接受新 prompt，限定时间内退出；不得在客户端断开后继续执行工具。
+7. history 提交规则：取消时保留已产生的部分输出并补齐合成 tool result；内部错误不提交本次 turn。pump 失败/lag 时不提交。
+
+行为测试（至少）：
+
+· 两个 session 并发 prompt；cancel 其中一个，另一个正常完成并返回 end_turn。
+· cancel 后目标 prompt 返回 cancelled；同一 session 之后还能再发新 prompt。
+· cancel 时 in-flight 工具收到 failed 更新；没有遗留 in_progress。
+· 无 active prompt 时 cancel 幂等；同一 session 第二个 prompt 返回 busy。
+· SIGTERM/EOF 时两个 session 都被取消，进程在超时内退出；skills drain 执行。
+· stdout 写失败模拟：prompt 被取消，进程不 panic、不无限写。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p jessica-cli acp
+```
+
+禁止：把 cancel 实现成全局取消；取消后 session 永久不可用；在取消路径丢事件或 panic；修改 jessica-core；新增第三方 crate；用 sleep 轮询代替 token。
+
+Task ACP-4：限制、内容/错误策略、隐私与配置加固
+
+目标：把 ACP 服务从“能跑”加固到“可控”：session/prompt/history 上限、notice 能力门控、错误码与消息、日志隐私、配置热加载与文档。
+
+操作：
+
+1. 强制执行并测试 `max_sessions`、`max_prompt_bytes`、`max_history_messages`、`max_history_bytes`；超限行为确定且错误消息可操作；history 裁剪只丢最旧完整 turn，不拆 tool call/result 对。
+2. `notice` 只允许在客户端 `clientCapabilities.session.notices` 声明时发送；否则不得发送 notice。BudgetExceeded/PolicyDenied 等提示优先通过 stopReason/tool_call_update 表达，不强行用 notice。
+3. 统一错误码与消息：method not found、invalid params、session busy、session not found、internal error；错误消息不得包含密钥、完整 prompt 或完整工具参数。JSON-RPC 错误与 prompt 内工具失败要区分。
+4. 隐私与日志：ACP 模式 stdout 纯净；stderr 只输出必要诊断；不启用 ACP TRACE；不在日志中打印 prompt、工具参数、env 值、密钥。客户端断开/写失败路径同样遵守。
+5. 配置热加载：ACP 复用现有 ConfigWatcher；每个 prompt 取最新配置快照；events/memory/skills/wasm/reliability 等不可热改段按现有规则拒绝或保留启动值；wasm 工具仍启动时加载（与 REPL 一致）。若实现发现热加载会破坏 cwd/memory 作用域，记录 Deferred，不在本 Task 强行扩大。
+6. 文档：在 README 或 examples 中给出 ACP 启动命令、编辑器配置示例、能力/非目标、cwd 限制、无 MCP/无权限/无 session load 的明确说明。
+7. 汇总 Phase 6 已知限制到文末 Deferred，不把可选能力偷偷塞进本 Task。
+
+行为测试（至少）：
+
+· 超过 session 上限、prompt 上限、history 条数/字节上限的请求返回确定错误；合法边界不误拒。
+· history 裁剪后 provider 请求仍然合法（tool call/result 成对），且最旧 turn 被丢弃。
+· 客户端未声明 notices 时零 notice；声明时按 schema 发送。
+· 各错误路径返回预期 JSON-RPC 错误码/消息，stdout 仍只有 JSON-RPC。
+· 配置热加载：修改允许的配置后，下一个 prompt 使用新值；修改不可热改段的行为与现有 REPL 一致。
+· 日志隐私测试：构造含敏感字符串的 prompt/工具参数，断言 stderr 不出现该完整内容（允许出现工具名/错误类别）。
+
+验收：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test -p jessica-cli acp
+```
+
+并执行真实 ACP 客户端手工互通，至少覆盖 **Paseo**（getpaseo/paseo）：initialize → session/new → 两轮 prompt → session/cancel，记录 Paseo 版本、启动命令/配置方式、每一阶段的观察结果与失败日志。若本机无法安装 Paseo，必须在 Task 记录中说明阻塞原因，并至少用官方 SDK 客户端或另一真实 ACP 客户端完成同等验收；脚本化客户端只用于自动化测试，不能替代真实客户端验收。若 Paseo 互通暴露 MCP、权限请求、session/load 等超出 ACP-0–4 范围的需求，记录到 Deferred 并由用户决定是否单开 ACP-5/6/7，不得在 ACP-4 顺手实现。不依赖真实模型时可用脚本化 provider。
+
+禁止：在本 Task 实现 MCP/权限/session load；修改 jessica-core；把 notice 用于未声明能力的客户端；在错误消息中泄露敏感内容；新增第三方 crate；顺手重构 ACP-0–3 之外的行为。
+
+ACP-5（可选，默认不做）：最小 MCP stdio 客户端
+
+目标：补齐 ACP v1 对 stdio MCP server 的 MUST 要求。只有在用户明确要求“完全合规”或目标编辑器必须传 MCP server 时单开 Task。
+
+操作：按 `session/new.mcpServers` 启动 stdio 子进程；MCP initialize、tools/list、tools/call；工具按 server 命名空间注册并经过现有 Policy/Guard；session 关闭时回收子进程；HTTP/SSE MCP 继续不支持；env/密钥不落日志；失败返回结构化错误。验收需用 stub MCP server 覆盖初始化、工具发现、调用、超时、关闭与 env 脱敏。禁止在 ACP-0–4 中顺手实现。
+
+ACP-6（可选，默认不做）：session/request_permission
+
+目标：实现 ACP 权限请求。开工前必须由用户决定 core API 方案：
+
+· A）批准给 `jessica_core::tool::Tool` 增加带默认实现的 `execute_with_call`（仍需单开 core Task）；
+· B）接受 jessica-runtime task-local 传递当前 ToolCall（不改 core，但引入隐式上下文）；
+· C）不做权限请求（当前默认）。
+
+禁止使用空/合成 `toolCallId` 糊弄客户端。实现时需覆盖 allow_once/reject_once、客户端 cancelled、超时、错误路径，并保证工具未获批准时绝不执行。
+
+ACP-7（可选，默认不做）：session/load、list、delete
+
+目标：跨进程持久化 ACP 会话历史并支持 ACP 会话生命周期方法。需要持久化 ACP session → 内部 turn → 消息索引；提供宽容的只读事件读取；按 ACP 要求通过 `session/update` 重放历史；实现 list/delete；不得修改 jessica-core。当前首期只在内存保存 history，进程退出即丢失；不声明 `loadSession`。
+
+Phase 6 已知限制（同时记录到文末 Deferred）：
+
+· 首期不是完全 ACP 合规：不支持 MCP stdio（v1 MUST）；非空 `mcpServers` 直接报错。
+· 不做权限请求；bash/write 的约束仍依赖 AllowlistPolicy，编辑器看到工具调用但不能逐次批准。
+· 不支持 `session/load`/`list`/`delete`/`resume`/`close`；进程退出丢失 ACP 对话历史。
+· cwd 必须在启动 workspace root 内；memory/recorder/skills/wasm 仍是进程级作用域，不支持多 workspace。
+· ACP 首期禁用 acceptance 重试；与 REPL/one-shot 的行为不同。
+· 每 turn 记录完整历史，事件库存储随对话增长呈 O(n²)；后续可改为增量 + 引用。
+· EventPump 的 broadcast lag 仍是风险；ACP 路径必须把 lag 当错误，不能静默丢文本。
+· 不支持 ACP v2 alpha；不保证与所有客户端/所有 v1 次要版本完全互通，需要真实客户端手工验收，至少覆盖 Paseo。
+
+---
+
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
 
 1. 一次会话只做一个 Task，完成后主动运行该 Task 的所有验收命令，把结果贴出来。
@@ -1380,6 +1619,14 @@ Task 5.4.3a ☑ 约 85 分钟 jessica-providers 为 `ReliabilityConfig` 增加 `
 Task 5.4.3b ☑ 约 100 分钟 jessica-providers 为 `ReliabilityConfig` 增加 `requests_per_minute`（默认 0 = 不限）、`burst`（默认 1）、`max_concurrent`（默认 0 = 不限），新增 `DEFAULT_REQUESTS_PER_MINUTE` / `DEFAULT_BURST` / `DEFAULT_MAX_CONCURRENT` / `MAX_REQUESTS_PER_MINUTE` / `MAX_BURST` / `MAX_CONCURRENT` 导出；`validate` 拒绝超过上限的 rpm/burst/max_concurrent，并在 rpm>0 且 burst=0 时返回 `ValueTooSmall { field: "burst" }`（rpm=0 时允许 burst=0）。实现 `TokenBucket`：容量 = burst，按 rpm 线性补充，核心 `try_consume(Instant)` 为注入时钟的纯状态转换，返回立即通过或等待时长；内部使用整数微令牌（`MICROTOKENS_PER_TOKEN = 1_000_000`），补充余数跨调用保留、不产生浮点漂移，且不会累积超过容量。`TokenGuard` 在尚未 dispatch 时被 drop 会退还令牌；`RateLimiter` 在 rpm=0 时不构造令牌桶，在 max_concurrent=0 时不构造 Semaphore。`ReliableProvider` 持有单个 `Arc<RateLimiter>`，同一实例被父 turn、子 Agent 与技能提炼器共享，不在每 turn 重建。每个物理 attempt（含重试）固定顺序：先 `wait_for_token`（`tokio::time::sleep`，drop 可取消），再 `acquire_owned` permit，再 commit 令牌并调用底层 provider，绝不持有 permit 等待令牌；permit 保存在 `RetryStreamState` 中随该 attempt 的流生命周期持有，在 `Done`、终止 `Err`、`LlmEvent::Error` 或 stream drop 时释放；重试在 backoff 前释放 permit，下一 attempt 重新走令牌与 permit 获取；熔断 fast-fail 发生在等待令牌之前。模块文档写明 v1 只限制 RPM 与并发、不做 TPM（usage 仅在终止 `Done` 可见，精确 TPM 需单独设计）。jessica-cli `[reliability]` 增加三个字段、默认值与字段级校验（含 rpm>0/burst=0 及三个上限），`to_provider_config()` 完整转换；`enabled=false` 仍直接返回 base provider，不构造限流器。测试：jessica-providers 119 单测（新增 13：burst 内立即通过且超出按 rpm 等待、补充容量封顶、整数余数跨区间无漂移、rpm=0 永不等待、同一实例下父/子/提炼器三个 caller 共享令牌桶、重试每次消耗令牌、重试重新获取 permit 而不绕过并发、max_concurrent=2 时第三个等待并在此前两个释放后进入、成功/setup 失败/流失败/取消 drop 均释放 permit、等 permit 时取消会退还令牌、三个字段边界与 burst=0 规则）；jessica-cli 94 单测 + reliability E2E 7 个（新增 2：REPL 两 turn 在 rpm=60/burst=1 下请求间隔 >= 800ms；rpm=0/burst=0 两 turn 间隔 < 800ms 且均 Completed）。workspace 578 passed, 0 failed, 2 ignored。偏离/说明：1) E2E 时间戳由脚本化 server 在读完请求时记录，按要求只用宽松上下界；2) 令牌在熔断检查之后、permit 之前扣除，若在 dispatch 前取消由 `TokenGuard` 退还，避免取消请求永久占用额度；3) 未实现 TPM、未修改 jessica-core、未新增第三方 crate。
 Task 5.4.4 ☑ 约 15 分钟 jessica-cli 新增 REPL 配置热加载。`config.rs` 为 Budget/Policy/Delegation/Reliability/Events/Memory/Skills/Wasm/Sensor/Acceptance 增加 `PartialEq`（不用序列化字符串比较），并新增 `changed_immutable_section`：按 events→memory→skills→wasm→reliability 固定顺序返回首个变化段名。新增 `hot_reload.rs`：`ConfigWatcher` 在 spawn 返回前读取初始 `(mtime, len)` 指纹，后台每 1s 轮询（`MissedTickBehavior::Delay`，测试注入 20ms），指纹不变则不读文件；变化时先 `HarnessConfig::load` 完整解析并校验，再重读指纹，若读取期间文件又变化则丢弃本次样本且不推进已接受指纹（避免非原子写入把截断/空文件解析成默认配置发布）；稳定后无论成功失败都更新指纹。成功且不可热加载段未变 → `sender.send(Arc::new(config))` 并输出 `[config] reloaded`；不可热加载段变化 → 整份拒绝并输出 ``[config] reload rejected: `{section}` is not hot-reloadable``；解析/校验失败 → 输出 `config reload failed: {error}`；元数据不可读 → `config reload failed: cannot read metadata for {path}`；receiver 关闭时任务退出；`Drop` abort JoinHandle。`app.rs` 的 `CliRuntime` 改为持有 `watch::Receiver<Arc<HarnessConfig>>`，删除缓存的 `system_prompt` 字段；新增 `config_snapshot()`，`run_turn`/`resume_turn` 每次仅克隆一次快照并同时传给 `initial_messages` 与 `build_turn`，system prompt 每 turn 由 `system_prompt(root, config)` 计算，工具 schema、policy、guards、delegation factory/executor、sensors、acceptance、AgentLoop budget 全部取同一快照；消息构造仍为 `fresh_conversation` 的 `[system, memory guide, skill guide, user]`，memory/skills 仍每 turn 各召回一次、无额外召回或连接重建。`main.rs` 启动时仍只加载/校验一次配置，之后建立 `watch::channel`；仅 REPL（`Mode::Turn { resume: None, prompt: None }` 且有 config path）经 `watched_config_path` 启动 watcher，one-shot/resume/replay/skills 不启动；退出前 drop watcher 再 shutdown。测试：hot_reload 模块 7 个（可热加载发布、不可热加载拒绝且 watcher 继续工作、非法 TOML 保留旧快照且继续工作、非法 delegation allowlist 整体拒绝、仅可热加载段接受、五段名称与顺序、首个变化段优先）；app 4 个（发布后下 turn 使用、turn 中途 reload 只影响下一 turn、新 max_rounds 生效、新 tool_timeout 使 `sleep 0.2` 在下 turn 以 BudgetExceeded 终止且 provider 恰 2 次调用）；main 1 个模式谓词；新增 `tests/hot_reload_e2e.rs` 3 个脚本化 SSE E2E（两轮之间改配置：第二轮 system prompt 与 tools schema 变化、消息仍 `[system,system,user]` 且每 turn 恰一条 memory guide、stderr 含 `[config] reloaded`；events 不可热加载与非法 TOML 后 REPL 存活并最终成功 reload；one-shot 在响应期间改配置不产生 reload 日志、只有 1 次请求）。偏离/说明：1) 现有架构下 tools schema 不按 `policy.allowed_tools` 过滤（registry 广播全部工具，allowlist 在执行期拒绝），因此 E2E 同时修改 policy 与 delegation 才能同时观察 system prompt 与 schema 变化，未改生产过滤逻辑；2) 增加指纹稳定性复核和测试原子 `rename` 写入，避免非原子写入的瞬时文档被发布；3) 非 REPL 模式用 one-shot E2E + 谓词单测覆盖，未为 resume/replay/skills 各写独立 E2E；4) 日志走 CLI 既有 stderr `eprintln` 约定。未新增第三方 crate、未修改 jessica-core、未重建后台 worker、未在 turn 中途替换快照。验收：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test -p jessica-cli` 148 passed（106 unit + 13 delegation + 3 hot_reload + 5 memory + 7 reliability + 1 replay + 1 resume + 11 skills + 1 wasm）；`cargo test --workspace` 593 passed, 0 failed, 2 ignored。
 Task 5.4.5 ☑ 约 16 分钟 jessica-cli 新增 `shutdown` 模块与进程级 `ShutdownController`（root `CancellationToken` + 每 turn `child_token()`；提供 `request_shutdown`/`force`/`on_signal`/`is_shutting_down`/`signal`；第一次信号记录种类并取消 root，第二次 force，重复信号幂等且不回退已记录状态）。`SignalListener::spawn` 在返回前同步注册 Unix SIGINT/SIGTERM（非 Unix 回退 `ctrl_c`），第一次信号输出 `[shutdown] ... received; stopping new turns and draining`，第二次输出 `[shutdown] second ... received; exiting immediately` 并在 flush stdout 后 `std::process::exit` 130/143。`app.rs` 移除每 turn 重复创建的 Ctrl+C 任务，`build_turn` 只从 controller 取 child token；`run_turn`/`resume_turn` 在构造后若 token 已取消则零 provider 请求直接返回 `Cancelled`。`main.rs` 在 Turn 模式启动前安装监听；REPL 的 `read_line` 用 `biased select!` 同时等待输入与 `shutdown.cancelled()`，关闭后不再接受输入也不新建 turn。drain 顺序固定为：停止新 turn → 取消当前 turn → 由既有 turn 路径等待 EventPump 持久化终态（沿用 `PUMP_TIMEOUT=30s`）→ `SkillsAssembly::drain()`（受 `skills.drain_timeout_ms` 限制，超时只 warn，不覆盖信号码）→ flush stdout/stderr → 按信号退出。退出码：信号优先，SIGINT=130、SIGTERM=143（即使 turn 同时返回错误）；无信号时 `Completed`/`Cancelled`=0，`BudgetExceeded`/`AcceptanceFailed`/`Error` 及 early error=1。模块文档写明限制：`SessionEnded(Cancelled)` 是终态不可 `--resume`（可恢复关闭需单开 Task）；CommandSensor/CommandAcceptanceCheck 无超时，挂起只能靠第二次信号强制退出（命令超时另开 Task）；不处理 SIGHUP 等其他信号。测试：shutdown 模块 5 个单测（首次取消 active child、第二次 force 且后续 Ignore、关闭后新建 token 已取消、两个 turn token 互不影响、退出码/信号名）；app 2 个（预取消后零 provider 请求、单个 turn 完成不取消进程或下一 turn）；main 2 个（信号码优先于错误结果、无信号时 Cancelled=0/失败=1）；新增 `tests/shutdown_e2e.rs` 4 个 Unix E2E（SIGTERM 中断挂起 turn → 143，事件库恰有 SessionStarted 与单个 SessionEnded(Cancelled)；空闲 REPL SIGINT → 130 且不建 session、不写事件；在途技能 job 在 SIGTERM 后正常 drain 完成 → 143 且 job Done；第二次 SIGTERM 强制退出 → 143、恰 2 次 provider 请求、job 保持 Pending/Processing 可恢复、stderr 含强制退出警告），stdout 均无 panic。偏离/说明：1) `CliRuntime::new` 参数增至 8 个，用 `#[allow(clippy::too_many_arguments)]` 并注释其为唯一装配点；2) 单测直接把 `ShutdownSignal` 注入 `ShutdownController`，未额外抽象 OS 信号通道（`SignalListener` 由 E2E 覆盖）；3) 额外增加技能 worker 正常 drain 的第 4 个 E2E，超出最低要求；4) drain/flush 后显式 `std::process::exit`：REPL 空闲时 `tokio::io::stdin()` 在 blocking pool 上留有 pending read，从 `#[tokio::main]` 返回会等待该 read，stdin 未关闭时进程无法退出；显式 exit 避免此挂起，并使空闲信号路径的退出确定；5) 信号退出码优先于 turn 错误，确保 SIGINT/SIGTERM 不混为 0；6) 未改 jessica-core、未新增第三方 crate。验收：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test -p jessica-cli` 161 passed（115 unit + 13 delegation_e2e + 3 hot_reload_e2e + 5 memory_e2e + 7 reliability_e2e + 1 replay_e2e + 1 resume_e2e + 4 shutdown_e2e + 11 skills_e2e + 1 wasm_tool_e2e）；`cargo test --workspace` 606 passed, 0 failed, 2 ignored。
+Task ACP-0 ☑ 约 110 分钟（含 SIGTERM/EOF 竞态定位与修复） 依赖门禁：用户以“请执行 Task ACP-0”批准 `agent-client-protocol` 5.3.0；workspace 声明 `default-features = false, features = ["stdio"]`，未启用 process/unstable_protocol_v2/default。`cargo tree -p agent-client-protocol` 审查新增传递依赖：agent-client-protocol-derive/schema、anyhow、derive_more、serde_with、strum、blocking、uuid（SessionId）及 async-channel/async-task/event-listener/crossbeam-utils 等 stdio/宏依赖；无既有内部 crate 反向依赖。新增 `Mode::Acp` 与 `parse_acp_args`：支持 `jessica acp`、`jessica acp --config <path>` 与 `jessica --config <path> acp`；未知参数、缺失/重复 config 均结构化报错。ACP 分支复用启动时的全局配置加载与 root 解析，安装 `ShutdownController` + `SignalListener`，不进入 REPL/replay/skills 输出路径。`acp.rs` 用 `Agent.v1().name("jessica").on_receive_request(initialize).connect_to(Stdio::new())`：始终返回 protocolVersion=1（客户端传 0/2/999 同样回 1，由客户端决定是否断开）、agentInfo name=jessica/version=crate 版本、loadSession=false、promptCapabilities image/audio/embeddedContext=false、mcpCapabilities http/sse=false、sessionCapabilities={}、authMethods=[]；模块零 stdout 写入且不安装 tracing subscriber。优雅退出：stdin EOF 返回 Ok→exit 0；首次 SIGINT/SIGTERM 触发 `shutdown.cancelled()`，最多等待 250ms 让已生成的响应 flush 后返回，并沿用既有 signal 退出码（SIGTERM=143）；ACP-0 无 session，该值只覆盖单行 initialize 响应，ACP-2 需随 session 取消/排空重新设计；第二次信号强制退出语义由既有 controller 保留。未实现方法经 SDK fallback 返回 -32601（须先完成 initialize；v1 协议在 initialize 前对其他请求返回 -32600，是 SDK 的协议守卫，不视为实现缺陷）。行为测试：4 个单元（initialize 能力/identity、0/2/999 均回 v1）+ 新增 `tests/acp_stdio.rs` 7 个真实进程 E2E（initialize 全字段、非 1 版本、未知方法 -32601 且进程存活、整段 stdout 仅合法 JSON-RPC、stdin EOF 限时 exit 0、SIGTERM exit 143 且 stderr 含信号诊断、`--config` 指向缺失文件 exit 1 且 stdout 为空）。SIGTERM 用例用 `try_wait` 轮询且保持 stdin 打开：tokio `Child::wait` 会先关闭 stdin，制造 EOF 与信号的竞态（曾复现 exit 0）；实现侧 `select!` 使用 `biased`，已记录信号优先于同时到达的 EOF。该用例 8 路并发压测 240 次、整文件重复 15 次均通过。偏离/说明：1) ACP-0 未装配 provider/recorder/memory/skills/wasm/CliRuntime——initialize 不应要求 API key，且本 Task 无 session；完整 runtime 装配留 ACP-2，ACP 分支已复用配置加载/root/shutdown；2) 可执行文件名仍为 `jessica-cli`（`cargo run -p jessica-cli -- acp`），`jessica acp` 指子命令，改名见 Deferred；3) EventPump 未进入 ACP 路径，因此 stdout 纯净无需改 pump，ACP-1 仍按要求增加 Silent 策略；4) 未修改 jessica-core，未启用 v2/process，未实现任何 session 方法。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 617 passed, 0 failed, 2 ignored；`cargo test -p jessica-cli acp` 11 passed（4 unit + 7 E2E）；`cargo test -p jessica-cli` 172 passed（119 unit + 53 integration）。
+Task ACP-1 ☐ 未开始 — 仅执行上下文重构，不改现有 CLI 行为
+Task ACP-2 ☐ 未开始 — 首期禁用 acceptance 重试；不实现 MCP/权限/load
+Task ACP-3 ☐ 未开始 — 取消、并发、关闭
+Task ACP-4 ☐ 未开始 — 限制、错误、隐私与配置加固；真实客户端验收至少覆盖 Paseo
+Task ACP-5 ☐ 可选 — 默认不做；MCP stdio，完整合规前必须完成
+Task ACP-6 ☐ 可选 — 默认不做；需先决定 core API 方案
+Task ACP-7 ☐ 可选 — 默认不做；session/load/list/delete
 
 ---
 
@@ -1435,6 +1682,16 @@ Deferred（待办，由用户决定是否单开 Task）
 · 5.3 将子工具超时固定为 5000ms，未提供配置项。若未来需要独立配置，需单开 Task 增加 `delegation.child_tool_timeout_ms`，并在配置加载期验证 `child_tool_timeout_ms < delegation.timeout_ms < budget.tool_timeout_ms`，同时保留默认值不变；不得在运行期按模型输入动态调整。
 · 5.4.5 的优雅关闭通过取消当前 turn 产生 `SessionEnded(Cancelled)`，该终态在当前恢复语义下不可 `--resume`；第二次信号强制退出会放弃 skill drain。若需要“可恢复关闭”（先持久化 checkpoint 并以非终态结束，后续 `--resume` 继续），需单开 Task 定义 checkpoint 事件、Cancelled 的恢复语义与 drain 中断后的 job 恢复规则，不能在 shutdown 路径顺手修改恢复语义。SIGHUP 等其他信号仍未处理；需要时单开 Task。
 · 5.4.5 只处理 SIGINT/SIGTERM，且信号监听仅在 CLI Turn/REPL 路径安装；`skills` 子命令、replay 等短路径不安装监听，进程按默认信号处置退出。若这些路径也需要优雅关闭，需单开 Task 统一入口。
+· Task 5.5 可观测性（OTLP 导出、会话回放可视化）暂缓：2026-11-14 用户决定暂时放弃设计/实现。未新增依赖、未修改 jessica-core、未落盘设计文档。若重启，须先 review OTel 依赖方案（官方 SDK vs 手写 OTLP/JSON）、遥测脱敏边界与查看器只读 API，并单开 Task；不得在 5.1–5.4 或收尾工作中顺手实现。
+· Phase 6 ACP-0–ACP-4 首期不支持 MCP stdio；ACP v1 规定 stdio MCP 为 MUST，因此首期不是完全合规。`session/new` 对非空 `mcpServers` 明确报错；完整合规需单开 ACP-5，不得在 ACP-0–4 中顺手实现。
+· Phase 6 首期不实现 `session/request_permission`；bash/write 仍只受 AllowlistPolicy 约束。若需逐次权限批准，须先决定 `jessica-core::tool::Tool` 的 call-id API 方案（或接受 runtime task-local 方案），单开 ACP-6；不得用空/合成 toolCallId。
+· Phase 6 首期不实现 `session/load`/`list`/`delete`/`resume`/`close`；ACP 对话历史只在内存，进程退出即丢失。若需跨进程恢复，须单开 ACP-7，先设计持久化 ACP session → 内部 turn → 消息索引与宽容只读事件读取。
+· Phase 6 的 ACP session `cwd` 必须位于启动 workspace root 内；memory/recorder/skills/wasm 仍按启动 root 作用域，因此不支持一个进程服务多个 workspace。若需 per-session workspace 服务，须单开 Task。
+· Phase 6 的 ACP 模式禁用 acceptance 重试（每 prompt 单次 attempt）；与 REPL/one-shot 的 acceptance 行为不同。启用重试前必须先定义 v1 客户端对 `messageId`/notice 的兼容策略。
+· Phase 6 每个 prompt 都把完整历史写入事件库，存储随对话增长呈 O(n²)；后续可改为增量 + 前序 turn 引用，但不得改变 replay 语义而不单开 Task。
+· Phase 6 ACP 路径必须把 EventPump broadcast `Lagged` 当内部错误处理；现有 CLI 的“只 warn 并继续”行为不得用于 ACP。若要彻底消除 lag，需另开 Task 改同步持久化/背压设计。
+· Phase 6 只支持 ACP stable v1，不支持 v2 alpha；真实客户端互通（至少 initialize → new → 两轮 prompt → cancel）需要人工验收，至少覆盖 Paseo，不能仅凭单元测试或脚本化客户端宣称支持。
+· 可执行文件名仍为 `jessica-cli`（需要 `cargo run -p jessica-cli -- acp`，安装后命令名为 `jessica-cli`），而 Phase 6 Task 文案写的是 `jessica acp`。改名（如设置 `[[bin]] name = "jessica"`）会影响现有脚本、文档与发布产物，需单开 Task 统一命名并更新全部调用点，不得在 ACP Task 中顺手改动。
 
 ---
 

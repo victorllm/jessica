@@ -1077,6 +1077,15 @@ pub(crate) enum CliError {
     /// The provider reliability wrapper could not be assembled.
     #[error("provider reliability setup failed: {0}")]
     Reliability(#[from] jessica_providers::ReliabilityConfigError),
+    /// The ACP transport or protocol layer failed.
+    #[error("ACP transport failed: {0}")]
+    Acp(#[from] agent_client_protocol::Error),
+    /// An `acp` argument was not recognized.
+    #[error("unexpected acp argument `{argument}`")]
+    UnknownAcpArgument {
+        /// Unrecognized argument.
+        argument: String,
+    },
 }
 
 #[cfg(test)]

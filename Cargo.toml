@@ -44,3 +44,8 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 # of sha256(canonical workspace path). This is the only new third-party crate
 # approved for the layered-memory work.
 sha2 = "0.10"
+# Task ACP-0 (user-approved by the instruction to execute the task): the
+# official ACP v1 SDK provides the stdio JSON-RPC transport and the stable v1
+# schema types. Only `stdio` is enabled; default features, `process`, and
+# `unstable_protocol_v2` stay disabled so Jessica exposes stable ACP v1 only.
+agent-client-protocol = { version = "5.3.0", default-features = false, features = ["stdio"] }
