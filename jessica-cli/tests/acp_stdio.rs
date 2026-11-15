@@ -393,6 +393,12 @@ fn sse(payloads: &[String]) -> String {
     )
 }
 
+/// Returns one provider failure response with no body.
+fn internal_server_error() -> String {
+    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        .to_owned()
+}
+
 /// Returns one SSE response carrying text.
 fn text_response(content: &str) -> String {
     sse(&[content_chunk(content), finish_chunk("stop")])
@@ -460,13 +466,18 @@ fn finish_chunk(reason: &str) -> String {
 
 /// Builds an `initialize` request with the given protocol version.
 fn initialize(id: u64, protocol_version: u16) -> Value {
+    initialize_with_capabilities(id, protocol_version, json!({}))
+}
+
+/// Builds an `initialize` request with explicit client capabilities.
+fn initialize_with_capabilities(id: u64, protocol_version: u16, capabilities: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "initialize",
         "params": {
             "protocolVersion": protocol_version,
-            "clientCapabilities": {},
+            "clientCapabilities": capabilities,
         },
     })
 }
@@ -537,12 +548,23 @@ async fn acp_initialize_with_unsupported_version_still_reports_v1() {
 
 /// Completes the mandatory ACP handshake.
 async fn handshake(acp: &mut AcpProcess) {
-    acp.send(initialize(1, 1)).await;
+    handshake_with_capabilities(acp, json!({})).await;
+}
+
+/// Completes the handshake while advertising explicit client capabilities.
+async fn handshake_with_capabilities(acp: &mut AcpProcess, capabilities: Value) {
+    acp.send(initialize_with_capabilities(1, 1, capabilities))
+        .await;
     let response = acp.recv().await;
     assert!(
         response.get("result").is_some(),
         "initialize must succeed: {response}"
     );
+}
+
+/// Completes the handshake while advertising live notice support.
+async fn handshake_with_notices(acp: &mut AcpProcess) {
+    handshake_with_capabilities(acp, json!({"session": {"notices": {}}})).await;
 }
 
 /// Creates a session and returns its protocol id.
@@ -648,6 +670,23 @@ fn update_kind(update: &Value) -> &str {
         .unwrap_or_else(|| panic!("updates must carry sessionUpdate: {update}"))
 }
 
+/// Atomically replaces a configuration file so the watcher never sees a
+/// transient empty document.
+fn write_config_atomic(path: &Path, body: &str) {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, body).expect("temporary config must be written");
+    std::fs::rename(&temporary, path).expect("config must be replaced atomically");
+}
+
+/// Returns the system prompt sent in one provider request.
+fn request_system_prompt(body: &str) -> String {
+    let request: Value = serde_json::from_str(body).expect("provider request must be JSON");
+    request["messages"][0]["content"]
+        .as_str()
+        .expect("the first provider message must be the system prompt")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn acp_unknown_method_returns_method_not_found_and_keeps_running() {
     let mut acp = AcpProcess::spawn(&[]).await;
@@ -674,6 +713,14 @@ async fn acp_unknown_method_returns_method_not_found_and_keeps_running() {
         assert_eq!(
             response["error"]["code"], -32601,
             "an unimplemented method must be reported as Method not found: {response}"
+        );
+        assert_eq!(
+            response["error"]["message"], "Method not found",
+            "the method-not-found message must stay stable: {response}"
+        );
+        assert_eq!(
+            response["error"]["data"], method,
+            "the SDK may identify the missing method, but must not echo request parameters: {response}"
         );
     }
 
@@ -737,12 +784,54 @@ async fn acp_session_new_validates_cwd_and_rejects_unsupported_fields() {
 }
 
 #[tokio::test]
+async fn acp_session_limit_accepts_the_last_slot_and_rejects_the_next() {
+    let workspace = TempDir::new("session-limit");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, "[acp]\nmax_sessions = 1\n")
+        .expect("ACP configuration must be written");
+
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let first = create_session(&mut acp, 2, &workspace.path).await;
+    assert!(!first.is_empty());
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/new",
+        "params": {"cwd": workspace.path, "mcpServers": []},
+    }))
+    .await;
+    let rejected = acp.recv().await;
+
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "the session limit is an invalid-params boundary: {rejected}"
+    );
+    assert_eq!(
+        rejected["error"]["message"], "session limit reached",
+        "the limit error must be stable and actionable: {rejected}"
+    );
+    assert_eq!(rejected["error"]["data"]["reason"], "session_limit_reached");
+    assert_eq!(rejected["error"]["data"]["maxSessions"], 1);
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
 async fn acp_prompt_validation_rejects_bad_content_without_a_model_call() {
     let workspace = TempDir::new("content");
     let config = workspace.path.join("harness.toml");
     std::fs::write(&config, "[acp]\nmax_prompt_bytes = 8\n")
         .expect("ACP configuration must be written");
-    let provider = MockProvider::start(Vec::new());
+    let provider = MockProvider::start(vec![text_response("accepted")]);
 
     let mut acp = AcpProcess::spawn_in(
         Some(&workspace.path),
@@ -761,16 +850,26 @@ async fn acp_prompt_validation_rejects_bad_content_without_a_model_call() {
         (
             "image",
             json!([{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]),
+            "unsupported prompt content block: image",
         ),
         (
             "embedded resource",
             json!([{"type": "resource", "resource": {"text": "hi", "uri": "file:///x"}}]),
+            "unsupported prompt content block: resource",
         ),
-        ("empty", json!([{"type": "text", "text": "   "}])),
-        ("oversized", json!([{"type": "text", "text": "123456789"}])),
+        (
+            "empty",
+            json!([{"type": "text", "text": "   "}]),
+            "prompt must not be empty",
+        ),
+        (
+            "oversized",
+            json!([{"type": "text", "text": "123456789"}]),
+            "prompt exceeds the maximum of 8 bytes",
+        ),
     ];
 
-    for (index, (label, prompt)) in prompts.into_iter().enumerate() {
+    for (index, (label, prompt, expected_message)) in prompts.into_iter().enumerate() {
         let id = (index + 3) as u64;
         acp.send(json!({
             "jsonrpc": "2.0",
@@ -785,14 +884,33 @@ async fn acp_prompt_validation_rejects_bad_content_without_a_model_call() {
             response["error"]["code"], -32602,
             "{label} prompt must be rejected: {response}"
         );
+        assert_eq!(
+            response["error"]["message"], expected_message,
+            "{label} must return a stable, actionable message: {response}"
+        );
     }
+
+    let (_, accepted) = prompt_until_response(
+        &mut acp,
+        7,
+        &session,
+        json!([{"type": "text", "text": "12345678"}]),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"]["stopReason"], "end_turn",
+        "a prompt exactly at the byte limit must be accepted: {accepted}"
+    );
 
     acp.close_stdin();
     assert_eq!(acp.wait().await.code(), Some(0));
-    assert!(
-        provider.finish().is_empty(),
-        "rejected prompts must never reach the provider"
+    let requests = provider.finish();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the prompt exactly at the limit may reach the provider"
     );
+    assert!(requests[0].contains("12345678"));
 }
 
 #[tokio::test]
@@ -1353,6 +1471,10 @@ async fn acp_maps_token_budget_exhaustion_to_max_tokens_and_keeps_history() {
                 && update["content"]["text"] == "partial answer"),
         "text produced before the boundary must still stream: {updates:?}"
     );
+    assert!(
+        updates.iter().all(|update| update_kind(update) != "notice"),
+        "a client that did not advertise session.notices must receive zero notices: {updates:?}"
+    );
 
     let (_updates, response) = prompt_until_response(
         &mut acp,
@@ -1370,6 +1492,306 @@ async fn acp_maps_token_budget_exhaustion_to_max_tokens_and_keeps_history() {
     assert!(
         requests[1].contains("partial answer"),
         "a governed stop must still commit the partial turn"
+    );
+}
+
+#[tokio::test]
+async fn acp_sends_a_schema_valid_notice_only_when_the_client_advertises_it() {
+    let workspace = TempDir::new("notices");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_tokens = 1\nmax_rounds = 4\n\n[policy]\nallowed_tools = []\n",
+    )
+    .expect("budget configuration must be written");
+    let provider = MockProvider::start(vec![sse(&[
+        content_chunk("partial answer"),
+        usage_chunk(10, 10),
+        finish_chunk("stop"),
+    ])]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake_with_notices(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    let (updates, response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "spend tokens"}]),
+    )
+    .await;
+
+    assert_eq!(
+        response["result"]["stopReason"], "max_tokens",
+        "the stop reason remains the primary budget signal: {response}"
+    );
+    let notices: Vec<&Value> = updates
+        .iter()
+        .filter(|update| update_kind(update) == "notice")
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "a client advertising notices must receive one content-free budget notice: {updates:?}"
+    );
+    let notice = notices[0];
+    assert_eq!(notice["severity"], "warning");
+    assert_eq!(notice["title"], "Token budget exhausted");
+    assert!(
+        notice["description"]
+            .as_str()
+            .is_some_and(|description| !description.is_empty()),
+        "the notice must remain schema-valid with a usable description: {notice}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(provider.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn acp_error_paths_are_stable_and_keep_sensitive_content_out_of_stderr() {
+    const PROMPT_SECRET: &str = "PROMPT_SECRET_7f3c";
+    const TOOL_SECRET: &str = "TOOL_SECRET_91ab";
+
+    let workspace = TempDir::new("privacy");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 4\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_secret",
+            "bash",
+            json!({"command": format!("printf '%s' '{TOOL_SECRET}'")}),
+        )]),
+        internal_server_error(),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let (_, missing) = prompt_until_response(
+        &mut acp,
+        2,
+        "acp-missing",
+        json!([{"type": "text", "text": format!("{PROMPT_SECRET} missing session")}]),
+    )
+    .await;
+    assert_eq!(
+        missing["error"]["code"], -32002,
+        "an unknown session must be resource-not-found: {missing}"
+    );
+    assert_eq!(missing["error"]["message"], "Resource not found");
+    assert_eq!(missing["error"]["data"]["sessionId"], "acp-missing");
+    assert!(
+        !missing.to_string().contains(PROMPT_SECRET),
+        "the unknown-session error must not echo prompt content: {missing}"
+    );
+
+    let session = create_session(&mut acp, 3, &workspace.path).await;
+    let (_updates, failed) = prompt_until_response(
+        &mut acp,
+        4,
+        &session,
+        json!([{"type": "text", "text": format!("{PROMPT_SECRET} run the tool")}]),
+    )
+    .await;
+    assert_eq!(
+        failed["error"]["code"], -32603,
+        "an internal provider failure must use the internal-error code: {failed}"
+    );
+    assert_eq!(
+        failed["error"]["message"], "prompt failed",
+        "provider details must not leak through the error: {failed}"
+    );
+    assert!(
+        !failed.to_string().contains(PROMPT_SECRET) && !failed.to_string().contains(TOOL_SECRET),
+        "the prompt error must not echo prompt or tool content: {failed}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    let stderr = acp.remaining_stderr().await;
+    assert!(
+        !stderr.contains(PROMPT_SECRET),
+        "stderr must never contain the prompt: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(TOOL_SECRET),
+        "stderr must never contain tool arguments or results: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "error handling must not panic: {stderr:?}"
+    );
+
+    let rest = acp.remaining_stdout().await;
+    for line in rest.lines().filter(|line| !line.trim().is_empty()) {
+        parse_message(line);
+    }
+
+    let requests = provider.finish();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the failing tool turn must make one tool-continuation provider call"
+    );
+    assert!(
+        requests[0].contains(PROMPT_SECRET),
+        "the fixture must actually send the sensitive prompt to the provider"
+    );
+    assert!(
+        requests[1].contains(TOOL_SECRET),
+        "the fixture must actually send the sensitive tool call to the provider"
+    );
+}
+
+#[tokio::test]
+async fn acp_hot_reload_applies_reloadable_sections_and_rejects_acp_limits() {
+    let workspace = TempDir::new("hot-reload");
+    let config = workspace.path.join("harness.toml");
+    let base = "\
+[budget]
+max_rounds = 4
+max_tokens = 100000
+
+[policy]
+allowed_tools = [\"read_file\"]
+
+[acp]
+max_prompt_bytes = 8
+";
+    write_config_atomic(&config, base);
+    let provider = MockProvider::start(vec![
+        text_response("first answer"),
+        text_response("second answer"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    let (_, first) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "12345678"}]),
+    )
+    .await;
+    assert_eq!(first["result"]["stopReason"], "end_turn");
+
+    // A policy change is reloadable and must affect the next prompt's tools.
+    write_config_atomic(
+        &config,
+        "\
+[budget]
+max_rounds = 4
+max_tokens = 100000
+
+[policy]
+allowed_tools = [\"bash\"]
+
+[acp]
+max_prompt_bytes = 8
+",
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let (_, second) = prompt_until_response(
+        &mut acp,
+        4,
+        &session,
+        json!([{"type": "text", "text": "next"}]),
+    )
+    .await;
+    assert_eq!(
+        second["result"]["stopReason"], "end_turn",
+        "the prompt after a reload must run normally: {second}"
+    );
+
+    // ACP limits are startup-only. The watcher must reject the whole document
+    // and keep the startup value even though the policy change alone would be
+    // reloadable.
+    write_config_atomic(
+        &config,
+        "\
+[budget]
+max_rounds = 4
+max_tokens = 100000
+
+[policy]
+allowed_tools = [\"bash\"]
+
+[acp]
+max_prompt_bytes = 64
+",
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let (_, rejected) = prompt_until_response(
+        &mut acp,
+        5,
+        &session,
+        json!([{"type": "text", "text": "123456789"}]),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"], -32602,
+        "an ACP limit reload must not change the startup prompt bound: {rejected}"
+    );
+    assert_eq!(
+        rejected["error"]["message"],
+        "prompt exceeds the maximum of 8 bytes"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    let stderr = acp.remaining_stderr().await;
+    assert!(
+        stderr.contains("[config] reloaded"),
+        "a reloadable change must be reported on stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("[config] reload rejected: `acp`"),
+        "an ACP limit change must be rejected by name: {stderr:?}"
+    );
+
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        request_system_prompt(&requests[0]).contains("allowlist: read_file"),
+        "the first prompt must use the startup policy"
+    );
+    assert!(
+        request_system_prompt(&requests[1]).contains("allowlist: bash"),
+        "the next prompt must use the reloaded policy"
     );
 }
 

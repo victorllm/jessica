@@ -761,6 +761,15 @@ mod tests {
             Err(PromptContentError::Empty)
         );
         assert_eq!(
+            prompt_text(&[ContentBlock::Text(TextContent::new("12345678"))], 8),
+            Ok("12345678".to_owned()),
+            "the configured byte limit is inclusive"
+        );
+        assert_eq!(
+            prompt_text(&[ContentBlock::Text(TextContent::new("123456789"))], 8),
+            Err(PromptContentError::TooLarge { max_bytes: 8 })
+        );
+        assert_eq!(
             prompt_text(&[ContentBlock::Text(TextContent::new("too long"))], 3),
             Err(PromptContentError::TooLarge { max_bytes: 3 })
         );
@@ -893,6 +902,60 @@ mod tests {
         let history = session.history_snapshot();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0], Message::user("second message"));
+    }
+
+    #[test]
+    fn history_limits_are_inclusive_and_only_excess_turns_are_dropped() {
+        let messages = vec![
+            Message::user("first message"),
+            Message::assistant("first answer"),
+            Message::user("second message"),
+            Message::assistant("second answer"),
+        ];
+        let exact_bytes = serde_json::to_vec(&messages)
+            .expect("history messages must serialize")
+            .len();
+
+        let mut at_both_limits = messages.clone();
+        trim_history(
+            &mut at_both_limits,
+            HistoryLimits {
+                max_messages: messages.len(),
+                max_bytes: exact_bytes,
+            },
+        );
+        assert_eq!(
+            at_both_limits, messages,
+            "a history exactly at both limits must be retained"
+        );
+
+        let mut one_message_over = messages.clone();
+        trim_history(
+            &mut one_message_over,
+            HistoryLimits {
+                max_messages: messages.len() - 1,
+                max_bytes: exact_bytes,
+            },
+        );
+        assert_eq!(
+            one_message_over,
+            messages[2..],
+            "exceeding only the message limit must drop the oldest complete turn"
+        );
+
+        let mut one_byte_over = messages.clone();
+        trim_history(
+            &mut one_byte_over,
+            HistoryLimits {
+                max_messages: messages.len(),
+                max_bytes: exact_bytes - 1,
+            },
+        );
+        assert_eq!(
+            one_byte_over,
+            messages[2..],
+            "exceeding only the byte limit must drop the oldest complete turn"
+        );
     }
 
     #[test]
