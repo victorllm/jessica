@@ -1,10 +1,12 @@
 //! Stable ACP v1 agent transport over stdio.
 //!
-//! The server implements `initialize`, `session/new`, and `session/prompt`.
-//! A prompt is prepared synchronously (session lookup, content validation,
-//! busy check), then model and tool work runs in a task spawned on the
-//! connection so the SDK dispatch loop keeps receiving messages. Cancellation,
-//! session close, permissions, session load, and MCP arrive in later tasks.
+//! The server implements `initialize`, `session/new`, `session/prompt`, and
+//! `session/cancel`. A prompt is prepared synchronously (session lookup,
+//! content validation, busy check), then model and tool work runs in a task
+//! spawned on the connection so the SDK dispatch loop keeps receiving
+//! messages. Cancellation is scoped to one session prompt; sessions run
+//! concurrently and process shutdown or stdin EOF cancels every session before
+//! a bounded drain.
 //!
 //! Stdout is reserved for newline-delimited JSON-RPC. This module never writes
 //! to stdout itself, and the CLI installs no tracing subscriber, so ACP
@@ -17,19 +19,21 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, Implementation, InitializeRequest, InitializeResponse, McpCapabilities,
-    MessageId, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
-    PromptResponse, SessionCapabilities, SessionId as AcpSessionId, SessionNotification,
-    StopReason,
+    AgentCapabilities, CancelNotification, Implementation, InitializeRequest, InitializeResponse,
+    McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, PromptCapabilities,
+    PromptRequest, PromptResponse, SessionCapabilities, SessionId as AcpSessionId,
+    SessionNotification, StopReason,
 };
 use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
 use serde_json::json;
-use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::sync::{OnceCell, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::acp_events::{AcpEventMapper, BudgetStopReason, budget_stop_reason};
+use crate::acp_events::{
+    AcpEventMapper, BudgetStopReason, InFlightTools, budget_stop_reason, interrupted_tool_update,
+};
 use crate::acp_session::{
     AcpSession, AcpSessionRegistry, HistoryLimits, PromptGuard, SessionError, prompt_text,
 };
@@ -38,18 +42,19 @@ use crate::config::HarnessConfig;
 use crate::pump::UpdateSink;
 use crate::shutdown::ShutdownController;
 
-/// Maximum time allowed for the transport to flush after a shutdown signal.
-///
-/// ACP-2 has no cancellation or session-close semantics; ACP-3 owns draining
-/// live prompts and revisits this bound. Until then a signal returns after at
-/// most this grace period, leaving already queued responses time to flush.
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+/// Maximum time spent waiting for active prompts to finish during shutdown.
+const PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Time allowed for the transport to flush after prompts have drained.
+const TRANSPORT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
 /// Serves stable ACP v1 over stdin/stdout until EOF or shutdown.
 ///
 /// A clean stdin EOF is a successful termination. On SIGINT or SIGTERM the
-/// caller's [`ShutdownController`] is cancelled and the transport gets a short
-/// grace period to flush. Session cancellation and draining are ACP-3 work.
+/// caller's [`ShutdownController`] is cancelled, every session lifetime token
+/// is cancelled, active prompts are drained with a bound, skills are drained,
+/// and queued responses get a short flush window. A drain timeout only logs a
+/// warning; the process never waits forever for a stuck prompt.
 pub(crate) async fn run(
     config: HarnessConfig,
     root: PathBuf,
@@ -62,14 +67,16 @@ pub(crate) async fn run(
         Arc::clone(&shutdown),
     ));
 
+    let initialize_service = Arc::clone(&service);
     let new_session_service = Arc::clone(&service);
     let prompt_service = Arc::clone(&service);
+    let cancel_service = Arc::clone(&service);
     let connection = Agent
         .v1()
         .name("jessica")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _connection| {
-                responder.respond(initialize_response(&request))
+                initialize_service.initialize(&request, responder)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -88,20 +95,58 @@ pub(crate) async fn run(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_notification(
+            async move |notification: CancelNotification, _connection| {
+                cancel_service.cancel(&notification.session_id);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .connect_to(Stdio::new());
     tokio::pin!(connection);
+    let transport_failed = service.transport_failure.clone();
 
+    let mut connection_result = None;
     tokio::select! {
         // A signal that is already recorded takes precedence when the client
         // closes stdin at the same time: the signal determines the exit code.
         biased;
-        _ = shutdown.cancelled() => {
-            match timeout(SHUTDOWN_GRACE_PERIOD, &mut connection).await {
-                Ok(result) => result.map_err(CliError::Acp),
-                Err(_) => Ok(()),
+        _ = shutdown.cancelled() => {}
+        _ = transport_failed.cancelled() => {}
+        result = &mut connection => connection_result = Some(result),
+    }
+
+    service.begin_shutdown();
+    match connection_result {
+        Some(_) => {
+            // The transport is gone and the SDK has cancelled its spawned
+            // tasks. Wait briefly for their guards, then drain skills.
+            if !service.wait_for_prompts(PROMPT_DRAIN_TIMEOUT).await {
+                tracing::warn!("acp prompt drain timed out after transport close");
             }
         }
-        result = &mut connection => result.map_err(CliError::Acp),
+        None => {
+            // Keep driving the connection while prompt workers observe their
+            // cancellation and enqueue final updates and responses.
+            let drained = service.wait_for_prompts(PROMPT_DRAIN_TIMEOUT);
+            tokio::pin!(drained);
+            tokio::select! {
+                _ = &mut drained => {}
+                result = &mut connection => connection_result = Some(result),
+            }
+            if connection_result.is_none() {
+                if let Ok(result) = timeout(TRANSPORT_FLUSH_GRACE, &mut connection).await {
+                    connection_result = Some(result);
+                }
+            } else if !service.wait_for_prompts(PROMPT_DRAIN_TIMEOUT).await {
+                tracing::warn!("acp prompt drain timed out after transport close");
+            }
+        }
+    }
+    service.drain_skills().await;
+    match connection_result {
+        Some(result) => result.map_err(CliError::Acp),
+        None => Ok(()),
     }
 }
 
@@ -127,6 +172,10 @@ struct AcpService {
     shutdown: Arc<ShutdownController>,
     /// Live sessions and their bounded histories.
     registry: AcpSessionRegistry,
+    /// Tracks prompt workers and rejects new prompts once shutdown begins.
+    prompts: Arc<PromptTracker>,
+    /// Cancelled when a protocol write fails because the client disconnected.
+    transport_failure: CancellationToken,
     /// Provider, recorder, wasm, memory, and skills, assembled on first prompt.
     ///
     /// Assembly is lazy so `initialize` and `session/new` work even when a
@@ -145,14 +194,101 @@ impl AcpService {
                 max_messages: config.acp.max_history_messages,
                 max_bytes: config.acp.max_history_bytes,
             },
+            shutdown.child_token(),
         );
         Self {
             config,
             root,
             shutdown,
             registry,
+            prompts: Arc::new(PromptTracker::new()),
+            transport_failure: CancellationToken::new(),
             runtime: OnceCell::new(),
         }
+    }
+
+    /// Returns whether this service no longer accepts new sessions or prompts.
+    fn is_closing(&self) -> bool {
+        self.prompts.is_closing()
+            || self.shutdown.is_shutting_down()
+            || self.transport_failure.is_cancelled()
+    }
+
+    /// Stops accepting work and cancels every session lifetime token.
+    ///
+    /// This is idempotent and synchronous so it can be called from request
+    /// handlers and the transport writer without awaiting.
+    fn begin_shutdown(&self) {
+        self.prompts.close();
+        self.registry.cancel_all();
+    }
+
+    /// Records a broken transport, cancels work, and wakes the transport loop.
+    fn fail_transport(&self) {
+        self.begin_shutdown();
+        self.transport_failure.cancel();
+    }
+
+    /// Cancels the active prompt of one session, ignoring unknown sessions.
+    ///
+    /// Returns whether an active prompt was cancelled. A notification for an
+    /// unknown or idle session is a silent no-op, as ACP requires.
+    fn cancel(&self, session_id: &AcpSessionId) -> bool {
+        let Some(session) = self.registry.get(&session_id.to_string()) else {
+            return false;
+        };
+        let cancelled = session.cancel_prompt();
+        tracing::debug!(
+            session_id = session.id(),
+            cancelled,
+            "acp session cancel requested"
+        );
+        cancelled
+    }
+
+    /// Waits until every prompt worker has released its activity guard.
+    ///
+    /// Returns `false` if the bound expires. A drain timeout only logs at the
+    /// call site; it never extends the process lifetime without bound.
+    async fn wait_for_prompts(&self, limit: Duration) -> bool {
+        let mut active = self.prompts.changed.subscribe();
+        if *active.borrow_and_update() == 0 {
+            return true;
+        }
+        timeout(limit, async {
+            loop {
+                if *active.borrow_and_update() == 0 {
+                    break;
+                }
+                if active.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Drains already assembled skills, if a runtime exists.
+    ///
+    /// A runtime that was never assembled has no skill worker to drain. This
+    /// avoids starting provider or memory initialization during shutdown.
+    async fn drain_skills(&self) {
+        if let Some(Ok(runtime)) = self.runtime.get() {
+            runtime.shutdown().await;
+        }
+    }
+
+    /// Implements `initialize`.
+    fn initialize(
+        &self,
+        request: &InitializeRequest,
+        responder: agent_client_protocol::v1::Responder<InitializeResponse>,
+    ) -> Result<(), Error> {
+        if self.is_closing() {
+            return responder.respond_with_error(shutting_down_error());
+        }
+        responder.respond(initialize_response(request))
     }
 
     /// Returns the shared runtime, assembling it exactly once.
@@ -180,6 +316,9 @@ impl AcpService {
 
     /// Implements `session/new`.
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
         if !request.mcp_servers.is_empty() {
             return Err(invalid_params(
                 "mcpServers are not supported in this ACP version",
@@ -207,16 +346,22 @@ impl AcpService {
 
     /// Validates a prompt and acquires the session's single prompt lease.
     fn prepare_prompt(&self, request: &PromptRequest) -> Result<PreparedPrompt, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
         let session = self
             .registry
             .get(&request.session_id.to_string())
             .ok_or_else(|| session_not_found(&request.session_id))?;
         let user_input = prompt_text(&request.prompt, self.config.acp.max_prompt_bytes)
             .map_err(|error| invalid_params(error.to_string()))?;
-        let token = self.shutdown.child_token();
-        let (history, guard) = session
-            .begin_prompt(token)
-            .map_err(|_| invalid_params("session busy").data(json!({"reason": "session_busy"})))?;
+        let activity = self.prompts.begin().ok_or_else(shutting_down_error)?;
+        let (history, guard) = match session.begin_prompt() {
+            Ok(started) => started,
+            Err(_) => {
+                return Err(invalid_params("session busy").data(json!({"reason": "session_busy"})));
+            }
+        };
         let turn_id = session.next_turn_id();
         Ok(PreparedPrompt {
             session,
@@ -224,6 +369,7 @@ impl AcpService {
             user_input,
             turn_id,
             guard,
+            activity,
         })
     }
 
@@ -253,6 +399,91 @@ struct PreparedPrompt {
     turn_id: SessionId,
     /// Lease released by commit or drop.
     guard: PromptGuard,
+    /// Counted until the prompt worker sends its final response.
+    activity: PromptActivity,
+}
+
+/// Counts active prompt workers and stops accepting new ones during shutdown.
+struct PromptTracker {
+    /// Closing flag and active prompt count, changed together.
+    state: Mutex<PromptTrackerState>,
+    /// Observable active prompt count.
+    changed: watch::Sender<usize>,
+}
+
+/// Mutable state protected by [`PromptTracker::state`].
+struct PromptTrackerState {
+    /// Whether shutdown has stopped new prompts.
+    closing: bool,
+    /// Number of prompt workers that have not finished.
+    active: usize,
+}
+
+impl PromptTracker {
+    /// Creates an open tracker with no active prompts.
+    fn new() -> Self {
+        let (changed, _receiver) = watch::channel(0);
+        Self {
+            state: Mutex::new(PromptTrackerState {
+                closing: false,
+                active: 0,
+            }),
+            changed,
+        }
+    }
+
+    /// Starts one prompt unless shutdown has already begun.
+    fn begin(self: &Arc<Self>) -> Option<PromptActivity> {
+        let active = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.closing {
+                return None;
+            }
+            state.active += 1;
+            state.active
+        };
+        self.changed.send_replace(active);
+        Some(PromptActivity {
+            tracker: Arc::clone(self),
+        })
+    }
+
+    /// Stops accepting prompts. Existing workers still finish and decrement.
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closing = true;
+    }
+
+    /// Returns whether prompt acceptance has stopped.
+    fn is_closing(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closing
+    }
+}
+
+/// One active prompt worker's activity count.
+struct PromptActivity {
+    /// Tracker decremented when this guard drops.
+    tracker: Arc<PromptTracker>,
+}
+
+impl Drop for PromptActivity {
+    fn drop(&mut self) {
+        let active = {
+            let mut state = self
+                .tracker
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.active = state.active.saturating_sub(1);
+            state.active
+        };
+        self.tracker.changed.send_replace(active);
+    }
 }
 
 /// Handles one `session/prompt` without blocking the dispatch loop.
@@ -269,11 +500,12 @@ async fn handle_prompt(
 
     let (updates, receiver) = mpsc::unbounded_channel();
     let writer_connection = connection.clone();
+    let writer_service = Arc::clone(&service);
     if connection
-        .spawn(async move { run_update_writer(writer_connection, receiver).await })
+        .spawn(async move { run_update_writer(writer_connection, receiver, writer_service).await })
         .is_err()
     {
-        // Dropping `prepared` releases the busy state.
+        // Dropping `prepared` releases the busy state and activity count.
         return responder.respond_with_error(internal_prompt_error());
     }
 
@@ -297,18 +529,21 @@ async fn run_prompt_worker(
         history,
         user_input,
         turn_id,
-        guard,
+        mut guard,
+        activity: _activity,
     } = prepared;
     let session_id = session.id().to_owned();
     let cwd = session.cwd().to_path_buf();
     drop(session);
 
     let observations = Arc::new(PromptObservations::default());
+    let in_flight = Arc::new(InFlightTools::default());
     let mapper = AcpEventMapper::new(cwd.clone(), MessageId::new(turn_id.to_string()));
     let sink: Arc<dyn UpdateSink> = Arc::new(AcpUpdateSink {
-        session_id: AcpSessionId::new(session_id),
+        session_id: AcpSessionId::new(session_id.clone()),
         mapper,
         observations: Arc::clone(&observations),
+        in_flight: Arc::clone(&in_flight),
         updates: updates.clone(),
     });
     let execution = execute_prompt(
@@ -325,27 +560,60 @@ async fn run_prompt_worker(
     )
     .await;
 
+    // A cancelled or failed turn can stop between a tool start and its result.
+    // Close every remainder before the barrier so no client sees a tool stuck
+    // in progress and the failed updates precede the prompt response.
+    for call in in_flight.take_pending() {
+        let notification = SessionNotification::new(
+            AcpSessionId::new(session_id.clone()),
+            interrupted_tool_update(&call),
+        );
+        let _ = updates.send(WriterMessage::Update(Box::new(notification)));
+    }
+
     // Every update was enqueued before `execute_prompt` returned. The barrier
     // is ordered behind them, so a successful acknowledgement proves that the
     // writer attempted every update before the response is sent.
     let updates_delivered = update_barrier(&updates).await;
     let PromptExecution { terminal, commit } = execution;
-    if updates_delivered && terminal != PromptTerminal::Error {
-        match commit {
-            Some(messages) => guard.commit(messages),
-            None => drop(guard),
-        }
+
+    // The cancel handler takes this gate before setting the flag. Holding it
+    // until the response is enqueued makes the cancellation and response a
+    // single ordered decision: a cancel that wins the gate forces `cancelled`
+    // even if the underlying turn already completed or failed.
+    let response_gate = guard.response_gate();
+    let gate = response_gate.lock().unwrap_or_else(PoisonError::into_inner);
+    let terminal = if guard.cancel_requested() {
+        PromptTerminal::Stop(StopReason::Cancelled)
     } else {
-        drop(guard);
+        terminal
+    };
+
+    if updates_delivered
+        && terminal != PromptTerminal::Error
+        && let Some(messages) = commit
+    {
+        guard.commit(messages);
     }
 
-    if !updates_delivered {
-        return responder.respond_with_error(internal_prompt_error());
+    let response = if !updates_delivered {
+        responder.respond_with_error(internal_prompt_error())
+    } else {
+        match terminal {
+            PromptTerminal::Stop(reason) => responder.respond(PromptResponse::new(reason)),
+            PromptTerminal::Error => responder.respond_with_error(internal_prompt_error()),
+        }
+    };
+    if response.is_err() {
+        // A response that cannot be written means the client is gone even if
+        // no session update exposed the broken pipe first.
+        service.fail_transport();
     }
-    match terminal {
-        PromptTerminal::Stop(reason) => responder.respond(PromptResponse::new(reason)),
-        PromptTerminal::Error => responder.respond_with_error(internal_prompt_error()),
-    }
+    // Release only after the response is enqueued so a following prompt from
+    // the client is not rejected as busy. The activity guard drops after this.
+    guard.release();
+    drop(gate);
+    response
 }
 
 /// Inputs captured for one prompt execution.
@@ -498,6 +766,8 @@ struct AcpUpdateSink {
     mapper: AcpEventMapper,
     /// Shared budget observations.
     observations: Arc<PromptObservations>,
+    /// Tool calls announced but not yet finished.
+    in_flight: Arc<InFlightTools>,
     /// FIFO writer queue.
     updates: mpsc::UnboundedSender<WriterMessage>,
 }
@@ -505,6 +775,7 @@ struct AcpUpdateSink {
 impl UpdateSink for AcpUpdateSink {
     fn publish(&self, event: &AgentEvent) {
         self.observations.observe(event);
+        self.in_flight.observe(event);
         let Some(update) = self.mapper.map(event) else {
             return;
         };
@@ -527,6 +798,7 @@ enum WriterMessage {
 async fn run_update_writer(
     connection: ConnectionTo<Client>,
     mut receiver: mpsc::UnboundedReceiver<WriterMessage>,
+    service: Arc<AcpService>,
 ) -> Result<(), Error> {
     let mut failed = false;
     while let Some(message) = receiver.recv().await {
@@ -534,6 +806,9 @@ async fn run_update_writer(
             WriterMessage::Update(notification) => {
                 if !failed && connection.send_notification(*notification).is_err() {
                     failed = true;
+                    // The client is gone. Stop every session instead of
+                    // continuing tools whose output can never be delivered.
+                    service.fail_transport();
                 }
             }
             WriterMessage::Barrier(acknowledge) => {
@@ -611,6 +886,11 @@ fn session_not_found(session_id: &AcpSessionId) -> Error {
 /// Generic internal error that cannot leak provider or prompt details.
 fn internal_prompt_error() -> Error {
     Error::new(ErrorCode::INTERNAL_ERROR, "prompt failed")
+}
+
+/// Error returned once shutdown has stopped accepting new work.
+fn shutting_down_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "agent is shutting down")
 }
 
 #[cfg(test)]
@@ -793,9 +1073,7 @@ mod tests {
         session: &Arc<AcpSession>,
         input: &str,
     ) -> PromptTerminal {
-        let (history, guard) = session
-            .begin_prompt(service.shutdown.child_token())
-            .expect("prompt must start");
+        let (history, mut guard) = session.begin_prompt().expect("prompt must start");
         let execution = execute_prompt(
             service,
             PromptExecutionRequest {
@@ -903,6 +1181,114 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(error.message, "session busy");
         assert_eq!(error.data, Some(json!({"reason": "session_busy"})));
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_only_the_target_session_prompt() {
+        let root = temp_root("cancel-scope");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let (service, _config) = service_with(provider, &root, HarnessConfig::default());
+        let first = create_session(&service, root.clone()).await;
+        let second = create_session(&service, root).await;
+        let request_for = |session: &Arc<AcpSession>| {
+            PromptRequest::new(
+                AcpSessionId::new(session.id().to_owned()),
+                vec![ContentBlock::Text(TextContent::new("hello"))],
+            )
+        };
+        let first_prompt = service
+            .prepare_prompt(&request_for(&first))
+            .expect("first session prompt");
+        let second_prompt = service
+            .prepare_prompt(&request_for(&second))
+            .expect("second session prompt");
+
+        service.cancel(&AcpSessionId::new(first.id().to_owned()));
+
+        assert!(first_prompt.guard.cancel_requested());
+        assert!(first_prompt.guard.token().is_cancelled());
+        assert!(
+            !second_prompt.guard.token().is_cancelled(),
+            "cancelling one prompt must not cancel another session"
+        );
+        assert!(
+            !second_prompt.guard.cancel_requested(),
+            "only an explicit client cancel marks the flag"
+        );
+        assert!(
+            !service.cancel(&AcpSessionId::new("acp-missing")),
+            "an unknown session cancel is ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_work_and_waits_for_active_prompts() {
+        let root = temp_root("drain");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let (service, _config) = service_with(provider, &root, HarnessConfig::default());
+        let session = create_session(&service, root.clone()).await;
+        let request = PromptRequest::new(
+            AcpSessionId::new(session.id().to_owned()),
+            vec![ContentBlock::Text(TextContent::new("active"))],
+        );
+        let active = service.prepare_prompt(&request).expect("active prompt");
+
+        service.begin_shutdown();
+
+        assert!(service.is_closing());
+        assert!(
+            active.guard.token().is_cancelled(),
+            "shutdown must cancel the session lifetime token"
+        );
+        assert!(
+            !service.wait_for_prompts(Duration::from_millis(10)).await,
+            "the active prompt must still be counted"
+        );
+        let error = service
+            .prepare_prompt(&request)
+            .err()
+            .expect("shutdown must reject a new prompt");
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.message, "agent is shutting down");
+        let new_session_error = service
+            .new_session(NewSessionRequest::new(root))
+            .await
+            .expect_err("shutdown must reject session creation");
+        assert_eq!(new_session_error.code, ErrorCode::INTERNAL_ERROR);
+
+        drop(active);
+        assert!(
+            service.wait_for_prompts(Duration::from_secs(1)).await,
+            "dropping the final prompt must release the drain wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_cancels_all_sessions_and_wakes_the_run_loop() {
+        let root = temp_root("transport-failure");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let (service, _config) = service_with(provider, &root, HarnessConfig::default());
+        let first = create_session(&service, root.clone()).await;
+        let second = create_session(&service, root).await;
+        let request = |session: &Arc<AcpSession>| {
+            PromptRequest::new(
+                AcpSessionId::new(session.id().to_owned()),
+                vec![ContentBlock::Text(TextContent::new("active"))],
+            )
+        };
+        let first_prompt = service
+            .prepare_prompt(&request(&first))
+            .expect("first prompt");
+        let second_prompt = service
+            .prepare_prompt(&request(&second))
+            .expect("second prompt");
+
+        service.fail_transport();
+
+        assert!(service.transport_failure.is_cancelled());
+        assert!(service.is_closing());
+        assert!(first_prompt.guard.token().is_cancelled());
+        assert!(second_prompt.guard.token().is_cancelled());
     }
 
     #[tokio::test]

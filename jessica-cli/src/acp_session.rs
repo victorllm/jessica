@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agent_client_protocol::v1::schema::ContentBlock;
@@ -82,6 +82,12 @@ pub(crate) struct AcpSession {
     turn_sequence: AtomicU64,
     /// Limits applied whenever a prompt commits history.
     limits: HistoryLimits,
+    /// Lifetime token cancelled when the process or transport shuts down.
+    ///
+    /// Prompt tokens are children of this token, so cancelling it stops the
+    /// current prompt without making the session permanently unusable when a
+    /// client sends `session/cancel`.
+    lifetime: CancellationToken,
 }
 
 impl AcpSession {
@@ -106,35 +112,61 @@ impl AcpSession {
     /// The busy check and the active flag are one mutex operation. Callers
     /// hold the returned guard for the whole prompt; dropping it without
     /// [`PromptGuard::commit`] releases the session without changing history.
+    /// The prompt token is a child of this session's lifetime token.
     pub(crate) fn begin_prompt(
         self: &Arc<Self>,
-        token: CancellationToken,
     ) -> Result<(Vec<Message>, PromptGuard), PromptBusy> {
         let mut state = self.lock_state();
         if state.active.is_some() {
             return Err(PromptBusy);
         }
-        state.active = Some(token.clone());
+        let control = Arc::new(PromptControl {
+            token: self.lifetime.child_token(),
+            cancel_requested: AtomicBool::new(false),
+            response_gate: Arc::new(Mutex::new(())),
+        });
+        state.active = Some(Arc::clone(&control));
         let history = state.history.clone();
         drop(state);
         Ok((
             history,
             PromptGuard {
                 session: Arc::clone(self),
-                token,
-                finished: false,
+                control,
+                released: false,
             },
         ))
     }
 
-    /// Clears the active flag and optionally appends a committed turn.
-    fn finish_prompt(&self, commit: Option<Vec<Message>>) {
+    /// Cancels the active prompt, returning whether one was active.
+    ///
+    /// Cancelling is idempotent and leaves the session available for a later
+    /// prompt. The response gate is taken before the flag is set so a worker
+    /// that has not yet chosen its final response observes the cancellation.
+    pub(crate) fn cancel_prompt(&self) -> bool {
+        let control = self.lock_state().active.clone();
+        let Some(control) = control else {
+            return false;
+        };
+        control.cancel();
+        true
+    }
+
+    /// Cancels the session lifetime token and therefore any active prompt.
+    pub(crate) fn cancel_lifetime(&self) {
+        self.lifetime.cancel();
+    }
+
+    /// Appends a committed turn and trims the history.
+    fn append_history(&self, messages: Vec<Message>) {
         let mut state = self.lock_state();
-        state.active = None;
-        if let Some(messages) = commit {
-            state.history.extend(messages);
-            trim_history(&mut state.history, self.limits);
-        }
+        state.history.extend(messages);
+        trim_history(&mut state.history, self.limits);
+    }
+
+    /// Clears the active flag.
+    fn finish_prompt(&self) {
+        self.lock_state().active = None;
     }
 
     /// Locks the session state, recovering from a poisoned lock.
@@ -160,8 +192,30 @@ impl AcpSession {
 struct SessionState {
     /// Conversation retained from earlier prompts.
     history: Vec<Message>,
-    /// Cancellation token for the prompt currently owning the session.
-    active: Option<CancellationToken>,
+    /// Control block for the prompt currently owning the session.
+    active: Option<Arc<PromptControl>>,
+}
+
+/// Cancellation and response ordering for one active prompt.
+struct PromptControl {
+    /// Prompt token, a child of the session lifetime token.
+    token: CancellationToken,
+    /// Whether the client explicitly sent `session/cancel`.
+    cancel_requested: AtomicBool,
+    /// Serializes the cancel handler with the worker's final response choice.
+    response_gate: Arc<Mutex<()>>,
+}
+
+impl PromptControl {
+    /// Marks the prompt cancelled and stops its underlying work.
+    fn cancel(&self) {
+        let _gate = self
+            .response_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        self.token.cancel();
+    }
 }
 
 /// The session already has an active prompt.
@@ -173,39 +227,56 @@ pub(crate) struct PromptBusy;
 ///
 /// The guard releases the busy state on every exit path. A successful or
 /// partial terminal turn calls [`PromptGuard::commit`]; an internal failure
-/// simply drops the guard and leaves history unchanged.
+/// simply drops the guard and leaves history unchanged. [`PromptGuard::release`]
+/// can be called once the response is enqueued so the next prompt is not
+/// rejected as busy after the client observes the result.
 pub(crate) struct PromptGuard {
     /// Session whose active flag this guard owns.
     session: Arc<AcpSession>,
-    /// Cancellation token created for this prompt.
-    token: CancellationToken,
+    /// Cancellation and ordering state shared with `session/cancel`.
+    control: Arc<PromptControl>,
     /// Whether the guard already released the session.
-    finished: bool,
+    released: bool,
 }
 
 impl PromptGuard {
     /// Returns this prompt's cancellation token.
     pub(crate) fn token(&self) -> &CancellationToken {
-        &self.token
+        &self.control.token
     }
 
-    /// Appends this turn's messages and releases the session.
+    /// Returns whether the client explicitly cancelled this prompt.
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.control.cancel_requested.load(Ordering::SeqCst)
+    }
+
+    /// Returns the gate that orders cancellation against the final response.
+    pub(crate) fn response_gate(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.control.response_gate)
+    }
+
+    /// Appends this turn's messages without releasing the session.
     ///
     /// Missing tool results are synthesized immediately after the assistant
     /// message that requested them. History is then trimmed at complete-turn
     /// boundaries.
-    pub(crate) fn commit(mut self, messages: Vec<Message>) {
+    pub(crate) fn commit(&mut self, messages: Vec<Message>) {
         let messages = complete_tool_pairs(messages);
-        self.session.finish_prompt(Some(messages));
-        self.finished = true;
+        self.session.append_history(messages);
+    }
+
+    /// Releases the active prompt so the session can accept another prompt.
+    pub(crate) fn release(&mut self) {
+        if !self.released {
+            self.session.finish_prompt();
+            self.released = true;
+        }
     }
 }
 
 impl Drop for PromptGuard {
     fn drop(&mut self) {
-        if !self.finished {
-            self.session.finish_prompt(None);
-        }
+        self.release();
     }
 }
 
@@ -221,17 +292,29 @@ pub(crate) struct AcpSessionRegistry {
     sequence: AtomicU64,
     /// Sessions keyed by protocol id.
     sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
+    /// Parent token for every session lifetime token.
+    lifetime_parent: CancellationToken,
 }
 
 impl AcpSessionRegistry {
     /// Creates an empty registry rooted at an already canonical startup path.
-    pub(crate) fn new(root: PathBuf, max_sessions: usize, limits: HistoryLimits) -> Self {
+    ///
+    /// `lifetime_parent` is normally a child of the process shutdown token.
+    /// Cancelling it or [`AcpSessionRegistry::cancel_all`] ends every session
+    /// and its active prompt while leaving the process free to drain.
+    pub(crate) fn new(
+        root: PathBuf,
+        max_sessions: usize,
+        limits: HistoryLimits,
+        lifetime_parent: CancellationToken,
+    ) -> Self {
         Self {
             root,
             max_sessions,
             limits,
             sequence: AtomicU64::new(0),
             sessions: Mutex::new(HashMap::new()),
+            lifetime_parent,
         }
     }
 
@@ -275,6 +358,7 @@ impl AcpSessionRegistry {
             state: Mutex::new(SessionState::default()),
             turn_sequence: AtomicU64::new(0),
             limits: self.limits,
+            lifetime: self.lifetime_parent.child_token(),
         });
         sessions.insert(id, Arc::clone(&session));
         Ok(session)
@@ -287,6 +371,21 @@ impl AcpSessionRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned()
+    }
+
+    /// Cancels every session lifetime token and their active prompts.
+    pub(crate) fn cancel_all(&self) {
+        self.lifetime_parent.cancel();
+        let sessions: Vec<Arc<AcpSession>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            session.cancel_lifetime();
+        }
     }
 
     /// Returns the number of live sessions (test support).
@@ -454,6 +553,7 @@ mod tests {
                     max_messages: 200,
                     max_bytes: 2 * 1024 * 1024,
                 },
+                CancellationToken::new(),
             ),
             root,
         )
@@ -529,18 +629,16 @@ mod tests {
             .create(root)
             .await
             .expect("session must be created");
-        let (_history, guard) = session
-            .begin_prompt(CancellationToken::new())
-            .expect("first prompt must start");
+        let (_history, guard) = session.begin_prompt().expect("first prompt must start");
         let busy = session
-            .begin_prompt(CancellationToken::new())
+            .begin_prompt()
             .err()
             .expect("second prompt must be rejected");
         assert_eq!(busy.to_string(), "session busy");
 
         drop(guard);
         session
-            .begin_prompt(CancellationToken::new())
+            .begin_prompt()
             .expect("a new prompt must start after the first ends");
     }
 
@@ -549,15 +647,95 @@ mod tests {
         let (registry, root) = registry("parallel", 2).await;
         let first = registry.create(root.clone()).await.expect("first session");
         let second = registry.create(root).await.expect("second session");
-        let _first_guard = first
-            .begin_prompt(CancellationToken::new())
-            .expect("first session prompt");
-        second
-            .begin_prompt(CancellationToken::new())
+        let (_history, first_guard) = first.begin_prompt().expect("first session prompt");
+        let (_history, second_guard) = second
+            .begin_prompt()
             .expect("another session must not be busy");
 
         assert_ne!(first.id(), second.id());
         assert!(first.id().starts_with("acp-"));
+        assert!(!first_guard.token().is_cancelled());
+        assert!(!second_guard.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_prompt_is_idempotent_and_the_session_stays_usable() {
+        let (registry, root) = registry("cancel", 1).await;
+        let session = registry
+            .create(root)
+            .await
+            .expect("session must be created");
+
+        assert!(
+            !session.cancel_prompt(),
+            "cancel without an active prompt must be a no-op"
+        );
+
+        let (_history, mut guard) = session.begin_prompt().expect("prompt must start");
+        assert!(
+            session.cancel_prompt(),
+            "the active prompt must be cancelled"
+        );
+        assert!(guard.token().is_cancelled());
+        assert!(guard.cancel_requested());
+        assert!(
+            session.cancel_prompt(),
+            "repeated cancellation must remain a no-op on the active prompt"
+        );
+        assert!(guard.token().is_cancelled());
+        assert!(guard.cancel_requested());
+
+        guard.release();
+        session
+            .begin_prompt()
+            .expect("a cancelled prompt must not poison the session");
+    }
+
+    #[tokio::test]
+    async fn session_lifetime_cancellation_reaches_prompt_tokens_only_for_that_session() {
+        let lifetime = CancellationToken::new();
+        let root = std::env::temp_dir().join(format!(
+            "jessica-acp-lifetime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock must follow the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root must exist");
+        let root = std::fs::canonicalize(root).expect("root must resolve");
+        let registry = AcpSessionRegistry::new(
+            root.clone(),
+            2,
+            HistoryLimits {
+                max_messages: 200,
+                max_bytes: 2 * 1024 * 1024,
+            },
+            lifetime.clone(),
+        );
+        let first = registry.create(root.clone()).await.expect("first session");
+        let second = registry.create(root).await.expect("second session");
+        let (_history, first_guard) = first.begin_prompt().expect("first prompt");
+        let (_history, second_guard) = second.begin_prompt().expect("second prompt");
+
+        lifetime.cancel();
+
+        assert!(first_guard.token().is_cancelled());
+        assert!(second_guard.token().is_cancelled());
+        assert!(
+            !first_guard.cancel_requested(),
+            "process-level cancellation is not a client cancel"
+        );
+
+        drop(first_guard);
+        first.cancel_lifetime();
+        let (_history, replacement) = first
+            .begin_prompt()
+            .expect("the session lease is released after shutdown cancellation");
+        assert!(
+            replacement.token().is_cancelled(),
+            "a prompt started after lifetime cancellation must start cancelled"
+        );
     }
 
     #[test]
@@ -659,14 +837,13 @@ mod tests {
                 max_messages: 2,
                 max_bytes: 2 * 1024 * 1024,
             },
+            CancellationToken::new(),
         );
         let session = registry
             .create(root)
             .await
             .expect("session must be created");
-        let (_history, guard) = session
-            .begin_prompt(CancellationToken::new())
-            .expect("prompt must start");
+        let (_history, mut guard) = session.begin_prompt().expect("prompt must start");
         let old_call = ToolCall::new("old", "read_file", json!({"path": "old"}));
         guard.commit(vec![
             Message::user("old"),
@@ -700,14 +877,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("jessica-acp-bytes-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("root must exist");
         let root = std::fs::canonicalize(root).expect("root must resolve");
-        let registry = AcpSessionRegistry::new(root.clone(), 1, limits);
+        let registry = AcpSessionRegistry::new(root.clone(), 1, limits, CancellationToken::new());
         let session = registry
             .create(root)
             .await
             .expect("session must be created");
-        let (_history, guard) = session
-            .begin_prompt(CancellationToken::new())
-            .expect("prompt must start");
+        let (_history, mut guard) = session.begin_prompt().expect("prompt must start");
         guard.commit(vec![
             Message::user("first message"),
             Message::assistant("first answer"),
