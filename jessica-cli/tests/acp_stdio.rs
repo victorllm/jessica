@@ -26,8 +26,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 struct AcpProcess {
     /// Child process; stdin is taken when the test closes the stream.
     child: Child,
-    /// Line-oriented protocol output.
-    stdout: BufReader<ChildStdout>,
+    /// Line-oriented protocol output; `None` after a test closes the pipe.
+    stdout: Option<BufReader<ChildStdout>>,
     /// Diagnostics, read only by tests that assert on them.
     stderr: Option<ChildStderr>,
 }
@@ -67,7 +67,7 @@ impl AcpProcess {
         let stderr = child.stderr.take();
         Self {
             child,
-            stdout,
+            stdout: Some(stdout),
             stderr,
         }
     }
@@ -89,9 +89,13 @@ impl AcpProcess {
 
     /// Reads one non-empty protocol line, failing on EOF or timeout.
     async fn recv_line(&mut self) -> String {
+        let stdout = self
+            .stdout
+            .as_mut()
+            .expect("the test must not read protocol output after closing stdout");
         loop {
             let mut line = String::new();
-            let read = self.stdout.read_line(&mut line);
+            let read = stdout.read_line(&mut line);
             let count = match timeout(TEST_TIMEOUT, read).await {
                 Ok(Ok(count)) => count,
                 Ok(Err(error)) => panic!("failed to read ACP stdout: {error}"),
@@ -114,6 +118,11 @@ impl AcpProcess {
     /// Closes stdin to signal clean EOF.
     fn close_stdin(&mut self) {
         drop(self.child.stdin.take());
+    }
+
+    /// Drops the stdout read end so the next protocol write fails.
+    fn close_stdout(&mut self) {
+        drop(self.stdout.take());
     }
 
     /// Waits for the process to exit within [`TEST_TIMEOUT`].
@@ -151,8 +160,11 @@ impl AcpProcess {
 
     /// Reads everything still buffered on stdout after the process exited.
     async fn remaining_stdout(&mut self) -> String {
+        let Some(mut stdout) = self.stdout.take() else {
+            return String::new();
+        };
         let mut rest = String::new();
-        timeout(TEST_TIMEOUT, self.stdout.read_to_string(&mut rest))
+        timeout(TEST_TIMEOUT, stdout.read_to_string(&mut rest))
             .await
             .expect("reading remaining stdout must not time out")
             .expect("remaining stdout must be readable");
@@ -566,7 +578,15 @@ async fn prompt_until_response(
         "params": {"sessionId": session_id, "prompt": prompt},
     }))
     .await;
+    collect_until_response(acp, id, session_id).await
+}
 
+/// Collects one session's updates until its prompt response arrives.
+async fn collect_until_response(
+    acp: &mut AcpProcess,
+    id: u64,
+    session_id: &str,
+) -> (Vec<Value>, Value) {
     let mut updates = Vec::new();
     loop {
         let line = acp.recv_line().await;
@@ -585,6 +605,40 @@ async fn prompt_until_response(
         );
         updates.push(message["params"]["update"].clone());
     }
+}
+
+/// Waits for the first update of `kind` on one session.
+async fn collect_update_of_kind(acp: &mut AcpProcess, session_id: &str, kind: &str) -> Vec<Value> {
+    let mut updates = Vec::new();
+    loop {
+        let line = acp.recv_line().await;
+        let message = parse_message(&line);
+        assert!(
+            message.get("id").is_none(),
+            "a prompt response arrived before the expected {kind} update: {message}"
+        );
+        assert_eq!(message["method"], "session/update");
+        assert_eq!(
+            message["params"]["sessionId"], session_id,
+            "the expected update must belong to the active session: {message}"
+        );
+        let update = message["params"]["update"].clone();
+        let found = update_kind(&update) == kind;
+        updates.push(update);
+        if found {
+            return updates;
+        }
+    }
+}
+
+/// Sends the `session/cancel` notification for one session.
+async fn send_cancel(acp: &mut AcpProcess, session_id: &str) {
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id},
+    }))
+    .await;
 }
 
 /// Returns the `sessionUpdate` tag of one update object.
@@ -862,6 +916,392 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
     assert!(
         requests[2].contains("note contents"),
         "the tool result must be replayed to the provider"
+    );
+}
+
+#[tokio::test]
+async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usable() {
+    let workspace = TempDir::new("cancel");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[("call_sleep", "bash", json!({"command": "sleep 30"}))]),
+        tool_calls_response(&[(
+            "call_wait",
+            "bash",
+            json!({"command": "while [ ! -f go ]; do sleep 0.05; done"}),
+        )]),
+        text_response("other session answer"),
+        text_response("after cancellation"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let cancelled_session = create_session(&mut acp, 2, &workspace.path).await;
+    let other_session = create_session(&mut acp, 3, &workspace.path).await;
+
+    // Cancelling an unknown session and a session with no active prompt is an
+    // ignored notification, not an error or a global cancellation.
+    send_cancel(&mut acp, "acp-unknown").await;
+    send_cancel(&mut acp, &cancelled_session).await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": cancelled_session,
+            "prompt": [{"type": "text", "text": "first question"}],
+        },
+    }))
+    .await;
+    let started_updates = collect_update_of_kind(&mut acp, &cancelled_session, "tool_call").await;
+    assert!(
+        started_updates.iter().any(|update| {
+            update_kind(update) == "tool_call"
+                && update["toolCallId"] == "call_sleep"
+                && update["status"] == "in_progress"
+        }),
+        "the bash tool must be observably in progress: {started_updates:?}"
+    );
+
+    // The same session cannot start a second prompt while the first is active.
+    let (_, busy_response) = prompt_until_response(
+        &mut acp,
+        5,
+        &cancelled_session,
+        json!([{"type": "text", "text": "must be busy"}]),
+    )
+    .await;
+    assert_eq!(
+        busy_response["error"]["code"], -32602,
+        "a second active prompt must be rejected: {busy_response}"
+    );
+    assert_eq!(
+        busy_response["error"]["data"]["reason"], "session_busy",
+        "the busy error must be actionable: {busy_response}"
+    );
+
+    // A different session starts and stays in a tool while the first session
+    // is still running. Cancelling the first must not stop the second.
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": other_session,
+            "prompt": [{"type": "text", "text": "finish independently"}],
+        },
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &other_session, "tool_call").await;
+
+    send_cancel(&mut acp, &cancelled_session).await;
+    let (closing_updates, cancelled_response) =
+        collect_until_response(&mut acp, 4, &cancelled_session).await;
+    assert_eq!(
+        cancelled_response["result"]["stopReason"], "cancelled",
+        "the cancelled prompt must not report end_turn: {cancelled_response}"
+    );
+
+    // The second session was blocked in bash until this file appeared. It
+    // finishes only after the other session's cancellation has been answered.
+    std::fs::write(workspace.path.join("go"), "release").expect("the release file must be written");
+    let (_, other_response) = collect_until_response(&mut acp, 6, &other_session).await;
+    assert_eq!(
+        other_response["result"]["stopReason"], "end_turn",
+        "the untouched session must finish normally: {other_response}"
+    );
+
+    let mut final_status = std::collections::BTreeMap::new();
+    for update in started_updates.iter().chain(closing_updates.iter()) {
+        if matches!(update_kind(update), "tool_call" | "tool_call_update") {
+            let id = update["toolCallId"]
+                .as_str()
+                .expect("tool updates must carry an id");
+            let status = update["status"]
+                .as_str()
+                .expect("tool updates must carry a status");
+            final_status.insert(id.to_owned(), status.to_owned());
+        }
+    }
+    assert_eq!(
+        final_status.get("call_sleep").map(String::as_str),
+        Some("failed"),
+        "an interrupted tool must receive a failed update: {closing_updates:?}"
+    );
+    assert!(
+        closing_updates.iter().any(|update| {
+            update_kind(update) == "tool_call_update"
+                && update["status"] == "failed"
+                && update["content"][0]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("cancelled"))
+        }),
+        "the failed update must explain the cancellation: {closing_updates:?}"
+    );
+    assert!(
+        final_status.values().all(|status| status != "in_progress"),
+        "no tool call may remain in progress after the response: {final_status:?}"
+    );
+
+    // The cancelled session stays usable and its partial turn is carried into
+    // the next provider request with a synthesized tool result.
+    let (_, follow_up) = prompt_until_response(
+        &mut acp,
+        7,
+        &cancelled_session,
+        json!([{"type": "text", "text": "continue after cancel"}]),
+    )
+    .await;
+    assert_eq!(
+        follow_up["result"]["stopReason"], "end_turn",
+        "a cancelled prompt must not poison its session: {follow_up}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    let requests = provider.finish();
+    assert_eq!(
+        requests.len(),
+        4,
+        "two interrupted tools plus two completed continuations must reach the provider"
+    );
+    assert!(
+        requests[3].contains("first question")
+            && requests[3].contains("tool execution was interrupted")
+            && requests[3].contains("continue after cancel"),
+        "cancelled history must keep partial output and a synthesized tool result: {}",
+        requests[3]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_sigterm_cancels_two_active_sessions_and_exits_within_the_bound() {
+    let workspace = TempDir::new("sigterm-active");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [skills]\nenabled = true\npath = \"skills.db\"\ndrain_timeout_ms = 500\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[("call_a", "bash", json!({"command": "sleep 30"}))]),
+        tool_calls_response(&[("call_b", "bash", json!({"command": "sleep 30"}))]),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let first = create_session(&mut acp, 2, &workspace.path).await;
+    let second = create_session(&mut acp, 3, &workspace.path).await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {"sessionId": first, "prompt": [{"type": "text", "text": "first"}]},
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &first, "tool_call").await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {"sessionId": second, "prompt": [{"type": "text", "text": "second"}]},
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &second, "tool_call").await;
+
+    let pid = acp.child.id().expect("the child must still be running");
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("the kill utility must be available");
+    assert!(status.success(), "SIGTERM delivery must succeed");
+
+    let started = Instant::now();
+    let exit = acp.wait_keeping_stdin().await;
+    assert!(
+        started.elapsed() < TEST_TIMEOUT,
+        "two active sessions must drain within the bounded timeout"
+    );
+    let stderr = acp.remaining_stderr().await;
+    assert_eq!(
+        exit.code(),
+        Some(143),
+        "the first signal must keep the SIGTERM exit code; stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "shutdown must not panic: {stderr:?}"
+    );
+
+    let rest = acp.remaining_stdout().await;
+    let responses: Vec<Value> = rest
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_message)
+        .filter(|message| message.get("id").is_some())
+        .collect();
+    for id in [4, 5] {
+        let response = responses
+            .iter()
+            .find(|message| message["id"] == id)
+            .unwrap_or_else(|| panic!("session {id} must receive a prompt response: {rest:?}"));
+        assert_eq!(
+            response["result"]["stopReason"], "cancelled",
+            "shutdown must cancel every active prompt: {response}"
+        );
+    }
+    assert!(
+        workspace.path.join("skills.db").is_file(),
+        "the configured skill worker must be assembled and drained before exit"
+    );
+    assert_eq!(provider.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn acp_stdin_eof_cancels_two_active_sessions_and_exits_within_the_bound() {
+    let workspace = TempDir::new("eof-active");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[("call_a", "bash", json!({"command": "sleep 30"}))]),
+        tool_calls_response(&[("call_b", "bash", json!({"command": "sleep 30"}))]),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let first = create_session(&mut acp, 2, &workspace.path).await;
+    let second = create_session(&mut acp, 3, &workspace.path).await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {"sessionId": first, "prompt": [{"type": "text", "text": "first"}]},
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &first, "tool_call").await;
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {"sessionId": second, "prompt": [{"type": "text", "text": "second"}]},
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &second, "tool_call").await;
+
+    acp.close_stdin();
+    let started = Instant::now();
+    let status = acp.wait().await;
+    assert!(
+        started.elapsed() < TEST_TIMEOUT,
+        "stdin EOF must cancel active prompts and exit within the bound"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a client disconnect is a clean ACP termination"
+    );
+    assert_eq!(
+        provider.finish().len(),
+        2,
+        "disconnecting must not let interrupted tools start another provider call"
+    );
+}
+
+#[tokio::test]
+async fn acp_stdout_failure_cancels_work_without_panicking_or_hanging() {
+    let workspace = TempDir::new("stdout-failure");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![tool_calls_response(&[(
+        "call_sleep",
+        "bash",
+        json!({"command": "sleep 30"}),
+    )])]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    // Drop the read end before the prompt so the first session update writes
+    // into a closed pipe. The client is gone; tools must not keep running.
+    acp.close_stdout();
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {"sessionId": session, "prompt": [{"type": "text", "text": "start"}]},
+    }))
+    .await;
+
+    let exit = acp.wait_keeping_stdin().await;
+    let stderr = acp.remaining_stderr().await;
+    assert!(
+        exit.code().is_some(),
+        "a broken stdout must end the process instead of retrying forever"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "a protocol write failure must not panic: {stderr:?}"
+    );
+    assert_eq!(
+        provider.finish().len(),
+        1,
+        "the interrupted tool must not reach the provider again after the client disconnects"
     );
 }
 

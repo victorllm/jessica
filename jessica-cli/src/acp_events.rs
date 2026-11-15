@@ -6,19 +6,22 @@
 //! response instead of the update stream.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use agent_client_protocol::v1::schema::{
-    Content, ContentBlock, ContentChunk, MessageId, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    Content, ContentBlock, ContentChunk, MessageId, SessionUpdate, TextContent,
+    ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind,
 };
-use jessica_core::types::{AgentEvent, BudgetKind};
+use jessica_core::types::{AgentEvent, BudgetKind, ToolCall};
 use serde_json::Value;
 
 /// Maximum characters retained in a tool-call title.
 const TOOL_TITLE_CHARS: usize = 120;
 /// Maximum bytes retained in a raw tool input or output value.
 const RAW_VALUE_BYTES: usize = 16 * 1024;
+/// Content used to fail a tool call that never produced a result.
+const CANCELLED_TOOL_CONTENT: &str = "tool execution was cancelled";
 
 /// Maps one prompt's agent events to ACP updates.
 pub(crate) struct AcpEventMapper {
@@ -44,7 +47,10 @@ impl AcpEventMapper {
                 ))
             }
             AgentEvent::ToolCallStarted { call } => {
-                let mut started = ToolCall::new(call.id.clone(), tool_title(&call.name, &call.arguments))
+                let mut started = AcpToolCall::new(
+                    call.id.clone(),
+                    tool_title(&call.name, &call.arguments),
+                )
                     .name(call.name.clone())
                     .kind(tool_kind(&call.name))
                     .status(ToolCallStatus::InProgress)
@@ -89,6 +95,59 @@ impl AcpEventMapper {
             AgentEvent::ModelDelta { .. } => None,
         }
     }
+}
+
+/// Tracks tool calls announced but not yet finished for one prompt.
+///
+/// A cancelled or failed turn can end between `ToolCallStarted` and
+/// `ToolCallFinished`. The worker drains this set and emits one failed update
+/// for each remainder, so a client never observes a permanently in-progress
+/// tool call.
+#[derive(Default)]
+pub(crate) struct InFlightTools {
+    /// Calls in announcement order.
+    calls: Mutex<Vec<ToolCall>>,
+}
+
+impl InFlightTools {
+    /// Records a started call or removes a finished one.
+    pub(crate) fn observe(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ToolCallStarted { call } => {
+                let mut calls = self.lock();
+                if !calls.iter().any(|tracked| tracked.id == call.id) {
+                    calls.push(call.clone());
+                }
+            }
+            AgentEvent::ToolCallFinished { result } => {
+                self.lock()
+                    .retain(|tracked| tracked.id != result.tool_call_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Removes and returns every call that has not finished.
+    pub(crate) fn take_pending(&self) -> Vec<ToolCall> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    /// Locks the tracked calls, recovering from poisoning.
+    fn lock(&self) -> MutexGuard<'_, Vec<ToolCall>> {
+        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Builds the failed update that closes a tool call interrupted by the turn.
+pub(crate) fn interrupted_tool_update(call: &jessica_core::types::ToolCall) -> SessionUpdate {
+    let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+        TextContent::new(CANCELLED_TOOL_CONTENT),
+    )))];
+    let fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::Failed)
+        .content(content)
+        .raw_output(Value::String(CANCELLED_TOOL_CONTENT.to_owned()));
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id.clone(), fields))
 }
 
 /// Maps a budget kind to the ACP stop reason it represents.
@@ -406,6 +465,39 @@ mod tests {
             };
             assert_eq!(call.kind, expected, "wrong kind for {name}");
         }
+    }
+
+    #[test]
+    fn interrupted_tools_are_closed_once_and_only_unfinished_calls_remain() {
+        let tools = InFlightTools::default();
+        tools.observe(&AgentEvent::ToolCallStarted {
+            call: ToolCall::new("read", "read_file", json!({"path": "a"})),
+        });
+        tools.observe(&AgentEvent::ToolCallStarted {
+            call: ToolCall::new("bash", "bash", json!({"command": "sleep 1"})),
+        });
+        tools.observe(&AgentEvent::ToolCallFinished {
+            result: ToolResult::success("read", "contents"),
+        });
+
+        let pending = tools.take_pending();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "bash");
+        let update = interrupted_tool_update(&pending[0]);
+        let SessionUpdate::ToolCallUpdate(update) = update else {
+            panic!("expected a tool update");
+        };
+        assert_eq!(update.tool_call_id.to_string(), "bash");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            update.fields.raw_output,
+            Some(Value::String(CANCELLED_TOOL_CONTENT.to_owned()))
+        );
+        assert!(
+            tools.take_pending().is_empty(),
+            "closing an interrupted call must be a one-shot drain"
+        );
     }
 
     #[test]
