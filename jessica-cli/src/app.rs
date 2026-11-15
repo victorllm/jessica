@@ -33,7 +33,7 @@ use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::memory::MemoryAssembly;
-use crate::pump::{EventPump, SessionSnapshot};
+use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
@@ -121,6 +121,92 @@ impl AttemptContext {
     }
 }
 
+/// Workspace and cancellation context for one turn.
+///
+/// The canonical root is the boundary for every per-turn file tool, bash
+/// command, sensor, acceptance check, and delegation child. The startup root
+/// owned by [`CliRuntime`] remains responsible for process-level resources
+/// such as memory, skills, wasm plugins, and the event recorder.
+pub(crate) struct TurnScope {
+    /// Canonical workspace root for this turn.
+    root: PathBuf,
+    /// Token whose cancellation ends this turn.
+    cancel_parent: CancellationToken,
+}
+
+impl TurnScope {
+    /// Canonicalizes `root` and binds the turn to `cancel_parent`.
+    ///
+    /// Canonicalization runs on the blocking pool because a network or FUSE
+    /// workspace can block. A path that does not exist is a structured error;
+    /// the turn never falls back to an uncanonicalized root.
+    pub(crate) async fn new(
+        root: PathBuf,
+        cancel_parent: CancellationToken,
+    ) -> Result<Self, CliError> {
+        let requested = root.display().to_string();
+        let root = tokio::task::spawn_blocking(move || std::fs::canonicalize(root))
+            .await
+            .map_err(CliError::CanonicalizeRootTask)?
+            .map_err(|source| CliError::CanonicalizeRoot {
+                path: requested,
+                source,
+            })?;
+        Ok(Self {
+            root,
+            cancel_parent,
+        })
+    }
+
+    /// Returns the canonical workspace root.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns the token whose cancellation ends this turn.
+    pub(crate) fn cancel_parent(&self) -> &CancellationToken {
+        &self.cancel_parent
+    }
+}
+
+/// Inputs for one reusable turn execution.
+pub(crate) struct TurnRequest {
+    /// Workspace and cancellation context for this turn.
+    pub(crate) scope: TurnScope,
+    /// Conversation established before this turn's user input.
+    ///
+    /// The CLI passes an empty slice because it starts one session per turn.
+    /// A multi-turn client carries earlier messages here. History is placed
+    /// after the system and guide messages and before the new user input.
+    pub(crate) history: Vec<Message>,
+    /// New user input for this turn.
+    pub(crate) user_input: String,
+    /// Programmatic event consumer.
+    ///
+    /// When present the pump runs with [`PumpOutput::Silent`] and every event
+    /// is published to this sink in pump order. When absent the pump keeps the
+    /// existing `HumanConsole` rendering.
+    pub(crate) update_sink: Option<Arc<dyn UpdateSink>>,
+    /// Per-turn override for the configured acceptance retry budget.
+    ///
+    /// `None` uses `config.acceptance.max_retries`. `Some(0)` runs the check
+    /// once without retrying even when the configuration allows retries.
+    pub(crate) acceptance_retries: Option<u32>,
+}
+
+/// Observable result of one reusable turn execution.
+pub(crate) struct TurnOutcome {
+    /// Final reason, including governance overrides.
+    pub(crate) reason: SessionEndReason,
+    /// Conversation reconstructed for this turn, including history.
+    ///
+    /// A turn cancelled before it starts returns an empty vector because no
+    /// attempt ran. The CLI only needs the reason; the programmatic turn path
+    /// consumes this transcript directly.
+    #[allow(dead_code)]
+    pub(crate) messages: Vec<Message>,
+}
+
 /// Owns the provider, configuration snapshot source, and workspace.
 pub(crate) struct CliRuntime {
     provider: Arc<dyn LlmProvider>,
@@ -202,28 +288,73 @@ impl CliRuntime {
 
     /// Runs one user request with the configured governance.
     ///
-    /// A fresh turn starts with `system prompt → recalled memory (if any) →
-    /// user`. Memory is recalled exactly once per turn, before the first
-    /// attempt; acceptance retries reuse the same initial conversation. A turn
-    /// that finally completes is written to memory according to the configured
-    /// write policy.
+    /// This is the CLI entry point: it binds the turn to the startup workspace
+    /// root, starts without history, and uses the configured acceptance retry
+    /// budget. REPL, one-shot, and resume behavior is unchanged; the reusable
+    /// path is [`CliRuntime::run_turn_request`].
     pub(crate) async fn run_turn(&self, input: String) -> Result<SessionEndReason, CliError> {
+        let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
+        let outcome = self
+            .run_turn_request(TurnRequest {
+                scope,
+                history: Vec::new(),
+                user_input: input,
+                update_sink: None,
+                acceptance_retries: None,
+            })
+            .await?;
+        Ok(outcome.reason)
+    }
+
+    /// Executes one turn with an explicit workspace scope and history.
+    ///
+    /// A turn starts with `system prompt → recalled memory (if any) → recalled
+    /// skills (if any) → history → user input`. Memory and skills are recalled
+    /// exactly once per turn, before the first attempt; acceptance retries
+    /// reuse the same initial conversation. A turn that finally completes is
+    /// written to memory and may enqueue a skill job according to the
+    /// configured policies. Signal counts cover only messages created by this
+    /// turn, never tool calls replayed from `history`.
+    pub(crate) async fn run_turn_request(
+        &self,
+        request: TurnRequest,
+    ) -> Result<TurnOutcome, CliError> {
+        let TurnRequest {
+            scope,
+            history,
+            user_input,
+            update_sink,
+            acceptance_retries,
+        } = request;
+
         // One snapshot for the whole turn. `build_turn` and
         // `initial_messages` must never mix a newer published config with an
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
-        let setup = self.build_turn(true, &config)?;
+        let setup = self.build_turn(&scope, true, &config, update_sink)?;
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
         // skill recall, session recording, and every model request.
         if setup.cancel.is_cancelled() {
             setup.shutdown();
-            return Ok(SessionEndReason::Cancelled);
+            return Ok(TurnOutcome {
+                reason: SessionEndReason::Cancelled,
+                messages: Vec::new(),
+            });
         }
         let first_session = next_session_id();
         let initial = self
-            .initial_messages(&first_session, input.as_str(), &config)
+            .initial_messages(
+                &scope,
+                &first_session,
+                &history,
+                user_input.as_str(),
+                &config,
+            )
             .await;
+        // Everything before this offset is history or guide material and never
+        // contributes to this turn's structured counts.
+        let turn_start = initial.len();
 
         let context = AttemptContext::from_setup(&setup, self.recorder.clone());
         let (
@@ -235,20 +366,21 @@ impl CliRuntime {
             signals,
             attempt_start,
         ) = if let Some(acceptance) = &config.acceptance {
+            let retries = acceptance_retries.unwrap_or(acceptance.max_retries);
             let check = CommandAcceptanceCheck::new(
                 acceptance.name.clone(),
                 acceptance.command.clone(),
                 acceptance.args.clone(),
-                resolve_dir(&self.root, acceptance.working_dir.as_deref()),
+                resolve_dir(scope.root(), acceptance.working_dir.as_deref()),
             );
             let runner = AcceptanceRunner::new(
                 Arc::new(check) as Arc<dyn AcceptanceCheck>,
-                acceptance.max_retries,
+                retries,
                 setup.events.clone(),
             );
             let mut next_session = Some(first_session.clone());
             let mut latest_session = None;
-            let mut latest_attempt_start = 0_usize;
+            let mut latest_attempt_start = turn_start;
             let outcome = runner
                 .run(initial, |messages| {
                     latest_attempt_start = messages.len();
@@ -287,7 +419,7 @@ impl CliRuntime {
                 },
             )
             .await;
-            let (tool_calls, rounds) = structured_counts(&attempt.messages, 0);
+            let (tool_calls, rounds) = structured_counts(&attempt.messages, turn_start);
             (
                 attempt.reason,
                 setup.governance.tripped(),
@@ -295,7 +427,7 @@ impl CliRuntime {
                 attempt.last_output,
                 attempt.messages,
                 TurnSignals::new(attempt.reason, tool_calls, rounds),
-                0,
+                turn_start,
             )
         };
 
@@ -309,18 +441,22 @@ impl CliRuntime {
             reason == SessionEndReason::Completed && !setup.governance.tripped();
         let turn_index = stable_turn_index(&final_messages);
         if governed_completed {
+            // Memory describes the whole turn, including every acceptance
+            // attempt; skill signals describe the final attempt. Both slices
+            // exclude history and guide messages replayed from before the
+            // turn.
             self.record_turn_memory(
                 &final_session,
-                &input,
+                &user_input,
                 &final_output,
-                &final_messages,
+                final_messages.get(turn_start..).unwrap_or(&[]),
                 turn_index,
             )
             .await;
             self.record_skill_job(
                 &final_session,
                 turn_index,
-                &input,
+                &user_input,
                 &final_output,
                 &signals,
                 final_messages.get(attempt_start..).unwrap_or(&[]),
@@ -329,18 +465,24 @@ impl CliRuntime {
         }
 
         setup.shutdown();
-        Ok(reason)
+        Ok(TurnOutcome {
+            reason,
+            messages: final_messages,
+        })
     }
 
     /// Builds the initial conversation for a fresh turn.
     ///
-    /// The order is fixed: system prompt, optional guide message, user input.
-    /// A disabled or failed guide simply omits the middle message. Memory and
-    /// skills are each recalled exactly once here; the system prompt is
-    /// rendered from the same configuration snapshot as the rest of the turn.
+    /// The order is fixed: system prompt, optional memory guide, optional
+    /// skill guide, history, then user input. A disabled or failed guide
+    /// simply omits that message. Memory and skills are each recalled exactly
+    /// once here; the system prompt is rendered from the same configuration
+    /// snapshot as the rest of the turn and from the turn's canonical root.
     async fn initial_messages(
         &self,
+        scope: &TurnScope,
         session: &SessionId,
+        history: &[Message],
         input: &str,
         config: &HarnessConfig,
     ) -> Vec<Message> {
@@ -353,17 +495,20 @@ impl CliRuntime {
             None => None,
         };
         fresh_conversation(
-            &system_prompt(&self.root, config),
+            &system_prompt(scope.root(), config),
             memory_message,
             skill_message,
+            history,
             input,
         )
     }
 
     /// Writes the completed turn to memory when the policy allows it.
     ///
-    /// Memory failures are warned about and never change the reason or exit
-    /// code of the turn.
+    /// `messages` must contain only messages created by this turn, so tool
+    /// calls replayed from history never inflate the recorded count. Memory
+    /// failures are warned about and never change the reason or exit code of
+    /// the turn.
     async fn record_turn_memory(
         &self,
         session_id: &SessionId,
@@ -459,7 +604,8 @@ impl CliRuntime {
             .unwrap_or_default();
 
         let config = self.config_snapshot();
-        let setup = self.build_turn(false, &config)?;
+        let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
+        let setup = self.build_turn(&scope, false, &config, None)?;
         if setup.cancel.is_cancelled() {
             setup.shutdown();
             return Ok(SessionEndReason::Cancelled);
@@ -506,11 +652,15 @@ impl CliRuntime {
     ///
     /// `allow_delegation` is false on the resume path. Resume continues a
     /// recorded loop but never constructs a child factory or executor; a fresh
-    /// turn constructs them only when `[delegation]` is enabled.
+    /// turn constructs them only when `[delegation]` is enabled. `update_sink`
+    /// selects silent protocol output for a programmatic client; without a
+    /// sink the pump keeps rendering to the terminal.
     fn build_turn(
         &self,
+        scope: &TurnScope,
         allow_delegation: bool,
         config: &HarnessConfig,
+        update_sink: Option<Arc<dyn UpdateSink>>,
     ) -> Result<TurnSetup, CliError> {
         let timeout = config.budget.tool_timeout();
         let token_guard = Arc::new(TokenBudgetGuard::new(config.budget.max_tokens));
@@ -526,7 +676,7 @@ impl CliRuntime {
         ];
         let policy: Arc<dyn Policy> =
             Arc::new(AllowlistPolicy::new(config.policy.allowed_tools.clone()));
-        let sensors = self.build_sensors(config);
+        let sensors = self.build_sensors(scope, config);
         let harness = Arc::new(
             Harness::with_event_capacity(Vec::new(), DEFAULT_EVENT_CAPACITY)
                 .with_guards(guards)
@@ -535,9 +685,9 @@ impl CliRuntime {
         );
 
         let events = harness.events();
-        // Every turn derives its own child token; only the process-level
-        // controller and this turn (through the loop) may cancel it.
-        let cancel = self.shutdown.child_token();
+        // Every turn derives its own child token; only the scope's parent and
+        // this turn (through the loop) may cancel it.
+        let cancel = scope.cancel_parent().child_token();
         let governance = Arc::new(GovernanceState::new(events.clone(), cancel.clone()));
         let provider: Arc<dyn LlmProvider> = Arc::new(TokenCountingProvider::new(
             Arc::clone(&self.provider),
@@ -547,9 +697,10 @@ impl CliRuntime {
         // The child executor receives the same counting provider, so every
         // child call charges the parent token guard and can cancel the turn.
         let delegation =
-            self.build_child_executor(allow_delegation, Arc::clone(&provider), config)?;
+            self.build_child_executor(scope, allow_delegation, Arc::clone(&provider), config)?;
 
         let registry = self.build_tool_registry(
+            scope,
             Arc::clone(&harness),
             Arc::clone(&governance),
             timeout,
@@ -563,10 +714,17 @@ impl CliRuntime {
             config.budget.to_budget(),
             events.clone(),
         ));
+        let output = if update_sink.is_some() {
+            PumpOutput::Silent
+        } else {
+            PumpOutput::HumanConsole
+        };
         let pump = Arc::new(EventPump::new(
             Arc::clone(&harness),
             Arc::clone(&governance),
             self.recorder.clone(),
+            output,
+            update_sink,
         ));
         let pump_task = tokio::spawn(Arc::clone(&pump).run(harness.subscribe()));
 
@@ -582,13 +740,13 @@ impl CliRuntime {
         })
     }
 
-    fn build_sensors(&self, config: &HarnessConfig) -> Vec<Arc<dyn Sensor>> {
+    fn build_sensors(&self, scope: &TurnScope, config: &HarnessConfig) -> Vec<Arc<dyn Sensor>> {
         let Some(sensor) = &config.sensor else {
             return Vec::new();
         };
         let command = CommandSensor::new(&sensor.name, &sensor.command)
             .args(sensor.args.clone())
-            .with_current_dir(resolve_dir(&self.root, sensor.working_dir.as_deref()));
+            .with_current_dir(resolve_dir(scope.root(), sensor.working_dir.as_deref()));
         vec![Arc::new(command) as Arc<dyn Sensor>]
     }
 
@@ -598,6 +756,7 @@ impl CliRuntime {
     /// is false, and in that case does not construct the factory or executor.
     fn build_child_executor(
         &self,
+        scope: &TurnScope,
         allow_delegation: bool,
         provider: Arc<dyn LlmProvider>,
         config: &HarnessConfig,
@@ -607,7 +766,7 @@ impl CliRuntime {
         }
 
         let factory: Arc<dyn ChildToolFactory> =
-            Arc::new(NativeChildToolFactory::new(self.root.clone()));
+            Arc::new(NativeChildToolFactory::new(scope.root().to_path_buf()));
         let parent = ParentCapabilities::new(
             config.policy.allowed_tools.clone(),
             NATIVE_CHILD_TOOLS.iter().map(|name| (*name).to_owned()),
@@ -617,8 +776,10 @@ impl CliRuntime {
         Ok(Some(Arc::new(executor)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tool_registry(
         &self,
+        scope: &TurnScope,
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
         timeout: Duration,
@@ -628,7 +789,7 @@ impl CliRuntime {
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
 
-        let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(self.root.clone()));
+        let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(scope.root().to_path_buf()));
         let read = GovernedTool::new(
             read,
             Arc::clone(&harness),
@@ -644,7 +805,7 @@ impl CliRuntime {
                 source,
             })?;
 
-        let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(self.root.clone()));
+        let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(scope.root().to_path_buf()));
         let write = GovernedTool::new(
             write,
             Arc::clone(&harness),
@@ -675,7 +836,8 @@ impl CliRuntime {
                 .map_err(|source| CliError::RegisterTool { name, source })?;
         }
 
-        let bash: Arc<dyn Tool> = Arc::new(BashTool::new());
+        let bash: Arc<dyn Tool> =
+            Arc::new(BashTool::new().with_current_dir(scope.root().to_path_buf()));
         let bash = GovernedTool::new(
             bash,
             Arc::clone(&harness),
@@ -891,14 +1053,16 @@ fn resolve_dir(root: &Path, configured: Option<&Path>) -> PathBuf {
 /// Builds a fresh conversation in its required order.
 ///
 /// The order is fixed: system prompt, optional memory guide, optional skill
-/// guide, then user input.
+/// guide, history, then user input. History is empty for a CLI turn and
+/// carries earlier multi-turn context for a programmatic client.
 fn fresh_conversation(
     system_prompt: &str,
     memory_message: Option<Message>,
     skill_message: Option<Message>,
+    history: &[Message],
     input: &str,
 ) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(4);
+    let mut messages = Vec::with_capacity(4 + history.len());
     messages.push(Message::system(system_prompt));
     if let Some(message) = memory_message {
         messages.push(message);
@@ -906,6 +1070,7 @@ fn fresh_conversation(
     if let Some(message) = skill_message {
         messages.push(message);
     }
+    messages.extend_from_slice(history);
     messages.push(Message::user(input));
     messages
 }
@@ -935,9 +1100,10 @@ fn acceptance_signals(outcome: &AcceptanceOutcome, attempt_start: usize) -> Turn
 /// Derives a stable turn index from the session transcript.
 ///
 /// The index is the number of user turns already present before this one,
-/// counted from structured messages. This CLI starts one session per turn, so
-/// a fresh turn and every resume of that turn both derive `0`. The value never
-/// depends on a process-local counter and is stable across restarts.
+/// counted from structured messages. A CLI turn starts one session and both a
+/// fresh turn and every resume of that turn derive `0`; a multi-turn client
+/// that carries history derives the number of earlier user turns. The value
+/// never depends on a process-local counter and is stable across restarts.
 fn stable_turn_index(messages: &[Message]) -> u64 {
     let user_turns = messages
         .iter()
@@ -1062,6 +1228,18 @@ pub(crate) enum CliError {
     /// The blocking current-directory task failed.
     #[error("current-directory task failed: {0}")]
     CurrentDirTask(#[source] tokio::task::JoinError),
+    /// The per-turn workspace root could not be canonicalized.
+    #[error("failed to canonicalize the turn workspace root `{path}`: {source}")]
+    CanonicalizeRoot {
+        /// Root path exactly as requested by the caller.
+        path: String,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// The blocking canonicalization task failed.
+    #[error("workspace root canonicalization task failed: {0}")]
+    CanonicalizeRootTask(#[source] tokio::task::JoinError),
     /// A `skills` argument was missing, unknown, or malformed.
     #[error("invalid skills command: {message}")]
     InvalidSkillsCommand {
@@ -1187,6 +1365,24 @@ mod tests {
         }
     }
 
+    /// Provider whose model stream never produces an event.
+    struct PendingProvider {
+        /// Notified as soon as the provider is entered.
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PendingProvider {
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            self.started.notify_one();
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
     /// Builds a text response that reports `tokens` total usage.
     fn done_text(text: &str, tokens: u64) -> Vec<LlmEvent> {
         vec![
@@ -1242,6 +1438,92 @@ mod tests {
         ]
     }
 
+    /// Builds a response that asks `read_file` for one path.
+    fn read_request(id: &str, path: &str) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(id, "read_file", json!({ "path": path })),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
+    /// Builds a response that asks `write_file` for one path and content.
+    fn write_request(id: &str, path: &str, content: &str) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(
+                    id,
+                    "write_file",
+                    json!({ "path": path, "content": content }),
+                ),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
+    /// Temporary directory removed when the test ends.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        /// Creates a unique canonical temporary directory.
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jessica-app-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the clock must be after the epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("temporary directory must be creatable");
+            let path = std::fs::canonicalize(&path).expect("temporary directory must resolve");
+            Self { path }
+        }
+
+        /// Returns the canonical path.
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Sink double that records every event published by the pump.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    impl RecordingSink {
+        /// Returns a snapshot of the events observed so far.
+        fn events(&self) -> Vec<AgentEvent> {
+            self.events
+                .lock()
+                .expect("sink events mutex poisoned")
+                .clone()
+        }
+    }
+
+    impl UpdateSink for RecordingSink {
+        fn publish(&self, event: &AgentEvent) {
+            self.events
+                .lock()
+                .expect("sink events mutex poisoned")
+                .push(event.clone());
+        }
+    }
+
     /// Extracts schema names in registry order.
     fn schema_names(tools: &[ToolSchema]) -> Vec<&str> {
         tools
@@ -1279,6 +1561,13 @@ mod tests {
         )
     }
 
+    /// Creates a turn scope rooted at the process current directory.
+    async fn test_scope() -> TurnScope {
+        TurnScope::new(PathBuf::from("."), CancellationToken::new())
+            .await
+            .expect("the test workspace must canonicalize")
+    }
+
     /// Returns the system prompt the provider observed for one call.
     fn system_prompt_of(call: &ProviderCall) -> &str {
         call.messages
@@ -1294,7 +1583,7 @@ mod tests {
         let enabled_runtime = runtime_with(Arc::clone(&enabled_provider), enabled_config());
         let enabled_config_snapshot = enabled_runtime.config_snapshot();
         let setup = enabled_runtime
-            .build_turn(true, &enabled_config_snapshot)
+            .build_turn(&test_scope().await, true, &enabled_config_snapshot, None)
             .expect("turn should build");
         let reason = setup
             .agent
@@ -1319,7 +1608,7 @@ mod tests {
             runtime_with(Arc::clone(&disabled_provider), HarnessConfig::default());
         let disabled_config_snapshot = disabled_runtime.config_snapshot();
         let setup = disabled_runtime
-            .build_turn(true, &disabled_config_snapshot)
+            .build_turn(&test_scope().await, true, &disabled_config_snapshot, None)
             .expect("turn should build");
         setup
             .agent
@@ -1339,7 +1628,7 @@ mod tests {
         let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
         let resume_config_snapshot = resume_runtime.config_snapshot();
         let setup = resume_runtime
-            .build_turn(false, &resume_config_snapshot)
+            .build_turn(&test_scope().await, false, &resume_config_snapshot, None)
             .expect("turn should build");
         setup
             .agent
@@ -1370,7 +1659,7 @@ mod tests {
         let runtime = runtime_with(Arc::clone(&provider), enabled_config());
         let config = runtime.config_snapshot();
         let setup = runtime
-            .build_turn(true, &config)
+            .build_turn(&test_scope().await, true, &config, None)
             .expect("turn should build");
 
         let reason = setup
@@ -1610,6 +1899,7 @@ mod tests {
             "system prompt",
             Some(Message::system("[记忆参考] remembered fact")),
             Some(Message::system("[技能参考] reusable procedure")),
+            &[],
             "new question",
         );
 
@@ -1632,7 +1922,7 @@ mod tests {
 
     #[test]
     fn absent_guides_keep_the_original_system_then_user_order() {
-        let messages = fresh_conversation("system prompt", None, None, "question");
+        let messages = fresh_conversation("system prompt", None, None, &[], "question");
 
         assert_eq!(
             messages,
@@ -1646,6 +1936,7 @@ mod tests {
             "system prompt",
             None,
             Some(Message::system("[技能参考] reuse")),
+            &[],
             "question",
         );
 
@@ -1797,6 +2088,399 @@ mod tests {
             provider.calls().len(),
             2,
             "each turn must acquire an independent child token"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_scopes_isolate_file_tools_and_reject_out_of_bound_paths() {
+        let base = TempDir::new("turn-scopes");
+        let root_a = base.path().join("a");
+        let root_b = base.path().join("b");
+        std::fs::create_dir_all(&root_a).expect("root a must be creatable");
+        std::fs::create_dir_all(&root_b).expect("root b must be creatable");
+        std::fs::write(root_a.join("inside.txt"), "alpha").expect("file a must be writable");
+        std::fs::write(root_b.join("inside.txt"), "beta").expect("file b must be writable");
+        std::fs::write(base.path().join("outside.txt"), "secret")
+            .expect("outside file must be writable");
+        let canonical_a = std::fs::canonicalize(&root_a).expect("root a must resolve");
+        let canonical_b = std::fs::canonicalize(&root_b).expect("root b must resolve");
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            read_request("a-read", "inside.txt"),
+            write_request("a-write", "written.txt", "from-a"),
+            done_text("a done", 1),
+            read_request("b-read", "inside.txt"),
+            write_request("b-write", "written.txt", "from-b"),
+            done_text("b done", 1),
+            read_request("escape", "../outside.txt"),
+            done_text("escape done", 1),
+        ]));
+        let runtime = runtime_with(Arc::clone(&provider), HarnessConfig::default());
+
+        for (root, input) in [(&root_a, "work in a"), (&root_b, "work in b")] {
+            let outcome = runtime
+                .run_turn_request(TurnRequest {
+                    scope: TurnScope::new(root.clone(), CancellationToken::new())
+                        .await
+                        .expect("turn root must canonicalize"),
+                    history: Vec::new(),
+                    user_input: input.to_owned(),
+                    update_sink: None,
+                    acceptance_retries: None,
+                })
+                .await
+                .expect("turn must run");
+            assert_eq!(outcome.reason, SessionEndReason::Completed);
+        }
+        let escape = runtime
+            .run_turn_request(TurnRequest {
+                scope: TurnScope::new(root_a.clone(), CancellationToken::new())
+                    .await
+                    .expect("turn root must canonicalize"),
+                history: Vec::new(),
+                user_input: "escape".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+            })
+            .await
+            .expect("turn must run");
+        assert_eq!(escape.reason, SessionEndReason::Completed);
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 8);
+        assert!(
+            system_prompt_of(&calls[0])
+                .contains(canonical_a.to_str().expect("temporary paths must be UTF-8")),
+            "the first turn must render the first root into its prompt"
+        );
+        assert_eq!(
+            calls[1].messages.last().expect("tool result").content,
+            "alpha",
+            "the first turn must read from its own root"
+        );
+        assert!(
+            system_prompt_of(&calls[3])
+                .contains(canonical_b.to_str().expect("temporary paths must be UTF-8")),
+            "the second turn must render the second root into its prompt"
+        );
+        assert_eq!(
+            calls[4].messages.last().expect("tool result").content,
+            "beta",
+            "the second turn must read from its own root"
+        );
+        assert!(
+            system_prompt_of(&calls[6])
+                .contains(canonical_a.to_str().expect("temporary paths must be UTF-8")),
+            "later turns must return to the root supplied by their scope"
+        );
+        assert!(
+            calls[7]
+                .messages
+                .last()
+                .expect("tool result")
+                .content
+                .contains("outside the workspace"),
+            "a path above the turn root must be rejected: {}",
+            calls[7].messages.last().expect("tool result").content
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(canonical_a.join("written.txt"))
+                .expect("turn a must write its file"),
+            "from-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canonical_b.join("written.txt"))
+                .expect("turn b must write its file"),
+            "from-b"
+        );
+        assert!(
+            !canonical_a.join("outside.txt").exists() && !canonical_b.join("outside.txt").exists(),
+            "out-of-bound reads must not copy the file into a turn root"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_scope_parent_does_not_cancel_another_turn() {
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            HarnessConfig::default(),
+        );
+        let config = runtime.config_snapshot();
+        let parent_a = CancellationToken::new();
+        let parent_b = CancellationToken::new();
+        let scope_a = TurnScope::new(PathBuf::from("."), parent_a.clone())
+            .await
+            .expect("scope a must build");
+        let scope_b = TurnScope::new(PathBuf::from("."), parent_b.clone())
+            .await
+            .expect("scope b must build");
+        let setup_a = runtime
+            .build_turn(&scope_a, false, &config, None)
+            .expect("turn a must build");
+        let setup_b = runtime
+            .build_turn(&scope_b, false, &config, None)
+            .expect("turn b must build");
+
+        parent_a.cancel();
+
+        assert!(
+            setup_a.cancel.is_cancelled(),
+            "cancelling the scope parent must cancel the child turn token"
+        );
+        assert!(
+            !setup_b.cancel.is_cancelled(),
+            "another turn's token must stay independent"
+        );
+        assert!(!parent_b.is_cancelled());
+        setup_a.shutdown();
+        setup_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_scope_parent_stops_an_in_flight_turn() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn LlmProvider> = Arc::new(PendingProvider {
+            started: Arc::clone(&started),
+        });
+        let (_sender, receiver) = watch::channel(Arc::new(HarnessConfig::default()));
+        let runtime = CliRuntime::new(
+            provider,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Arc::new(ShutdownController::new()),
+        );
+        let parent = CancellationToken::new();
+        let scope = TurnScope::new(PathBuf::from("."), parent.clone())
+            .await
+            .expect("scope must build");
+        let turn = runtime.run_turn_request(TurnRequest {
+            scope,
+            history: Vec::new(),
+            user_input: "hang".to_owned(),
+            update_sink: None,
+            acceptance_retries: None,
+        });
+        let canceller = async move {
+            started.notified().await;
+            parent.cancel();
+        };
+
+        let (outcome, ()) = tokio::join!(turn, canceller);
+
+        let outcome = outcome.expect("a cancelled turn must return an outcome");
+        assert_eq!(
+            outcome.reason,
+            SessionEndReason::Cancelled,
+            "the provider was entered and its pending stream must be cancelled by the parent token"
+        );
+        assert_eq!(
+            outcome.messages.last(),
+            Some(&Message::user("hang")),
+            "cancellation must preserve the initial transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_scope_rejects_a_missing_workspace_root() {
+        let missing = std::env::temp_dir().join(format!(
+            "jessica-missing-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock must be after the epoch")
+                .as_nanos()
+        ));
+
+        let error = TurnScope::new(missing.clone(), CancellationToken::new())
+            .await
+            .err()
+            .expect("a missing root must not produce a scope");
+
+        assert!(
+            error.to_string().contains("canonicalize"),
+            "the error must name the failed canonicalization: {error}"
+        );
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "the error must name the requested path: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_replayed_before_the_new_input_and_excluded_from_counts() {
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("new answer", 1)]));
+        let runtime = runtime_with(Arc::clone(&provider), HarnessConfig::default());
+        let history = vec![
+            Message::user("old question"),
+            Message::assistant_with_tool_calls(
+                "old",
+                vec![ToolCall::new(
+                    "old-call",
+                    "read_file",
+                    json!({"path": "old"}),
+                )],
+            ),
+            Message::tool("old-call", "old output"),
+            Message::assistant("old answer"),
+        ];
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: history.clone(),
+                user_input: "new question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+            })
+            .await
+            .expect("turn must run");
+
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        let observed = &calls[0].messages;
+        assert_eq!(
+            observed.len(),
+            1 + history.len() + 1,
+            "the prompt must be system, history, then the new input"
+        );
+        assert_eq!(observed[0].role, Role::System);
+        assert_eq!(&observed[1..=history.len()], history.as_slice());
+        assert_eq!(observed.last(), Some(&Message::user("new question")));
+
+        let turn_start = observed.len();
+        let counts = structured_counts(&outcome.messages, turn_start);
+        assert_eq!(
+            counts,
+            (0, 1),
+            "tool calls replayed from history must not count toward this turn"
+        );
+        let signals = TurnSignals::new(SessionEndReason::Completed, counts.0, counts.1);
+        assert!(
+            !jessica_harness::SkillTrigger::new(1, 2).should_trigger(&signals),
+            "historical tool calls must not cross a one-call skill threshold"
+        );
+        assert_eq!(
+            stable_turn_index(&outcome.messages),
+            1,
+            "one user turn precedes the new input in the carried history"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_outcome_matches_the_event_rebuilt_transcript() {
+        let workspace = TempDir::new("outcome-transcript");
+        std::fs::write(workspace.path().join("README.md"), "contents")
+            .expect("workspace file must be writable");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            read_request("read-1", "README.md"),
+            done_text("finished", 1),
+        ]));
+        let runtime = runtime_with(provider, HarnessConfig::default());
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: TurnScope::new(workspace.path().to_path_buf(), CancellationToken::new())
+                    .await
+                    .expect("workspace root must canonicalize"),
+                history: Vec::new(),
+                user_input: "inspect".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+            })
+            .await
+            .expect("turn must run");
+
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+        assert_eq!(outcome.messages.len(), 5);
+        assert_eq!(outcome.messages[0].role, Role::System);
+        assert_eq!(outcome.messages[1], Message::user("inspect"));
+        assert_eq!(outcome.messages[2].role, Role::Assistant);
+        assert_eq!(outcome.messages[2].tool_calls.len(), 1);
+        assert_eq!(outcome.messages[2].tool_calls[0].id, "read-1");
+        assert_eq!(outcome.messages[2].tool_calls[0].name, "read_file");
+        assert_eq!(
+            outcome.messages[3],
+            Message::tool("read-1", "contents"),
+            "the transcript must contain the same tool result the event stream carried"
+        );
+        assert_eq!(outcome.messages[4], Message::assistant("finished"));
+    }
+
+    #[tokio::test]
+    async fn a_programmatic_turn_forwards_every_event_to_its_sink() {
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 1)]));
+        let runtime = runtime_with(provider, HarnessConfig::default());
+        let sink = Arc::new(RecordingSink::default());
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: Some(Arc::clone(&sink) as Arc<dyn UpdateSink>),
+                acceptance_retries: None,
+            })
+            .await
+            .expect("turn must run");
+
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+        let observed = sink.events();
+        assert!(
+            matches!(observed.first(), Some(AgentEvent::SessionStarted { .. })),
+            "the sink must observe the session start first"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelDelta { text } if text == "answer")),
+            "the sink must observe streamed model text"
+        );
+        assert!(
+            matches!(
+                observed.last(),
+                Some(AgentEvent::SessionEnded {
+                    reason: SessionEndReason::Completed,
+                    ..
+                })
+            ),
+            "the sink must observe the final terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_request_can_run_acceptance_once_without_retries() {
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 1)]));
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 2\n",
+        )
+        .expect("acceptance config must parse");
+        let runtime = runtime_with(Arc::clone(&provider), config);
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: Some(0),
+            })
+            .await
+            .expect("turn must run");
+
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "a per-turn zero retry budget must override the configured retries"
         );
     }
 }

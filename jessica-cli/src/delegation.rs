@@ -2,8 +2,8 @@
 //!
 //! A child agent shares the parent's filesystem boundary: [`ReadFileTool`] and
 //! [`WriteFileTool`] are rooted at the same workspace directory, and
-//! [`BashTool`] is the same native implementation the parent uses. The child
-//! gets no sandbox of its own.
+//! [`BashTool`] starts commands in that directory. The child gets no sandbox of
+//! its own.
 //!
 //! The only intentionally shared mutable state is the parent's provider token
 //! budget: the CLI passes the same counting provider to the executor, so child
@@ -43,7 +43,7 @@ impl ChildToolFactory for NativeChildToolFactory {
                 let tool: Arc<dyn Tool> = match name.as_str() {
                     "read_file" => Arc::new(ReadFileTool::new(self.root.clone())),
                     "write_file" => Arc::new(WriteFileTool::new(self.root.clone())),
-                    "bash" => Arc::new(BashTool::new()),
+                    "bash" => Arc::new(BashTool::new().with_current_dir(self.root.clone())),
                     other => {
                         return Err(DelegationError::ToolFactory {
                             message: format!(
