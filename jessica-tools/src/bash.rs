@@ -1,5 +1,6 @@
 //! `bash` tool with a wall-clock timeout and bounded output.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ const DEFAULT_OUTPUT_LIMIT: usize = 64 * 1024;
 pub struct BashTool {
     timeout: Duration,
     output_limit: usize,
+    current_dir: Option<PathBuf>,
 }
 
 impl BashTool {
@@ -42,7 +44,18 @@ impl BashTool {
         Self {
             timeout,
             output_limit,
+            current_dir: None,
         }
+    }
+
+    /// Sets the directory in which commands are spawned.
+    ///
+    /// This is additive: a tool built by [`BashTool::new`] keeps inheriting the
+    /// process current directory. A path that does not exist is reported as a
+    /// spawn failure when the command runs, not when the tool is built.
+    pub fn with_current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
     }
 }
 
@@ -51,6 +64,7 @@ impl Default for BashTool {
         Self {
             timeout: DEFAULT_TIMEOUT,
             output_limit: DEFAULT_OUTPUT_LIMIT,
+            current_dir: None,
         }
     }
 }
@@ -104,6 +118,9 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(dir) = &self.current_dir {
+            command.current_dir(dir);
+        }
 
         let child = match command.spawn() {
             Ok(child) => child,
@@ -223,4 +240,113 @@ fn render(output: &CommandOutput) -> String {
     }
 
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Temporary directory removed when the test ends.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        /// Creates a unique directory and stores its canonical path.
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jessica-bash-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("the clock must be after the epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("temporary directory must be creatable");
+            let path = std::fs::canonicalize(&path).expect("temporary directory must resolve");
+            Self { path }
+        }
+
+        /// Returns the canonical path.
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_current_directory_is_used_by_spawned_commands() {
+        let temp = TempDir::new("explicit-cwd");
+        std::fs::write(temp.path().join("marker.txt"), "inside")
+            .expect("marker file must be writable");
+        let tool =
+            BashTool::with_limits(Duration::from_secs(10), 4096).with_current_dir(temp.path());
+
+        let result = tool
+            .execute(json!({"command": "pwd -P && test -f marker.txt && echo marker-present"}))
+            .await;
+
+        assert!(!result.is_error, "unexpected failure: {}", result.content);
+        assert!(
+            result.content.contains("marker-present"),
+            "the command must observe the configured directory: {}",
+            result.content
+        );
+        assert!(
+            result
+                .content
+                .contains(temp.path().to_str().expect("temp path must be UTF-8")),
+            "pwd must report the configured directory: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unset_current_directory_keeps_inheriting_the_process_directory() {
+        let expected =
+            std::env::current_dir().expect("the process current directory must be readable");
+        let expected = std::fs::canonicalize(expected).expect("current directory must resolve");
+        let tool = BashTool::new();
+
+        let result = tool.execute(json!({"command": "pwd -P"})).await;
+
+        assert!(!result.is_error, "unexpected failure: {}", result.content);
+        assert!(
+            result
+                .content
+                .contains(expected.to_str().expect("current path must be UTF-8")),
+            "an unset directory must keep the original behavior: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_current_directory_is_reported_as_a_spawn_failure() {
+        let missing = std::env::temp_dir().join(format!(
+            "jessica-bash-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock must be after the epoch")
+                .as_nanos()
+        ));
+        let tool = BashTool::new().with_current_dir(&missing);
+
+        let result = tool.execute(json!({"command": "true"})).await;
+
+        assert!(result.is_error, "a missing cwd must fail the tool call");
+        assert!(
+            result.content.contains("failed to spawn bash"),
+            "the failure must name the spawn step: {}",
+            result.content
+        );
+    }
 }
