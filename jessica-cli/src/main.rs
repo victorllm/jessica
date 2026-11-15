@@ -752,8 +752,8 @@ fn print_usage() {
          \n\
          Runs a stable Agent Client Protocol (ACP) v1 agent over stdin/stdout.\n\
          Stdout carries only newline-delimited JSON-RPC; diagnostics go to stderr.\n\
-         The process exits on stdin EOF, SIGINT, or SIGTERM. This phase implements\n\
-         only the `initialize` handshake; session methods return -32601."
+         The process exits on stdin EOF, SIGINT, or SIGTERM. Implements\n\
+         `initialize`, `session/new`, `session/prompt`, and `session/cancel`."
     );
 }
 
