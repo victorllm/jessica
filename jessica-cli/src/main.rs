@@ -1,6 +1,7 @@
 //! Governed one-shot / REPL front end for Jessica.
 
 mod acceptance_check;
+mod acp;
 mod app;
 mod config;
 mod delegation;
@@ -148,6 +149,21 @@ async fn run() -> RunOutcome {
             // this point. On the normal path the listener is now quiescent.
             drop(listener);
             RunOutcome { result, signal }
+        }
+        Mode::Acp => {
+            // ACP owns stdout, so this branch must not touch the REPL, replay,
+            // or skills output paths. The signal listener is installed before
+            // the transport starts so an early SIGTERM still shuts down
+            // gracefully.
+            let shutdown = Arc::new(ShutdownController::new());
+            let listener = SignalListener::spawn(Arc::clone(&shutdown));
+            let result = acp::run(Arc::clone(&shutdown)).await;
+            let signal = shutdown.signal();
+            drop(listener);
+            RunOutcome {
+                result: result.map(|()| None),
+                signal,
+            }
         }
     }
 }
@@ -330,6 +346,8 @@ enum Mode {
         /// Review command to execute.
         command: SkillCommand,
     },
+    /// Serves stable ACP v1 over stdin/stdout.
+    Acp,
 }
 
 /// Returns the configuration path watched by this execution path.
@@ -389,6 +407,9 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                     mode: Mode::Skills { command },
                 }));
             }
+            "acp" if resume.is_none() && prompt_parts.is_empty() => {
+                return parse_acp_args(config, args);
+            }
             "--resume" => {
                 let id = args.next().ok_or(CliError::MissingResumeSessionId)?;
                 set_resume(&mut resume, &id)?;
@@ -417,6 +438,44 @@ fn parse_args() -> Result<Option<Options>, CliError> {
     Ok(Some(Options {
         config,
         mode: Mode::Turn { resume, prompt },
+    }))
+}
+
+/// Parses the arguments following the `acp` subcommand.
+///
+/// The only accepted argument is the configuration flag, in either form. Any
+/// other argument is rejected instead of being treated as a prompt: a typo
+/// must not silently start a long-lived protocol server with defaults.
+fn parse_acp_args(
+    mut config: Option<PathBuf>,
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<Options>, CliError> {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(None);
+            }
+            "--config" => {
+                let path = args.next().ok_or(CliError::MissingConfigPath)?;
+                set_config(&mut config, PathBuf::from(path))?;
+            }
+            _ if arg.starts_with("--config=") => {
+                let path = arg
+                    .strip_prefix("--config=")
+                    .filter(|path| !path.is_empty())
+                    .ok_or(CliError::MissingConfigPath)?;
+                set_config(&mut config, PathBuf::from(path))?;
+            }
+            _ => {
+                return Err(CliError::UnknownAcpArgument { argument: arg });
+            }
+        }
+    }
+
+    Ok(Some(Options {
+        config,
+        mode: Mode::Acp,
     }))
 }
 
@@ -665,7 +724,14 @@ fn print_usage() {
          Replays a recorded session offline: the recorded model responses and tool\n\
          results drive the loop, and the resulting events are written as JSONL. It\n\
          requires an [events] path, never calls the model or a tool, and never reads\n\
-         the clock or the network."
+         the clock or the network.\n\
+         \n\
+         Usage: jessica [--config <path>] acp\n\
+         \n\
+         Runs a stable Agent Client Protocol (ACP) v1 agent over stdin/stdout.\n\
+         Stdout carries only newline-delimited JSON-RPC; diagnostics go to stderr.\n\
+         The process exits on stdin EOF, SIGINT, or SIGTERM. This phase implements\n\
+         only the `initialize` handshake; session methods return -32601."
     );
 }
 
@@ -851,6 +917,46 @@ mod tests {
             },
         };
         assert_eq!(watched_config_path(&skills, &config), None);
+
+        assert_eq!(
+            watched_config_path(&Mode::Acp, &config),
+            None,
+            "ACP loads the startup configuration once and does not watch it"
+        );
+    }
+
+    #[test]
+    fn acp_accepts_the_config_flag_on_either_side() {
+        let config = PathBuf::from("harness.toml");
+        for (initial, arguments) in [
+            (None, vec!["--config", "harness.toml"]),
+            (None, vec!["--config=harness.toml"]),
+            (Some(config.clone()), vec![]),
+        ] {
+            let options = parse_acp_args(initial, skill_args(&arguments))
+                .expect("acp arguments must parse")
+                .expect("not a help request");
+            assert_eq!(options.config, Some(config.clone()));
+            assert!(matches!(options.mode, Mode::Acp));
+        }
+    }
+
+    #[test]
+    fn acp_rejects_prompts_and_malformed_flags() {
+        let error = parse_acp_args(None, skill_args(&["hello"]))
+            .err()
+            .expect("a prompt must not be accepted in ACP mode");
+        assert!(error.to_string().contains("hello"));
+
+        let error = parse_acp_args(None, skill_args(&["--unknown"]))
+            .err()
+            .expect("unknown flags must be rejected");
+        assert!(error.to_string().contains("--unknown"));
+
+        let error = parse_acp_args(None, skill_args(&["--config"]))
+            .err()
+            .expect("a missing config path must be rejected");
+        assert!(error.to_string().contains("path"));
     }
 
     /// Concrete provider that distinguishes the legacy and classified paths.
