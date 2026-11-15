@@ -8,11 +8,23 @@
 //! concurrently and process shutdown or stdin EOF cancels every session before
 //! a bounded drain.
 //!
+//! Limits are copied from the `[acp]` section at startup. Session IDs remain
+//! bounded by `max_sessions`, prompt text by `max_prompt_bytes`, and history by
+//! its message and byte limits; trimming removes only the oldest complete user
+//! turn. Optional session notices are emitted only when the client advertised
+//! `clientCapabilities.session.notices`. Reloadable configuration is observed
+//! by a watcher started beside the lazily assembled runtime, so the next prompt
+//! uses the latest reloadable snapshot while startup-only sections keep their
+//! original values.
+//!
 //! Stdout is reserved for newline-delimited JSON-RPC. This module never writes
 //! to stdout itself, and the CLI installs no tracing subscriber, so ACP
-//! diagnostics cannot corrupt the protocol stream.
+//! diagnostics cannot corrupt the protocol stream. Errors and diagnostics are
+//! content-free: they never include prompt text, tool arguments, environment
+//! values, or credentials.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -20,9 +32,9 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, Implementation, InitializeRequest, InitializeResponse,
-    McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, SessionCapabilities, SessionId as AcpSessionId,
-    SessionNotification, StopReason,
+    McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionCapabilities,
+    SessionId as AcpSessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
@@ -39,6 +51,7 @@ use crate::acp_session::{
 };
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
 use crate::config::HarnessConfig;
+use crate::hot_reload::ConfigWatcher;
 use crate::pump::UpdateSink;
 use crate::shutdown::ShutdownController;
 
@@ -58,12 +71,14 @@ const TRANSPORT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 pub(crate) async fn run(
     config: HarnessConfig,
     root: PathBuf,
+    watch_path: Option<PathBuf>,
     shutdown: Arc<ShutdownController>,
 ) -> Result<(), CliError> {
     let root = canonical_startup_root(root).await?;
     let service = Arc::new(AcpService::new(
         Arc::new(config),
         root,
+        watch_path,
         Arc::clone(&shutdown),
     ));
 
@@ -164,29 +179,52 @@ async fn canonical_startup_root(root: PathBuf) -> Result<PathBuf, CliError> {
 
 /// Runtime state shared by the ACP request handlers.
 struct AcpService {
-    /// Startup configuration, including ACP limits.
+    /// Startup configuration, including immutable ACP limits.
     config: Arc<HarnessConfig>,
     /// Canonical startup workspace root.
     root: PathBuf,
+    /// Configuration file to watch once the runtime exists, if `--config` was
+    /// supplied.
+    watch_path: Option<PathBuf>,
     /// Process-level shutdown token source.
     shutdown: Arc<ShutdownController>,
     /// Live sessions and their bounded histories.
     registry: AcpSessionRegistry,
     /// Tracks prompt workers and rejects new prompts once shutdown begins.
     prompts: Arc<PromptTracker>,
+    /// Whether the initialized client advertised `session.notices`.
+    ///
+    /// Defaults to false. A notice must never be sent unless this is set by a
+    /// completed `initialize` request.
+    client_notices: AtomicBool,
     /// Cancelled when a protocol write fails because the client disconnected.
     transport_failure: CancellationToken,
     /// Provider, recorder, wasm, memory, and skills, assembled on first prompt.
     ///
     /// Assembly is lazy so `initialize` and `session/new` work even when a
     /// provider credential is absent. The first failure is cached and maps to
-    /// a generic internal error; no provider detail is exposed.
-    runtime: OnceCell<Result<Arc<CliRuntime>, ()>>,
+    /// a generic internal error; no provider detail is exposed. The config
+    /// watcher lives beside the runtime and starts only after assembly, so
+    /// every later prompt observes the newest reloadable snapshot.
+    runtime: OnceCell<Result<RuntimeAssembly, ()>>,
+}
+
+/// The lazily assembled runtime and its optional configuration watcher.
+struct RuntimeAssembly {
+    /// Shared runtime used by every prompt.
+    runtime: Arc<CliRuntime>,
+    /// Kept alive for the process lifetime; dropping it stops reloads.
+    _config_watcher: Option<ConfigWatcher>,
 }
 
 impl AcpService {
     /// Creates the service around a canonical startup root.
-    fn new(config: Arc<HarnessConfig>, root: PathBuf, shutdown: Arc<ShutdownController>) -> Self {
+    fn new(
+        config: Arc<HarnessConfig>,
+        root: PathBuf,
+        watch_path: Option<PathBuf>,
+        shutdown: Arc<ShutdownController>,
+    ) -> Self {
         let registry = AcpSessionRegistry::new(
             root.clone(),
             config.acp.max_sessions,
@@ -199,9 +237,11 @@ impl AcpService {
         Self {
             config,
             root,
+            watch_path,
             shutdown,
             registry,
             prompts: Arc::new(PromptTracker::new()),
+            client_notices: AtomicBool::new(false),
             transport_failure: CancellationToken::new(),
             runtime: OnceCell::new(),
         }
@@ -274,8 +314,8 @@ impl AcpService {
     /// A runtime that was never assembled has no skill worker to drain. This
     /// avoids starting provider or memory initialization during shutdown.
     async fn drain_skills(&self) {
-        if let Some(Ok(runtime)) = self.runtime.get() {
-            runtime.shutdown().await;
+        if let Some(Ok(assembly)) = self.runtime.get() {
+            assembly.runtime.shutdown().await;
         }
     }
 
@@ -288,19 +328,41 @@ impl AcpService {
         if self.is_closing() {
             return responder.respond_with_error(shutting_down_error());
         }
+        self.client_notices
+            .store(client_supports_notices(request), Ordering::SeqCst);
         responder.respond(initialize_response(request))
+    }
+
+    /// Returns whether the client advertised `session.notices`.
+    fn client_supports_notices(&self) -> bool {
+        self.client_notices.load(Ordering::SeqCst)
     }
 
     /// Returns the shared runtime, assembling it exactly once.
     async fn runtime(&self) -> Result<Arc<CliRuntime>, ()> {
         let config = Arc::clone(&self.config);
         let root = self.root.clone();
+        let watch_path = self.watch_path.clone();
         let shutdown = Arc::clone(&self.shutdown);
         match self
             .runtime
             .get_or_init(|| async move {
                 match crate::assemble_runtime(config, root, shutdown).await {
-                    Ok((runtime, _config_sender)) => Ok(Arc::new(runtime)),
+                    Ok((runtime, config_sender)) => {
+                        let watcher = match watch_path {
+                            Some(path) => Some(ConfigWatcher::spawn(path, config_sender).await),
+                            None => {
+                                // No file to watch: dropping the sender leaves
+                                // the startup snapshot in the receiver.
+                                drop(config_sender);
+                                None
+                            }
+                        };
+                        Ok(RuntimeAssembly {
+                            runtime: Arc::new(runtime),
+                            _config_watcher: watcher,
+                        })
+                    }
                     Err(_) => {
                         tracing::warn!("acp runtime assembly failed");
                         Err(())
@@ -309,7 +371,7 @@ impl AcpService {
             })
             .await
         {
-            Ok(runtime) => Ok(Arc::clone(runtime)),
+            Ok(assembly) => Ok(Arc::clone(&assembly.runtime)),
             Err(()) => Err(()),
         }
     }
@@ -381,8 +443,11 @@ impl AcpService {
         shutdown: Arc<ShutdownController>,
         runtime: Arc<CliRuntime>,
     ) -> Self {
-        let service = Self::new(config, root, shutdown);
-        let _ = service.runtime.set(Ok(runtime));
+        let service = Self::new(config, root, None, shutdown);
+        let _ = service.runtime.set(Ok(RuntimeAssembly {
+            runtime,
+            _config_watcher: None,
+        }));
         service
     }
 }
@@ -571,11 +636,22 @@ async fn run_prompt_worker(
         let _ = updates.send(WriterMessage::Update(Box::new(notification)));
     }
 
+    let PromptExecution { terminal, commit } = execution;
+    // A notice is optional and only legal when the client advertised
+    // `session.notices`. The stop reason already carries the budget outcome,
+    // so dropping the notice for other clients loses no protocol information.
+    if !guard.cancel_requested()
+        && service.client_supports_notices()
+        && let Some(update) = budget_notice(terminal)
+    {
+        let notification = SessionNotification::new(AcpSessionId::new(session_id.clone()), update);
+        let _ = updates.send(WriterMessage::Update(Box::new(notification)));
+    }
+
     // Every update was enqueued before `execute_prompt` returned. The barrier
     // is ordered behind them, so a successful acknowledgement proves that the
     // writer attempted every update before the response is sent.
     let updates_delivered = update_barrier(&updates).await;
-    let PromptExecution { terminal, commit } = execution;
 
     // The cancel handler takes this gate before setting the flag. Holding it
     // until the response is enqueued makes the cancellation and response a
@@ -681,6 +757,45 @@ async fn execute_prompt(service: &AcpService, request: PromptExecutionRequest) -
     };
     let commit = matches!(terminal, PromptTerminal::Stop(_)).then(|| turn_new_messages(&outcome));
     PromptExecution { terminal, commit }
+}
+
+/// Returns whether the initialize request advertises live session notices.
+///
+/// The ACP contract requires `{}` under `clientCapabilities.session.notices`;
+/// omitted or `null` means unsupported.
+fn client_supports_notices(request: &InitializeRequest) -> bool {
+    request
+        .client_capabilities
+        .session
+        .as_ref()
+        .and_then(|session| session.notices.as_ref())
+        .is_some()
+}
+
+/// Builds the optional, content-free notice for a budget stop.
+///
+/// Policy denials and ordinary failures are already carried by
+/// `tool_call_update` and JSON-RPC errors, so only budget exhaustion uses a
+/// notice. The title is non-empty as the schema requires and neither field
+/// contains prompt text, tool arguments, environment values, or credentials.
+fn budget_notice(terminal: PromptTerminal) -> Option<SessionUpdate> {
+    match terminal {
+        PromptTerminal::Stop(StopReason::MaxTokens) => Some(SessionUpdate::Notice(
+            Notice::new(NoticeSeverity::Warning, "Token budget exhausted").description(
+                "The prompt stopped at the configured token budget. Start a new session or raise the budget to continue.",
+            ),
+        )),
+        PromptTerminal::Stop(StopReason::MaxTurnRequests) => Some(SessionUpdate::Notice(
+            Notice::new(
+                NoticeSeverity::Warning,
+                "Turn request budget exhausted",
+            )
+            .description(
+                "The prompt stopped at the configured model request limit. Start a new session or raise the budget to continue.",
+            ),
+        )),
+        PromptTerminal::Stop(_) | PromptTerminal::Error => None,
+    }
 }
 
 /// Maps the outcome reason with the observed budget kind.
@@ -905,7 +1020,7 @@ mod tests {
     use futures::StreamExt;
     use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
     use jessica_core::tool::ToolSchema;
-    use jessica_core::types::TokenUsage;
+    use jessica_core::types::{TokenUsage, ToolCall};
     use tokio::sync::Notify;
     use tokio::sync::watch;
 
@@ -997,6 +1112,18 @@ mod tests {
         vec![
             LlmEvent::TextDelta {
                 text: text.to_owned(),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
+    /// Builds one model turn that requests a tool call.
+    fn tool_call_response(id: &str, name: &str, arguments: serde_json::Value) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(id, name, arguments),
             },
             LlmEvent::Done {
                 usage: Some(TokenUsage::new(1, 1)),
@@ -1136,6 +1263,70 @@ mod tests {
             &contents[contents.len() - 2..],
             ["first answer", "second question"]
         );
+    }
+
+    #[tokio::test]
+    async fn trimmed_history_keeps_tool_pairs_while_dropping_the_oldest_turn() {
+        let root = temp_root("history-trim-provider");
+        std::fs::write(root.join("NOTE.txt"), "note contents")
+            .expect("fixture note must be written");
+        let config = HarnessConfig::from_toml_str("[acp]\nmax_history_messages = 4\n")
+            .expect("history limit config must parse");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer"),
+            tool_call_response("call_read", "read_file", json!({"path": "NOTE.txt"})),
+            done_text("tool answer"),
+            done_text("third answer"),
+        ]));
+        let (service, _config) = service_with(Arc::clone(&provider), &root, config);
+        let session = create_session(&service, root).await;
+
+        assert_eq!(
+            run_turn_for_test(&service, &session, "first question").await,
+            PromptTerminal::Stop(StopReason::EndTurn)
+        );
+        assert_eq!(
+            run_turn_for_test(&service, &session, "use the tool").await,
+            PromptTerminal::Stop(StopReason::EndTurn)
+        );
+        assert_eq!(
+            run_turn_for_test(&service, &session, "third question").await,
+            PromptTerminal::Stop(StopReason::EndTurn)
+        );
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 4, "the tool turn makes two provider calls");
+        let third_prompt = &calls[3].messages;
+        let contents: Vec<&str> = third_prompt
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            !contents.contains(&"first question") && !contents.contains(&"first answer"),
+            "the oldest complete turn must be gone: {contents:?}"
+        );
+
+        let start = third_prompt
+            .iter()
+            .position(|message| message.content == "use the tool")
+            .expect("the retained turn must start at its user message");
+        assert_eq!(start + 4, third_prompt.len() - 1);
+        assert_eq!(
+            third_prompt[start + 1].role,
+            jessica_core::types::Role::Assistant
+        );
+        assert_eq!(third_prompt[start + 1].tool_calls.len(), 1);
+        assert_eq!(
+            third_prompt[start + 2].role,
+            jessica_core::types::Role::Tool
+        );
+        assert_eq!(
+            third_prompt[start + 2].tool_call_id.as_deref(),
+            Some(third_prompt[start + 1].tool_calls[0].id.as_str()),
+            "the tool result must immediately follow its call and use the same id"
+        );
+        assert_eq!(third_prompt[start + 3].content, "tool answer");
+        assert_eq!(third_prompt[start + 4].content, "third question");
     }
 
     #[tokio::test]
@@ -1451,6 +1642,64 @@ mod tests {
             budget_stop_reason(Some(BudgetKind::TokenLimit)),
             BudgetStopReason::MaxTokens
         );
+    }
+
+    #[test]
+    fn notice_capability_requires_an_explicit_session_notices_entry() {
+        let mut request = InitializeRequest::new(ProtocolVersion::V1);
+        assert!(
+            !client_supports_notices(&request),
+            "an empty clientCapabilities object means no notices"
+        );
+
+        request.client_capabilities = agent_client_protocol::v1::schema::ClientCapabilities::new()
+            .session(agent_client_protocol::v1::schema::ClientSessionCapabilities::new());
+        assert!(
+            !client_supports_notices(&request),
+            "session capabilities without notices are not support"
+        );
+
+        request.client_capabilities = agent_client_protocol::v1::schema::ClientCapabilities::new()
+            .session(
+                agent_client_protocol::v1::schema::ClientSessionCapabilities::new()
+                    .notices(agent_client_protocol::v1::schema::NoticeCapabilities::new()),
+            );
+        assert!(
+            client_supports_notices(&request),
+            "an explicit empty notices object advertises support"
+        );
+    }
+
+    #[test]
+    fn budget_stops_build_schema_valid_content_free_notices() {
+        for (stop, expected_title) in [
+            (StopReason::MaxTokens, "Token budget exhausted"),
+            (StopReason::MaxTurnRequests, "Turn request budget exhausted"),
+        ] {
+            let update = budget_notice(PromptTerminal::Stop(stop))
+                .expect("a budget stop may be accompanied by a notice");
+            let value = serde_json::to_value(update).expect("notice must serialize");
+            assert_eq!(value["sessionUpdate"], "notice");
+            assert_eq!(value["severity"], "warning");
+            assert_eq!(value["title"], expected_title);
+            assert!(
+                value["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.is_empty()),
+                "the notice should explain how to continue"
+            );
+        }
+        for stop in [
+            StopReason::EndTurn,
+            StopReason::Cancelled,
+            StopReason::Refusal,
+        ] {
+            assert!(
+                budget_notice(PromptTerminal::Stop(stop)).is_none(),
+                "non-budget stops must not produce notices"
+            );
+        }
+        assert!(budget_notice(PromptTerminal::Error).is_none());
     }
 
     #[test]

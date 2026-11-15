@@ -156,10 +156,12 @@ async fn run() -> RunOutcome {
             // ACP owns stdout, so this branch must not touch the REPL, replay,
             // or skills output paths. The signal listener is installed before
             // the transport starts so an early SIGTERM still shuts down
-            // gracefully.
+            // gracefully. The watcher starts when the lazy runtime is
+            // assembled, so every later prompt reads the newest reloadable
+            // snapshot.
             let shutdown = Arc::new(ShutdownController::new());
             let listener = SignalListener::spawn(Arc::clone(&shutdown));
-            let result = acp::run(config, root, Arc::clone(&shutdown)).await;
+            let result = acp::run(config, root, watch_path, Arc::clone(&shutdown)).await;
             let signal = shutdown.signal();
             drop(listener);
             RunOutcome {
@@ -229,8 +231,8 @@ pub(crate) async fn assemble_runtime(
     let memory = MemoryAssembly::open(&config.memory, &root).await;
     let skills = SkillsAssembly::open(&config.skills, &root, Arc::clone(&provider)).await;
     // The startup configuration is loaded and validated once. The receiver is
-    // the per-turn snapshot source; only the REPL installs a watcher capable
-    // of publishing a newer value.
+    // the per-turn snapshot source; only the REPL and ACP server install a
+    // watcher capable of publishing a newer value.
     let (config_sender, config_receiver) = watch::channel(config);
     let runtime = CliRuntime::new(
         provider,
@@ -369,15 +371,18 @@ enum Mode {
 
 /// Returns the configuration path watched by this execution path.
 ///
-/// Only an interactive REPL (a `Turn` with neither `--resume` nor a prompt)
-/// owns a long-lived config watcher. One-shot, resume, replay, and skills
-/// return `None`, so they load the startup configuration exactly once.
+/// An interactive REPL (a `Turn` with neither `--resume` nor a prompt) and
+/// the long-lived ACP server own a config watcher. The ACP watcher starts when
+/// the lazy runtime is assembled, so every later prompt reads the newest
+/// reloadable snapshot. One-shot, resume, replay, and skills return `None`, so
+/// they load the startup configuration exactly once.
 fn watched_config_path(mode: &Mode, config_path: &Option<PathBuf>) -> Option<PathBuf> {
     match mode {
         Mode::Turn {
             resume: None,
             prompt: None,
-        } => config_path.clone(),
+        }
+        | Mode::Acp => config_path.clone(),
         _ => None,
     }
 }
@@ -900,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_interactive_repl_watches_the_config_file() {
+    fn only_long_lived_modes_watch_the_config_file() {
         let config = Some(PathBuf::from("harness.toml"));
         let repl = Mode::Turn {
             resume: None,
@@ -937,9 +942,10 @@ mod tests {
 
         assert_eq!(
             watched_config_path(&Mode::Acp, &config),
-            None,
-            "ACP loads the startup configuration once and does not watch it"
+            config,
+            "ACP serves long-lived prompts and must observe reloadable config"
         );
+        assert_eq!(watched_config_path(&Mode::Acp, &None), None);
     }
 
     #[test]

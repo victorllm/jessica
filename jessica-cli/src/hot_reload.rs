@@ -1,11 +1,12 @@
-//! Background configuration hot reload for the interactive REPL.
+//! Background configuration hot reload for long-lived modes.
 //!
-//! The watcher is started only by the REPL path. It polls the configuration
-//! file's `(mtime, len)` fingerprint once per second, parses and validates a
-//! changed file, and publishes the new immutable snapshot through a
-//! [`tokio::sync::watch`] channel. Sections that own startup-only resources
-//! (events, memory, skills, wasm, reliability) reject the whole reload: those
-//! connections and workers are never rebuilt while the process runs.
+//! The watcher is started by the interactive REPL and, after lazy assembly, by
+//! the ACP server. It polls the configuration file's `(mtime, len)` fingerprint
+//! once per second, parses and validates a changed file, and publishes the new
+//! immutable snapshot through a [`tokio::sync::watch`] channel. Sections that
+//! own startup-only resources (events, memory, skills, wasm, reliability, and
+//! ACP limits) reject the whole reload: those connections and workers are never
+//! rebuilt while the process runs.
 //!
 //! A bad or partially invalid file updates the fingerprint before it is
 //! processed, so repeated polls of the same file do not spam the console. The
@@ -425,6 +426,7 @@ enabled = true
                 "[reliability]\nenabled = true\n",
                 "reliability",
             ),
+            ("acp", "[acp]\nmax_prompt_bytes = 4096\n", "acp"),
         ];
         for (label, toml, expected) in cases {
             let next = HarnessConfig::from_toml_str(toml)
