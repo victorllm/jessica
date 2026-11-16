@@ -5,6 +5,7 @@
 //! lifecycle events stay internal, and errors are returned on the prompt
 //! response instead of the update stream.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -13,7 +14,7 @@ use agent_client_protocol::v1::schema::{
     ToolCall as AcpToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind,
 };
-use jessica_core::types::{AgentEvent, BudgetKind, ToolCall};
+use jessica_core::types::{AgentEvent, BudgetKind, Message, Role, ToolCall};
 use serde_json::Value;
 
 /// Maximum characters retained in a tool-call title.
@@ -150,6 +151,83 @@ pub(crate) fn interrupted_tool_update(call: &jessica_core::types::ToolCall) -> S
     SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call.id.clone(), fields))
 }
 
+/// Projects committed conversation history into replay updates.
+///
+/// ACP requires `session/load` to send the stored conversation through
+/// `session/update` before its response. System prompts and injected memory or
+/// skill guides stay internal. Each user and assistant text message gets its
+/// own message id, and tool calls are announced before their recorded results.
+/// Tool results without a preceding tool call are omitted so a client never
+/// receives an update for an id it has not seen.
+pub(crate) fn history_updates(cwd: &Path, history: &[Message]) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    let mut announced_calls = HashSet::new();
+    for (position, message) in history.iter().enumerate() {
+        match message.role {
+            Role::System => {}
+            Role::User if !message.content.is_empty() => {
+                updates.push(SessionUpdate::UserMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(
+                        message.content.clone(),
+                    )))
+                    .message_id(MessageId::new(format!("history-{position}-user"))),
+                ));
+            }
+            Role::User => {}
+            Role::Assistant => {
+                if !message.content.is_empty() {
+                    updates.push(SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::Text(TextContent::new(
+                            message.content.clone(),
+                        )))
+                        .message_id(MessageId::new(format!("history-{position}-assistant"))),
+                    ));
+                }
+                for call in &message.tool_calls {
+                    announced_calls.insert(call.id.as_str());
+                    let mut started =
+                        AcpToolCall::new(call.id.clone(), tool_title(&call.name, &call.arguments))
+                            .name(call.name.clone())
+                            .kind(tool_kind(&call.name))
+                            .status(ToolCallStatus::InProgress)
+                            .raw_input(truncate_raw_input(&call.arguments));
+                    let locations = tool_locations(cwd, &call.name, &call.arguments);
+                    if !locations.is_empty() {
+                        started = started.locations(locations);
+                    }
+                    updates.push(SessionUpdate::ToolCall(started));
+                }
+            }
+            Role::Tool => {
+                let Some(tool_call_id) = &message.tool_call_id else {
+                    continue;
+                };
+                if !announced_calls.contains(tool_call_id.as_str()) {
+                    continue;
+                }
+                let status = if message.content.starts_with("tool error:") {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                let text = truncate_text(&message.content, RAW_VALUE_BYTES);
+                let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+                    TextContent::new(text.clone()),
+                )))];
+                let fields = ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(content)
+                    .raw_output(Value::String(text));
+                updates.push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    tool_call_id.clone(),
+                    fields,
+                )));
+            }
+        }
+    }
+    updates
+}
+
 /// Maps a budget kind to the ACP stop reason it represents.
 pub(crate) fn budget_stop_reason(kind: Option<BudgetKind>) -> BudgetStopReason {
     match kind {
@@ -264,7 +342,7 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
-    use jessica_core::types::{SessionEndReason, ToolCall, ToolResult};
+    use jessica_core::types::{Message, SessionEndReason, ToolCall, ToolResult};
     use serde_json::json;
 
     fn mapper() -> AcpEventMapper {
@@ -518,5 +596,141 @@ mod tests {
             );
         }
         assert_eq!(budget_stop_reason(None), BudgetStopReason::MaxTurnRequests);
+    }
+
+    #[test]
+    fn history_replays_user_assistant_text_and_tool_lifecycle_in_order() {
+        let history = vec![
+            Message::system("internal bootstrap"),
+            Message::user("read NOTE.txt"),
+            Message::assistant_with_tool_calls(
+                "checking",
+                vec![ToolCall::new(
+                    "call_read",
+                    "read_file",
+                    json!({"path": "NOTE.txt"}),
+                )],
+            ),
+            Message::tool("call_read", "note contents"),
+            Message::assistant("done"),
+            Message::user("thanks"),
+        ];
+
+        let updates = history_updates(Path::new("/workspace"), &history);
+
+        let kinds: Vec<&str> = updates
+            .iter()
+            .map(|update| match update {
+                SessionUpdate::UserMessageChunk(_) => "user_message_chunk",
+                SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
+                SessionUpdate::ToolCall(_) => "tool_call",
+                SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
+                other => panic!("unexpected history update: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call_update",
+                "agent_message_chunk",
+                "user_message_chunk",
+            ],
+            "system bootstrap must be omitted and tool calls must precede results"
+        );
+        assert!(
+            !serde_json::to_string(&updates)
+                .expect("updates must serialize")
+                .contains("internal bootstrap")
+        );
+
+        let SessionUpdate::ToolCall(started) = &updates[2] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(started.tool_call_id.to_string(), "call_read");
+        assert_eq!(started.title, "read_file: NOTE.txt");
+        assert_eq!(started.status, ToolCallStatus::InProgress);
+        assert_eq!(started.kind, ToolKind::Read);
+        assert_eq!(
+            started.locations[0].path,
+            PathBuf::from("/workspace/NOTE.txt")
+        );
+
+        let SessionUpdate::ToolCallUpdate(finished) = &updates[3] else {
+            panic!("expected tool update");
+        };
+        assert_eq!(finished.tool_call_id.to_string(), "call_read");
+        assert_eq!(finished.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(
+            finished.fields.raw_output,
+            Some(Value::String("note contents".to_owned()))
+        );
+    }
+
+    #[test]
+    fn history_replays_failed_tools_and_gives_text_messages_distinct_ids() {
+        let history = vec![
+            Message::user("first"),
+            Message::assistant("first answer"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new(
+                    "call_bash",
+                    "bash",
+                    json!({"command": "false"}),
+                )],
+            ),
+            Message::tool("call_bash", "tool error: exit status 1"),
+        ];
+
+        let updates = history_updates(Path::new("/workspace"), &history);
+
+        let SessionUpdate::AgentMessageChunk(answer) = &updates[1] else {
+            panic!("expected assistant text");
+        };
+        let SessionUpdate::UserMessageChunk(question) = &updates[0] else {
+            panic!("expected user text");
+        };
+        assert_ne!(
+            answer.message_id, question.message_id,
+            "distinct history messages must not merge in the client"
+        );
+        let SessionUpdate::ToolCallUpdate(failed) = &updates[3] else {
+            panic!("expected tool update");
+        };
+        assert_eq!(failed.fields.status, Some(ToolCallStatus::Failed));
+        assert_eq!(
+            failed.fields.raw_output,
+            Some(Value::String("tool error: exit status 1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn history_skips_orphan_tool_messages_and_truncates_large_results() {
+        let history = vec![
+            Message::tool("orphan", "unattached"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new("call", "read_file", json!({"path": "a"}))],
+            ),
+            Message::tool("call", "x".repeat(RAW_VALUE_BYTES + 100)),
+        ];
+
+        let updates = history_updates(Path::new("/workspace"), &history);
+
+        assert_eq!(updates.len(), 2, "the orphan tool message must be skipped");
+        assert!(matches!(updates[0], SessionUpdate::ToolCall(_)));
+        let SessionUpdate::ToolCallUpdate(update) = &updates[1] else {
+            panic!("expected tool update");
+        };
+        let raw = update
+            .fields
+            .raw_output
+            .as_ref()
+            .and_then(Value::as_str)
+            .expect("raw output must be text");
+        assert_eq!(raw.len(), RAW_VALUE_BYTES);
     }
 }
