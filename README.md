@@ -78,6 +78,55 @@ changes to reloadable sections such as `[budget]`, `[policy]`, `[sensor]`,
 `events`, `memory`, `skills`, `wasm`, `reliability`, or `acp` reject the whole
 reload and keep the startup value. WASM tools are loaded once at startup.
 
+### Stdio MCP servers
+
+`session/new` accepts MCP servers using the **stdio** transport. Jessica starts
+one child process per server, runs the MCP `initialize` handshake, sends
+`notifications/initialized`, discovers tools with paginated `tools/list`, and
+returns the new session only after discovery succeeds. The command must be an
+absolute path; `args` and `env` are passed to the child, and the child's working
+directory is the session cwd. ACP-provided environment variables are overlaid
+on the inherited process environment.
+
+Each discovered tool is exposed to the model as
+`mcp__<server>__<tool>`. Characters that providers commonly reject are replaced
+with `_` in that provider-visible name; the original MCP tool name is still
+used for `tools/call`. MCP tools are **not** automatically allowed. Add the
+namespaced name to the policy allowlist explicitly:
+
+```toml
+[policy]
+allowed_tools = ["read_file", "mcp__filesystem__read_file"]
+```
+
+Policy is reloadable, so a later turn can pick up a changed allowlist. Every
+MCP call still passes through the same policy, `budget.tool_timeout_ms`,
+`ToolTimeoutGuard`, and `ResultSizeGuard` path as native and WASM tools.
+MCP `isError` results become failed `ToolResult`s; protocol and transport
+failures also become tool errors rather than panics. Text content is preserved,
+while image/audio payloads and other binary data are represented by short
+placeholders instead of being copied into the transcript.
+
+Fixed MCP bounds apply per session: at most 8 servers, at most 256 tools, a
+4 MiB maximum server line, 10 seconds for initialization and discovery, and an
+internal 60-second safety bound for a tool call (normally the configured tool
+timeout fires first). There are no MCP-specific configuration keys.
+
+MCP children are session-scoped. `session/close`, `session/delete`, transport
+failure, session creation failure, and process shutdown kill and reap every
+child. `session/cancel` only cancels the active prompt; it does not stop the
+session's MCP servers. Child stderr is drained and discarded, and MCP
+environment values and credentials are never logged, persisted, or included in
+ACP errors.
+
+HTTP and SSE MCP transports are not supported and return `-32602`. Invalid
+server declarations (empty or duplicate names, relative commands, too many
+servers, or colliding/oversized tool sets) also return `-32602`; failures after
+a process starts, including initialization or discovery errors, return a
+content-free `-32603` with `{"reason":"mcp_server_startup_failed"}`. Only
+`session/new` starts MCP servers: non-empty `mcpServers` on `session/load` or
+`session/resume` remain rejected with `-32602`.
+
 ### Session recovery and lifecycle
 
 Enable the persisted session lifecycle by configuring both the event store and
@@ -185,7 +234,7 @@ Paseo: add this entry under `agents.providers` in `~/.paseo/config.json`
           "OPENAI_MODEL": "your-model",
           "OPENAI_BASE_URL": "https://api.openai.com/v1"
         },
-        "supportsMcpServers": false,
+        "supportsMcpServers": true,
         "additionalModels": []
       }
     }
@@ -193,12 +242,15 @@ Paseo: add this entry under `agents.providers` in `~/.paseo/config.json`
 }
 ```
 
-Set `supportsMcpServers` to `false` because Jessica rejects non-empty
-`mcpServers` on `session/new`, `session/load`, and `session/resume`. Sessions
-are recoverable only when the harness file passed with `--config` configures
-`[events].path` and `[acp].state_dir`. With persistence, clients that check
-`loadSession` use `session/load`; clients that prefer the non-replaying
-lifecycle can use `session/resume`.
+`supportsMcpServers` may be `true`: Jessica accepts stdio MCP servers on
+`session/new`. A client that offers only HTTP/SSE MCP transports still receives
+`-32602`; use stdio servers. MCP servers are rejected on `session/load` and
+`session/resume`, so a client that persists MCP configuration should start a new
+session rather than resuming one with `mcpServers`. Sessions are recoverable
+only when the harness file passed with `--config` configures `[events].path`
+and `[acp].state_dir`. With persistence, clients that check `loadSession` use
+`session/load`; clients that prefer the non-replaying lifecycle can use
+`session/resume`.
 
 Paseo 0.15.x performs a **global** provider catalog probe with
 `cwd = $HOME`. Jessica's startup workspace root is the directory in which its
@@ -223,9 +275,10 @@ client's ACP documentation if it differs.
   `session/list` validates an optional filter cwd the same way.
 - Supported prompt content is text and `resource_link`. Image, audio, embedded
   resource blocks, and unknown variants are rejected before any model call.
-- **No MCP**: ACP v1 requires stdio MCP support, which this phase does not
-  implement. Non-empty `mcpServers` are rejected; MCP is a documented Phase 6
-  limitation, not silently ignored.
+- **MCP**: stdio servers are supported on `session/new`; their tools are
+  namespaced and go through the normal policy and guards. HTTP/SSE transports
+  are rejected, and `session/load`/`session/resume` still reject non-empty
+  `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
 - **No permission requests**: tools run under Jessica's configured policy
   allowlist. A denied call produces a failed `tool_call_update`; Jessica never
   sends `session/request_permission`.

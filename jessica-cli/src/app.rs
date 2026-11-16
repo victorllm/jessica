@@ -200,6 +200,14 @@ pub(crate) struct TurnRequest {
     /// per-turn `cli-{pid}-{counter}` id. Acceptance retries still allocate
     /// their own CLI ids.
     pub(crate) session_id: Option<SessionId>,
+    /// Session-scoped tools registered in addition to the built-in and WASM
+    /// tools.
+    ///
+    /// ACP uses this for MCP tools discovered for one session. Every tool is
+    /// still wrapped in [`GovernedTool`], so policy, timeout, and result-size
+    /// rules apply exactly as they do to native tools. The CLI and resume
+    /// paths pass an empty slice.
+    pub(crate) extra_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// Observable result of one reusable turn execution.
@@ -321,6 +329,7 @@ impl CliRuntime {
                 update_sink: None,
                 acceptance_retries: None,
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await?;
         Ok(outcome.reason)
@@ -346,13 +355,14 @@ impl CliRuntime {
             update_sink,
             acceptance_retries,
             session_id,
+            extra_tools,
         } = request;
 
         // One snapshot for the whole turn. `build_turn` and
         // `initial_messages` must never mix a newer published config with an
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
-        let setup = self.build_turn(&scope, true, &config, update_sink)?;
+        let setup = self.build_turn(&scope, true, &config, update_sink, &extra_tools)?;
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
         // skill recall, session recording, and every model request.
@@ -631,7 +641,7 @@ impl CliRuntime {
 
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
-        let setup = self.build_turn(&scope, false, &config, None)?;
+        let setup = self.build_turn(&scope, false, &config, None, &[])?;
         if setup.cancel.is_cancelled() {
             setup.shutdown();
             return Ok(SessionEndReason::Cancelled);
@@ -680,13 +690,16 @@ impl CliRuntime {
     /// recorded loop but never constructs a child factory or executor; a fresh
     /// turn constructs them only when `[delegation]` is enabled. `update_sink`
     /// selects silent protocol output for a programmatic client; without a
-    /// sink the pump keeps rendering to the terminal.
+    /// sink the pump keeps rendering to the terminal. `extra_tools` contains
+    /// session-scoped tools such as MCP discoveries; each is still wrapped in
+    /// [`GovernedTool`] by [`CliRuntime::build_tool_registry`].
     fn build_turn(
         &self,
         scope: &TurnScope,
         allow_delegation: bool,
         config: &HarnessConfig,
         update_sink: Option<Arc<dyn UpdateSink>>,
+        extra_tools: &[Arc<dyn Tool>],
     ) -> Result<TurnSetup, CliError> {
         let timeout = config.budget.tool_timeout();
         let token_guard = Arc::new(TokenBudgetGuard::new(config.budget.max_tokens));
@@ -733,6 +746,7 @@ impl CliRuntime {
             Arc::clone(&timeout_guard),
             Arc::clone(&result_guard),
             delegation,
+            extra_tools,
         )?;
         let agent = Arc::new(AgentLoop::new(
             provider,
@@ -812,6 +826,7 @@ impl CliRuntime {
         timeout_guard: Arc<ToolTimeoutGuard>,
         result_guard: Arc<ResultSizeGuard>,
         delegation: Option<Arc<AgentChildExecutor>>,
+        extra_tools: &[Arc<dyn Tool>],
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
 
@@ -848,6 +863,21 @@ impl CliRuntime {
             })?;
 
         for tool in &self.wasm_tools {
+            let name = tool.name().to_owned();
+            let governed = GovernedTool::new(
+                Arc::clone(tool),
+                Arc::clone(&harness),
+                Arc::clone(&governance),
+                timeout,
+                Arc::clone(&timeout_guard),
+                Arc::clone(&result_guard),
+            );
+            registry
+                .register(Arc::new(governed))
+                .map_err(|source| CliError::RegisterTool { name, source })?;
+        }
+
+        for tool in extra_tools {
             let name = tool.name().to_owned();
             let governed = GovernedTool::new(
                 Arc::clone(tool),
@@ -1615,7 +1645,13 @@ mod tests {
         let enabled_runtime = runtime_with(Arc::clone(&enabled_provider), enabled_config());
         let enabled_config_snapshot = enabled_runtime.config_snapshot();
         let setup = enabled_runtime
-            .build_turn(&test_scope().await, true, &enabled_config_snapshot, None)
+            .build_turn(
+                &test_scope().await,
+                true,
+                &enabled_config_snapshot,
+                None,
+                &[],
+            )
             .expect("turn should build");
         let reason = setup
             .agent
@@ -1640,7 +1676,13 @@ mod tests {
             runtime_with(Arc::clone(&disabled_provider), HarnessConfig::default());
         let disabled_config_snapshot = disabled_runtime.config_snapshot();
         let setup = disabled_runtime
-            .build_turn(&test_scope().await, true, &disabled_config_snapshot, None)
+            .build_turn(
+                &test_scope().await,
+                true,
+                &disabled_config_snapshot,
+                None,
+                &[],
+            )
             .expect("turn should build");
         setup
             .agent
@@ -1660,7 +1702,13 @@ mod tests {
         let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
         let resume_config_snapshot = resume_runtime.config_snapshot();
         let setup = resume_runtime
-            .build_turn(&test_scope().await, false, &resume_config_snapshot, None)
+            .build_turn(
+                &test_scope().await,
+                false,
+                &resume_config_snapshot,
+                None,
+                &[],
+            )
             .expect("turn should build");
         setup
             .agent
@@ -1691,7 +1739,7 @@ mod tests {
         let runtime = runtime_with(Arc::clone(&provider), enabled_config());
         let config = runtime.config_snapshot();
         let setup = runtime
-            .build_turn(&test_scope().await, true, &config, None)
+            .build_turn(&test_scope().await, true, &config, None, &[])
             .expect("turn should build");
 
         let reason = setup
@@ -2160,6 +2208,7 @@ mod tests {
                     update_sink: None,
                     acceptance_retries: None,
                     session_id: None,
+                    extra_tools: Vec::new(),
                 })
                 .await
                 .expect("turn must run");
@@ -2175,6 +2224,7 @@ mod tests {
                 update_sink: None,
                 acceptance_retries: None,
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await
             .expect("turn must run");
@@ -2250,10 +2300,10 @@ mod tests {
             .await
             .expect("scope b must build");
         let setup_a = runtime
-            .build_turn(&scope_a, false, &config, None)
+            .build_turn(&scope_a, false, &config, None, &[])
             .expect("turn a must build");
         let setup_b = runtime
-            .build_turn(&scope_b, false, &config, None)
+            .build_turn(&scope_b, false, &config, None, &[])
             .expect("turn b must build");
 
         parent_a.cancel();
@@ -2299,6 +2349,7 @@ mod tests {
             update_sink: None,
             acceptance_retries: None,
             session_id: None,
+            extra_tools: Vec::new(),
         });
         let canceller = async move {
             started.notified().await;
@@ -2372,6 +2423,7 @@ mod tests {
                 update_sink: None,
                 acceptance_retries: None,
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await
             .expect("turn must run");
@@ -2429,6 +2481,7 @@ mod tests {
                 update_sink: None,
                 acceptance_retries: None,
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await
             .expect("turn must run");
@@ -2463,6 +2516,7 @@ mod tests {
                 update_sink: Some(Arc::clone(&sink) as Arc<dyn UpdateSink>),
                 acceptance_retries: None,
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await
             .expect("turn must run");
@@ -2511,6 +2565,7 @@ mod tests {
                 update_sink: None,
                 acceptance_retries: Some(0),
                 session_id: None,
+                extra_tools: Vec::new(),
             })
             .await
             .expect("turn must run");

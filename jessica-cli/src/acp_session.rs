@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::v1::schema::ContentBlock;
+use jessica_core::tool::Tool;
 use jessica_core::types::{Message, Role, SessionId};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+
+use crate::mcp::McpSession;
 
 /// Process-wide session sequence.
 ///
@@ -125,6 +128,13 @@ pub(crate) struct AcpSession {
     /// current prompt without making the session permanently unusable when a
     /// client sends `session/cancel`.
     lifetime: CancellationToken,
+    /// MCP servers started for this session, attached exactly once before the
+    /// session is returned to the client.
+    ///
+    /// MCP children are session-scoped: `session/cancel` only cancels the
+    /// active prompt, while close, delete, transport failure, and process
+    /// shutdown cancel the lifetime and reclaim every child.
+    mcp: OnceLock<Arc<McpSession>>,
 }
 
 impl AcpSession {
@@ -194,9 +204,42 @@ impl AcpSession {
         true
     }
 
-    /// Cancels the session lifetime token and therefore any active prompt.
+    /// Cancels the session lifetime token and reclaims MCP child processes.
+    ///
+    /// Prompt cancellation does not call this method; only session close,
+    /// delete, transport failure, or process shutdown end the lifetime.
     pub(crate) fn cancel_lifetime(&self) {
         self.lifetime.cancel();
+        self.shutdown_mcp();
+    }
+
+    /// Attaches MCP servers discovered while handling `session/new`.
+    ///
+    /// The session has not been returned to the client yet, so a second attach
+    /// is an internal error. Returning the duplicate `Arc` would let the
+    /// caller report it, but normal ACP flow cannot reach that branch; the
+    /// duplicate is dropped and shuts its children down to avoid orphaning
+    /// them.
+    pub(crate) fn attach_mcp(&self, mcp: Arc<McpSession>) {
+        if self.mcp.set(mcp).is_err() {
+            tracing::warn!(session_id = %self.id, "acp session already has MCP servers");
+        }
+    }
+
+    /// Snapshots this session's MCP tools for one prompt turn.
+    ///
+    /// Every turn receives the same handles; the underlying connection and
+    /// child processes stay owned by the session. Closed sessions have no
+    /// tools because their lifetime shutdown discarded the MCP session.
+    pub(crate) fn mcp_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.mcp.get().map(|mcp| mcp.tools()).unwrap_or_default()
+    }
+
+    /// Shuts down MCP children if any were attached.
+    fn shutdown_mcp(&self) {
+        if let Some(mcp) = self.mcp.get() {
+            mcp.shutdown();
+        }
     }
 
     /// Waits until no prompt owns the session, up to `limit`.
@@ -465,6 +508,7 @@ impl AcpSessionRegistry {
             limits: self.limits,
             activity: watch::channel(()).0,
             lifetime: self.lifetime_parent.child_token(),
+            mcp: OnceLock::new(),
         });
         sessions.insert(id, Arc::clone(&session));
         Ok(session)

@@ -21,6 +21,14 @@
 //! not advertised; `session/close` remains available because it only releases
 //! live in-memory sessions.
 //!
+//! `session/new` starts stdio MCP servers supplied by the client. Their tools
+//! are exposed as `mcp__<server>__<tool>` and pass through the same policy,
+//! timeout, and result-size guards as native tools; they are not automatically
+//! allowed by the default policy. MCP children are reclaimed on close, delete,
+//! transport failure, and process shutdown. HTTP/SSE MCP servers and MCP
+//! servers on `session/load` or `session/resume` remain unsupported and are
+//! rejected with `-32602`.
+//!
 //! Limits are copied from the `[acp]` section at startup. Session IDs remain
 //! bounded by `max_sessions`, prompt text by `max_prompt_bytes`, and history by
 //! its message and byte limits; trimming removes only the oldest complete user
@@ -47,13 +55,14 @@ use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, Notice,
-    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    LoadSessionResponse, McpCapabilities, McpServer, MessageId, NewSessionRequest,
+    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
     SessionDeleteCapabilities, SessionId as AcpSessionId, SessionInfo, SessionListCapabilities,
     SessionNotification, SessionResumeCapabilities, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
+use jessica_core::tool::Tool;
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
 use serde_json::json;
 use tokio::sync::{OnceCell, mpsc, oneshot, watch};
@@ -71,6 +80,7 @@ use crate::acp_store::{AcpLoadError, AcpPersistence, AcpSessionIndex};
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
 use crate::config::HarnessConfig;
 use crate::hot_reload::ConfigWatcher;
+use crate::mcp::{MAX_MCP_SERVERS_PER_SESSION, McpError, McpSession, StdioServerConfig};
 use crate::pump::UpdateSink;
 use crate::shutdown::ShutdownController;
 
@@ -468,11 +478,7 @@ impl AcpService {
         if self.is_closing() {
             return Err(shutting_down_error());
         }
-        if !request.mcp_servers.is_empty() {
-            return Err(invalid_params(
-                "mcpServers are not supported in this ACP version",
-            ));
-        }
+        let mcp_configs = stdio_mcp_configs(&request.mcp_servers).map_err(mcp_config_error)?;
         if !request.additional_directories.is_empty() {
             return Err(invalid_params(
                 "additionalDirectories are not supported in this ACP version",
@@ -489,6 +495,24 @@ impl AcpService {
             .create(request.cwd)
             .await
             .map_err(session_error)?;
+        if !mcp_configs.is_empty() {
+            // Start MCP before returning session/new so the client never sees
+            // a session whose declared servers failed silently. Any already
+            // started child is reclaimed by McpSession::start; the session
+            // itself is removed here before the error response.
+            let mcp = match McpSession::start(mcp_configs, session.cwd()).await {
+                Ok(mcp) => mcp,
+                Err(error) => {
+                    self.registry.remove(session.id());
+                    tracing::warn!(
+                        error = %error,
+                        "acp MCP server startup failed"
+                    );
+                    return Err(mcp_start_error(error));
+                }
+            };
+            session.attach_mcp(mcp);
+        }
         if let Some(persistence) = &self.persistence
             && let Err(error) = persistence
                 .create_session(session.id(), session.cwd())
@@ -829,6 +853,7 @@ impl AcpService {
             }
         };
         let turn_id = session.next_turn_id();
+        let mcp_tools = session.mcp_tools();
         Ok(PreparedPrompt {
             session,
             history,
@@ -836,6 +861,7 @@ impl AcpService {
             turn_id,
             guard,
             activity,
+            mcp_tools,
         })
     }
 
@@ -954,11 +980,85 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Converts ACP MCP server declarations to validated stdio configurations.
+///
+/// Only `session/new` calls this. HTTP and SSE transports are rejected; the
+/// remaining name, command, duplicate, and tool-shape validation happens in
+/// [`McpSession::start`] before any child process is spawned.
+fn stdio_mcp_configs(servers: &[McpServer]) -> Result<Vec<StdioServerConfig>, McpError> {
+    if servers.len() > MAX_MCP_SERVERS_PER_SESSION {
+        return Err(McpError::TooManyServers {
+            max: MAX_MCP_SERVERS_PER_SESSION,
+        });
+    }
+    let mut configs = Vec::with_capacity(servers.len());
+    for server in servers {
+        match server {
+            McpServer::Stdio(server) => configs.push(StdioServerConfig {
+                name: server.name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.clone(), variable.value.clone()))
+                    .collect(),
+            }),
+            McpServer::Http(_) => {
+                return Err(McpError::UnsupportedTransport { transport: "http" });
+            }
+            McpServer::Sse(_) => {
+                return Err(McpError::UnsupportedTransport { transport: "sse" });
+            }
+            _ => {
+                return Err(McpError::UnsupportedTransport {
+                    transport: "unknown",
+                });
+            }
+        }
+    }
+    Ok(configs)
+}
+
+/// Maps MCP configuration errors to invalid params.
+///
+/// These errors are all caused by the client's `mcpServers` declaration and
+/// occur before any process is started.
+fn mcp_config_error(error: McpError) -> Error {
+    invalid_params(error.to_string())
+}
+
+/// Maps MCP startup failures to a stable JSON-RPC error.
+///
+/// Configuration and discovery-shape failures use `-32602`; process startup,
+/// protocol, timeout, and JSON-RPC failures use a content-free `-32603`.
+fn mcp_start_error(error: McpError) -> Error {
+    match error {
+        McpError::TooManyServers { .. }
+        | McpError::EmptyServerName
+        | McpError::DuplicateServerName { .. }
+        | McpError::InvalidCommand { .. }
+        | McpError::TooManyTools { .. }
+        | McpError::ToolNameCollision { .. }
+        | McpError::InvalidTool { .. } => invalid_params(error.to_string()),
+        McpError::UnsupportedTransport { .. }
+        | McpError::Spawn { .. }
+        | McpError::Protocol { .. }
+        | McpError::Timeout { .. }
+        | McpError::Rpc { .. }
+        | McpError::Closed { .. } => Error::new(
+            ErrorCode::INTERNAL_ERROR,
+            "MCP server initialization failed",
+        )
+        .data(json!({"reason": "mcp_server_startup_failed"})),
+    }
+}
+
 /// Rejects session lifecycle fields Jessica does not support.
 ///
-/// `session/load` and `session/resume` share these fields. Rejecting non-empty
-/// values keeps the advertised capability surface honest: Jessica neither
-/// connects MCP servers nor activates additional roots or custom prompts.
+/// `session/load` and `session/resume` share these fields. MCP servers are
+/// only started by `session/new`; load and resume still reject them, as do
+/// additional roots and custom prompts.
 fn reject_unsupported_lifecycle_fields(
     has_mcp_servers: bool,
     has_additional_directories: bool,
@@ -966,7 +1066,7 @@ fn reject_unsupported_lifecycle_fields(
 ) -> Result<(), Error> {
     if has_mcp_servers {
         return Err(invalid_params(
-            "mcpServers are not supported in this ACP version",
+            "mcpServers are only supported on session/new",
         ));
     }
     if has_additional_directories {
@@ -996,6 +1096,11 @@ struct PreparedPrompt {
     guard: PromptGuard,
     /// Counted until the prompt worker sends its final response.
     activity: PromptActivity,
+    /// Session-scoped MCP tools snapshotted before the worker starts.
+    ///
+    /// The worker drops the session handle early, so the tool `Arc`s must
+    /// travel with the prepared prompt.
+    mcp_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// Counts active prompt workers and stops accepting new ones during shutdown.
@@ -1126,6 +1231,7 @@ async fn run_prompt_worker(
         turn_id,
         mut guard,
         activity: _activity,
+        mcp_tools,
     } = prepared;
     let session_id = session.id().to_owned();
     let cwd = session.cwd().to_path_buf();
@@ -1151,6 +1257,7 @@ async fn run_prompt_worker(
             token: guard.token().clone(),
             sink,
             observations: Arc::clone(&observations),
+            extra_tools: mcp_tools,
         },
     )
     .await;
@@ -1254,6 +1361,8 @@ struct PromptExecutionRequest {
     sink: Arc<dyn UpdateSink>,
     /// Budget observations shared with the sink.
     observations: Arc<PromptObservations>,
+    /// Session-scoped MCP tools to register for this turn.
+    extra_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// Runs the agent loop and maps its terminal state.
@@ -1266,6 +1375,7 @@ async fn execute_prompt(service: &AcpService, request: PromptExecutionRequest) -
         token,
         sink,
         observations,
+        extra_tools,
     } = request;
     let runtime = match service.runtime().await {
         Ok(runtime) => runtime,
@@ -1284,6 +1394,7 @@ async fn execute_prompt(service: &AcpService, request: PromptExecutionRequest) -
             // ACP-2 deliberately runs at most one acceptance attempt.
             acceptance_retries: Some(0),
             session_id: Some(turn_id),
+            extra_tools,
         })
         .await
     {
@@ -1499,8 +1610,9 @@ async fn update_barrier(updates: &mpsc::UnboundedSender<WriterMessage>) -> bool 
 /// store were opened at startup. `session/close` is always advertised because
 /// it only releases live in-memory state and needs no index. Every other
 /// optional capability stays explicitly disabled so clients never probe
-/// unsupported content types, MCP transports, or lifecycle methods. Baseline
-/// text and resource-link prompts are always supported.
+/// unsupported content types, HTTP/SSE MCP transports, or lifecycle methods.
+/// Stdio MCP has no capability flag in ACP v1 and is accepted by `session/new`.
+/// Baseline text and resource-link prompts are always supported.
 fn initialize_response(request: &InitializeRequest, persistence: bool) -> InitializeResponse {
     tracing::debug!(
         requested_protocol_version = request.protocol_version.as_u16(),
@@ -1805,6 +1917,7 @@ mod tests {
                 token: guard.token().clone(),
                 sink: Arc::new(NullSink),
                 observations: Arc::new(PromptObservations::default()),
+                extra_tools: Vec::new(),
             },
         )
         .await;
@@ -2077,18 +2190,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_rejects_mcp_additional_roots_and_system_prompt() {
+    async fn session_new_rejects_unsupported_mcp_transports_and_fields() {
         let root = temp_root("new-session");
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         let (service, _config) = service_with(provider, &root, HarnessConfig::default());
 
-        let mut with_mcp = NewSessionRequest::new(root.clone());
-        with_mcp.mcp_servers = vec![agent_client_protocol::v1::schema::McpServer::Stdio(
-            agent_client_protocol::v1::schema::McpServerStdio::new(
-                "server",
-                PathBuf::from("/bin/server"),
+        let mut with_http = NewSessionRequest::new(root.clone());
+        with_http.mcp_servers = vec![agent_client_protocol::v1::schema::McpServer::Http(
+            agent_client_protocol::v1::schema::McpServerHttp::new(
+                "remote",
+                "https://example.invalid/mcp",
             ),
         )];
+        let mut with_sse = NewSessionRequest::new(root.clone());
+        with_sse.mcp_servers = vec![agent_client_protocol::v1::schema::McpServer::Sse(
+            agent_client_protocol::v1::schema::McpServerSse::new(
+                "remote",
+                "https://example.invalid/mcp",
+            ),
+        )];
+        let mut with_relative_command = NewSessionRequest::new(root.clone());
+        with_relative_command.mcp_servers =
+            vec![agent_client_protocol::v1::schema::McpServer::Stdio(
+                agent_client_protocol::v1::schema::McpServerStdio::new(
+                    "server",
+                    PathBuf::from("relative-server"),
+                ),
+            )];
         let mut with_directory = NewSessionRequest::new(root.clone());
         with_directory.additional_directories = vec![root.clone()];
         let mut with_prompt = NewSessionRequest::new(root);
@@ -2097,7 +2225,13 @@ mod tests {
                 ContentBlock::Text(TextContent::new("custom")),
             ]));
 
-        for request in [with_mcp, with_directory, with_prompt] {
+        for request in [
+            with_http,
+            with_sse,
+            with_relative_command,
+            with_directory,
+            with_prompt,
+        ] {
             let error = service
                 .new_session(request)
                 .await

@@ -11,6 +11,7 @@ mod delegation;
 mod events;
 mod governance;
 mod hot_reload;
+mod mcp;
 mod memory;
 mod pump;
 mod replay;
