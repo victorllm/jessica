@@ -22,6 +22,24 @@ use tokio::time::timeout;
 /// Upper bound for any single protocol round trip or process exit.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Python interpreter used to run the deterministic MCP fixture.
+const PYTHON: &str = "/usr/bin/python3";
+
+/// Absolute path to the MCP stdio fixture.
+const MCP_STUB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_stub.py");
+
+/// Requires the local interpreter and fixture before starting an MCP test.
+fn assert_mcp_fixture_available() {
+    assert!(
+        Path::new(PYTHON).is_file(),
+        "MCP acceptance requires the Python interpreter at {PYTHON}"
+    );
+    assert!(
+        Path::new(MCP_STUB).is_file(),
+        "MCP acceptance requires the fixture at {MCP_STUB}"
+    );
+}
+
 /// One running ACP agent process under test.
 struct AcpProcess {
     /// Child process; stdin is taken when the test closes the stream.
@@ -598,6 +616,130 @@ async fn request_response(acp: &mut AcpProcess, id: u64, method: &str, params: V
     acp.recv().await
 }
 
+/// Builds one ACP stdio MCP server declaration for the fixture.
+fn mcp_stdio_server(environment: &[(&str, String)]) -> Value {
+    let env: Vec<Value> = environment
+        .iter()
+        .map(|(name, value)| json!({"name": name, "value": value}))
+        .collect();
+    json!({
+        "name": "stub",
+        "command": PYTHON,
+        "args": ["-I", MCP_STUB],
+        "env": env,
+    })
+}
+
+/// Returns the fixture's environment for one test workspace and mode.
+fn mcp_stub_env(
+    workspace: &TempDir,
+    mode: &str,
+    secret: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut environment = vec![
+        ("MCP_STUB_MODE", mode.to_owned()),
+        ("MCP_STUB_PID_FILE", mcp_pid_path(workspace)),
+        ("MCP_STUB_CALL_LOG", mcp_call_log_path(workspace)),
+    ];
+    if let Some(secret) = secret {
+        environment.push(("MCP_STUB_SECRET", secret.to_owned()));
+        environment.push(("MCP_STUB_REQUIRE_SECRET", secret.to_owned()));
+    }
+    environment
+}
+
+/// Returns the fixture pid-file path for one workspace.
+fn mcp_pid_path(workspace: &TempDir) -> String {
+    workspace
+        .path
+        .join("mcp.pid")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Returns the fixture tool-call-log path for one workspace.
+fn mcp_call_log_path(workspace: &TempDir) -> String {
+    workspace
+        .path
+        .join("mcp-calls.log")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Writes a harness configuration with a fixed MCP tool allowlist.
+fn write_mcp_config(workspace: &TempDir, allowed_tools: &[&str], tool_timeout_ms: u64) -> PathBuf {
+    let path = workspace.path.join("harness.toml");
+    let allowed_tools =
+        serde_json::to_string(allowed_tools).expect("allowlist must serialize as JSON");
+    std::fs::write(
+        &path,
+        format!(
+            "[budget]\nmax_rounds = 4\nmax_tokens = 100000\n\
+             tool_timeout_ms = {tool_timeout_ms}\n\n\
+             [policy]\nallowed_tools = {allowed_tools}\n"
+        ),
+    )
+    .expect("harness configuration must be written");
+    path
+}
+
+/// Creates a session declaring exactly one stdio MCP server.
+async fn create_mcp_session(acp: &mut AcpProcess, id: u64, cwd: &Path, server: Value) -> Value {
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/new",
+        "params": {
+            "cwd": cwd.to_str().expect("utf-8 cwd"),
+            "mcpServers": [server],
+        },
+    }))
+    .await;
+    acp.recv().await
+}
+
+/// Waits for the fixture to publish its pid.
+async fn wait_for_mcp_pid(path: &Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = tokio::fs::read_to_string(path).await
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "MCP stub did not write its pid file at {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until the operating system no longer reports the process.
+///
+/// A killed but unreaped child remains visible as a zombie in `/proc`, so this
+/// also verifies that Jessica reaped the MCP child rather than only signalling
+/// it.
+async fn wait_for_process_gone(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "MCP child {pid} was not reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Returns the fixture's recorded tool invocations.
+fn mcp_call_log(workspace: &TempDir) -> String {
+    std::fs::read_to_string(mcp_call_log_path(workspace)).unwrap_or_default()
+}
+
 /// Sends `session/load` and collects every replay update before its response.
 async fn load_session_until_response(
     acp: &mut AcpProcess,
@@ -797,11 +939,6 @@ async fn acp_session_new_validates_cwd_and_rejects_unsupported_fields() {
         ("missing", json!(workspace.path.join("missing")), None),
         ("file", json!(file), None),
         ("outside", json!(outside.path), None),
-        (
-            "mcp",
-            json!(workspace.path),
-            Some(json!([{"name": "server", "command": "/bin/true", "args": [], "env": []}])),
-        ),
     ];
 
     for (index, (label, cwd, mcp_servers)) in cases.into_iter().enumerate() {
@@ -1358,7 +1495,7 @@ async fn acp_session_load_handles_empty_state_and_stable_errors() {
     let unsupported = second.recv().await;
     assert_eq!(
         unsupported["error"]["code"], -32602,
-        "load must reject MCP servers just like session/new: {unsupported}"
+        "load must reject MCP servers because only session/new starts them: {unsupported}"
     );
 
     let (replayed, empty) =
@@ -1861,7 +1998,7 @@ async fn acp_session_resume_restores_context_without_replaying_history() {
     .await;
     assert_eq!(
         unsupported["error"]["code"], -32602,
-        "resume must reject MCP servers like load: {unsupported}"
+        "resume must reject MCP servers because only session/new starts them: {unsupported}"
     );
 
     let (_, continued) = prompt_until_response(
@@ -3092,4 +3229,401 @@ async fn acp_config_flag_is_honored_before_serving() {
         acp.remaining_stderr().await.contains("configuration"),
         "the configuration failure must be reported on stderr"
     );
+}
+
+#[tokio::test]
+async fn acp_mcp_stdio_discovers_and_invokes_namespaced_tool() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-invoke");
+    let secret = "mcp-secret-must-not-leak";
+    let config = write_mcp_config(&workspace, &["mcp__stub__echo"], 10_000);
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_mcp_echo",
+            "mcp__stub__echo",
+            json!({"text": "hello from mcp"}),
+        )]),
+        text_response("mcp turn complete"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", Some(secret))),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stdio MCP session must be created: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "the MCP child must be running after session/new"
+    );
+
+    let (updates, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "use the MCP echo tool"}]),
+    )
+    .await;
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "the MCP-backed turn must complete: {prompt_response}"
+    );
+    let started = updates
+        .iter()
+        .find(|update| update_kind(update) == "tool_call" && update["name"] == "mcp__stub__echo")
+        .unwrap_or_else(|| panic!("the namespaced MCP tool must start: {updates:?}"));
+    assert!(
+        started.get("kind").is_none(),
+        "ACP omits the default `other` tool kind: {started}"
+    );
+    assert_eq!(started["rawInput"], json!({"text": "hello from mcp"}));
+    let finished = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_mcp_echo"
+        })
+        .unwrap_or_else(|| panic!("the MCP tool must finish: {updates:?}"));
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["rawOutput"], "hello from mcp");
+    assert_eq!(
+        mcp_call_log(&workspace).trim(),
+        "echo",
+        "exactly one real MCP tools/call must have occurred"
+    );
+
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2, "one tool round plus one final answer");
+    assert!(
+        requests[0].contains("mcp__stub__echo"),
+        "the provider must receive the namespaced MCP tool schema"
+    );
+    assert!(
+        requests[1].contains("hello from mcp"),
+        "the MCP result must be returned to the model"
+    );
+    assert!(
+        !requests.iter().any(|request| request.contains(secret)),
+        "MCP environment values must never reach the provider"
+    );
+    assert!(
+        !format!("{updates:?}{prompt_response}").contains(secret),
+        "MCP environment values must never reach protocol updates"
+    );
+
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;
+    assert!(
+        close.get("result").is_some(),
+        "closing the MCP session must succeed: {close}"
+    );
+    wait_for_process_gone(pid).await;
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    let stderr = acp.remaining_stderr().await;
+    assert!(
+        !stderr.contains(secret),
+        "the drained MCP stderr must not be logged: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn acp_mcp_tool_is_denied_by_policy_without_reaching_server() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-denied");
+    let config = write_mcp_config(&workspace, &["read_file"], 10_000);
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_denied",
+            "mcp__stub__echo",
+            json!({"text": "must not reach stub"}),
+        )]),
+        text_response("adapted after policy denial"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", None)),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stdio MCP session must be created: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+
+    let (updates, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "try the MCP tool"}]),
+    )
+    .await;
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "the model may adapt after a policy denial: {prompt_response}"
+    );
+    let failed = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_denied"
+        })
+        .unwrap_or_else(|| panic!("the denied MCP tool must finish: {updates:?}"));
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("denied by policy")),
+        "the model must see the policy denial: {failed}"
+    );
+    assert_eq!(
+        mcp_call_log(&workspace),
+        "",
+        "a policy-denied MCP tool must never reach the child process"
+    );
+
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].contains("denied by policy"),
+        "the denial must be returned to the model"
+    );
+
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+    wait_for_process_gone(pid).await;
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_mcp_tool_timeout_ends_turn_and_close_reaps_child() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-timeout");
+    let config = write_mcp_config(&workspace, &["mcp__stub__slow"], 250);
+    let provider = MockProvider::start(vec![tool_calls_response(&[(
+        "call_slow",
+        "mcp__stub__slow",
+        json!({"seconds": 30}),
+    )])]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", None)),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stdio MCP session must be created: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+
+    let started = Instant::now();
+    let (updates, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "call the slow MCP tool"}]),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the configured tool timeout must stop the MCP call promptly"
+    );
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "max_turn_requests",
+        "a tool timeout is a governed turn boundary: {prompt_response}"
+    );
+    let statuses: Vec<&str> = updates
+        .iter()
+        .filter(|update| matches!(update_kind(update), "tool_call" | "tool_call_update"))
+        .filter_map(|update| update["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["in_progress", "failed"],
+        "the timed-out MCP call must end failed and never remain in progress: {updates:?}"
+    );
+    assert_eq!(
+        mcp_call_log(&workspace).trim(),
+        "slow",
+        "the timeout must occur after the call reached the MCP server"
+    );
+
+    assert_eq!(provider.finish().len(), 1);
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+    wait_for_process_gone(pid).await;
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_mcp_startup_failures_return_internal_error_and_reap_child() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-startup-failure");
+    let mut acp = AcpProcess::spawn_in(Some(&workspace.path), &[], &[]).await;
+    handshake(&mut acp).await;
+
+    for (index, mode) in ["init-error", "list-error", "malformed"]
+        .into_iter()
+        .enumerate()
+    {
+        let pid_file = workspace.path.join("mcp.pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let response = create_mcp_session(
+            &mut acp,
+            2 + index as u64,
+            &workspace.path,
+            mcp_stdio_server(&mcp_stub_env(&workspace, mode, None)),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"], -32603,
+            "{mode} must fail session creation without leaking protocol details: {response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["reason"], "mcp_server_startup_failed",
+            "the error data must carry the stable MCP startup reason: {response}"
+        );
+        let pid = wait_for_mcp_pid(&pid_file).await;
+        wait_for_process_gone(pid).await;
+    }
+
+    let _ = std::fs::remove_file(workspace.path.join("mcp.pid"));
+    let response = create_mcp_session(
+        &mut acp,
+        10,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", None)),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the agent must still create sessions: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+    let close =
+        request_response(&mut acp, 11, "session/close", json!({"sessionId": session})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+    wait_for_process_gone(pid).await;
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_mcp_children_are_reaped_on_shutdown_and_env_is_not_logged() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-shutdown");
+    let secret = "shutdown-secret-must-not-leak";
+    let mut acp = AcpProcess::spawn_in(Some(&workspace.path), &[], &[]).await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", Some(secret))),
+    )
+    .await;
+    assert!(
+        response["result"]["sessionId"].is_string(),
+        "the session must start with the expected secret: {response}"
+    );
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "the MCP child must be alive before shutdown"
+    );
+    assert!(
+        !response.to_string().contains(secret),
+        "environment values must not appear in session/new output"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    wait_for_process_gone(pid).await;
+    let stderr = acp.remaining_stderr().await;
+    assert!(
+        !stderr.contains(secret),
+        "MCP child stderr must be drained without being logged: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn acp_session_new_rejects_http_mcp_and_keeps_running() {
+    let workspace = TempDir::new("mcp-http");
+    let mut acp = AcpProcess::spawn_in(Some(&workspace.path), &[], &[]).await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        json!({
+            "name": "remote",
+            "url": "https://example.invalid/mcp",
+            "headers": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "HTTP MCP must be rejected because only stdio is supported: {response}"
+    );
+    assert!(
+        response.get("result").is_none(),
+        "HTTP MCP must not create a session: {response}"
+    );
+
+    // The failed request must not poison later session creation.
+    let created = create_session(&mut acp, 3, &workspace.path).await;
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": created})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
 }
