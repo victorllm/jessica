@@ -1,18 +1,25 @@
 //! Stable ACP v1 agent transport over stdio.
 //!
-//! The server implements `initialize`, `session/new`, `session/load` (when
-//! persistence is configured), `session/prompt`, and `session/cancel`. A prompt
-//! is prepared synchronously (session lookup, content validation, busy check),
-//! then model and tool work runs in a task spawned on the connection so the SDK
-//! dispatch loop keeps receiving messages. Cancellation is scoped to one
-//! session prompt; sessions run concurrently and process shutdown or stdin EOF
-//! cancels every session before a bounded drain.
+//! The server implements `initialize`, `session/new`, `session/prompt`,
+//! `session/cancel`, and `session/close`. When persistence is configured it
+//! also implements `session/load`, `session/list`, `session/resume`, and
+//! `session/delete`. A prompt is prepared synchronously (session lookup,
+//! content validation, busy check), then model and tool work runs in a task
+//! spawned on the connection so the SDK dispatch loop keeps receiving
+//! messages. Cancellation is scoped to one session prompt; sessions run
+//! concurrently and process shutdown or stdin EOF cancels every session
+//! before a bounded drain.
 //!
 //! When `[acp].state_dir` and `[events].path` are both configured, each ACP
 //! session is indexed on disk and every committed prompt turn is linked to its
 //! event-store stream. `session/load` reconstructs the newest stable history
 //! from those turns and replays it as `session/update` notifications before the
-//! load response. Without persistence, `loadSession` is not advertised.
+//! load response. `session/resume` restores the same context without replay.
+//! `session/list` exposes only session id, cwd, and last-update time.
+//! `session/delete` removes only the index; the event store stays append-only.
+//! Without persistence, `loadSession` and all indexed lifecycle methods are
+//! not advertised; `session/close` remains available because it only releases
+//! live in-memory sessions.
 //!
 //! Limits are copied from the `[acp]` section at startup. Session IDs remain
 //! bounded by `max_sessions`, prompt text by `max_prompt_bytes`, and history by
@@ -37,10 +44,14 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, CancelNotification, Implementation, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, McpCapabilities, MessageId, NewSessionRequest,
-    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionCapabilities, SessionId as AcpSessionId, SessionNotification, SessionUpdate, StopReason,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, Notice,
+    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionDeleteCapabilities, SessionId as AcpSessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
@@ -56,7 +67,7 @@ use crate::acp_events::{
 use crate::acp_session::{
     AcpSession, AcpSessionRegistry, HistoryLimits, PromptGuard, SessionError, prompt_text,
 };
-use crate::acp_store::{AcpLoadError, AcpPersistence};
+use crate::acp_store::{AcpLoadError, AcpPersistence, AcpSessionIndex};
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
 use crate::config::HarnessConfig;
 use crate::hot_reload::ConfigWatcher;
@@ -68,6 +79,18 @@ const PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Time allowed for the transport to flush after prompts have drained.
 const TRANSPORT_FLUSH_GRACE: Duration = Duration::from_millis(250);
+
+/// Number of sessions returned by one `session/list` page.
+const SESSION_LIST_PAGE_SIZE: usize = 100;
+
+/// Prefix marking the versioned opaque `session/list` cursor.
+const SESSION_LIST_CURSOR_PREFIX: &str = "acp-list-v1:";
+
+/// Maximum accepted cursor length, well above any real cursor.
+const SESSION_LIST_CURSOR_MAX_BYTES: usize = 512;
+
+/// Bounded wait for a closed or deleted session's active prompt to stop.
+const SESSION_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serves stable ACP v1 over stdin/stdout until EOF or shutdown.
 ///
@@ -96,6 +119,10 @@ pub(crate) async fn run(
     let initialize_service = Arc::clone(&service);
     let new_session_service = Arc::clone(&service);
     let load_session_service = Arc::clone(&service);
+    let list_sessions_service = Arc::clone(&service);
+    let delete_session_service = Arc::clone(&service);
+    let resume_session_service = Arc::clone(&service);
+    let close_session_service = Arc::clone(&service);
     let prompt_service = Arc::clone(&service);
     let cancel_service = Arc::clone(&service);
     let connection = Agent
@@ -121,6 +148,42 @@ pub(crate) async fn run(
                 load_session_service
                     .load_session(request, responder, connection)
                     .await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ListSessionsRequest, responder, _connection| {
+                match list_sessions_service.list_sessions(request).await {
+                    Ok(response) => responder.respond(response),
+                    Err(error) => responder.respond_with_error(error),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: DeleteSessionRequest, responder, _connection| {
+                match delete_session_service.delete_session(request).await {
+                    Ok(response) => responder.respond(response),
+                    Err(error) => responder.respond_with_error(error),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ResumeSessionRequest, responder, _connection| {
+                match resume_session_service.resume_session(request).await {
+                    Ok(response) => responder.respond(response),
+                    Err(error) => responder.respond_with_error(error),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CloseSessionRequest, responder, _connection| {
+                match close_session_service.close_session(request).await {
+                    Ok(response) => responder.respond(response),
+                    Err(error) => responder.respond_with_error(error),
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -457,22 +520,14 @@ impl AcpService {
             return responder.respond_with_error(shutting_down_error());
         }
         let Some(persistence) = &self.persistence else {
-            return responder.respond_with_error(session_load_unsupported());
+            return responder.respond_with_error(persistence_required());
         };
-        if !request.mcp_servers.is_empty() {
-            return responder.respond_with_error(invalid_params(
-                "mcpServers are not supported in this ACP version",
-            ));
-        }
-        if !request.additional_directories.is_empty() {
-            return responder.respond_with_error(invalid_params(
-                "additionalDirectories are not supported in this ACP version",
-            ));
-        }
-        if request.system_prompt.is_some() {
-            return responder.respond_with_error(invalid_params(
-                "systemPrompt is not supported in this ACP version",
-            ));
+        if let Err(error) = reject_unsupported_lifecycle_fields(
+            !request.mcp_servers.is_empty(),
+            !request.additional_directories.is_empty(),
+            request.system_prompt.is_some(),
+        ) {
+            return responder.respond_with_error(error);
         }
 
         let session_id = request.session_id.to_string();
@@ -480,25 +535,13 @@ impl AcpService {
             return responder.respond_with_error(invalid_params("session is already loaded"));
         }
 
-        let index = match persistence.lookup(&session_id).await {
-            Ok(Some(index)) => index,
-            Ok(None) => {
-                return responder.respond_with_error(session_not_found(&request.session_id));
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "acp session index lookup failed");
-                return responder.respond_with_error(internal_load_error());
-            }
+        let index = match self
+            .resolve_persisted_session(persistence, &request.session_id, request.cwd)
+            .await
+        {
+            Ok(index) => index,
+            Err(error) => return responder.respond_with_error(error),
         };
-
-        let cwd = match self.registry.validate_cwd(request.cwd).await {
-            Ok(cwd) => cwd,
-            Err(error) => return responder.respond_with_error(session_error(error)),
-        };
-        if cwd != index.cwd() {
-            return responder
-                .respond_with_error(invalid_params("cwd does not match the persisted session"));
-        }
 
         let history = match persistence.history_for(&index).await {
             Ok(history) => history,
@@ -510,7 +553,7 @@ impl AcpService {
         let replay_history = history.clone();
         let session = match self
             .registry
-            .restore(session_id.clone(), cwd, history)
+            .restore(session_id.clone(), index.cwd().to_path_buf(), history)
             .await
         {
             Ok(session) => session,
@@ -533,6 +576,238 @@ impl AcpService {
         }
         tracing::debug!(session_id = session.id(), "acp session loaded");
         Ok(())
+    }
+
+    /// Looks up a persisted session and verifies its canonical cwd.
+    ///
+    /// The request cwd must resolve to exactly the cwd recorded when the
+    /// session was created. The caller receives the index whose cwd is already
+    /// canonical, so it can restore the session without resolving it again.
+    async fn resolve_persisted_session(
+        &self,
+        persistence: &AcpPersistence,
+        session_id: &AcpSessionId,
+        requested_cwd: PathBuf,
+    ) -> Result<AcpSessionIndex, Error> {
+        let session_id_string = session_id.to_string();
+        let index = match persistence.lookup(&session_id_string).await {
+            Ok(Some(index)) => index,
+            Ok(None) => return Err(session_not_found(session_id)),
+            Err(error) => {
+                tracing::warn!(error = %error, "acp session index lookup failed");
+                return Err(internal_load_error());
+            }
+        };
+        let cwd = self
+            .registry
+            .validate_cwd(requested_cwd)
+            .await
+            .map_err(session_error)?;
+        if cwd != index.cwd() {
+            return Err(invalid_params("cwd does not match the persisted session"));
+        }
+        Ok(index)
+    }
+
+    /// Implements `session/list`.
+    ///
+    /// Results are filtered to the startup workspace root and optionally to
+    /// one exact canonical cwd. Ordering is `updatedAt` descending with the
+    /// session id ascending as a deterministic tie-break. Only session id,
+    /// cwd, and `updatedAt` are exposed; titles and conversation content are
+    /// never returned.
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
+        let Some(persistence) = &self.persistence else {
+            return Err(persistence_required());
+        };
+        let cwd_filter = match request.cwd {
+            Some(cwd) => Some(
+                self.registry
+                    .validate_cwd(cwd)
+                    .await
+                    .map_err(session_error)?,
+            ),
+            None => None,
+        };
+        let cursor = match request.cursor.as_deref() {
+            Some(value) => Some(decode_list_cursor(value)?),
+            None => None,
+        };
+
+        let mut indexes = persistence.list().await.map_err(|error| {
+            tracing::warn!(error = %error, "acp session index listing failed");
+            internal_list_error()
+        })?;
+        indexes.retain(|index| {
+            index.cwd().starts_with(&self.root)
+                && cwd_filter.as_ref().is_none_or(|cwd| index.cwd() == cwd)
+        });
+        indexes.sort_by(|left, right| {
+            right
+                .updated_at()
+                .cmp(&left.updated_at())
+                .then_with(|| left.session_id().cmp(right.session_id()))
+        });
+        if let Some(cursor) = &cursor {
+            indexes.retain(|index| cursor.is_before(index));
+        }
+
+        let page_len = indexes.len().min(SESSION_LIST_PAGE_SIZE);
+        let sessions = indexes[..page_len]
+            .iter()
+            .map(|index| {
+                let mut info = SessionInfo::new(
+                    AcpSessionId::new(index.session_id().to_owned()),
+                    index.cwd().to_path_buf(),
+                );
+                if let Some(updated_at) = format_rfc3339_millis(index.updated_at()) {
+                    info = info.updated_at(updated_at);
+                }
+                info
+            })
+            .collect();
+        let next_cursor = if indexes.len() > page_len {
+            Some(encode_list_cursor(&indexes[page_len - 1]))
+        } else {
+            None
+        };
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
+    }
+
+    /// Implements `session/delete`.
+    ///
+    /// Deleting removes the ACP index and cancels a live session, but never
+    /// removes event-store rows. A repeated delete of an unknown session maps
+    /// to the protocol's session-not-found error.
+    async fn delete_session(
+        &self,
+        request: DeleteSessionRequest,
+    ) -> Result<DeleteSessionResponse, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
+        let Some(persistence) = &self.persistence else {
+            return Err(persistence_required());
+        };
+        let session_id = request.session_id.to_string();
+        let live = self.registry.get(&session_id);
+        let was_live = live.is_some();
+        let deleted = persistence.delete(&session_id).await.map_err(|error| {
+            tracing::warn!(error = %error, "acp session index deletion failed");
+            internal_delete_error()
+        })?;
+        if let Some(session) = live {
+            self.registry.remove(&session_id);
+            if !session.wait_idle(SESSION_CLOSE_DRAIN_TIMEOUT).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "acp deleted session drain timed out"
+                );
+            }
+        }
+        if !deleted && !was_live {
+            return Err(session_not_found(&request.session_id));
+        }
+        tracing::debug!(session_id = %session_id, "acp session deleted");
+        Ok(DeleteSessionResponse::new())
+    }
+
+    /// Implements `session/resume`.
+    ///
+    /// Unlike `session/load`, resume restores conversation context without
+    /// replaying it. Resuming an already live session with the same cwd is
+    /// idempotent. The index is retained on disk.
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
+        let Some(persistence) = &self.persistence else {
+            return Err(persistence_required());
+        };
+        reject_unsupported_lifecycle_fields(
+            !request.mcp_servers.is_empty(),
+            !request.additional_directories.is_empty(),
+            request.system_prompt.is_some(),
+        )?;
+
+        let session_id = request.session_id.to_string();
+        if let Some(session) = self.registry.get(&session_id) {
+            let cwd = self
+                .registry
+                .validate_cwd(request.cwd)
+                .await
+                .map_err(session_error)?;
+            if session.cwd() != cwd {
+                return Err(invalid_params("cwd does not match the persisted session"));
+            }
+            tracing::debug!(session_id = %session_id, "acp live session resumed");
+            return Ok(ResumeSessionResponse::new());
+        }
+
+        let index = self
+            .resolve_persisted_session(persistence, &request.session_id, request.cwd)
+            .await?;
+        let history = match persistence.history_for(&index).await {
+            Ok(history) => history,
+            Err(AcpLoadError::NoRecoverableTurn { .. }) => {
+                tracing::warn!("acp session has no recoverable turn");
+                return Err(internal_resume_error());
+            }
+        };
+        let session = self
+            .registry
+            .restore(session_id.clone(), index.cwd().to_path_buf(), history)
+            .await
+            .map_err(session_error)?;
+        tracing::debug!(session_id = session.id(), "acp session resumed");
+        Ok(ResumeSessionResponse::new())
+    }
+
+    /// Implements `session/close`.
+    ///
+    /// Close always releases in-memory state and cancels active work. When
+    /// persistence is configured, the index is deliberately retained so the
+    /// client can load or resume the session later. Closing an indexed session
+    /// that is not live is an idempotent success.
+    async fn close_session(
+        &self,
+        request: CloseSessionRequest,
+    ) -> Result<CloseSessionResponse, Error> {
+        if self.is_closing() {
+            return Err(shutting_down_error());
+        }
+        let session_id = request.session_id.to_string();
+        if let Some(session) = self.registry.get(&session_id) {
+            self.registry.remove(&session_id);
+            if !session.wait_idle(SESSION_CLOSE_DRAIN_TIMEOUT).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "acp closed session drain timed out"
+                );
+            }
+            tracing::debug!(session_id = %session_id, "acp session closed");
+            return Ok(CloseSessionResponse::new());
+        }
+        if let Some(persistence) = &self.persistence {
+            match persistence.exists(&session_id).await {
+                Ok(true) => return Ok(CloseSessionResponse::new()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "acp session existence check failed");
+                    return Err(internal_close_error());
+                }
+            }
+        }
+        Err(session_not_found(&request.session_id))
     }
 
     /// Validates a prompt and acquires the session's single prompt lease.
@@ -579,6 +854,132 @@ impl AcpService {
         }));
         service
     }
+}
+
+/// Position of the last session returned by one `session/list` page.
+#[derive(Debug)]
+struct SessionListCursor {
+    /// Update time of the last returned session.
+    updated_at: u64,
+    /// Session id of the last returned session.
+    session_id: String,
+}
+
+impl SessionListCursor {
+    /// Returns whether `index` sorts strictly after this cursor.
+    fn is_before(&self, index: &AcpSessionIndex) -> bool {
+        index.updated_at() < self.updated_at
+            || (index.updated_at() == self.updated_at
+                && index.session_id() > self.session_id.as_str())
+    }
+}
+
+/// Encodes the opaque cursor for the last session on a page.
+fn encode_list_cursor(index: &AcpSessionIndex) -> String {
+    format!(
+        "{SESSION_LIST_CURSOR_PREFIX}{}:{}",
+        index.updated_at(),
+        index.session_id()
+    )
+}
+
+/// Decodes and validates an opaque `session/list` cursor.
+fn decode_list_cursor(value: &str) -> Result<SessionListCursor, Error> {
+    if value.len() > SESSION_LIST_CURSOR_MAX_BYTES {
+        return Err(invalid_params("cursor is invalid"));
+    }
+    let rest = value
+        .strip_prefix(SESSION_LIST_CURSOR_PREFIX)
+        .ok_or_else(|| invalid_params("cursor is invalid"))?;
+    let (updated_at, session_id) = rest
+        .split_once(':')
+        .ok_or_else(|| invalid_params("cursor is invalid"))?;
+    if session_id.is_empty() {
+        return Err(invalid_params("cursor is invalid"));
+    }
+    let updated_at = updated_at
+        .parse::<u64>()
+        .map_err(|_| invalid_params("cursor is invalid"))?;
+    Ok(SessionListCursor {
+        updated_at,
+        session_id: session_id.to_owned(),
+    })
+}
+
+/// Formats Unix milliseconds as a UTC RFC 3339 timestamp.
+///
+/// The ACP schema describes `updatedAt` as ISO 8601. Jessica does not depend
+/// on a date-formatting crate, so this implements the civil-date conversion
+/// directly. Out-of-range years are omitted instead of returning an invalid
+/// timestamp; current wall-clock times always fit.
+fn format_rfc3339_millis(millis: u64) -> Option<String> {
+    let seconds = i64::try_from(millis / 1_000).ok()?;
+    let milliseconds = millis % 1_000;
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9_999).contains(&year) {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z"
+    ))
+}
+
+/// Converts days since the Unix epoch to a civil Gregorian date.
+///
+/// This is Howard Hinnant's `civil_from_days` algorithm, which is valid for
+/// the full range needed by RFC 3339 formatting.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+/// Rejects session lifecycle fields Jessica does not support.
+///
+/// `session/load` and `session/resume` share these fields. Rejecting non-empty
+/// values keeps the advertised capability surface honest: Jessica neither
+/// connects MCP servers nor activates additional roots or custom prompts.
+fn reject_unsupported_lifecycle_fields(
+    has_mcp_servers: bool,
+    has_additional_directories: bool,
+    has_system_prompt: bool,
+) -> Result<(), Error> {
+    if has_mcp_servers {
+        return Err(invalid_params(
+            "mcpServers are not supported in this ACP version",
+        ));
+    }
+    if has_additional_directories {
+        return Err(invalid_params(
+            "additionalDirectories are not supported in this ACP version",
+        ));
+    }
+    if has_system_prompt {
+        return Err(invalid_params(
+            "systemPrompt is not supported in this ACP version",
+        ));
+    }
+    Ok(())
 }
 
 /// Inputs captured while the session is marked busy.
@@ -1093,24 +1494,34 @@ async fn update_barrier(updates: &mpsc::UnboundedSender<WriterMessage>) -> bool 
 ///
 /// Jessica supports only stable ACP v1. A client that requests a different
 /// version receives v1, as the v1 schema requires when the requested version
-/// is unsupported; the client decides whether to disconnect. Session loading is
-/// advertised only when a persistence index and event store were opened at
-/// startup. Every other optional capability stays explicitly disabled so
-/// clients never probe unsupported content types, MCP transports, or session
-/// lifecycle methods. Baseline text and resource-link prompts are always
-/// supported.
-fn initialize_response(request: &InitializeRequest, load_session: bool) -> InitializeResponse {
+/// is unsupported; the client decides whether to disconnect. Indexed session
+/// lifecycle methods are advertised only when a persistence index and event
+/// store were opened at startup. `session/close` is always advertised because
+/// it only releases live in-memory state and needs no index. Every other
+/// optional capability stays explicitly disabled so clients never probe
+/// unsupported content types, MCP transports, or lifecycle methods. Baseline
+/// text and resource-link prompts are always supported.
+fn initialize_response(request: &InitializeRequest, persistence: bool) -> InitializeResponse {
     tracing::debug!(
         requested_protocol_version = request.protocol_version.as_u16(),
         supported_protocol_version = ProtocolVersion::V1.as_u16(),
-        load_session,
+        persistence,
         "acp initialize"
     );
+
+    let mut session_capabilities =
+        SessionCapabilities::new().close(SessionCloseCapabilities::new());
+    if persistence {
+        session_capabilities = session_capabilities
+            .list(SessionListCapabilities::new())
+            .delete(SessionDeleteCapabilities::new())
+            .resume(SessionResumeCapabilities::new());
+    }
 
     InitializeResponse::new(ProtocolVersion::V1)
         .agent_capabilities(
             AgentCapabilities::new()
-                .load_session(load_session)
+                .load_session(persistence)
                 .prompt_capabilities(
                     PromptCapabilities::new()
                         .image(false)
@@ -1118,7 +1529,7 @@ fn initialize_response(request: &InitializeRequest, load_session: bool) -> Initi
                         .embedded_context(false),
                 )
                 .mcp_capabilities(McpCapabilities::new().http(false).sse(false))
-                .session_capabilities(SessionCapabilities::new()),
+                .session_capabilities(session_capabilities),
         )
         .auth_methods(Vec::new())
         .agent_info(Implementation::new("jessica", env!("CARGO_PKG_VERSION")))
@@ -1161,8 +1572,28 @@ fn internal_load_error() -> Error {
     Error::new(ErrorCode::INTERNAL_ERROR, "session load failed")
 }
 
-/// Method-not-found error when persistence was not configured.
-fn session_load_unsupported() -> Error {
+/// Generic internal error for an unlistable session index.
+fn internal_list_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session list failed")
+}
+
+/// Generic internal error for an undeletable session index.
+fn internal_delete_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session delete failed")
+}
+
+/// Generic internal error for an unrestorable session.
+fn internal_resume_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session resume failed")
+}
+
+/// Generic internal error for an unreadable close target.
+fn internal_close_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session close failed")
+}
+
+/// Method-not-found error when an indexed method has no persistence.
+fn persistence_required() -> Error {
     Error::method_not_found()
 }
 
@@ -1866,15 +2297,74 @@ mod tests {
     }
 
     #[test]
+    fn list_cursors_are_versioned_and_reject_malformed_values() {
+        let cursor = decode_list_cursor("acp-list-v1:1700000000123:acp-1-2-0")
+            .expect("a versioned cursor must decode");
+        assert_eq!(cursor.updated_at, 1_700_000_000_123);
+        assert_eq!(cursor.session_id, "acp-1-2-0");
+
+        for invalid in [
+            "",
+            "1700000000123:acp-1",
+            "acp-list-v1:not-a-number:acp-1",
+            "acp-list-v1:1700000000123:",
+            "acp-list-v1:1700000000123",
+        ] {
+            let error =
+                decode_list_cursor(invalid).expect_err("malformed cursors must be rejected");
+            assert_eq!(
+                error.code,
+                ErrorCode::INVALID_PARAMS,
+                "cursor `{invalid}` must fail as invalid params"
+            );
+        }
+    }
+
+    #[test]
+    fn updated_at_formatting_is_utc_rfc3339_with_milliseconds() {
+        for (millis, expected) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (951_782_400_000, "2000-02-29T00:00:00.000Z"),
+            (1_700_000_000_123, "2023-11-14T22:13:20.123Z"),
+        ] {
+            assert_eq!(
+                format_rfc3339_millis(millis).as_deref(),
+                Some(expected),
+                "Unix millisecond {millis} must format deterministically"
+            );
+        }
+    }
+
+    #[test]
     fn initialize_advertises_v1_and_only_the_configured_optional_capabilities() {
         let response = initialize_response(&InitializeRequest::new(ProtocolVersion::V1), false);
         assert_eq!(response.protocol_version, ProtocolVersion::V1);
         assert!(!response.agent_capabilities.load_session);
+        let session = &response.agent_capabilities.session_capabilities;
+        assert!(
+            session.close.is_some(),
+            "close only releases live state and needs no persistence"
+        );
+        assert!(session.list.is_none());
+        assert!(session.delete.is_none());
+        assert!(session.resume.is_none());
+
         let persisted = initialize_response(&InitializeRequest::new(ProtocolVersion::V1), true);
         assert!(
             persisted.agent_capabilities.load_session,
             "persistence must advertise session/load"
         );
+        let session = &persisted.agent_capabilities.session_capabilities;
+        assert!(session.list.is_some(), "persistence must advertise list");
+        assert!(
+            session.delete.is_some(),
+            "persistence must advertise delete"
+        );
+        assert!(
+            session.resume.is_some(),
+            "persistence must advertise resume"
+        );
+        assert!(session.close.is_some(), "close is always advertised");
         assert!(!response.agent_capabilities.prompt_capabilities.image);
         assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(

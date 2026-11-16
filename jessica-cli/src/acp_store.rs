@@ -9,8 +9,14 @@
 //!
 //! The index is deliberately not a transcript. It never stores prompt text,
 //! tool arguments, model output, environment values, or credentials. Missing
-//! indexes are treated as unknown sessions; malformed indexes are reported as
-//! internal load failures rather than silently discarded.
+//! indexes are treated as unknown sessions. A directly requested malformed
+//! index is reported as an internal load failure; listing skips malformed
+//! entries so one damaged file cannot hide every valid session.
+//!
+//! `session/delete` removes only this index. The append-only event store is
+//! never modified or deleted, so deletion is a logical operation from ACP's
+//! perspective. Mutations are serialized in-process to keep a late prompt
+//! commit from recreating an index that was just deleted.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +47,12 @@ pub(crate) struct AcpPersistence {
     recorder: Arc<EventRecorder>,
     /// ACP history limits applied after reconstruction.
     limits: HistoryLimits,
+    /// Serializes index creation, turn updates, and deletion.
+    ///
+    /// A prompt worker can finish after a delete request started. Holding this
+    /// lock across the mutation ensures that worker observes the deleted index
+    /// as missing instead of recreating it with a stale turn list.
+    mutation: tokio::sync::Mutex<()>,
 }
 
 impl AcpPersistence {
@@ -70,6 +82,7 @@ impl AcpPersistence {
                 max_messages: config.acp.max_history_messages,
                 max_bytes: config.acp.max_history_bytes,
             },
+            mutation: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -79,6 +92,7 @@ impl AcpPersistence {
         session_id: &str,
         cwd: &Path,
     ) -> Result<(), AcpStoreError> {
+        let _mutation = self.mutation.lock().await;
         self.store
             .create_session(session_id, cwd, now_millis())
             .await
@@ -90,9 +104,34 @@ impl AcpPersistence {
         session_id: &str,
         turn_id: &SessionId,
     ) -> Result<(), AcpStoreError> {
+        let _mutation = self.mutation.lock().await;
         self.store
             .record_turn(session_id, turn_id.as_str(), now_millis())
             .await
+    }
+
+    /// Returns every valid index, skipping malformed or unrelated files.
+    ///
+    /// The returned order is filesystem-dependent; callers that expose a
+    /// stable protocol order must sort the result. Individual unreadable,
+    /// corrupt, version-mismatched, or misnamed indexes are logged and skipped
+    /// so one damaged file does not make the remaining sessions unlistable.
+    pub(crate) async fn list(&self) -> Result<Vec<AcpSessionIndex>, AcpStoreError> {
+        self.store.list().await
+    }
+
+    /// Returns whether an index exists for `session_id`.
+    pub(crate) async fn exists(&self, session_id: &str) -> Result<bool, AcpStoreError> {
+        self.store.exists(session_id).await
+    }
+
+    /// Deletes one session's index, returning whether it existed.
+    ///
+    /// Only the index file is removed. Event-store rows are append-only and
+    /// are deliberately left in place.
+    pub(crate) async fn delete(&self, session_id: &str) -> Result<bool, AcpStoreError> {
+        let _mutation = self.mutation.lock().await;
+        self.store.delete(session_id).await
     }
 
     /// Loads the index for one ACP session.
@@ -185,9 +224,19 @@ pub(crate) struct AcpSessionIndex {
 }
 
 impl AcpSessionIndex {
+    /// Returns the client-visible ACP session id.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Returns the canonical working directory recorded for this session.
     pub(crate) fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Returns the last successful update time in Unix milliseconds.
+    pub(crate) fn updated_at(&self) -> u64 {
+        self.updated_at
     }
 }
 
@@ -298,22 +347,15 @@ impl AcpSessionStore {
     /// Loads and validates one index.
     async fn load(&self, session_id: &str) -> Result<Option<AcpSessionIndex>, AcpStoreError> {
         let path = self.path_for(session_id);
-        let encoded = match tokio::fs::read(&path).await {
-            Ok(encoded) => encoded,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(AcpStoreError::Read { path, source }),
+        let index = match self.read_index(&path).await {
+            Ok(index) => index,
+            Err(AcpStoreError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
-        let index: AcpSessionIndex =
-            serde_json::from_slice(&encoded).map_err(|source| AcpStoreError::Corrupt {
-                path: path.clone(),
-                reason: source.to_string(),
-            })?;
-        if index.version != INDEX_VERSION {
-            return Err(AcpStoreError::UnsupportedVersion {
-                path,
-                version: index.version,
-            });
-        }
         if index.session_id != session_id {
             return Err(AcpStoreError::SessionMismatch {
                 path,
@@ -321,13 +363,129 @@ impl AcpSessionStore {
                 found: index.session_id,
             });
         }
-        if index.cwd.as_os_str().is_empty() || index.turns.iter().any(String::is_empty) {
-            return Err(AcpStoreError::Corrupt {
-                path,
-                reason: "index contains an empty path or turn id".to_owned(),
+        Ok(Some(index))
+    }
+
+    /// Returns every valid index in this store.
+    async fn list(&self) -> Result<Vec<AcpSessionIndex>, AcpStoreError> {
+        let mut entries = tokio::fs::read_dir(&self.directory)
+            .await
+            .map_err(|source| AcpStoreError::ReadDirectory {
+                path: self.directory.clone(),
+                source,
+            })?;
+        let mut indexes = Vec::new();
+        loop {
+            let entry =
+                entries
+                    .next_entry()
+                    .await
+                    .map_err(|source| AcpStoreError::ReadDirectory {
+                        path: self.directory.clone(),
+                        source,
+                    })?;
+            let Some(entry) = entry else {
+                break;
+            };
+            let file_type =
+                entry
+                    .file_type()
+                    .await
+                    .map_err(|source| AcpStoreError::ReadDirectory {
+                        path: entry.path(),
+                        source,
+                    })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(encoded_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if !is_lower_hex(encoded_id) {
+                continue;
+            }
+            let path = entry.path();
+            let index = match self.read_index(&path).await {
+                Ok(index) => index,
+                Err(error) => {
+                    tracing::warn!(error = %error, "acp session index skipped during list");
+                    continue;
+                }
+            };
+            if self.path_for(index.session_id()) != path {
+                tracing::warn!(
+                    path = %path.display(),
+                    "acp session index filename does not match its session id"
+                );
+                continue;
+            }
+            indexes.push(index);
+        }
+        Ok(indexes)
+    }
+
+    /// Returns whether one index path exists.
+    async fn exists(&self, session_id: &str) -> Result<bool, AcpStoreError> {
+        let path = self.path_for(session_id);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(AcpStoreError::Read { path, source }),
+        }
+    }
+
+    /// Removes one index, returning whether it existed.
+    async fn delete(&self, session_id: &str) -> Result<bool, AcpStoreError> {
+        let path = self.path_for(session_id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(AcpStoreError::Delete { path, source }),
+        }
+    }
+
+    /// Reads and structurally validates one index file.
+    async fn read_index(&self, path: &Path) -> Result<AcpSessionIndex, AcpStoreError> {
+        let encoded = tokio::fs::read(path)
+            .await
+            .map_err(|source| AcpStoreError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let index: AcpSessionIndex =
+            serde_json::from_slice(&encoded).map_err(|source| AcpStoreError::Corrupt {
+                path: path.to_path_buf(),
+                reason: source.to_string(),
+            })?;
+        if index.version != INDEX_VERSION {
+            return Err(AcpStoreError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                version: index.version,
             });
         }
-        Ok(Some(index))
+        if index.session_id.is_empty() {
+            return Err(AcpStoreError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "index contains an empty session id".to_owned(),
+            });
+        }
+        if !index.cwd.is_absolute() {
+            return Err(AcpStoreError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "index cwd is not absolute".to_owned(),
+            });
+        }
+        if index.turns.iter().any(String::is_empty) {
+            return Err(AcpStoreError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "index contains an empty turn id".to_owned(),
+            });
+        }
+        Ok(index)
     }
 
     /// Atomically replaces one index through a temporary file and rename.
@@ -395,6 +553,14 @@ fn file_stem(session_id: &str) -> String {
     hex_encode(session_id.as_bytes())
 }
 
+/// Returns whether `value` is a non-empty lowercase hexadecimal string.
+fn is_lower_hex(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Hex-encodes bytes without introducing a new dependency.
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -457,6 +623,15 @@ pub(crate) enum AcpStoreError {
     #[error("ACP session index `{path}` could not be written: {source}")]
     Write {
         /// Index or temporary path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// An index could not be deleted.
+    #[error("ACP session index `{path}` could not be deleted: {source}")]
+    Delete {
+        /// Index path.
         path: PathBuf,
         /// Underlying filesystem error.
         #[source]
@@ -662,6 +837,7 @@ mod tests {
                 max_messages: 200,
                 max_bytes: 2 * 1024 * 1024,
             },
+            mutation: tokio::sync::Mutex::new(()),
         };
         persistence
             .create_session("acp-session", &root)
@@ -758,6 +934,7 @@ mod tests {
                 max_messages: 200,
                 max_bytes: 2 * 1024 * 1024,
             },
+            mutation: tokio::sync::Mutex::new(()),
         };
         persistence
             .create_session("acp-session", &root)
@@ -788,6 +965,118 @@ mod tests {
             "2e2e2f2e2e2f6574632f706173737764"
         );
         assert!(!file_stem("a/b").contains('/'));
+    }
+
+    #[tokio::test]
+    async fn list_skips_unrelated_corrupt_and_misnamed_index_files() {
+        let directory = temp_dir("list").await;
+        let store = AcpSessionStore::open(directory.clone(), 8)
+            .await
+            .expect("store must open");
+        for (session_id, cwd, now) in [
+            ("first", Path::new("/workspace/first"), 10_u64),
+            ("second", Path::new("/workspace/second"), 20_u64),
+        ] {
+            store
+                .create_session(session_id, cwd, now)
+                .await
+                .expect("index must be created");
+        }
+
+        tokio::fs::write(directory.join("notes.txt"), b"not an index")
+            .await
+            .expect("unrelated file must be written");
+        tokio::fs::write(directory.join("not-hex.json"), b"{}")
+            .await
+            .expect("non-hex filename must be written");
+        tokio::fs::write(directory.join("deadbeef.json"), b"{not-json")
+            .await
+            .expect("corrupt index must be written");
+        tokio::fs::create_dir(directory.join("feedface.json"))
+            .await
+            .expect("unexpected directory must be created");
+
+        let mismatched_path = store.path_for("expected");
+        tokio::fs::write(
+            &mismatched_path,
+            serde_json::to_vec(&AcpSessionIndex {
+                version: INDEX_VERSION,
+                session_id: "different".to_owned(),
+                cwd: PathBuf::from("/workspace/different"),
+                created_at: 30,
+                updated_at: 30,
+                turns: Vec::new(),
+            })
+            .expect("fixture must encode"),
+        )
+        .await
+        .expect("misnamed index must be written");
+
+        let mut listed = store.list().await.expect("valid indexes must list");
+        listed.sort_by(|left, right| left.session_id().cmp(right.session_id()));
+        assert_eq!(
+            listed
+                .iter()
+                .map(|index| (index.session_id(), index.cwd(), index.updated_at()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first", Path::new("/workspace/first"), 10),
+                ("second", Path::new("/workspace/second"), 20),
+            ],
+            "only structurally valid, correctly named indexes may be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_only_the_index_and_is_idempotent() {
+        let directory = temp_dir("delete").await;
+        let store = AcpSessionStore::open(directory.clone(), 8)
+            .await
+            .expect("store must open");
+        store
+            .create_session("session", Path::new("/workspace"), 10)
+            .await
+            .expect("index must be created");
+        let index_path = store.path_for("session");
+
+        assert!(
+            store
+                .exists("session")
+                .await
+                .expect("existence check must succeed")
+        );
+        assert!(
+            store.delete("session").await.expect("delete must succeed"),
+            "an existing index must report a deletion"
+        );
+        assert!(
+            !store
+                .exists("session")
+                .await
+                .expect("existence check must succeed"),
+            "the index must be gone after deletion"
+        );
+        assert!(
+            store
+                .load("session")
+                .await
+                .expect("missing is not an I/O error")
+                .is_none(),
+            "a deleted index must read as unknown"
+        );
+        assert!(
+            !tokio::fs::try_exists(&index_path)
+                .await
+                .expect("path check must succeed"),
+            "the index file must be removed"
+        );
+        assert!(
+            !store
+                .delete("session")
+                .await
+                .expect("deleting an absent index is not an I/O error"),
+            "deleting an absent index must report no deletion"
+        );
     }
 
     #[test]

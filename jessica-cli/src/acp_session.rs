@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::v1::schema::ContentBlock;
 use jessica_core::types::{Message, Role, SessionId};
 use thiserror::Error;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Process-wide session sequence.
@@ -113,6 +114,11 @@ pub(crate) struct AcpSession {
     turn_sequence: AtomicU64,
     /// Limits applied whenever a prompt commits history.
     limits: HistoryLimits,
+    /// Broadcasts after each prompt releases the session.
+    ///
+    /// `session/close` and `session/delete` use this to wait a bounded time
+    /// for cancelled work to observe the cancellation before acknowledging.
+    activity: watch::Sender<()>,
     /// Lifetime token cancelled when the process or transport shuts down.
     ///
     /// Prompt tokens are children of this token, so cancelling it stops the
@@ -193,6 +199,27 @@ impl AcpSession {
         self.lifetime.cancel();
     }
 
+    /// Waits until no prompt owns the session, up to `limit`.
+    ///
+    /// Returns `false` when the bound expires. Callers use this after
+    /// cancelling a session so `session/close` and `session/delete` can wait
+    /// for active work to observe cancellation before acknowledging.
+    pub(crate) async fn wait_idle(&self, limit: Duration) -> bool {
+        let mut activity = self.activity.subscribe();
+        tokio::time::timeout(limit, async {
+            loop {
+                if self.lock_state().active.is_none() {
+                    return;
+                }
+                if activity.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Appends a committed turn and trims the history.
     fn append_history(&self, messages: Vec<Message>) {
         let mut state = self.lock_state();
@@ -200,9 +227,10 @@ impl AcpSession {
         trim_history(&mut state.history, self.limits);
     }
 
-    /// Clears the active flag.
+    /// Clears the active flag and wakes close/delete waiters.
     fn finish_prompt(&self) {
         self.lock_state().active = None;
+        self.activity.send_replace(());
     }
 
     /// Locks the session state, recovering from a poisoned lock.
@@ -435,6 +463,7 @@ impl AcpSessionRegistry {
             }),
             turn_sequence: AtomicU64::new(0),
             limits: self.limits,
+            activity: watch::channel(()).0,
             lifetime: self.lifetime_parent.child_token(),
         });
         sessions.insert(id, Arc::clone(&session));

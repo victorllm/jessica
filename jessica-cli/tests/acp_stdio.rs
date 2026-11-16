@@ -514,8 +514,8 @@ async fn acp_initialize_reports_v1_and_explicit_empty_capabilities() {
     );
     assert_eq!(
         result["agentCapabilities"]["sessionCapabilities"],
-        json!({}),
-        "no optional session lifecycle method is advertised"
+        json!({"close": {}}),
+        "only close is available without persistence"
     );
     assert_eq!(result["authMethods"], json!([]));
 
@@ -584,6 +584,18 @@ async fn create_session(acp: &mut AcpProcess, id: u64, cwd: &Path) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("session/new must return a session id: {response}"))
         .to_owned()
+}
+
+/// Sends one request that has no preceding notifications and reads its response.
+async fn request_response(acp: &mut AcpProcess, id: u64, method: &str, params: Value) -> Value {
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    }))
+    .await;
+    acp.recv().await
 }
 
 /// Sends `session/load` and collects every replay update before its response.
@@ -1075,7 +1087,7 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
 }
 
 #[tokio::test]
-async fn acp_initialize_advertises_load_only_after_opening_persistence() {
+async fn acp_initialize_advertises_indexed_lifecycle_only_after_opening_persistence() {
     let workspace = TempDir::new("load-capability");
     let config = workspace.path.join("harness.toml");
     std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
@@ -1092,6 +1104,11 @@ async fn acp_initialize_advertises_load_only_after_opening_persistence() {
     assert_eq!(
         response["result"]["agentCapabilities"]["loadSession"], true,
         "a successfully opened index and event store must advertise session/load: {response}"
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"],
+        json!({"list": {}, "delete": {}, "resume": {}, "close": {}}),
+        "persistence must advertise every supported indexed lifecycle method: {response}"
     );
     assert!(
         workspace.path.join("acp-state").is_dir(),
@@ -1399,6 +1416,806 @@ async fn acp_session_load_without_persistence_is_method_not_found() {
     assert_eq!(
         response["error"]["code"], -32601,
         "session/load must be absent when no persistence was configured: {response}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_session_list_exposes_only_metadata_and_skips_corrupt_indexes() {
+    let workspace = TempDir::new("list");
+    let subdirectory = workspace.path.join("sub");
+    std::fs::create_dir_all(&subdirectory).expect("subdirectory must exist");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let first = create_session(&mut acp, 2, &workspace.path).await;
+    let second = create_session(&mut acp, 3, &subdirectory).await;
+
+    // A damaged index must be skipped while every healthy session remains
+    // listable. The filename is valid hex so only content validation can
+    // reject it.
+    std::fs::write(
+        workspace.path.join("acp-state").join("deadbeef.json"),
+        b"{not-json",
+    )
+    .expect("corrupt index fixture must be written");
+
+    let response = request_response(&mut acp, 4, "session/list", json!({})).await;
+    let sessions = response["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session/list must return an array: {response}"));
+    assert_eq!(
+        sessions.len(),
+        2,
+        "the corrupt index must be skipped and both healthy indexes listed: {response}"
+    );
+    let mut listed_ids = std::collections::BTreeSet::new();
+    for session in sessions {
+        let object = session
+            .as_object()
+            .unwrap_or_else(|| panic!("each session must be an object: {session}"));
+        assert_eq!(
+            object
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["cwd", "sessionId", "updatedAt"]),
+            "list must expose id, cwd, and update time only: {session}"
+        );
+        assert!(
+            session.get("title").is_none(),
+            "Jessica stores no session titles and must not fabricate one: {session}"
+        );
+        let updated_at = session["updatedAt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("updatedAt must be a string: {session}"));
+        assert_eq!(
+            updated_at.len(),
+            24,
+            "updatedAt must use a fixed UTC RFC 3339 shape: {updated_at}"
+        );
+        assert!(
+            updated_at.ends_with('Z') && updated_at.as_bytes()[10] == b'T',
+            "updatedAt must be UTC with a T separator: {updated_at}"
+        );
+        listed_ids.insert(
+            session["sessionId"]
+                .as_str()
+                .expect("sessionId must be a string")
+                .to_owned(),
+        );
+    }
+    assert_eq!(
+        listed_ids,
+        std::collections::BTreeSet::from([first.clone(), second.clone()]),
+        "list must return exactly the healthy sessions"
+    );
+
+    let filtered =
+        request_response(&mut acp, 5, "session/list", json!({"cwd": subdirectory})).await;
+    let filtered_sessions = filtered["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("filtered list must return an array: {filtered}"));
+    assert_eq!(
+        filtered_sessions,
+        &vec![json!({
+            "sessionId": second,
+            "cwd": subdirectory,
+            "updatedAt": filtered_sessions[0]["updatedAt"],
+        })],
+        "the cwd filter must select exactly the canonical matching session: {filtered}"
+    );
+
+    for (id, params) in [
+        (6, json!({"cursor": "not-a-jessica-cursor"})),
+        (7, json!({"cwd": "relative/path"})),
+        (8, json!({"cwd": std::env::temp_dir()})),
+    ] {
+        let error = request_response(&mut acp, id, "session/list", params).await;
+        assert_eq!(
+            error["error"]["code"], -32602,
+            "invalid cursors and cwds must be rejected: {error}"
+        );
+    }
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_session_close_releases_live_state_and_keeps_the_index_for_reload() {
+    let workspace = TempDir::new("close");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+
+    let mut first = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut first).await;
+    let session = create_session(&mut first, 2, &workspace.path).await;
+
+    let closed = request_response(
+        &mut first,
+        3,
+        "session/close",
+        json!({"sessionId": session}),
+    )
+    .await;
+    assert!(
+        closed.get("result").is_some(),
+        "closing a live session must succeed: {closed}"
+    );
+
+    let prompt_after_close = request_response(
+        &mut first,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "must not run"}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        prompt_after_close["error"]["code"], -32002,
+        "close must remove the live session immediately: {prompt_after_close}"
+    );
+
+    let repeated = request_response(
+        &mut first,
+        5,
+        "session/close",
+        json!({"sessionId": session}),
+    )
+    .await;
+    assert!(
+        repeated.get("result").is_some(),
+        "closing an indexed but idle session is idempotent: {repeated}"
+    );
+    let unknown = request_response(
+        &mut first,
+        6,
+        "session/close",
+        json!({"sessionId": "acp-does-not-exist"}),
+    )
+    .await;
+    assert_eq!(
+        unknown["error"]["code"], -32002,
+        "closing an unknown session must be session-not-found: {unknown}"
+    );
+
+    let listed = request_response(&mut first, 7, "session/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"]
+            .as_array()
+            .expect("list must return an array")
+            .len(),
+        1,
+        "close must retain the index so the session remains listable: {listed}"
+    );
+    let (replayed, reloaded) =
+        load_session_until_response(&mut first, 8, &session, &workspace.path).await;
+    assert!(
+        reloaded.get("result").is_some(),
+        "the retained index must load after close: {reloaded}"
+    );
+    assert!(
+        replayed.is_empty(),
+        "a closed session with no turns must not synthesize replay: {replayed:?}"
+    );
+
+    first.close_stdin();
+    assert_eq!(first.wait().await.code(), Some(0));
+
+    let mut second = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut second).await;
+    let (_, restart_load) =
+        load_session_until_response(&mut second, 2, &session, &workspace.path).await;
+    assert!(
+        restart_load.get("result").is_some(),
+        "close must not delete the index across restarts: {restart_load}"
+    );
+    second.close_stdin();
+    assert_eq!(second.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_session_close_cancels_active_work_and_acknowledges_after_it_stops() {
+    let workspace = TempDir::new("close-active");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [events]\npath = \"events.db\"\n\n\
+         [acp]\nstate_dir = \"acp-state\"\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![tool_calls_response(&[(
+        "call_sleep",
+        "bash",
+        json!({"command": "sleep 30"}),
+    )])]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "start and then close"}],
+        },
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &session, "tool_call").await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/close",
+        "params": {"sessionId": session},
+    }))
+    .await;
+
+    let mut prompt_response = None;
+    let mut close_response = None;
+    while prompt_response.is_none() || close_response.is_none() {
+        let line = acp.recv_line().await;
+        let message = parse_message(&line);
+        match message.get("id").and_then(Value::as_u64) {
+            Some(3) => prompt_response = Some(message),
+            Some(4) => close_response = Some(message),
+            Some(other) => panic!("unexpected response id {other}: {message}"),
+            None => {
+                assert_eq!(message["method"], "session/update");
+                assert_eq!(
+                    message["params"]["sessionId"], session,
+                    "the closed session must not emit updates for another session"
+                );
+            }
+        }
+    }
+    let prompt_response = prompt_response.expect("the prompt must receive a response");
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "cancelled",
+        "close must cancel the active prompt: {prompt_response}"
+    );
+    let close_response = close_response.expect("close must receive a response");
+    assert!(
+        close_response.get("result").is_some(),
+        "close must succeed after the active prompt stops: {close_response}"
+    );
+
+    let listed = request_response(&mut acp, 5, "session/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "close must retain the indexed session: {listed}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(
+        provider.finish().len(),
+        1,
+        "the interrupted tool must not start a second model round after close"
+    );
+}
+
+#[tokio::test]
+async fn acp_session_resume_restores_context_without_replaying_history() {
+    let workspace = TempDir::new("resume");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+
+    let first_provider = MockProvider::start(vec![text_response("first answer")]);
+    let mut first = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", first_provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut first).await;
+    let session = create_session(&mut first, 2, &workspace.path).await;
+    let (_, prompt_response) = prompt_until_response(
+        &mut first,
+        3,
+        &session,
+        json!([{"type": "text", "text": "remember this"}]),
+    )
+    .await;
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+    first.close_stdin();
+    assert_eq!(first.wait().await.code(), Some(0));
+    assert_eq!(first_provider.finish().len(), 1);
+
+    let second_provider = MockProvider::start(vec![text_response("second answer")]);
+    let mut second = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", second_provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut second).await;
+
+    let resumed = request_response(
+        &mut second,
+        2,
+        "session/resume",
+        json!({
+            "sessionId": session,
+            "cwd": workspace.path,
+            "mcpServers": [],
+        }),
+    )
+    .await;
+    assert!(
+        resumed.get("result").is_some(),
+        "resume must succeed without replay notifications: {resumed}"
+    );
+    assert!(
+        second_provider.requests().is_empty(),
+        "resume must not call the model"
+    );
+
+    let live_resume = request_response(
+        &mut second,
+        3,
+        "session/resume",
+        json!({
+            "sessionId": session,
+            "cwd": workspace.path,
+            "mcpServers": [],
+        }),
+    )
+    .await;
+    assert!(
+        live_resume.get("result").is_some(),
+        "resuming the same live session with the same cwd must be idempotent: {live_resume}"
+    );
+
+    let wrong_cwd = request_response(
+        &mut second,
+        4,
+        "session/resume",
+        json!({
+            "sessionId": session,
+            "cwd": std::env::temp_dir(),
+            "mcpServers": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        wrong_cwd["error"]["code"], -32602,
+        "resume must reject a cwd outside the startup root: {wrong_cwd}"
+    );
+
+    let unknown = request_response(
+        &mut second,
+        5,
+        "session/resume",
+        json!({
+            "sessionId": "acp-does-not-exist",
+            "cwd": workspace.path,
+            "mcpServers": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown["error"]["code"], -32002,
+        "resume of an unknown session must be session-not-found: {unknown}"
+    );
+
+    let unsupported = request_response(
+        &mut second,
+        6,
+        "session/resume",
+        json!({
+            "sessionId": session,
+            "cwd": workspace.path,
+            "mcpServers": [{
+                "name": "server",
+                "command": "/bin/true",
+                "args": [],
+                "env": []
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        unsupported["error"]["code"], -32602,
+        "resume must reject MCP servers like load: {unsupported}"
+    );
+
+    let (_, continued) = prompt_until_response(
+        &mut second,
+        7,
+        &session,
+        json!([{"type": "text", "text": "what did I ask you to remember?"}]),
+    )
+    .await;
+    assert_eq!(
+        continued["result"]["stopReason"], "end_turn",
+        "a resumed session must accept a prompt: {continued}"
+    );
+
+    second.close_stdin();
+    assert_eq!(second.wait().await.code(), Some(0));
+    let requests = second_provider.finish();
+    assert_eq!(
+        requests.len(),
+        1,
+        "resume must restore context without spending a model request"
+    );
+    let request: Value = serde_json::from_str(&requests[0]).expect("provider request must be JSON");
+    let contents: Vec<&str> = request["messages"]
+        .as_array()
+        .expect("provider messages must be an array")
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        contents.contains(&"remember this") && contents.contains(&"first answer"),
+        "resume must restore earlier turns into the next prompt: {contents:?}"
+    );
+    assert_eq!(
+        contents.last().copied(),
+        Some("what did I ask you to remember?"),
+        "the new prompt must be appended after restored history"
+    );
+}
+
+#[tokio::test]
+async fn acp_session_delete_is_logical_and_removes_only_the_index() {
+    let workspace = TempDir::new("delete");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![text_response("persisted answer")]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+    let (_, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "keep the event log"}]),
+    )
+    .await;
+    assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
+
+    let state_dir = workspace.path.join("acp-state");
+    let events_db = workspace.path.join("events.db");
+    assert!(
+        std::fs::read_dir(&state_dir)
+            .expect("state directory must be readable")
+            .next()
+            .is_some(),
+        "the session index must exist before deletion"
+    );
+    assert!(
+        events_db.is_file(),
+        "the event store must exist before deletion"
+    );
+
+    let deleted =
+        request_response(&mut acp, 4, "session/delete", json!({"sessionId": session})).await;
+    assert!(
+        deleted.get("result").is_some(),
+        "deleting a live indexed session must succeed: {deleted}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&state_dir)
+            .expect("state directory must be readable")
+            .count(),
+        0,
+        "delete must remove exactly the ACP index"
+    );
+    assert!(
+        events_db.is_file(),
+        "delete must not physically remove the append-only event store"
+    );
+
+    let listed = request_response(&mut acp, 5, "session/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"],
+        json!([]),
+        "a deleted session must disappear from list: {listed}"
+    );
+    let load = request_response(
+        &mut acp,
+        6,
+        "session/load",
+        json!({
+            "sessionId": session,
+            "cwd": workspace.path,
+            "mcpServers": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        load["error"]["code"], -32002,
+        "a deleted session must no longer load: {load}"
+    );
+    let prompt_after_delete = request_response(
+        &mut acp,
+        7,
+        "session/prompt",
+        json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "must not run"}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        prompt_after_delete["error"]["code"], -32002,
+        "delete must release the live session: {prompt_after_delete}"
+    );
+    let repeated =
+        request_response(&mut acp, 8, "session/delete", json!({"sessionId": session})).await;
+    assert_eq!(
+        repeated["error"]["code"], -32002,
+        "deleting an unknown session must be session-not-found: {repeated}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(
+        provider.finish().len(),
+        1,
+        "deleting a session must not trigger model work"
+    );
+}
+
+#[tokio::test]
+async fn acp_session_delete_cancels_active_work_without_reindexing() {
+    let workspace = TempDir::new("delete-active");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [events]\npath = \"events.db\"\n\n\
+         [acp]\nstate_dir = \"acp-state\"\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![tool_calls_response(&[(
+        "call_sleep",
+        "bash",
+        json!({"command": "sleep 30"}),
+    )])]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "start and then delete"}],
+        },
+    }))
+    .await;
+    collect_update_of_kind(&mut acp, &session, "tool_call").await;
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/delete",
+        "params": {"sessionId": session},
+    }))
+    .await;
+
+    let mut prompt_response = None;
+    let mut delete_response = None;
+    while prompt_response.is_none() || delete_response.is_none() {
+        let line = acp.recv_line().await;
+        let message = parse_message(&line);
+        match message.get("id").and_then(Value::as_u64) {
+            Some(3) => prompt_response = Some(message),
+            Some(4) => delete_response = Some(message),
+            Some(other) => panic!("unexpected response id {other}: {message}"),
+            None => assert_eq!(message["method"], "session/update"),
+        }
+    }
+    assert_eq!(
+        prompt_response.expect("the prompt must respond")["result"]["stopReason"],
+        "cancelled",
+        "delete must cancel the active prompt"
+    );
+    assert!(
+        delete_response
+            .expect("delete must respond")
+            .get("result")
+            .is_some(),
+        "delete must succeed after cancelling the active prompt"
+    );
+
+    assert_eq!(
+        std::fs::read_dir(workspace.path.join("acp-state"))
+            .expect("state directory must be readable")
+            .count(),
+        0,
+        "a late prompt commit must not recreate the deleted index"
+    );
+    assert!(
+        workspace.path.join("events.db").is_file(),
+        "delete must retain the event store"
+    );
+    let listed = request_response(&mut acp, 5, "session/list", json!({})).await;
+    assert_eq!(
+        listed["result"]["sessions"],
+        json!([]),
+        "the deleted session must not return to list: {listed}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(provider.finish().len(), 1);
+}
+
+#[tokio::test]
+async fn acp_session_list_paginates_without_duplicates_or_loss() {
+    let workspace = TempDir::new("list-pages");
+    let config = workspace.path.join("harness.toml");
+    let config_body = format!("{PERSISTENCE_CONFIG}max_sessions = 105\n");
+    std::fs::write(&config, config_body).expect("harness configuration must be written");
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let mut created = std::collections::BTreeSet::new();
+    for sequence in 0..101_u64 {
+        let session = create_session(&mut acp, 2 + sequence, &workspace.path).await;
+        created.insert(session);
+    }
+
+    let first_page = request_response(&mut acp, 200, "session/list", json!({})).await;
+    let first_sessions = first_page["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the first page must be an array: {first_page}"));
+    assert_eq!(
+        first_sessions.len(),
+        100,
+        "one page must contain the fixed maximum of 100 sessions: {first_page}"
+    );
+    let cursor = first_page["result"]["nextCursor"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a full first page must provide a cursor: {first_page}"));
+
+    let second_page =
+        request_response(&mut acp, 201, "session/list", json!({"cursor": cursor})).await;
+    let second_sessions = second_page["result"]["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the second page must be an array: {second_page}"));
+    assert_eq!(
+        second_sessions.len(),
+        1,
+        "the second page must contain the remaining session: {second_page}"
+    );
+    assert!(
+        second_page["result"].get("nextCursor").is_none(),
+        "the final page must omit the cursor: {second_page}"
+    );
+
+    let mut paged = std::collections::BTreeSet::new();
+    for session in first_sessions.iter().chain(second_sessions) {
+        let id = session["sessionId"]
+            .as_str()
+            .expect("listed sessions must carry an id")
+            .to_owned();
+        assert!(
+            paged.insert(id),
+            "pagination must never return a duplicate session"
+        );
+    }
+    assert_eq!(
+        paged, created,
+        "concatenating both pages must return every created session exactly once"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_indexed_lifecycle_without_persistence_is_method_not_found_but_close_works() {
+    let mut acp = AcpProcess::spawn(&[]).await;
+    handshake(&mut acp).await;
+    let cwd = std::env::current_dir().expect("the test process must have a working directory");
+
+    for (id, method, params) in [
+        (2, "session/list", json!({})),
+        (
+            3,
+            "session/resume",
+            json!({
+                "sessionId": "acp-missing",
+                "cwd": cwd,
+                "mcpServers": [],
+            }),
+        ),
+        (4, "session/delete", json!({"sessionId": "acp-missing"})),
+    ] {
+        let response = request_response(&mut acp, id, method, params).await;
+        assert_eq!(
+            response["error"]["code"], -32601,
+            "{method} must be method-not-found without persistence: {response}"
+        );
+    }
+
+    let session = create_session(&mut acp, 5, &cwd).await;
+    let closed =
+        request_response(&mut acp, 6, "session/close", json!({"sessionId": session})).await;
+    assert!(
+        closed.get("result").is_some(),
+        "close must work without persistence because it only frees live state: {closed}"
+    );
+    let closed_twice =
+        request_response(&mut acp, 7, "session/close", json!({"sessionId": session})).await;
+    assert_eq!(
+        closed_twice["error"]["code"], -32002,
+        "close does not retain a memory-only session: {closed_twice}"
     );
 
     acp.close_stdin();

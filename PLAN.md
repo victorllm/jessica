@@ -1324,7 +1324,7 @@ cargo test --workspace
 
 ---
 
-Phase 6：ACP 支持（ACP-0 → ACP-4；ACP-7a；ACP-5/6/7b 可选）
+Phase 6：ACP 支持（ACP-0 → ACP-4；ACP-7a/7b；ACP-5/6 可选）
 
 背景：ACP（Agent Client Protocol）是编辑器/客户端与 Agent 之间的 JSON-RPC 2.0 over stdio 协议。Jessica 目前没有长驻 Agent 服务和跨 prompt 会话状态；本 Phase 把 `jessica acp` 做成一个长驻 stdio 服务，让 ACP 客户端可以创建会话、发送 prompt、接收流式更新并取消执行，同时保持 jessica-core 冻结、现有事件持久化与治理链不变。Phase 6 为 2026-11-15 新增，不在最初的 17 个 Task 内。
 
@@ -1335,7 +1335,7 @@ Phase 6 全局约束（适用于 ACP-0–ACP-4）：
 · 不修改 jessica-core 公共 API。允许的实现层改动：jessica-cli 内部装配、EventPump、配置；jessica-tools 仅为 BashTool 增加显式 cwd 的加法 API。jessica-runtime、jessica-harness、jessica-sandbox、jessica-providers、jessica-memory 原则上不改；确需改动必须停下询问用户并单开 Task。
 · ACP 模式下 stdout 只允许出现 JSON-RPC；禁止 `print!`/`println!` 业务输出；日志、警告、错误一律 stderr；不启用 ACP 传输层 TRACE 日志。
 · ACP session 的 `cwd` 必须为绝对路径、存在、是目录，canonicalize 后必须位于启动 workspace root 之内；memory、recorder、skills、wasm 仍按启动 root 作用域。多 workspace 服务不在本 Phase 范围。
-· ACP-0–ACP-4 不实现：MCP、`session/request_permission`、`session/load`/`list`/`delete`/`resume`/`close`、客户端 `fs/*` 与 `terminal/*`、图片/音频/embedded resource、session modes/config options/plan/usage update、ACP v2。
+· ACP-0–ACP-4 不实现：MCP、`session/request_permission`、`session/load`/`list`/`delete`/`resume`/`close`、客户端 `fs/*` 与 `terminal/*`、图片/音频/embedded resource、session modes/config options/plan/usage update、ACP v2。后续 ACP-7a/7b 已分别实现 `load` 与 `list`/`delete`/`resume`/`close`（受持久化能力门控）；ACP-5/6、archive/fork/status/set_title 仍未实现。
 · ACP 首期禁用 acceptance 重试（每个 prompt 只跑一次 attempt）；acceptance 失败返回 JSON-RPC error。原因：v1 客户端对多段 assistant 输出的 `messageId` 支持不一致，重试输出可能被拼接成一条消息。若 ACP-2 开工前用户决定启用重试，必须同时定义 `messageId` 与 notice 行为。
 · 历史上限默认：`max_history_messages = 200`、`max_history_bytes = 2 MiB`、`max_prompt_bytes = 1 MiB`、`max_sessions = 8`；全部可在 `[acp]` 配置中调整。
 · 每个 Task 完成前必须运行 `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`，并贴出结果。
@@ -1583,17 +1583,59 @@ ACP-6（可选，默认不做）：session/request_permission
 
 禁止使用空/合成 `toolCallId` 糊弄客户端。实现时需覆盖 allow_once/reject_once、客户端 cancelled、超时、错误路径，并保证工具未获批准时绝不执行。
 
-ACP-7b（可选，默认不做）：session/list、delete、resume、close
+Task ACP-7b：session/list、delete、resume、close（2026-11-16）
 
-目标：在 ACP-7a 的会话索引与 `session/load` 之上补齐剩余 ACP 会话生命周期方法。需要定义枚举已索引会话的分页与隐私边界、删除时如何处理只追加事件库（不得物理删除事件，只能删除索引或标记）、`resume` 与 `load` 的语义差异，以及 `close` 是否回收索引/内存 session。不得修改 jessica-core 或 jessica-memory；事件日志保持 append-only。ACP-7a 不实现这些方法。
+目标：在 ACP-7a 的会话索引与 `session/load` 之上补齐剩余 ACP 会话生命周期方法：`session/list`、`session/delete`、`session/resume`、`session/close`。保持 jessica-core 公共 API 与 jessica-memory 不变，事件库保持 append-only，不新增第三方 crate，不实现 ACP-5/6、archive/fork/status/set_title、MCP、权限请求或 ACP v2。
+
+实现范围与语义：
+
+1. 能力矩阵：`initialize.agentCapabilities.loadSession` 与 `sessionCapabilities.list/delete/resume` 仅在 `[events].path` + `[acp].state_dir` 持久化成功打开时为 true/存在；`sessionCapabilities.close` 始终存在，因为 close 只释放内存 session，不需要索引。未配置持久化时 load/list/delete/resume 返回 `-32601`，close 仍可关闭 live session。
+2. `session/list`：只枚举 canonical state_dir 下文件名 stem 为小写十六进制、内容通过 version=1/非空 id/绝对 cwd/非空 turn id 校验、且文件名与 session id 一致的普通 `.json` 索引；损坏、版本不符、错名、目录和符号链接跳过并 warn。结果再过滤为启动 workspace root 内的索引；可选 `cwd` 必须通过既有 absolute/exists/directory/root 校验并精确匹配。排序为 `updatedAt` 降序、session id 升序，页大小固定 100，`nextCursor` 为 `acp-list-v1:{updatedAtMillis}:{sessionId}` 的不透明游标，最大 512 字节；非法/超长游标返回 `-32602`。响应只含 `sessionId`、canonical `cwd`、UTC RFC 3339 毫秒 `updatedAt`，不返回 title、对话内容、turn id 或事件路径。
+3. `session/resume`：要求持久化与索引存在；拒绝非空 `mcpServers`/`additionalDirectories`/`systemPrompt`（`-32602`）；cwd 必须与索引 canonical cwd 一致（`-32602`）；未知 id `-32002`；历史重建与 ACP-7a 的 load 完全相同（最新可恢复 turn、过滤 System、`complete_tool_pairs`、`trim_history`），但恢复后**不发送任何 replay notification**。已 live 的同 id + 同 cwd resume 幂等成功；cwd 不符仍 `-32602`。
+4. `session/close`：不要求持久化。live session 先从 registry 移除，取消其 lifetime token，并通过每 session 的 `watch` 活动信号最多等待 5 秒让 active prompt 释放；确认后返回。配置持久化时索引保留，因此 close 后仍在 list 中且可 load/resume；对存在索引但未 live 的 session 幂等成功。无持久化或索引不存在且未 live 时返回 `-32002`。
+5. `session/delete`：逻辑删除。先在 `AcpPersistence.mutation` 锁下删除索引，再移除 live session 并最多等待 5 秒；事件库行一律不删除、不修改。索引不存在但 session live 时删除仍成功；两者都不存在时 `-32002`。mutation 锁串行化 create/record/delete，确保删除开始后晚到的 prompt commit 只会看到索引缺失并 warn，不会重建索引。
+6. 索引存储新增 `list`/`exists`/`delete`/`read_index`：`exists` 使用 `symlink_metadata` 且 NotFound 为 false；`delete` 使用 `remove_file` 且 NotFound 为 false/幂等；`read_index` 统一承担结构校验，load 仍对直接请求的损坏索引 fail-closed，list 才跳过损坏项。继续使用临时文件 + `write_all` + `sync_all` + `rename` 原子替换。
+7. `AcpSession` 新增 `activity: watch::Sender<()>`；`finish_prompt` 清 active 后广播，`wait_idle` 先订阅再检查，避免 close/delete 与 prompt 完成之间的丢失唤醒。
+8. JSON-RPC 错误映射：未知 session `-32002`；非法 cwd/cursor/lifecycle 字段 `-32602`；无持久化 `-32601`；索引读/写/删/列表内部失败 `-32603` 且消息固定为 `session load/list/delete/resume/close failed`，不泄露路径或事件内容；shutdown 期间返回既有 `agent is shutting down`。
+
+行为测试（禁止自证式 Ok 断言）：
+
+1. `acp_store` 新增 2 个，当前 9 个：list 只返回合法索引，跳过无关文件、损坏 JSON、版本不符与错名文件；delete 只删索引、幂等且不影响其他索引。
+2. ACP 服务单元新增覆盖：持久化/非持久化 initialize 能力矩阵；list 游标版本前缀、最大长度与非法值；UTC RFC 3339 毫秒格式（含闰年/边界日期）；lifecycle 字段拒绝与错误映射。
+3. `tests/acp_stdio.rs` 新增 8 个真实进程 E2E（总数 23→31）：list 只暴露元数据并跳过损坏索引；close 移出 live state、保留索引并可 reload；close 取消 active work 且等其停止后才响应；resume 恢复上下文但不 replay；delete 逻辑删除且事件库文件仍在；delete 取消 active work 后 state_dir 不被晚到 commit 重建；101 个 session 分页无重复/丢失（首页 100 + 剩余 1）；无持久化时 load/list/delete/resume 均 `-32601` 而 close 成功。
+4. 既有 `new/prompt/cancel/load`、stdout 纯净、隐私、reload、shutdown 测试全部保留并通过。
+
+真实客户端验收（2026-11-16 UTC）：
+
+· 官方 TypeScript ACP SDK `@agentclientprotocol/sdk` 2.7.0（临时目录 `/tmp/jessica-acp7b-sdk`，不进入仓库、不作为依赖）：连接 `target/debug/jessica-cli` + 本地脚本化 OpenAI-compatible mock，验证 initialize 能力矩阵；两个 live session 的 list 元数据/精确 cwd 过滤/非法游标 `-32602`；close 后索引仍在 list 且可重复 close；delete 后索引消失、`events.db` 大小不变、load 返回 `-32002`；进程重启后 list 保留；resume 零 replay，且随后 prompt 的 provider 请求包含恢复前 user/assistant 上下文；live resume 幂等；再次重启后 load 在响应前 replay 首轮与 resume 后轮次，且不包含已删除 session 内容。
+· Paseo 0.15.3：隔离 home `/tmp/jessica-acp7b-paseo/home`、daemon `127.0.0.1:6769`、从 `/home/ubuntu` 启动；workspace `/home/ubuntu/jessica-acp7b-paseo-workspace`；provider 为临时 wrapper，exec `target/debug/jessica-cli acp --config <harness>`，`supportsMcpServers=false`，env 指向本地 mock `127.0.0.1:46669`（不使用真实密钥/模型）。`provider diagnostic jessica` 为 Ready（ACP spawn/initialize/session/new/cleanup 全 ok）；首轮 `paseo run` 成功；`daemon stop/start` 后 agent 状态 closed，`agent send` 触发 `session/load`，logs 保留首轮且 provider 第二次请求包含首轮上下文，索引更新为 2 个 turn；`paseo delete` 后 ACP 子进程退出、索引仍保留 2 个 turn；随后 `paseo import <sessionId>` 成功恢复两轮历史且未新增 provider 请求。Paseo CLI 没有直接调用 listImportableSessions 的命令，list/delete/resume 的客户端行为由官方 SDK 覆盖；Paseo catalog probe 会创建若干空索引，属于既有 probe 行为。
+
+验收结果：
+
+· `cargo fmt --check` 通过。
+· `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+· `cargo test --workspace`：713 passed, 0 failed, 2 ignored（50 suites）。
+· `cargo test -p jessica-cli acp`：61 unit + 31 E2E 全通过。
+
+偏离/说明：
+
+1. close/delete 的 drain 上限为 5 秒；若 provider 或工具不响应取消，响应仍会返回，后台 worker 可能继续到自身退出。强保证需要另开 Task 设计强制终止与资源回收。
+2. list 会列出所有有效索引，包括尚无 committed turn 的空会话；这类 session 在进程重启后无法 load/resume，但可 delete/close。Paseo catalog probe 产生的空索引因此会出现在 list 中；若需隐藏，必须单开 Task 定义“可恢复”过滤和 live 空会话语义。
+3. load/resume 与 delete/close 之间没有全局请求串行化；mutation 锁只覆盖 create/record/delete 对索引的写。客户端不应并发对同一 session 发 load/resume 与 delete/close；若需线性一致性，须单开 Task 设计 per-session 状态机。
+4. list 是目录扫描快照，不保证跨并发索引写入的原子性；分页游标基于 `(updatedAt, sessionId)`，跨页期间新增/删除会产生正常漂移，但不会因基于 offset 而重复或跳过同一稳定集合。
+5. 时间格式未引入日期 crate，使用 Hinnant civil-date 算法；毫秒时间和本进程会话 id 足够稳定，若未来需要纳秒/时区扩展须单开 Task。
+6. 未修改 jessica-core、jessica-memory、workspace Cargo.toml 或部署的 `~/.local/bin/jessica-cli`。
 
 Phase 6 已知限制（同时记录到文末 Deferred）：
 
 · 首期不是完全 ACP 合规：不支持 MCP stdio（v1 MUST）；非空 `mcpServers` 直接报错。
 · 不做权限请求；bash/write 的约束仍依赖 AllowlistPolicy，编辑器看到工具调用但不能逐次批准。
-· 仅在同时配置 `[events].path` 与 `[acp].state_dir` 时支持 `session/load`；`session/list`/`delete`/`resume`/`close` 仍不支持。功能上线前创建的旧会话没有索引，不可恢复。
+· 仅在同时配置 `[events].path` 与 `[acp].state_dir` 时支持 `session/load`/`list`/`delete`/`resume`；`session/close` 始终可用（只释放内存 session）。功能上线前创建的旧会话没有索引，不可恢复。
+· `session/list` 只返回启动 workspace root 内通过校验的索引，并跳过损坏、版本不符、错名或非普通文件；响应只含 `sessionId`、canonical `cwd`、`updatedAt`，不返回 title 或对话内容。页大小固定 100，游标格式版本化为 `acp-list-v1:...`；尚无 committed turn 的空会话也会被列出，但进程重启后无法 load/resume。
+· `session/delete` 只删 ACP 索引并释放 live session，不物理删除 append-only 事件库；删除后该 id 不再 list/load/resume，也没有事件空间回收。若需要隐私删除或 GC，必须单开 Task 设计 tombstone/引用策略。
+· `session/close` 与 `session/delete` 会先取消 active prompt，再最多等待 5 秒；provider 或工具不响应取消时，响应仍会返回，后台 worker 可能继续到自身退出。`load`/`resume` 与 `delete`/`close` 之间没有全局请求串行化，客户端不应并发对同一 id 发互斥生命周期请求。
 · 恢复以最新可恢复 turn 的事件流为快照；最新 turn 缺失时回退到更旧 turn，因此可能丢失其后已提交的对话。索引追加与事件提交不是跨存储事务，进程崩溃可能使索引少记录一个 turn（可回退）或记录到尚未完整落盘的事件流（恢复失败后继续回退）。
-· ACP 索引没有跨进程文件锁；同一 `state_dir` 不应被多个 ACP 进程同时写入，否则后写的 turn 列表可能覆盖先写的内容。
+· ACP 索引没有跨进程文件锁；同一 `state_dir` 不应被多个 ACP 进程同时写入，否则后写的 turn 列表可能覆盖先写的内容。list 是目录扫描快照，跨页期间并发写入会造成正常漂移。
 · cwd 必须在启动 workspace root 内；memory/recorder/skills/wasm 仍是进程级作用域，不支持多 workspace。
 · ACP 首期禁用 acceptance 重试；与 REPL/one-shot 的行为不同。
 · 每 turn 记录完整历史，事件库存储随对话增长呈 O(n²)；后续可改为增量 + 引用。
@@ -1666,7 +1708,7 @@ Task ACP-4 ☑ 约 20 分钟（含 Paseo 0.15.3 手工互通与排障） 仅完�
 Task ACP-7a ☑ 约 120 分钟（含实现、进程重启 E2E、文档与 Paseo 0.15.3 验收） 仅实现 `session/load` 与 ACP 会话索引；未实现 `session/list`/`delete`/`resume`/`close`（ACP-7b），未实现 ACP-5/6，未修改 jessica-core 或 jessica-memory，未新增第三方 crate。配置：`[acp]` 增加可选 `state_dir`，相对路径按启动 root 解析；`HarnessConfig::validate` 要求存在时 `[events].path` 也存在，空路径由 `AcpConfig::validate` 拒绝；`state_dir` 与 `[acp]` 其余限制一样启动冻结、不参与热加载。新增 `AcpPersistence::open`：创建/canonicalize state dir，并用既有 `EventRecorder` 打开事件库；仅在两者成功后 `initialize.agentCapabilities.loadSession=true`，否则 false 且 `session/load` 返回 `-32601`。索引：每 session 一个 JSON v1 文件，文件名对 session id 做十六进制编码；字段仅 version/sessionId/canonical cwd/createdAt/updatedAt/turn ids，不写 prompt、模型输出、工具参数、env 或密钥；`deny_unknown_fields`，未知字段/版本不符/内容自相矛盾均 fail-closed；写入为同目录临时文件 + `write_all` + `sync_all` + `rename` 原子替换，失败清理临时文件；重复 `create_session` 拒绝覆盖。session/new 成功后写空索引，失败则从 registry 移除并返回 `-32603`。prompt 在 update barrier 成功且本次 turn 可提交时、response 之前追加内部 turn id；索引写失败只 warn，内存 session 继续可用，load 会回退到更旧可恢复 turn。session/turn id 均包含进程 nonce：session id 为 `acp-{pid}-{startup_nanos}-{seq}`，turn id 为 `{session_id}-{pid}-{startup_nanos}-t{turn_seq}`，避免恢复后的 session 从 t0 重新开始并覆盖旧事件 key。`session/load`：拒绝非空 `mcpServers`/`additionalDirectories`/`systemPrompt`（`-32602`）；未知 id `-32002`；cwd 通过既有 absolute/exists/directory/root 校验且必须等于索引 canonical cwd（`-32602`）；重复 load 同进程 `-32602`；索引损坏 `-32603`。历史重建从最新 turn 开始 `EventRecorder::load` + `recover_session`，缺失/损坏/无法恢复时回退到更旧 turn；全部不可恢复返回 `-32603`；过滤 `Role::System` 后执行 `complete_tool_pairs` 与既有 `trim_history`，再以原 id 恢复内存 session。重放：在 load response 之前通过 `session/update` 发送 user/assistant 文本（每消息独立 synthetic messageId）、tool_call（in_progress）和 tool result（completed/failed），孤立 tool result 不发送；写通知失败即关闭 transport 并移除刚恢复的 session。行为测试：新增 `acp_store` 7 个（索引 round-trip、turn 上限/去重、缺失/损坏/版本/未知字段/自相矛盾、重复创建不覆盖、最新 turn 回退与系统消息过滤、全部不可恢复 fail-closed、hex 文件名安全）；`acp_session` 新增 3 个（跨 registry 唯一 id、restore 保留 id/裁剪/续接 turn、restore 拒绝重复/越界 cwd/上限）；`acp_events` 新增 3 个（历史重放顺序/system 过滤/tool 生命周期、失败 tool 与独立 messageId、孤立 tool 跳过与输出截断）；`tests/acp_stdio.rs` 新增 4 个真实进程 E2E（持久化时 loadSession=true 且实际创建 state dir/事件库；含工具 turn 的进程重启后 load 在响应前重放 user/tool/tool result/assistant，并断言第二次 prompt 的 provider 请求包含完整恢复上下文；空 session load 与未知/错误 cwd/重复 load/MCP 拒绝；无持久化 `-32601`），E2E 总数 19→23。Paseo 0.15.3 真实客户端验收（2026-11-16 UTC）：隔离 home `/tmp/jessica-acp7a-paseo/home`、daemon `127.0.0.1:6768`、从 `/home/ubuntu` 启动；provider command 为临时 wrapper `/tmp/jessica-acp7a-paseo/jessica-paseo`，exec `target/debug/jessica-cli acp --config <harness>`，`supportsMcpServers=false`，env 指向本地脚本化 OpenAI-compatible SSE mock（`127.0.0.1:46668`，不嵌入真实密钥；未使用真实模型）；`[events].path` 与 `[acp].state_dir` 使用 workspace `/home/ubuntu/jessica-acp7a-paseo-workspace` 下绝对路径。阶段观察：`provider diagnostic jessica` 报 ACP spawn/initialize/session-new ok、Status Ready；`paseo run --provider jessica --cwd ... --title acp7a-load --wait-timeout 60s` 成功，agent logs 为 `[User] first prompt from paseo` + `first paseo answer`，mock 1 次请求，索引 1 个 turn；`daemon stop` 后 ACP 进程退出，`daemon start` 后 agent 状态 closed；`agent send <id> "second prompt from paseo"` 成功，logs 保留首轮并追加第二轮，mock 第 2 次请求为 4 条消息 `[system, first user, first assistant, Paseo 包裹的 second user]`，索引更新为 2 个 turn，事件库 2 个 turn session。Paseo provider catalog probe 额外创建了若干空索引 session（cwd=`/home/ubuntu`），不影响真实 agent。未改动已部署 `~/.local/bin/jessica-cli` 或默认 `~/.paseo/config.json`。偏离/说明：1) `state_dir` 必须显式配置，不自动从 events path 推导；2) turn id 在原 `{session}-tN` 中额外加入当前进程 nonce，因为恢复 session 的本地 turn sequence 从 0 重新开始；ACP-7a 之前没有持久化 ACP 会话，因此无兼容负担；3) 索引只保留最后 `max_history_messages` 个 turn id，与历史上限一致；4) 索引追加与事件库写入不是跨存储事务、索引无跨进程文件锁，已记入 Deferred；5) 历史重建以最新可恢复 turn 为快照，较旧 turn 仅作 fallback；6) Paseo 验收使用脚本化 provider，符合 Task 允许且避免真实费用/密钥泄露。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 701 passed, 0 failed, 2 ignored；`cargo test -p jessica-cli acp` 57 unit + 23 E2E 全通过。
 Task ACP-5 ☐ 可选 — 默认不做；MCP stdio，完整合规前必须完成
 Task ACP-6 ☐ 可选 — 默认不做；需先决定 core API 方案
-Task ACP-7b ☐ 可选 — 默认不做；session/list/delete/resume/close
+Task ACP-7b ☑ 约 30 分钟（含实现、8 个 E2E、官方 TypeScript ACP SDK 与 Paseo 0.15.3 验收） 仅实现 `session/list`/`delete`/`resume`/`close` 与索引枚举/删除；未实现 ACP-5/6、MCP、权限请求、archive/fork/status/set_title、ACP v2，未修改 jessica-core/jessica-memory/Cargo.toml，未新增第三方 crate。能力：`loadSession` 与 `sessionCapabilities.list/delete/resume` 仅在 `[events].path` + `[acp].state_dir` 成功打开时声明；`close` 始终声明，因为只释放内存 session。list：只枚举 canonical state_dir 中 stem 为小写十六进制、version=1/非空 id/绝对 cwd/非空 turn id、文件名与 id 一致的普通 `.json`；损坏/版本不符/错名/目录/符号链接跳过并 warn；过滤启动 root，可选 cwd 精确匹配；按 updatedAt 降序、session id 升序；固定页 100；游标 `acp-list-v1:{updatedAtMillis}:{sessionId}`（≤512B，非法 `-32602`）；只返回 sessionId/cwd/UTC RFC 3339 毫秒 updatedAt，无 title/内容/turn id。resume：拒绝非空 mcpServers/additionalDirectories/systemPrompt；同 cwd 校验；未知 `-32002`；历史重建复用 load，但零 replay；live 同 cwd 幂等。close：不要求持久化；live 先 remove、取消 lifetime token、经 per-session watch 最多等 5s；索引保留，close 后仍 list/load/resume；索引存在但未 live 幂等；无持久化/未知 `-32002`。delete：逻辑删除，先 mutation 锁下删索引，再 remove live 并最多等 5s；事件库不删不改；索引不存在但 live 成功；两者皆无 `-32002`；mutation 锁串行化 create/record/delete，晚到 prompt commit 不会重建索引。store 新增 list/exists/delete/read_index；exists 用 symlink_metadata，delete remove_file 幂等；load 对损坏直查 fail-closed，list 跳过；原子写保留。`AcpSession` 新增 watch 活动信号，finish_prompt 广播，wait_idle 先订阅再检查避免丢失唤醒。错误映射：未知 `-32002`、非法 `-32602`、无持久化 `-32601`、内部固定消息 `-32603`，不泄露路径/内容。测试：acp_store 新增 2（list 跳过无关/损坏/版本/错名；delete 只删索引且幂等），当前 9；ACP 服务单测新增能力矩阵/游标/UTC 日期/lifecycle 拒绝；`tests/acp_stdio.rs` 新增 8（list 元数据与损坏跳过；close 释放 live 且保留索引可 reload；close 取消 active 并等停止；resume 零 replay；delete 逻辑删除且事件库仍在；delete active 不重建索引；101 session 分页 100+1 无重复/丢失；无持久化 load/list/delete/resume `-32601` 而 close 成功），E2E 23→31。真实客户端（2026-11-16 UTC）：官方 `@agentclientprotocol/sdk` 2.7.0 临时脚本验证两 live session 的 list 元数据/cwd 过滤/非法游标、close 保留索引、delete 后 events.db 大小不变且 load `-32002`、重启后 list、resume 零 replay 且后续 provider 请求包含恢复上下文、live resume 幂等、再次重启 load 响应前 replay 且不含已删除 session；Paseo 0.15.3 隔离 home `/tmp/jessica-acp7b-paseo/home`、daemon `127.0.0.1:6769`、workspace `/home/ubuntu/jessica-acp7b-paseo-workspace`、临时 wrapper + 本地 mock `127.0.0.1:46669`，provider diagnostic Ready，首轮 run 成功，daemon stop/start 后 agent closed，`agent send` 经 load 保留首轮上下文并更新索引为 2 turns，`paseo delete` 后 ACP 子进程退出但索引仍保留，`paseo import <sessionId>` 恢复两轮历史且未新增 provider 请求；Paseo CLI 无直接 listImportableSessions 命令，list/delete/resume 由官方 SDK 覆盖。偏离/说明：close/delete drain 上限 5s，超时仍确认；list 包含零 turn 空索引（Paseo probe 会创建）；load/resume 与 delete/close 无全局串行化；list 是目录快照、跨页并发会漂移；RFC3339 手写无新依赖；未改部署 `~/.local/bin/jessica-cli`。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 713 passed, 0 failed, 2 ignored（50 suites）；`cargo test -p jessica-cli acp` 61 unit + 31 E2E 全通过。
 
 ---
 
@@ -1725,7 +1767,11 @@ Deferred（待办，由用户决定是否单开 Task）
 · Task 5.5 可观测性（OTLP 导出、会话回放可视化）暂缓：2026-11-14 用户决定暂时放弃设计/实现。未新增依赖、未修改 jessica-core、未落盘设计文档。若重启，须先 review OTel 依赖方案（官方 SDK vs 手写 OTLP/JSON）、遥测脱敏边界与查看器只读 API，并单开 Task；不得在 5.1–5.4 或收尾工作中顺手实现。
 · Phase 6 ACP-0–ACP-4 首期不支持 MCP stdio；ACP v1 规定 stdio MCP 为 MUST，因此首期不是完全合规。`session/new` 对非空 `mcpServers` 明确报错；完整合规需单开 ACP-5，不得在 ACP-0–4 中顺手实现。
 · Phase 6 首期不实现 `session/request_permission`；bash/write 仍只受 AllowlistPolicy 约束。若需逐次权限批准，须先决定 `jessica-core::tool::Tool` 的 call-id API 方案（或接受 runtime task-local 方案），单开 ACP-6；不得用空/合成 toolCallId。
-· ACP-7a 只实现 `session/load`；`session/list`/`delete`/`resume`/`close` 仍待 ACP-7b，由用户决定是否单开。事件库保持 append-only，delete 若实现也不能物理删除历史。
+· ACP-7b 已实现 `session/list`/`delete`/`resume`/`close`。delete 只删除 ACP 索引并释放 live session，事件库保持 append-only，不提供物理删除或空间回收。若需要隐私删除/GC，必须单开 Task 设计 tombstone、事件引用与跨会话恢复语义，不得直接修改或删除 append-only 事件行。
+· ACP-7b 的 close/delete 取消 active prompt 后最多等待 5 秒；provider/tool 不响应取消时仍会确认，worker 可能继续运行到自身退出。若需要强制终止/资源回收保证，须单开 Task 定义进程/工具级截止与状态回收。
+· ACP-7b 的 `session/list` 会列出所有有效索引，包括尚无 committed turn 的空会话；Paseo catalog probe 会创建此类索引，Paseo import preview 对 load 失败按“可见但无 preview”处理。若需隐藏空会话，必须先定义“可恢复”过滤与 live 空会话的 list 语义，并单开 Task。
+· ACP-7b 的 load/resume 与 delete/close 之间没有全局请求串行化；`AcpPersistence.mutation` 只串行化 create/record/delete 对索引的写。同一 session id 上并发互斥生命周期请求的最终状态由调度决定；若需线性一致性，须单开 Task 设计 per-session 状态机或锁。
+· ACP-7b 的 `session/list` 是目录扫描快照，不是跨并发写入的原子快照；基于 `(updatedAt, sessionId)` 的 keyset 游标在跨页期间新增/删除时会产生正常漂移。若需要稳定快照，须单开 Task 定义快照标识、生命周期与过期策略。
 · ACP-7a 之前创建的会话没有索引，无法恢复；索引也不兼容未来 schema 变更（当前 version=1，遇到不支持的版本 fail-closed 为 `-32603`）。若需要迁移旧会话，必须单开 Task 定义扫描/匹配规则与隐私边界。
 · ACP-7a 的索引更新是每 session 的读-改-原子写，没有跨进程文件锁；`[acp].state_dir` 只应供一个 ACP 进程使用。若需要多进程共享，须单开 Task 设计锁/冲突策略。
 · ACP-7a 的历史重建只从最新可恢复 turn 开始；若最新事件流损坏，会回退并丢失更晚已提交的 turn。若需要逐 turn 合并恢复所有历史，须单开 Task 处理 turn 边界、重复 user 消息与 tool pair 跨 turn 重组。
