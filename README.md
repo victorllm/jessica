@@ -265,6 +265,31 @@ daemon is started from `$HOME`, as in the acceptance run.
 The exact settings key and file location vary by client version; consult the
 client's ACP documentation if it differs.
 
+### Permission requests
+
+Before running a sensitive native tool, Jessica sends ACP
+`session/request_permission` and waits for the client. The fixed sensitive set is
+`bash`, `write_file`, and `delegate_task`; `read_file`, configured MCP tools, and
+WASM tools remain governed only by the policy allowlist.
+
+- Every request offers exactly `allow_once` ("Allow this execution") and
+  `reject_once` ("Reject this execution"). Jessica keeps no persistent approval
+  state across calls or turns.
+- The call is announced as a `tool_call` with its provider `toolCallId` before
+  the request is sent. That update carries the default `pending` status, which
+  ACP omits on the wire. On `allow_once` Jessica emits a `tool_call_update` with
+  status `in_progress` and the same id before execution starts.
+- A rejection, a client `cancelled` outcome, cancellation, transport failure, or
+  an unanswered request never executes the tool. Rejection and the 5-minute
+  answer deadline fail only that call and return an error result to the model; a
+  client `cancelled` outcome, `session/cancel`, close, or disconnect ends the
+  prompt as `cancelled`.
+- The 5-minute answer deadline is fixed and separate from the tool timeout. The
+  tool timeout starts only after approval.
+- Only the top-level `delegate_task` call asks for permission. The child agent's
+  tools run under that single delegation approval and never send their own
+  permission requests.
+
 ### cwd and capability boundaries
 
 - `session/new` requires an absolute `cwd` that exists, resolves to a directory,
@@ -279,9 +304,10 @@ client's ACP documentation if it differs.
   namespaced and go through the normal policy and guards. HTTP/SSE transports
   are rejected, and `session/load`/`session/resume` still reject non-empty
   `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
-- **No permission requests**: tools run under Jessica's configured policy
-  allowlist. A denied call produces a failed `tool_call_update`; Jessica never
-  sends `session/request_permission`.
+- **Permissions**: `bash`, `write_file`, and `delegate_task` ask through
+  `session/request_permission` before execution; see
+  [Permission requests](#permission-requests). A denied call produces a failed
+  `tool_call_update`.
 - **No archive/fork/status/set_title**: the stable v1 `list`, `delete`,
   `resume`, and `close` lifecycle methods are implemented, but archive, fork,
   status, session titles, and other unstable lifecycle extensions are not.

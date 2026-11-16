@@ -17,6 +17,8 @@ use agent_client_protocol::v1::schema::{
 use jessica_core::types::{AgentEvent, BudgetKind, Message, Role, ToolCall};
 use serde_json::Value;
 
+use crate::governance::permission_required;
+
 /// Maximum characters retained in a tool-call title.
 const TOOL_TITLE_CHARS: usize = 120;
 /// Maximum bytes retained in a raw tool input or output value.
@@ -25,6 +27,7 @@ const RAW_VALUE_BYTES: usize = 16 * 1024;
 const CANCELLED_TOOL_CONTENT: &str = "tool execution was cancelled";
 
 /// Maps one prompt's agent events to ACP updates.
+#[derive(Clone)]
 pub(crate) struct AcpEventMapper {
     /// Session working directory used to make tool locations absolute.
     cwd: PathBuf,
@@ -48,13 +51,20 @@ impl AcpEventMapper {
                 ))
             }
             AgentEvent::ToolCallStarted { call } => {
+                let status = if permission_required(&call.name) {
+                    // The call waits for client approval; `in_progress` is
+                    // sent only after the permission gate allows it.
+                    ToolCallStatus::Pending
+                } else {
+                    ToolCallStatus::InProgress
+                };
                 let mut started = AcpToolCall::new(
                     call.id.clone(),
                     tool_title(&call.name, &call.arguments),
                 )
                     .name(call.name.clone())
                     .kind(tool_kind(&call.name))
-                    .status(ToolCallStatus::InProgress)
+                    .status(status)
                     .raw_input(truncate_raw_input(&call.arguments));
                 let locations = tool_locations(&self.cwd, &call.name, &call.arguments);
                 if !locations.is_empty() {
@@ -95,6 +105,37 @@ impl AcpEventMapper {
             | AgentEvent::Error { .. } => None,
             AgentEvent::ModelDelta { .. } => None,
         }
+    }
+
+    /// Builds the `pending` tool-call payload of a permission request.
+    ///
+    /// The request repeats the identity and display fields of the call the
+    /// client already received through `tool_call`, using the same provider
+    /// id. It carries no command output or environment data.
+    pub(crate) fn permission_request_update(&self, call: &ToolCall) -> ToolCallUpdate {
+        let mut fields = ToolCallUpdateFields::new()
+            .title(tool_title(&call.name, &call.arguments))
+            .name(call.name.clone())
+            .kind(tool_kind(&call.name))
+            .status(ToolCallStatus::Pending)
+            .raw_input(truncate_raw_input(&call.arguments));
+        let locations = tool_locations(&self.cwd, &call.name, &call.arguments);
+        if !locations.is_empty() {
+            fields = fields.locations(locations);
+        }
+        ToolCallUpdate::new(call.id.clone(), fields)
+    }
+
+    /// Builds the update that moves an approved call to `in_progress`.
+    ///
+    /// This is sent only after the client selected an allowing option and
+    /// before the tool starts, so `pending` never turns directly into a
+    /// terminal status without an execution phase.
+    pub(crate) fn permission_granted_update(&self, call: &ToolCall) -> ToolCallUpdate {
+        ToolCallUpdate::new(
+            call.id.clone(),
+            ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+        )
     }
 }
 
@@ -414,6 +455,72 @@ mod tests {
             call.locations[0].path,
             PathBuf::from("/workspace/src/main.rs")
         );
+    }
+
+    #[test]
+    fn sensitive_tools_start_pending_and_others_start_in_progress() {
+        let mapper = mapper();
+        for (name, expected) in [
+            ("bash", ToolCallStatus::Pending),
+            ("write_file", ToolCallStatus::Pending),
+            ("delegate_task", ToolCallStatus::Pending),
+            ("read_file", ToolCallStatus::InProgress),
+            ("mcp__stub__echo", ToolCallStatus::InProgress),
+        ] {
+            let update = mapper
+                .map(&AgentEvent::ToolCallStarted {
+                    call: ToolCall::new("call-1", name, json!({"path": "a"})),
+                })
+                .expect("tool start must map");
+            let SessionUpdate::ToolCall(call) = update else {
+                panic!("expected a tool_call update");
+            };
+            assert_eq!(call.status, expected, "wrong start status for {name}");
+        }
+    }
+
+    #[test]
+    fn permission_request_update_reuses_the_call_id_and_display_fields() {
+        let mapper = mapper();
+        let call = ToolCall::new(
+            "call_write",
+            "write_file",
+            json!({"path": "out/result.txt", "content": "data"}),
+        );
+
+        let update = mapper.permission_request_update(&call);
+
+        assert_eq!(update.tool_call_id.to_string(), "call_write");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Pending));
+        assert_eq!(
+            update.fields.title.as_deref(),
+            Some("write_file: out/result.txt")
+        );
+        assert_eq!(update.fields.name.as_deref(), Some("write_file"));
+        assert_eq!(update.fields.kind, Some(ToolKind::Edit));
+        assert_eq!(
+            update.fields.raw_input,
+            Some(json!({"path": "out/result.txt", "content": "data"}))
+        );
+        assert_eq!(update.fields.locations.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            update.fields.locations.expect("locations must be present")[0].path,
+            PathBuf::from("/workspace/out/result.txt")
+        );
+    }
+
+    #[test]
+    fn permission_granted_update_moves_only_the_same_call_to_in_progress() {
+        let mapper = mapper();
+        let call = ToolCall::new("call_bash", "bash", json!({"command": "true"}));
+
+        let update = mapper.permission_granted_update(&call);
+
+        assert_eq!(update.tool_call_id.to_string(), "call_bash");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::InProgress));
+        assert!(update.fields.title.is_none());
+        assert!(update.fields.content.is_none());
+        assert!(update.fields.raw_output.is_none());
     }
 
     #[test]

@@ -151,6 +151,40 @@ impl Tool for RecordingTool {
     }
 }
 
+/// Tool that records full call metadata and rejects calls through `execute`.
+struct CallAwareTool {
+    calls: Arc<Mutex<Vec<ToolCall>>>,
+}
+
+impl CallAwareTool {
+    fn new(calls: Arc<Mutex<Vec<ToolCall>>>) -> Self {
+        Self { calls }
+    }
+}
+
+#[async_trait]
+impl Tool for CallAwareTool {
+    fn name(&self) -> &str {
+        "call_aware"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        json!({"type": "function", "function": {"name": "call_aware"}})
+    }
+
+    async fn execute(&self, _args: Value) -> ToolResult {
+        ToolResult::error("unused", "execute must not be called")
+    }
+
+    async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+        self.calls
+            .lock()
+            .expect("calls mutex poisoned")
+            .push(call.clone());
+        ToolResult::success(call.id.clone(), "observed")
+    }
+}
+
 /// Runs the loop with a fresh event channel and returns every emitted event.
 async fn run(
     provider: Arc<MockProvider>,
@@ -302,6 +336,46 @@ async fn single_tool_call_is_executed_and_result_is_fed_back() {
             Message::assistant_with_tool_calls("", vec![call]),
             Message::tool("call-1", "tool output"),
         ]
+    );
+}
+
+#[tokio::test]
+async fn agent_loop_passes_the_full_call_to_execute_with_call() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(CallAwareTool::new(Arc::clone(&calls))))
+        .expect("tool registration should succeed");
+    let tools = Arc::new(registry);
+
+    let call = ToolCall::new("call-ctx", "call_aware", json!({"value": 9}));
+    let provider = Arc::new(MockProvider::new(vec![
+        Response::Events(vec![
+            LlmEvent::ToolCallRequested { call: call.clone() },
+            LlmEvent::Done { usage: None },
+        ]),
+        text_response("done"),
+    ]));
+
+    let (reason, events) = run(
+        Arc::clone(&provider),
+        tools,
+        4,
+        vec![Message::user("go")],
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(reason, SessionEndReason::Completed);
+    assert_eq!(
+        *calls.lock().expect("calls mutex poisoned"),
+        vec![call.clone()]
+    );
+    assert!(
+        events.contains(&AgentEvent::ToolCallFinished {
+            result: ToolResult::success("call-ctx", "observed"),
+        }),
+        "the call-aware result must be fed back with the provider call id"
     );
 }
 

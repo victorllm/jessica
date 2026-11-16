@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::types::ToolResult;
+use crate::types::{ToolCall, ToolResult};
 
 /// JSON schema describing a tool, in the format expected by the LLM provider.
 pub type ToolSchema = Value;
@@ -27,6 +27,19 @@ pub trait Tool: Send + Sync {
     /// Failures are reported through [`ToolResult::is_error`] instead of a
     /// returned error so the model can observe and recover from them.
     async fn execute(&self, args: Value) -> ToolResult;
+
+    /// Executes the tool with the provider's full call metadata.
+    ///
+    /// The default implementation forwards the arguments to
+    /// [`Tool::execute`], discarding the call id and name. Tools and wrappers
+    /// that need to preserve or inspect the originating [`ToolCall`] should
+    /// override this method.
+    ///
+    /// Failures are reported through [`ToolResult::is_error`], matching
+    /// [`Tool::execute`].
+    async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+        self.execute(call.arguments.clone()).await
+    }
 }
 
 /// Error returned when a tool cannot be registered.
@@ -199,6 +212,52 @@ mod tests {
         let result = futures::executor::block_on(tool.execute(json!({"value": 7})));
         assert_eq!(result.tool_call_id, "call-1");
         assert_eq!(result.content, "{\"value\":7}");
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn default_execute_with_call_forwards_arguments() {
+        let tool = MockTool::new("echo");
+        let call = ToolCall::new("call-9", "echo", json!({"value": 11}));
+        let result = futures::executor::block_on(tool.execute_with_call(&call));
+
+        // The default implementation has no call-id behavior of its own; it
+        // forwards the exact arguments to `execute`.
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.content, "{\"value\":11}");
+        assert!(!result.is_error);
+    }
+
+    /// Tool that observes the full call context instead of only its arguments.
+    struct CallAwareTool;
+
+    #[async_trait]
+    impl Tool for CallAwareTool {
+        fn name(&self) -> &str {
+            "call-aware"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            json!({"type": "function", "function": {"name": "call-aware"}})
+        }
+
+        async fn execute(&self, _args: Value) -> ToolResult {
+            ToolResult::error("unused", "execute must not be called")
+        }
+
+        async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+            ToolResult::success(call.id.clone(), format!("{}:{}", call.name, call.arguments))
+        }
+    }
+
+    #[test]
+    fn execute_with_call_override_receives_the_original_call() {
+        let tool: Arc<dyn Tool> = Arc::new(CallAwareTool);
+        let call = ToolCall::new("call-42", "call-aware", json!({"key": "value"}));
+        let result = futures::executor::block_on(tool.execute_with_call(&call));
+
+        assert_eq!(result.tool_call_id, "call-42");
+        assert_eq!(result.content, "call-aware:{\"key\":\"value\"}");
         assert!(!result.is_error);
     }
 

@@ -246,7 +246,7 @@ impl AgentLoop {
                                     state,
                                 );
                             }
-                            result = tool.execute(call.arguments.clone()) => result,
+                            result = tool.execute_with_call(&call) => result,
                         }
                     }
                     None => {
