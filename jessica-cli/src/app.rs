@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
+use crate::acp_store::AcpStoreError;
 use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventRecorder, RecorderError};
@@ -1247,6 +1248,12 @@ pub(crate) enum CliError {
     /// Recording or loading events failed.
     #[error("event store failure: {0}")]
     Events(#[from] RecorderError),
+    /// ACP session recovery was configured without an event-store path.
+    #[error("ACP session recovery requires an [events] path")]
+    AcpPersistenceWithoutEvents,
+    /// The ACP session index could not be opened.
+    #[error("ACP session store failure: {0}")]
+    AcpStore(#[from] AcpStoreError),
     /// The current directory could not be determined.
     #[error("failed to determine the current directory: {0}")]
     CurrentDir(#[source] io::Error),

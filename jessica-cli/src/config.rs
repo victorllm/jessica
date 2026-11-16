@@ -223,6 +223,11 @@ impl HarnessConfig {
         }
         self.skills.validate()?;
         self.acp.validate()?;
+        if self.acp.state_dir.is_some() && self.events.path.is_none() {
+            return Err(invalid(
+                "acp.state_dir requires an [events] path for ACP session recovery",
+            ));
+        }
         Ok(())
     }
 }
@@ -273,6 +278,13 @@ pub struct AcpConfig {
     pub max_history_messages: usize,
     /// Maximum serialized byte length of one session's history.
     pub max_history_bytes: usize,
+    /// Optional directory holding the ACP session index.
+    ///
+    /// Relative paths resolve against the workspace root. When omitted, ACP
+    /// sessions are not recoverable across process restarts and
+    /// `session/load` is not advertised. When present, `events.path` must also
+    /// be configured because the index points at recorded turn streams.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for AcpConfig {
@@ -282,12 +294,13 @@ impl Default for AcpConfig {
             max_prompt_bytes: DEFAULT_ACP_MAX_PROMPT_BYTES,
             max_history_messages: DEFAULT_ACP_MAX_HISTORY_MESSAGES,
             max_history_bytes: DEFAULT_ACP_MAX_HISTORY_BYTES,
+            state_dir: None,
         }
     }
 }
 
 impl AcpConfig {
-    /// Rejects zero-valued limits.
+    /// Rejects zero-valued limits and an empty state directory.
     ///
     /// A zero session limit would make `session/new` unusable, and zero prompt
     /// or history limits would reject every prompt or every future turn. These
@@ -304,6 +317,13 @@ impl AcpConfig {
         }
         if self.max_history_bytes == 0 {
             return Err(invalid("acp.max_history_bytes must be at least 1"));
+        }
+        if self
+            .state_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(invalid("acp.state_dir must not be empty when present"));
         }
         Ok(())
     }
@@ -947,6 +967,29 @@ mod tests {
         assert_eq!(config.acp.max_prompt_bytes, 1024 * 1024);
         assert_eq!(config.acp.max_history_messages, 200);
         assert_eq!(config.acp.max_history_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.acp.state_dir, None);
+    }
+
+    #[test]
+    fn acp_state_dir_requires_the_event_store_and_rejects_blank_paths() {
+        let without_events = HarnessConfig::from_toml_str("[acp]\nstate_dir = \"acp-state\"\n")
+            .expect_err("ACP recovery needs the event store");
+        assert!(
+            without_events.to_string().contains("events"),
+            "the error must explain the dependency: {without_events}"
+        );
+
+        let blank = HarnessConfig::from_toml_str(
+            "[events]\npath = \"events.db\"\n[acp]\nstate_dir = \"\"\n",
+        )
+        .expect_err("blank state directory must fail");
+        assert!(blank.to_string().contains("state_dir"));
+
+        let configured = HarnessConfig::from_toml_str(
+            "[events]\npath = \"events.db\"\n[acp]\nstate_dir = \"acp-state\"\n",
+        )
+        .expect("ACP recovery configuration must parse");
+        assert_eq!(configured.acp.state_dir, Some(PathBuf::from("acp-state")));
     }
 
     #[test]

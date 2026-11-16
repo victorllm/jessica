@@ -46,10 +46,11 @@ cargo build -p jessica-cli
 `--config` is optional. Provider credentials come from the process environment:
 `JESSICA_PROVIDER` selects `openai` (default) or `anthropic`; the matching
 provider reads `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` or the
-`ANTHROPIC_*` equivalents. Only `initialize`, `session/new`, `session/prompt`,
-and `session/cancel` are implemented. Stdout carries JSON-RPC only; diagnostic
-messages go to stderr, and prompts, tool arguments, environment values, and
-secrets are never logged.
+`ANTHROPIC_*` equivalents. `initialize`, `session/new`, `session/prompt`, and
+`session/cancel` are always implemented; `session/load` is implemented when
+durable ACP state is configured (see below). Stdout carries JSON-RPC only;
+diagnostic messages go to stderr, and prompts, tool arguments, environment
+values, and secrets are never logged.
 
 ### Limits
 
@@ -75,6 +76,44 @@ changes to reloadable sections such as `[budget]`, `[policy]`, `[sensor]`,
 `[acceptance]`, and `[delegation]` apply to the next prompt, while changes to
 `events`, `memory`, `skills`, `wasm`, `reliability`, or `acp` reject the whole
 reload and keep the startup value. WASM tools are loaded once at startup.
+
+### Session recovery
+
+Enable `session/load` by configuring both the event store and the ACP state
+directory:
+
+```toml
+[events]
+path = "events.db"
+
+[acp]
+state_dir = "acp-state"
+```
+
+Relative paths resolve against the startup workspace. `state_dir` requires
+`events.path`; startup fails if only one is configured. The state directory
+contains one small index per ACP session: the session id, canonical cwd,
+timestamps, and committed turn ids. It never stores prompt text, tool
+arguments, model output, environment values, or credentials. Conversation
+history remains in the append-only event store.
+
+When both open successfully, `initialize` reports
+`agentCapabilities.loadSession = true`. `session/load` accepts a persisted
+session id and the same cwd recorded at creation, reconstructs the newest
+recoverable committed turn, filters internal system/bootstrap messages, applies
+the normal history limits, and replays the remaining user, assistant, and tool
+history as `session/update` notifications **before** the load response. The
+restored session then accepts `session/prompt` with the recovered context.
+Unknown session ids return `-32002`; mismatched cwd, already-loaded sessions,
+and unsupported request fields return `-32602`.
+
+Recovery covers sessions created after this feature was configured. Older ACP
+conversations have no index and are not recoverable. If the index points to a
+turn whose event metadata is missing or corrupt, Jessica falls back to the
+newest older recoverable turn. When no indexed turn is recoverable, loading
+fails with `-32603` rather than returning a silently empty conversation.
+`session/list`, `session/delete`, `session/resume`, and `session/close` remain
+unimplemented.
 
 ### Editor and client configuration
 
@@ -119,12 +158,18 @@ Paseo: add this entry under `agents.providers` in `~/.paseo/config.json`
           "OPENAI_MODEL": "your-model",
           "OPENAI_BASE_URL": "https://api.openai.com/v1"
         },
+        "supportsMcpServers": false,
         "additionalModels": []
       }
     }
   }
 }
 ```
+
+Set `supportsMcpServers` to `false` because Jessica rejects non-empty
+`mcpServers` on both `session/new` and `session/load`. Sessions are resumable
+only when the harness file passed with `--config` configures `[events].path`
+and `[acp].state_dir`.
 
 Paseo 0.15.x performs a **global** provider catalog probe with
 `cwd = $HOME`. Jessica's startup workspace root is the directory in which its
@@ -144,7 +189,8 @@ client's ACP documentation if it differs.
 - `session/new` requires an absolute `cwd` that exists, resolves to a directory,
   and remains inside the process startup workspace (Jessica's working directory)
   after symlink resolution. Relative, missing, file, and outside-root paths are
-  rejected with `-32602`.
+  rejected with `-32602`. `session/load` applies the same validation and also
+  requires the cwd to equal the persisted canonical cwd.
 - Supported prompt content is text and `resource_link`. Image, audio, embedded
   resource blocks, and unknown variants are rejected before any model call.
 - **No MCP**: ACP v1 requires stdio MCP support, which this phase does not
@@ -153,10 +199,10 @@ client's ACP documentation if it differs.
 - **No permission requests**: tools run under Jessica's configured policy
   allowlist. A denied call produces a failed `tool_call_update`; Jessica never
   sends `session/request_permission`.
-- **No session lifecycle beyond new/prompt/cancel**: `session/load`, `list`,
-  `delete`, `resume`, and `close` are not implemented, and no session is
-  persisted by the ACP layer. Conversation history is in-memory per session and
-  bounded by the limits above.
+- **No session lifecycle beyond new/load/prompt/cancel**: `session/list`,
+  `delete`, `resume`, and `close` are not implemented. Without `[acp].state_dir`
+  no session is persisted and `loadSession` is reported as `false`; with it,
+  only `session/load` of sessions created by this version is supported.
 - No client `fs/*` or `terminal/*` methods, image/audio/embedded resources,
   session modes/config options/plan/usage updates, or ACP v2.
 - Notices are sent only when the client advertises

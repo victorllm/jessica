@@ -586,6 +586,43 @@ async fn create_session(acp: &mut AcpProcess, id: u64, cwd: &Path) -> String {
         .to_owned()
 }
 
+/// Sends `session/load` and collects every replay update before its response.
+async fn load_session_until_response(
+    acp: &mut AcpProcess,
+    id: u64,
+    session_id: &str,
+    cwd: &Path,
+) -> (Vec<Value>, Value) {
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/load",
+        "params": {
+            "sessionId": session_id,
+            "cwd": cwd.to_str().expect("utf-8 cwd"),
+            "mcpServers": [],
+        },
+    }))
+    .await;
+    collect_until_response(acp, id, session_id).await
+}
+
+/// Configuration enabling both the event store and the ACP session index.
+const PERSISTENCE_CONFIG: &str = "\
+[budget]
+max_rounds = 4
+max_tokens = 100000
+
+[policy]
+allowed_tools = [\"read_file\"]
+
+[events]
+path = \"events.db\"
+
+[acp]
+state_dir = \"acp-state\"
+";
+
 /// Sends one prompt and collects every update that precedes its response.
 async fn prompt_until_response(
     acp: &mut AcpProcess,
@@ -1035,6 +1072,337 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
         requests[2].contains("note contents"),
         "the tool result must be replayed to the provider"
     );
+}
+
+#[tokio::test]
+async fn acp_initialize_advertises_load_only_after_opening_persistence() {
+    let workspace = TempDir::new("load-capability");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+
+    acp.send(initialize(1, 1)).await;
+    let response = acp.recv().await;
+
+    assert_eq!(
+        response["result"]["agentCapabilities"]["loadSession"], true,
+        "a successfully opened index and event store must advertise session/load: {response}"
+    );
+    assert!(
+        workspace.path.join("acp-state").is_dir(),
+        "startup must create the configured ACP state directory"
+    );
+    assert!(
+        workspace.path.join("events.db").is_file(),
+        "startup must open the configured event store before advertising load"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_session_load_after_restart_replays_history_and_continues_context() {
+    let workspace = TempDir::new("load-restart");
+    let note = workspace.path.join("NOTE.txt");
+    std::fs::write(&note, "note contents").expect("fixture note must be written");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+
+    let first_provider = MockProvider::start(vec![
+        tool_calls_response(&[("call_read", "read_file", json!({"path": "NOTE.txt"}))]),
+        text_response("read result answer"),
+    ]);
+    let mut first = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", first_provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut first).await;
+    let session = create_session(&mut first, 2, &workspace.path).await;
+    let (updates, response) = prompt_until_response(
+        &mut first,
+        3,
+        &session,
+        json!([{"type": "text", "text": "please read NOTE.txt"}]),
+    )
+    .await;
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the turn providing persisted history must complete: {response}"
+    );
+    assert_eq!(
+        updates.iter().map(update_kind).collect::<Vec<_>>(),
+        vec!["tool_call", "tool_call_update", "agent_message_chunk"],
+        "the fixture must persist a tool turn and its answer: {updates:?}"
+    );
+    first.close_stdin();
+    assert_eq!(first.wait().await.code(), Some(0));
+    assert_eq!(
+        first_provider.finish().len(),
+        2,
+        "the first process must persist both model rounds"
+    );
+
+    let second_provider = MockProvider::start(vec![text_response("second answer")]);
+    let mut second = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", second_provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut second).await;
+
+    let (replayed, load_response) =
+        load_session_until_response(&mut second, 2, &session, &workspace.path).await;
+    assert!(
+        load_response.get("result").is_some(),
+        "loading a persisted session must succeed: {load_response}"
+    );
+    assert_eq!(
+        replayed.iter().map(update_kind).collect::<Vec<_>>(),
+        vec![
+            "user_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk"
+        ],
+        "the complete non-system conversation must be replayed before the load response: {replayed:?}"
+    );
+    assert_eq!(replayed[0]["content"]["text"], "please read NOTE.txt");
+    assert_eq!(replayed[1]["toolCallId"], "call_read");
+    assert_eq!(replayed[1]["status"], "in_progress");
+    assert_eq!(replayed[2]["toolCallId"], "call_read");
+    assert_eq!(replayed[2]["status"], "completed");
+    assert_eq!(replayed[2]["rawOutput"], "note contents");
+    assert_eq!(replayed[3]["content"]["text"], "read result answer");
+    assert_ne!(
+        replayed[0]["messageId"], replayed[3]["messageId"],
+        "each replayed message must have a distinct message id"
+    );
+
+    let (_, prompt_response) = prompt_until_response(
+        &mut second,
+        3,
+        &session,
+        json!([{"type": "text", "text": "what was in the note?"}]),
+    )
+    .await;
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "a loaded session must accept another prompt: {prompt_response}"
+    );
+
+    second.close_stdin();
+    assert_eq!(second.wait().await.code(), Some(0));
+    let requests = second_provider.finish();
+    assert_eq!(
+        requests.len(),
+        1,
+        "loading must replay persisted history without calling the model"
+    );
+    let request: Value = serde_json::from_str(&requests[0]).expect("provider request must be JSON");
+    let messages = request["messages"]
+        .as_array()
+        .expect("the provider request must carry messages");
+    assert_eq!(
+        messages
+            .last()
+            .and_then(|message| message["content"].as_str()),
+        Some("what was in the note?"),
+        "the new user message must be appended after restored history"
+    );
+    assert!(
+        messages.iter().any(
+            |message| message["role"] == "user" && message["content"] == "please read NOTE.txt"
+        ),
+        "the restored user turn must reach the provider: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| message["role"] == "assistant"
+            && message["tool_calls"][0]["id"] == "call_read"),
+        "the restored assistant tool call must reach the provider: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["role"] == "tool" && message["content"] == "note contents"),
+        "the restored tool result must reach the provider: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["role"] == "assistant"
+                && message["content"] == "read result answer"),
+        "the restored assistant answer must reach the provider: {messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn acp_session_load_handles_empty_state_and_stable_errors() {
+    let workspace = TempDir::new("load-errors");
+    let subdirectory = workspace.path.join("sub");
+    std::fs::create_dir_all(&subdirectory).expect("subdirectory must exist");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(&config, PERSISTENCE_CONFIG).expect("harness configuration must be written");
+
+    let mut first = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut first).await;
+    let session = create_session(&mut first, 2, &workspace.path).await;
+    first.close_stdin();
+    assert_eq!(first.wait().await.code(), Some(0));
+
+    let mut second = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut second).await;
+
+    second
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/load",
+            "params": {
+                "sessionId": "acp-does-not-exist",
+                "cwd": workspace.path,
+                "mcpServers": [],
+            },
+        }))
+        .await;
+    let unknown = second.recv().await;
+    assert_eq!(
+        unknown["error"]["code"], -32002,
+        "an unknown session must use the reserved not-found code: {unknown}"
+    );
+
+    second
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/load",
+            "params": {
+                "sessionId": session,
+                "cwd": subdirectory,
+                "mcpServers": [],
+            },
+        }))
+        .await;
+    let wrong_cwd = second.recv().await;
+    assert_eq!(
+        wrong_cwd["error"]["code"], -32602,
+        "a different cwd must be rejected as invalid params: {wrong_cwd}"
+    );
+    assert!(
+        wrong_cwd["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cwd does not match")),
+        "the error must identify the cwd mismatch: {wrong_cwd}"
+    );
+
+    second
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/load",
+            "params": {
+                "sessionId": session,
+                "cwd": workspace.path,
+                "mcpServers": [{
+                    "name": "server",
+                    "command": "/bin/true",
+                    "args": [],
+                    "env": []
+                }],
+            },
+        }))
+        .await;
+    let unsupported = second.recv().await;
+    assert_eq!(
+        unsupported["error"]["code"], -32602,
+        "load must reject MCP servers just like session/new: {unsupported}"
+    );
+
+    let (replayed, empty) =
+        load_session_until_response(&mut second, 5, &session, &workspace.path).await;
+    assert!(
+        empty.get("result").is_some(),
+        "a session with no committed turns must still load: {empty}"
+    );
+    assert!(
+        replayed.is_empty(),
+        "an empty session must not replay synthetic updates: {replayed:?}"
+    );
+
+    second
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "session/load",
+            "params": {
+                "sessionId": session,
+                "cwd": workspace.path,
+                "mcpServers": [],
+            },
+        }))
+        .await;
+    let duplicate = second.recv().await;
+    assert_eq!(
+        duplicate["error"]["code"], -32602,
+        "loading the same live session twice must be rejected: {duplicate}"
+    );
+
+    second.close_stdin();
+    assert_eq!(second.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_session_load_without_persistence_is_method_not_found() {
+    let mut acp = AcpProcess::spawn(&[]).await;
+    handshake(&mut acp).await;
+    let cwd = std::env::current_dir().expect("the test process must have a working directory");
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/load",
+        "params": {
+            "sessionId": "acp-unrecoverable",
+            "cwd": cwd,
+            "mcpServers": [],
+        },
+    }))
+    .await;
+    let response = acp.recv().await;
+
+    assert_eq!(
+        response["error"]["code"], -32601,
+        "session/load must be absent when no persistence was configured: {response}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@ mod acceptance_check;
 mod acp;
 mod acp_events;
 mod acp_session;
+mod acp_store;
 mod app;
 mod config;
 mod delegation;

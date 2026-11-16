@@ -1,12 +1,18 @@
 //! Stable ACP v1 agent transport over stdio.
 //!
-//! The server implements `initialize`, `session/new`, `session/prompt`, and
-//! `session/cancel`. A prompt is prepared synchronously (session lookup,
-//! content validation, busy check), then model and tool work runs in a task
-//! spawned on the connection so the SDK dispatch loop keeps receiving
-//! messages. Cancellation is scoped to one session prompt; sessions run
-//! concurrently and process shutdown or stdin EOF cancels every session before
-//! a bounded drain.
+//! The server implements `initialize`, `session/new`, `session/load` (when
+//! persistence is configured), `session/prompt`, and `session/cancel`. A prompt
+//! is prepared synchronously (session lookup, content validation, busy check),
+//! then model and tool work runs in a task spawned on the connection so the SDK
+//! dispatch loop keeps receiving messages. Cancellation is scoped to one
+//! session prompt; sessions run concurrently and process shutdown or stdin EOF
+//! cancels every session before a bounded drain.
+//!
+//! When `[acp].state_dir` and `[events].path` are both configured, each ACP
+//! session is indexed on disk and every committed prompt turn is linked to its
+//! event-store stream. `session/load` reconstructs the newest stable history
+//! from those turns and replays it as `session/update` notifications before the
+//! load response. Without persistence, `loadSession` is not advertised.
 //!
 //! Limits are copied from the `[acp]` section at startup. Session IDs remain
 //! bounded by `max_sessions`, prompt text by `max_prompt_bytes`, and history by
@@ -32,9 +38,9 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, Implementation, InitializeRequest, InitializeResponse,
-    McpCapabilities, MessageId, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionCapabilities,
-    SessionId as AcpSessionId, SessionNotification, SessionUpdate, StopReason,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, MessageId, NewSessionRequest,
+    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionCapabilities, SessionId as AcpSessionId, SessionNotification, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
@@ -44,11 +50,13 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp_events::{
-    AcpEventMapper, BudgetStopReason, InFlightTools, budget_stop_reason, interrupted_tool_update,
+    AcpEventMapper, BudgetStopReason, InFlightTools, budget_stop_reason, history_updates,
+    interrupted_tool_update,
 };
 use crate::acp_session::{
     AcpSession, AcpSessionRegistry, HistoryLimits, PromptGuard, SessionError, prompt_text,
 };
+use crate::acp_store::{AcpLoadError, AcpPersistence};
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
 use crate::config::HarnessConfig;
 use crate::hot_reload::ConfigWatcher;
@@ -75,15 +83,19 @@ pub(crate) async fn run(
     shutdown: Arc<ShutdownController>,
 ) -> Result<(), CliError> {
     let root = canonical_startup_root(root).await?;
+    let config = Arc::new(config);
+    let persistence = AcpPersistence::open(&config, &root).await?.map(Arc::new);
     let service = Arc::new(AcpService::new(
-        Arc::new(config),
+        config,
         root,
         watch_path,
         Arc::clone(&shutdown),
+        persistence,
     ));
 
     let initialize_service = Arc::clone(&service);
     let new_session_service = Arc::clone(&service);
+    let load_session_service = Arc::clone(&service);
     let prompt_service = Arc::clone(&service);
     let cancel_service = Arc::clone(&service);
     let connection = Agent
@@ -101,6 +113,14 @@ pub(crate) async fn run(
                     Ok(response) => responder.respond(response),
                     Err(error) => responder.respond_with_error(error),
                 }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: LoadSessionRequest, responder, connection| {
+                load_session_service
+                    .load_session(request, responder, connection)
+                    .await
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -188,6 +208,8 @@ struct AcpService {
     watch_path: Option<PathBuf>,
     /// Process-level shutdown token source.
     shutdown: Arc<ShutdownController>,
+    /// Optional durable ACP session index and event-store reader.
+    persistence: Option<Arc<AcpPersistence>>,
     /// Live sessions and their bounded histories.
     registry: AcpSessionRegistry,
     /// Tracks prompt workers and rejects new prompts once shutdown begins.
@@ -224,6 +246,7 @@ impl AcpService {
         root: PathBuf,
         watch_path: Option<PathBuf>,
         shutdown: Arc<ShutdownController>,
+        persistence: Option<Arc<AcpPersistence>>,
     ) -> Self {
         let registry = AcpSessionRegistry::new(
             root.clone(),
@@ -239,6 +262,7 @@ impl AcpService {
             root,
             watch_path,
             shutdown,
+            persistence,
             registry,
             prompts: Arc::new(PromptTracker::new()),
             client_notices: AtomicBool::new(false),
@@ -330,7 +354,7 @@ impl AcpService {
         }
         self.client_notices
             .store(client_supports_notices(request), Ordering::SeqCst);
-        responder.respond(initialize_response(request))
+        responder.respond(initialize_response(request, self.persistence.is_some()))
     }
 
     /// Returns whether the client advertised `session.notices`.
@@ -402,8 +426,113 @@ impl AcpService {
             .create(request.cwd)
             .await
             .map_err(session_error)?;
+        if let Some(persistence) = &self.persistence
+            && let Err(error) = persistence
+                .create_session(session.id(), session.cwd())
+                .await
+        {
+            self.registry.remove(session.id());
+            tracing::warn!(
+                error = %error,
+                "acp session index creation failed"
+            );
+            return Err(internal_session_error());
+        }
         tracing::debug!(session_id = session.id(), "acp session created");
         Ok(NewSessionResponse::new(session.id().to_owned()))
+    }
+
+    /// Implements `session/load`.
+    ///
+    /// The request cwd must resolve to the canonical cwd recorded when the
+    /// session was created. Replay notifications are written before the load
+    /// response, and the restored session is immediately usable for prompts.
+    async fn load_session(
+        &self,
+        request: LoadSessionRequest,
+        responder: agent_client_protocol::v1::Responder<LoadSessionResponse>,
+        connection: ConnectionTo<Client>,
+    ) -> Result<(), Error> {
+        if self.is_closing() {
+            return responder.respond_with_error(shutting_down_error());
+        }
+        let Some(persistence) = &self.persistence else {
+            return responder.respond_with_error(session_load_unsupported());
+        };
+        if !request.mcp_servers.is_empty() {
+            return responder.respond_with_error(invalid_params(
+                "mcpServers are not supported in this ACP version",
+            ));
+        }
+        if !request.additional_directories.is_empty() {
+            return responder.respond_with_error(invalid_params(
+                "additionalDirectories are not supported in this ACP version",
+            ));
+        }
+        if request.system_prompt.is_some() {
+            return responder.respond_with_error(invalid_params(
+                "systemPrompt is not supported in this ACP version",
+            ));
+        }
+
+        let session_id = request.session_id.to_string();
+        if self.registry.get(&session_id).is_some() {
+            return responder.respond_with_error(invalid_params("session is already loaded"));
+        }
+
+        let index = match persistence.lookup(&session_id).await {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                return responder.respond_with_error(session_not_found(&request.session_id));
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "acp session index lookup failed");
+                return responder.respond_with_error(internal_load_error());
+            }
+        };
+
+        let cwd = match self.registry.validate_cwd(request.cwd).await {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(session_error(error)),
+        };
+        if cwd != index.cwd() {
+            return responder
+                .respond_with_error(invalid_params("cwd does not match the persisted session"));
+        }
+
+        let history = match persistence.history_for(&index).await {
+            Ok(history) => history,
+            Err(AcpLoadError::NoRecoverableTurn { .. }) => {
+                tracing::warn!("acp session has no recoverable turn");
+                return responder.respond_with_error(internal_load_error());
+            }
+        };
+        let replay_history = history.clone();
+        let session = match self
+            .registry
+            .restore(session_id.clone(), cwd, history)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => return responder.respond_with_error(session_error(error)),
+        };
+
+        for update in history_updates(session.cwd(), &replay_history) {
+            let notification =
+                SessionNotification::new(AcpSessionId::new(session_id.clone()), update);
+            if connection.send_notification(notification).is_err() {
+                self.fail_transport();
+                self.registry.remove(&session_id);
+                return responder.respond_with_error(internal_load_error());
+            }
+        }
+        if responder.respond(LoadSessionResponse::new()).is_err() {
+            self.fail_transport();
+            self.registry.remove(&session_id);
+            return Ok(());
+        }
+        tracing::debug!(session_id = session.id(), "acp session loaded");
+        Ok(())
     }
 
     /// Validates a prompt and acquires the session's single prompt lease.
@@ -443,7 +572,7 @@ impl AcpService {
         shutdown: Arc<ShutdownController>,
         runtime: Arc<CliRuntime>,
     ) -> Self {
-        let service = Self::new(config, root, None, shutdown);
+        let service = Self::new(config, root, None, shutdown, None);
         let _ = service.runtime.set(Ok(RuntimeAssembly {
             runtime,
             _config_watcher: None,
@@ -617,7 +746,7 @@ async fn run_prompt_worker(
             cwd,
             history,
             user_input,
-            turn_id,
+            turn_id: turn_id.clone(),
             token: guard.token().clone(),
             sink,
             observations: Arc::clone(&observations),
@@ -652,6 +781,22 @@ async fn run_prompt_worker(
     // is ordered behind them, so a successful acknowledgement proves that the
     // writer attempted every update before the response is sent.
     let updates_delivered = update_barrier(&updates).await;
+
+    // A turn is committed exactly when the barrier succeeded and execution
+    // produced commit messages. Persist its turn id before the response so a
+    // successfully answered prompt is recoverable. Index failure only warns:
+    // the in-memory session remains usable, while load falls back to an older
+    // recoverable turn.
+    if updates_delivered
+        && commit.is_some()
+        && let Some(persistence) = &service.persistence
+        && let Err(error) = persistence.record_turn(&session_id, &turn_id).await
+    {
+        tracing::warn!(
+            error = %error,
+            "acp committed turn index update failed"
+        );
+    }
 
     // The cancel handler takes this gate before setting the flag. Holding it
     // until the response is enqueued makes the cancellation and response a
@@ -948,21 +1093,24 @@ async fn update_barrier(updates: &mpsc::UnboundedSender<WriterMessage>) -> bool 
 ///
 /// Jessica supports only stable ACP v1. A client that requests a different
 /// version receives v1, as the v1 schema requires when the requested version
-/// is unsupported; the client decides whether to disconnect. All optional
-/// capabilities are explicitly disabled so clients never probe unsupported
-/// content types, MCP transports, session loading, or session lifecycle
-/// methods. Baseline text and resource-link prompts are always supported.
-fn initialize_response(request: &InitializeRequest) -> InitializeResponse {
+/// is unsupported; the client decides whether to disconnect. Session loading is
+/// advertised only when a persistence index and event store were opened at
+/// startup. Every other optional capability stays explicitly disabled so
+/// clients never probe unsupported content types, MCP transports, or session
+/// lifecycle methods. Baseline text and resource-link prompts are always
+/// supported.
+fn initialize_response(request: &InitializeRequest, load_session: bool) -> InitializeResponse {
     tracing::debug!(
         requested_protocol_version = request.protocol_version.as_u16(),
         supported_protocol_version = ProtocolVersion::V1.as_u16(),
+        load_session,
         "acp initialize"
     );
 
     InitializeResponse::new(ProtocolVersion::V1)
         .agent_capabilities(
             AgentCapabilities::new()
-                .load_session(false)
+                .load_session(load_session)
                 .prompt_capabilities(
                     PromptCapabilities::new()
                         .image(false)
@@ -1001,6 +1149,21 @@ fn session_not_found(session_id: &AcpSessionId) -> Error {
 /// Generic internal error that cannot leak provider or prompt details.
 fn internal_prompt_error() -> Error {
     Error::new(ErrorCode::INTERNAL_ERROR, "prompt failed")
+}
+
+/// Generic internal error for a session that could not be indexed.
+fn internal_session_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session creation failed")
+}
+
+/// Generic internal error for an unreadable or unrecoverable session.
+fn internal_load_error() -> Error {
+    Error::new(ErrorCode::INTERNAL_ERROR, "session load failed")
+}
+
+/// Method-not-found error when persistence was not configured.
+fn session_load_unsupported() -> Error {
+    Error::method_not_found()
 }
 
 /// Error returned once shutdown has stopped accepting new work.
@@ -1703,11 +1866,15 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_v1_and_no_optional_capabilities() {
-        let response = initialize_response(&InitializeRequest::new(ProtocolVersion::V1));
-
+    fn initialize_advertises_v1_and_only_the_configured_optional_capabilities() {
+        let response = initialize_response(&InitializeRequest::new(ProtocolVersion::V1), false);
         assert_eq!(response.protocol_version, ProtocolVersion::V1);
         assert!(!response.agent_capabilities.load_session);
+        let persisted = initialize_response(&InitializeRequest::new(ProtocolVersion::V1), true);
+        assert!(
+            persisted.agent_capabilities.load_session,
+            "persistence must advertise session/load"
+        );
         assert!(!response.agent_capabilities.prompt_capabilities.image);
         assert!(!response.agent_capabilities.prompt_capabilities.audio);
         assert!(
@@ -1733,7 +1900,7 @@ mod tests {
             ProtocolVersion::from(2_u16),
             ProtocolVersion::from(999_u16),
         ] {
-            let response = initialize_response(&InitializeRequest::new(requested));
+            let response = initialize_response(&InitializeRequest::new(requested), false);
 
             assert_eq!(
                 response.protocol_version,

@@ -8,12 +8,37 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::v1::schema::ContentBlock;
 use jessica_core::types::{Message, Role, SessionId};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+/// Process-wide session sequence.
+///
+/// A single counter keeps ids unique even if a test creates several registries
+/// in one process. In normal operation the ACP service owns one registry.
+static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Nonce that distinguishes this process's ACP sessions from earlier runs.
+static PROCESS_NONCE: OnceLock<String> = OnceLock::new();
+
+/// Returns a process-unique nonce for session ids and therefore turn ids.
+///
+/// The process id alone is reused by the operating system, so the startup
+/// nanosecond timestamp is included. A loaded session keeps its old id; only
+/// newly created sessions use this nonce.
+fn process_nonce() -> &'static str {
+    PROCESS_NONCE.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{nanos}", std::process::id())
+    })
+}
 
 /// Text used to close a tool call whose result never reached the transcript.
 const INTERRUPTED_TOOL_RESULT: &str = "tool error: tool execution was interrupted";
@@ -48,6 +73,12 @@ pub(crate) enum SessionError {
         /// Configured upper bound.
         max_sessions: usize,
     },
+    /// A restored session id is already live.
+    #[error("session is already loaded")]
+    AlreadyLoaded,
+    /// A restored session id was empty.
+    #[error("session id must not be empty")]
+    EmptyId,
 }
 
 /// Errors raised while preparing prompt content.
@@ -72,7 +103,7 @@ pub(crate) enum PromptContentError {
 
 /// One ACP session.
 pub(crate) struct AcpSession {
-    /// Protocol-visible session id (`acp-{pid}-{seq}`).
+    /// Protocol-visible session id (`acp-{process-nonce}-{seq}`).
     id: String,
     /// Canonical working directory validated at creation time.
     cwd: PathBuf,
@@ -102,9 +133,14 @@ impl AcpSession {
     }
 
     /// Allocates the internal turn id for the next prompt.
+    ///
+    /// The id includes the current process nonce as well as the per-session
+    /// sequence. A restored session starts its sequence at zero again, so
+    /// without the nonce its first new turn would reuse an event-store key from
+    /// the process that originally ran the session.
     pub(crate) fn next_turn_id(&self) -> SessionId {
         let sequence = self.turn_sequence.fetch_add(1, Ordering::Relaxed);
-        SessionId::new(format!("{}-t{sequence}", self.id))
+        SessionId::new(format!("{}-{}-t{sequence}", self.id, process_nonce()))
     }
 
     /// Marks a prompt active and snapshots the history it must receive.
@@ -288,8 +324,6 @@ pub(crate) struct AcpSessionRegistry {
     max_sessions: usize,
     /// History limits copied into every new session.
     limits: HistoryLimits,
-    /// Process-local session sequence.
-    sequence: AtomicU64,
     /// Sessions keyed by protocol id.
     sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
     /// Parent token for every session lifetime token.
@@ -312,7 +346,6 @@ impl AcpSessionRegistry {
             root,
             max_sessions,
             limits,
-            sequence: AtomicU64::new(0),
             sessions: Mutex::new(HashMap::new()),
             lifetime_parent,
         }
@@ -328,6 +361,37 @@ impl AcpSessionRegistry {
         &self,
         requested_cwd: PathBuf,
     ) -> Result<Arc<AcpSession>, SessionError> {
+        let canonical = self.validate_cwd(requested_cwd).await?;
+        let sequence = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let id = format!("acp-{}-{sequence}", process_nonce());
+        self.insert(id, canonical, Vec::new())
+    }
+
+    /// Restores a persisted session with its reconstructed history.
+    ///
+    /// The restored session uses the same validation and limit checks as a new
+    /// session. History is completed and trimmed with the live commit rules so
+    /// a recovered session cannot start with an orphan tool result.
+    pub(crate) async fn restore(
+        &self,
+        id: String,
+        requested_cwd: PathBuf,
+        history: Vec<Message>,
+    ) -> Result<Arc<AcpSession>, SessionError> {
+        if id.is_empty() {
+            return Err(SessionError::EmptyId);
+        }
+        let canonical = self.validate_cwd(requested_cwd).await?;
+        let mut history = complete_tool_pairs(history);
+        trim_history(&mut history, self.limits);
+        self.insert(id, canonical, history)
+    }
+
+    /// Validates a requested session working directory.
+    pub(crate) async fn validate_cwd(
+        &self,
+        requested_cwd: PathBuf,
+    ) -> Result<PathBuf, SessionError> {
         if !requested_cwd.is_absolute() {
             return Err(SessionError::CwdNotAbsolute);
         }
@@ -343,25 +407,50 @@ impl AcpSessionRegistry {
         if !canonical.starts_with(&self.root) {
             return Err(SessionError::CwdOutsideRoot);
         }
+        Ok(canonical)
+    }
 
+    /// Inserts a session after validating the live-session bound.
+    fn insert(
+        &self,
+        id: String,
+        canonical: PathBuf,
+        history: Vec<Message>,
+    ) -> Result<Arc<AcpSession>, SessionError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if sessions.contains_key(&id) {
+            return Err(SessionError::AlreadyLoaded);
+        }
         if sessions.len() >= self.max_sessions {
             return Err(SessionError::LimitReached {
                 max_sessions: self.max_sessions,
             });
         }
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let id = format!("acp-{}-{sequence}", std::process::id());
         let session = Arc::new(AcpSession {
             id: id.clone(),
             cwd: canonical,
-            state: Mutex::new(SessionState::default()),
+            state: Mutex::new(SessionState {
+                history,
+                active: None,
+            }),
             turn_sequence: AtomicU64::new(0),
             limits: self.limits,
             lifetime: self.lifetime_parent.child_token(),
         });
         sessions.insert(id, Arc::clone(&session));
         Ok(session)
+    }
+
+    /// Removes a session whose index could not be persisted.
+    pub(crate) fn remove(&self, id: &str) {
+        let removed = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        if let Some(session) = removed {
+            session.cancel_lifetime();
+        }
     }
 
     /// Looks up a session by its protocol id.
@@ -656,6 +745,123 @@ mod tests {
         assert!(first.id().starts_with("acp-"));
         assert!(!first_guard.token().is_cancelled());
         assert!(!second_guard.token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_ids_remain_unique_across_registries_in_one_process() {
+        let (first_registry, first_root) = registry("unique-a", 2).await;
+        let (second_registry, second_root) = registry("unique-b", 2).await;
+        let first = first_registry
+            .create(first_root)
+            .await
+            .expect("first registry session");
+        let second = second_registry
+            .create(second_root)
+            .await
+            .expect("second registry session");
+
+        assert_ne!(
+            first.id(),
+            second.id(),
+            "a process-wide sequence prevents index collisions across registries"
+        );
+        assert!(
+            first
+                .id()
+                .starts_with(&format!("acp-{}-", std::process::id())),
+            "the id must include the process component: {}",
+            first.id()
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_sessions_keep_the_persisted_id_and_trimmed_history() {
+        let (_, root) = registry("restore", 2).await;
+        let registry = AcpSessionRegistry::new(
+            root.clone(),
+            2,
+            HistoryLimits {
+                max_messages: 2,
+                max_bytes: 2 * 1024 * 1024,
+            },
+            CancellationToken::new(),
+        );
+        let session = registry
+            .restore(
+                "acp-persisted-0".to_owned(),
+                root,
+                vec![
+                    Message::system("bootstrap"),
+                    Message::user("old"),
+                    Message::assistant("old answer"),
+                    Message::user("new"),
+                    Message::assistant("new answer"),
+                ],
+            )
+            .await
+            .expect("session must be restored");
+
+        assert_eq!(session.id(), "acp-persisted-0");
+        assert_eq!(
+            session.history_snapshot(),
+            vec![Message::user("new"), Message::assistant("new answer")],
+            "restore must enforce the same history limits as a live session"
+        );
+        let turn_id = session.next_turn_id();
+        assert!(
+            turn_id.as_str().starts_with("acp-persisted-0-") && turn_id.as_str().ends_with("-t0"),
+            "turn ids continue from the restored session id: {turn_id}"
+        );
+        assert_ne!(
+            turn_id.as_str(),
+            "acp-persisted-0-t0",
+            "a restored session must not reuse the original process's turn key"
+        );
+        assert_eq!(
+            session.next_turn_id().as_str(),
+            turn_id.as_str().replace("-t0", "-t1"),
+            "the restored session still increments its own turn sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_duplicate_ids_invalid_cwd_and_session_limit() {
+        let (registry, root) = registry("restore-errors", 1).await;
+        registry
+            .restore("acp-same".to_owned(), root.clone(), Vec::new())
+            .await
+            .expect("first restore must succeed");
+
+        let duplicate = registry
+            .restore("acp-same".to_owned(), root.clone(), Vec::new())
+            .await
+            .err()
+            .expect("duplicate restore must fail");
+        assert_eq!(duplicate.to_string(), "session is already loaded");
+
+        let outside = std::env::temp_dir().join(format!(
+            "jessica-acp-restore-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock must follow the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).expect("outside directory must exist");
+        let invalid = registry
+            .restore("acp-outside".to_owned(), outside, Vec::new())
+            .await
+            .err()
+            .expect("outside cwd must fail");
+        assert!(invalid.to_string().contains("startup workspace root"));
+
+        let limited = registry
+            .restore("acp-second".to_owned(), root, Vec::new())
+            .await
+            .err()
+            .expect("the configured session limit must still apply");
+        assert!(limited.to_string().contains("maximum 1"));
+        assert_eq!(registry.len(), 1);
     }
 
     #[tokio::test]
