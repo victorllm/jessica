@@ -40,6 +40,41 @@ fn assert_mcp_fixture_available() {
     );
 }
 
+/// How the test client answers `session/request_permission`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionMode {
+    /// Approve every sensitive tool exactly once.
+    AllowOnce,
+    /// Reject every sensitive tool exactly once.
+    RejectOnce,
+    /// Answer with the protocol-level `cancelled` outcome.
+    Cancelled,
+    /// Leave requests to the test so it can assert on them.
+    Manual,
+}
+
+/// One answer the client may send to a permission request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionAnswer {
+    /// Select the offered `allow_once` option.
+    AllowOnce,
+    /// Select the offered `reject_once` option.
+    RejectOnce,
+    /// Cancel the whole prompt turn.
+    Cancelled,
+}
+
+impl PermissionAnswer {
+    /// Builds the `result.outcome` payload for one answer.
+    fn outcome(self) -> Value {
+        match self {
+            Self::AllowOnce => json!({"outcome": "selected", "optionId": "allow_once"}),
+            Self::RejectOnce => json!({"outcome": "selected", "optionId": "reject_once"}),
+            Self::Cancelled => json!({"outcome": "cancelled"}),
+        }
+    }
+}
+
 /// One running ACP agent process under test.
 struct AcpProcess {
     /// Child process; stdin is taken when the test closes the stream.
@@ -48,6 +83,10 @@ struct AcpProcess {
     stdout: Option<BufReader<ChildStdout>>,
     /// Diagnostics, read only by tests that assert on them.
     stderr: Option<ChildStderr>,
+    /// Automatic answer for permission requests.
+    permission_mode: PermissionMode,
+    /// Every permission request observed, in arrival order.
+    permission_requests: Vec<Value>,
 }
 
 impl AcpProcess {
@@ -87,7 +126,19 @@ impl AcpProcess {
             child,
             stdout: Some(stdout),
             stderr,
+            permission_mode: PermissionMode::AllowOnce,
+            permission_requests: Vec::new(),
         }
+    }
+
+    /// Changes how the client answers incoming permission requests.
+    fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.permission_mode = mode;
+    }
+
+    /// Returns every permission request observed so far.
+    fn permission_requests(&self) -> &[Value] {
+        &self.permission_requests
     }
 
     /// Sends one JSON-RPC message as a single newline-terminated line.
@@ -105,8 +156,8 @@ impl AcpProcess {
             .expect("flushing ACP stdin must succeed");
     }
 
-    /// Reads one non-empty protocol line, failing on EOF or timeout.
-    async fn recv_line(&mut self) -> String {
+    /// Reads one non-empty protocol line without interpreting it.
+    async fn read_protocol_line(&mut self) -> String {
         let stdout = self
             .stdout
             .as_mut()
@@ -125,6 +176,46 @@ impl AcpProcess {
                 return trimmed.to_owned();
             }
         }
+    }
+
+    /// Reads one protocol line, answering permission requests automatically.
+    ///
+    /// Permission requests are client-bound JSON-RPC requests rather than
+    /// session updates, so they may appear between any two updates. Tests that
+    /// assert on them switch to [`PermissionMode::Manual`] and read the
+    /// request itself.
+    async fn recv_line(&mut self) -> String {
+        loop {
+            let line = self.read_protocol_line().await;
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                return line;
+            };
+            if message.get("method").and_then(Value::as_str) != Some("session/request_permission") {
+                return line;
+            }
+            self.permission_requests.push(message.clone());
+            let answer = match self.permission_mode {
+                PermissionMode::Manual => return line,
+                PermissionMode::AllowOnce => PermissionAnswer::AllowOnce,
+                PermissionMode::RejectOnce => PermissionAnswer::RejectOnce,
+                PermissionMode::Cancelled => PermissionAnswer::Cancelled,
+            };
+            self.respond_permission(&message, answer).await;
+        }
+    }
+
+    /// Sends one answer for a permission request, echoing its JSON-RPC id.
+    async fn respond_permission(&mut self, request: &Value, answer: PermissionAnswer) {
+        let id = request
+            .get("id")
+            .cloned()
+            .expect("permission requests must carry an id");
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"outcome": answer.outcome()},
+        }))
+        .await;
     }
 
     /// Reads one line and parses it as a JSON-RPC message.
@@ -808,6 +899,9 @@ async fn collect_until_response(
             assert_eq!(message["id"], id, "the response must match the prompt id");
             return (updates, message);
         }
+        if is_protocol_level_notification(&message) {
+            continue;
+        }
         assert_eq!(
             message["method"], "session/update",
             "only session updates may precede a prompt response: {message}"
@@ -818,6 +912,14 @@ async fn collect_until_response(
         );
         updates.push(message["params"]["update"].clone());
     }
+}
+
+/// Returns whether `message` is a protocol-level `$/` notification.
+fn is_protocol_level_notification(message: &Value) -> bool {
+    message
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.starts_with("$/"))
 }
 
 /// Waits for the first update of `kind` on one session.
@@ -837,6 +939,53 @@ async fn collect_update_of_kind(acp: &mut AcpProcess, session_id: &str, kind: &s
         );
         let update = message["params"]["update"].clone();
         let found = update_kind(&update) == kind;
+        updates.push(update);
+        if found {
+            return updates;
+        }
+    }
+}
+
+/// Reads messages until the next client-bound permission request arrives.
+///
+/// Only meaningful in [`PermissionMode::Manual`]; the default modes consume
+/// requests inside [`AcpProcess::recv_line`].
+async fn collect_until_permission(acp: &mut AcpProcess) -> (Vec<Value>, Value) {
+    let mut messages = Vec::new();
+    loop {
+        let line = acp.recv_line().await;
+        let message = parse_message(&line);
+        if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            return (messages, message);
+        }
+        messages.push(message);
+    }
+}
+
+/// Reads session updates until one tool call reports `status`.
+async fn collect_until_tool_status(
+    acp: &mut AcpProcess,
+    session_id: &str,
+    call_id: &str,
+    status: &str,
+) -> Vec<Value> {
+    let mut updates = Vec::new();
+    loop {
+        let line = acp.recv_line().await;
+        let message = parse_message(&line);
+        assert!(
+            message.get("id").is_none(),
+            "a response arrived before {call_id} reached {status}: {message}"
+        );
+        if is_protocol_level_notification(&message) {
+            continue;
+        }
+        assert_eq!(message["method"], "session/update");
+        assert_eq!(message["params"]["sessionId"], session_id);
+        let update = message["params"]["update"].clone();
+        let found = matches!(update_kind(&update), "tool_call" | "tool_call_update")
+            && update["toolCallId"] == call_id
+            && update["status"] == status;
         updates.push(update);
         if found {
             return updates;
@@ -1194,6 +1343,11 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
     assert_eq!(finished["content"][0]["content"]["type"], "text");
     assert_eq!(finished["content"][0]["content"]["text"], "note contents");
     assert_eq!(second_updates[2]["content"]["text"], "second answer");
+    assert!(
+        acp.permission_requests().is_empty(),
+        "read_file is policy-only and must never ask for permission: {:?}",
+        acp.permission_requests()
+    );
 
     acp.close_stdin();
     assert_eq!(acp.wait().await.code(), Some(0));
@@ -1828,6 +1982,9 @@ async fn acp_session_close_cancels_active_work_and_acknowledges_after_it_stops()
     while prompt_response.is_none() || close_response.is_none() {
         let line = acp.recv_line().await;
         let message = parse_message(&line);
+        if is_protocol_level_notification(&message) {
+            continue;
+        }
         match message.get("id").and_then(Value::as_u64) {
             Some(3) => prompt_response = Some(message),
             Some(4) => close_response = Some(message),
@@ -2204,6 +2361,9 @@ async fn acp_session_delete_cancels_active_work_without_reindexing() {
     while prompt_response.is_none() || delete_response.is_none() {
         let line = acp.recv_line().await;
         let message = parse_message(&line);
+        if is_protocol_level_notification(&message) {
+            continue;
+        }
         match message.get("id").and_then(Value::as_u64) {
             Some(3) => prompt_response = Some(message),
             Some(4) => delete_response = Some(message),
@@ -2408,14 +2568,26 @@ async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usabl
         },
     }))
     .await;
-    let started_updates = collect_update_of_kind(&mut acp, &cancelled_session, "tool_call").await;
+    let mut started_updates =
+        collect_update_of_kind(&mut acp, &cancelled_session, "tool_call").await;
     assert!(
         started_updates.iter().any(|update| {
             update_kind(update) == "tool_call"
                 && update["toolCallId"] == "call_sleep"
+                && update.get("status").is_none()
+        }),
+        "ACP omits the default pending status, so the call must be pending before permission: {started_updates:?}"
+    );
+    started_updates.extend(
+        collect_until_tool_status(&mut acp, &cancelled_session, "call_sleep", "in_progress").await,
+    );
+    assert!(
+        started_updates.iter().any(|update| {
+            update_kind(update) == "tool_call_update"
+                && update["toolCallId"] == "call_sleep"
                 && update["status"] == "in_progress"
         }),
-        "the bash tool must be observably in progress: {started_updates:?}"
+        "the approved bash tool must be observably in progress: {started_updates:?}"
     );
 
     // The same session cannot start a second prompt while the first is active.
@@ -2448,6 +2620,7 @@ async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usabl
     }))
     .await;
     collect_update_of_kind(&mut acp, &other_session, "tool_call").await;
+    collect_until_tool_status(&mut acp, &other_session, "call_wait", "in_progress").await;
 
     send_cancel(&mut acp, &cancelled_session).await;
     let (closing_updates, cancelled_response) =
@@ -2472,9 +2645,8 @@ async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usabl
             let id = update["toolCallId"]
                 .as_str()
                 .expect("tool updates must carry an id");
-            let status = update["status"]
-                .as_str()
-                .expect("tool updates must carry a status");
+            // ACP omits the default `pending` status on the announcing update.
+            let status = update["status"].as_str().unwrap_or("pending");
             final_status.insert(id.to_owned(), status.to_owned());
         }
     }
@@ -2529,6 +2701,467 @@ async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usabl
     );
 }
 
+/// Starts an ACP process with one allowed sensitive tool and a scratch workspace.
+async fn spawn_permission_harness(
+    workspace: &TempDir,
+    allowed_tools: &str,
+    provider: &MockProvider,
+) -> AcpProcess {
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+             [policy]\nallowed_tools = [{allowed_tools}]\n"
+        ),
+    )
+    .expect("harness configuration must be written");
+    AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn acp_allow_once_asks_before_running_a_sensitive_tool() {
+    let workspace = TempDir::new("permission-allow");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_approved",
+            "bash",
+            json!({"command": "printf approved > approved.txt"}),
+        )]),
+        text_response("approved command finished"),
+    ]);
+    let mut acp = spawn_permission_harness(&workspace, "\"bash\"", &provider).await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+    acp.set_permission_mode(PermissionMode::Manual);
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "run the approved command"}],
+        },
+    }))
+    .await;
+
+    let (before, request) = collect_until_permission(&mut acp).await;
+    let announced = before
+        .iter()
+        .find(|message| {
+            message["method"] == "session/update"
+                && update_kind(&message["params"]["update"]) == "tool_call"
+                && message["params"]["update"]["toolCallId"] == "call_approved"
+        })
+        .unwrap_or_else(|| panic!("the tool_call update must precede the request: {before:?}"));
+    let announced = &announced["params"]["update"];
+    assert!(
+        announced.get("status").is_none(),
+        "ACP omits the default pending status, so a sensitive tool must not claim execution: {announced}"
+    );
+    assert_eq!(announced["title"], "bash: printf approved > approved.txt");
+    assert_eq!(
+        announced["rawInput"]["command"], "printf approved > approved.txt",
+        "the client must see what it is asked to approve: {announced}"
+    );
+    assert!(
+        before.iter().all(|message| {
+            let update = &message["params"]["update"];
+            !(matches!(update_kind(update), "tool_call" | "tool_call_update")
+                && update["toolCallId"] == "call_approved"
+                && update["status"] == "in_progress")
+        }),
+        "no execution update may precede the permission request: {before:?}"
+    );
+    assert!(
+        !workspace.path.join("approved.txt").exists(),
+        "the tool must not run before the client answers"
+    );
+
+    assert_eq!(request["method"], "session/request_permission");
+    assert_eq!(request["params"]["sessionId"], session);
+    assert!(
+        request.get("id").is_some(),
+        "the permission request must be a request with a JSON-RPC id: {request}"
+    );
+    let requested = &request["params"]["toolCall"];
+    assert_eq!(requested["toolCallId"], "call_approved");
+    assert_eq!(requested["status"], "pending");
+    assert_eq!(requested["title"], "bash: printf approved > approved.txt");
+    let options: Vec<(&str, &str)> = request["params"]["options"]
+        .as_array()
+        .expect("permission options must be an array")
+        .iter()
+        .map(|option| {
+            (
+                option["optionId"]
+                    .as_str()
+                    .expect("options must carry an id"),
+                option["kind"].as_str().expect("options must carry a kind"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        options,
+        vec![("allow_once", "allow_once"), ("reject_once", "reject_once")],
+        "only one-shot choices may be offered: {request}"
+    );
+    assert_eq!(
+        acp.permission_requests().len(),
+        1,
+        "one sensitive tool call must produce one permission request"
+    );
+
+    acp.respond_permission(&request, PermissionAnswer::AllowOnce)
+        .await;
+    let (updates, response) = collect_until_response(&mut acp, 3, &session).await;
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "an approved tool must let the turn finish: {response}"
+    );
+    let statuses: Vec<&str> = updates
+        .iter()
+        .filter(|update| {
+            matches!(update_kind(update), "tool_call" | "tool_call_update")
+                && update["toolCallId"] == "call_approved"
+        })
+        .filter_map(|update| update["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["in_progress", "completed"],
+        "approval must open execution and record completion: {updates:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path.join("approved.txt"))
+            .expect("the approved command must write its file"),
+        "approved"
+    );
+    assert_eq!(acp.permission_requests().len(), 1);
+    assert_eq!(
+        provider.finish().len(),
+        2,
+        "one tool round plus one final answer must reach the provider"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_reject_once_never_runs_the_tool_and_reports_the_denial() {
+    let workspace = TempDir::new("permission-reject");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_denied",
+            "write_file",
+            json!({"path": "denied.txt", "content": "must not exist"}),
+        )]),
+        text_response("adapted after rejection"),
+    ]);
+    let mut acp = spawn_permission_harness(&workspace, "\"write_file\"", &provider).await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+    acp.set_permission_mode(PermissionMode::RejectOnce);
+
+    let (updates, response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "write the denied file"}]),
+    )
+    .await;
+
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the model may adapt after a rejection: {response}"
+    );
+    assert_eq!(
+        acp.permission_requests().len(),
+        1,
+        "the sensitive call must be offered exactly once"
+    );
+    assert_eq!(
+        acp.permission_requests()[0]["params"]["toolCall"]["toolCallId"],
+        "call_denied"
+    );
+    let started = updates
+        .iter()
+        .find(|update| update_kind(update) == "tool_call" && update["toolCallId"] == "call_denied")
+        .expect("the rejected call must be announced");
+    assert!(
+        started.get("status").is_none(),
+        "ACP omits the default pending status: {started}"
+    );
+    let statuses: Vec<&str> = updates
+        .iter()
+        .filter(|update| {
+            matches!(update_kind(update), "tool_call" | "tool_call_update")
+                && update["toolCallId"] == "call_denied"
+        })
+        .filter_map(|update| update["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["failed"],
+        "a rejected call must never enter in_progress: {updates:?}"
+    );
+    let failed = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_denied"
+        })
+        .expect("the rejected call must finish");
+    assert!(
+        failed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("denied by the user")),
+        "the model must see why the call did not run: {failed}"
+    );
+    assert!(
+        !workspace.path.join("denied.txt").exists(),
+        "a rejected write must not touch the workspace"
+    );
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].contains("denied by the user"),
+        "the denial must be returned to the model"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_cancelled_permission_outcome_ends_the_turn_without_running_the_tool() {
+    let workspace = TempDir::new("permission-cancelled");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_cancelled",
+            "bash",
+            json!({"command": "printf ran > ran.txt"}),
+        )]),
+        text_response("after cancelled permission"),
+    ]);
+    let mut acp = spawn_permission_harness(&workspace, "\"bash\"", &provider).await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+    acp.set_permission_mode(PermissionMode::Cancelled);
+
+    let (updates, response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "ask and cancel"}]),
+    )
+    .await;
+
+    assert_eq!(
+        response["result"]["stopReason"], "cancelled",
+        "a cancelled permission outcome must end the turn cancelled: {response}"
+    );
+    assert!(
+        updates.iter().all(|update| {
+            !(matches!(update_kind(update), "tool_call" | "tool_call_update")
+                && update["toolCallId"] == "call_cancelled"
+                && update["status"] == "in_progress")
+        }),
+        "a cancelled permission must not open execution: {updates:?}"
+    );
+    assert!(
+        !workspace.path.join("ran.txt").exists(),
+        "the cancelled tool must not run"
+    );
+    assert_eq!(acp.permission_requests().len(), 1);
+    assert_eq!(
+        acp.permission_requests()[0]["params"]["toolCall"]["toolCallId"],
+        "call_cancelled"
+    );
+
+    let (_, follow_up) = prompt_until_response(
+        &mut acp,
+        4,
+        &session,
+        json!([{"type": "text", "text": "continue after cancellation"}]),
+    )
+    .await;
+    assert_eq!(
+        follow_up["result"]["stopReason"], "end_turn",
+        "a cancelled permission must not poison the session: {follow_up}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(provider.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn acp_cancel_while_a_permission_is_pending_never_runs_the_tool() {
+    let workspace = TempDir::new("permission-pending-cancel");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_pending",
+            "bash",
+            json!({"command": "printf ran > pending.txt"}),
+        )]),
+        text_response("after pending cancellation"),
+    ]);
+    let mut acp = spawn_permission_harness(&workspace, "\"bash\"", &provider).await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+    acp.set_permission_mode(PermissionMode::Manual);
+
+    acp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "ask and wait"}],
+        },
+    }))
+    .await;
+    let (_, request) = collect_until_permission(&mut acp).await;
+    assert_eq!(request["params"]["toolCall"]["toolCallId"], "call_pending");
+
+    send_cancel(&mut acp, &session).await;
+    let (updates, response) = collect_until_response(&mut acp, 3, &session).await;
+    assert_eq!(
+        response["result"]["stopReason"], "cancelled",
+        "cancelling a pending permission must cancel the turn: {response}"
+    );
+    assert!(
+        updates.iter().all(|update| {
+            !(matches!(update_kind(update), "tool_call" | "tool_call_update")
+                && update["toolCallId"] == "call_pending"
+                && update["status"] == "in_progress")
+        }),
+        "a cancelled pending request must never open execution: {updates:?}"
+    );
+    assert!(
+        !workspace.path.join("pending.txt").exists(),
+        "the unapproved tool must not run after cancellation"
+    );
+    assert_eq!(acp.permission_requests().len(), 1);
+
+    let (_, follow_up) = prompt_until_response(
+        &mut acp,
+        4,
+        &session,
+        json!([{"type": "text", "text": "continue after cancel"}]),
+    )
+    .await;
+    assert_eq!(
+        follow_up["result"]["stopReason"], "end_turn",
+        "the session must stay usable: {follow_up}"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+    assert_eq!(provider.finish().len(), 2);
+}
+
+#[tokio::test]
+async fn acp_delegation_asks_only_for_the_parent_call() {
+    let workspace = TempDir::new("permission-delegation");
+    let config = workspace.path.join("harness.toml");
+    std::fs::write(
+        &config,
+        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+         [policy]\nallowed_tools = [\"bash\", \"delegate_task\"]\n\n\
+         [delegation]\nenabled = true\n",
+    )
+    .expect("harness configuration must be written");
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_delegate",
+            "delegate_task",
+            json!({"task": "write the child marker", "tools": ["bash"]}),
+        )]),
+        tool_calls_response(&[(
+            "child_marker",
+            "bash",
+            json!({"command": "printf child > child.txt"}),
+        )]),
+        text_response("child wrote the marker"),
+        text_response("parent done"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+    let session = create_session(&mut acp, 2, &workspace.path).await;
+
+    let (updates, response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "delegate the marker"}]),
+    )
+    .await;
+
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "the delegated turn must complete: {response}"
+    );
+    assert_eq!(
+        acp.permission_requests().len(),
+        1,
+        "only the top-level delegate_task call may ask; child tools run under it"
+    );
+    let request = &acp.permission_requests()[0];
+    assert_eq!(request["params"]["toolCall"]["toolCallId"], "call_delegate");
+    assert_eq!(
+        request["params"]["toolCall"]["rawInput"]["task"],
+        "write the child marker"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path.join("child.txt"))
+            .expect("the child bash tool must have run without a second request"),
+        "child"
+    );
+    let completed = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update"
+                && update["toolCallId"] == "call_delegate"
+                && update["status"] == "completed"
+        })
+        .unwrap_or_else(|| panic!("the parent call must complete: {updates:?}"));
+    assert!(
+        completed["rawOutput"]
+            .as_str()
+            .is_some_and(|output| output.contains("child wrote the marker")),
+        "the delegated answer must reach the parent: {completed}"
+    );
+    assert_eq!(
+        provider.finish().len(),
+        4,
+        "parent, child tool round, child answer, parent answer"
+    );
+
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn acp_sigterm_cancels_two_active_sessions_and_exits_within_the_bound() {
@@ -2567,6 +3200,7 @@ async fn acp_sigterm_cancels_two_active_sessions_and_exits_within_the_bound() {
     }))
     .await;
     collect_update_of_kind(&mut acp, &first, "tool_call").await;
+    collect_until_tool_status(&mut acp, &first, "call_a", "in_progress").await;
     acp.send(json!({
         "jsonrpc": "2.0",
         "id": 5,
@@ -2661,6 +3295,7 @@ async fn acp_stdin_eof_cancels_two_active_sessions_and_exits_within_the_bound() 
     }))
     .await;
     collect_update_of_kind(&mut acp, &first, "tool_call").await;
+    collect_until_tool_status(&mut acp, &first, "call_a", "in_progress").await;
     acp.send(json!({
         "jsonrpc": "2.0",
         "id": 5,

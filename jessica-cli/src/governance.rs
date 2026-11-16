@@ -6,13 +6,15 @@
 //!
 //! - [`TokenCountingProvider`] observes `LlmEvent::Done` and charges usage
 //!   against a shared [`TokenBudgetGuard`];
-//! - [`GovernedTool`] evaluates the harness policy before execution, enforces
+//! - [`GovernedTool`] evaluates the harness policy before execution, asks the
+//!   optional [`ToolPermissionGate`] for approval of sensitive tools, enforces
 //!   the wall-clock timeout, and checks the result-size guard afterwards.
 //!
 //! Both wrappers report budget trips through [`GovernanceState`], which emits
 //! the structured [`AgentEvent::BudgetExceeded`] event and cancels the session
 //! token. Policy denials are emitted but do not cancel: the model receives an
-//! error result and may adapt.
+//! error result and may adapt. Permission denial, cancellation, timeout, and
+//! delivery failure are also model-facing errors and never run the tool.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -135,7 +137,53 @@ impl LlmProvider for TokenCountingProvider {
     }
 }
 
-/// Tool adapter that applies policy, timeout, and result-size governance.
+/// Names of native tools that require explicit approval before running.
+///
+/// The set is deliberately fixed: `read_file` and every configured WASM or MCP
+/// tool remain governed by the allowlist policy alone. Delegated child tools
+/// are also outside this set because the single top-level `delegate_task`
+/// approval covers the child run.
+pub(crate) fn permission_required(name: &str) -> bool {
+    matches!(
+        name,
+        "bash" | "write_file" | jessica_runtime::DELEGATE_TASK_TOOL_NAME
+    )
+}
+
+/// Decision produced by a [`ToolPermissionGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPermissionDecision {
+    /// The user approved this one execution.
+    Allow,
+    /// The user rejected this one execution.
+    Reject,
+    /// The prompt or the permission request was cancelled.
+    Cancelled,
+    /// No decision arrived before the gate's fixed deadline.
+    TimedOut,
+    /// The request could not be delivered or answered.
+    TransportFailed,
+}
+
+/// Asks a client for approval before a sensitive tool runs.
+///
+/// Implementations run after policy authorization and before the tool timeout
+/// starts. They never execute the tool themselves. On [`Allow`] the gate has
+/// already arranged any protocol-visible transition from `pending` to
+/// `in_progress`; every other decision must leave the tool unexecuted.
+///
+/// [`Allow`]: ToolPermissionDecision::Allow
+#[async_trait]
+pub(crate) trait ToolPermissionGate: Send + Sync {
+    /// Requests permission for `call`.
+    ///
+    /// `call.id` is the provider-assigned id. Gates must not synthesize or
+    /// send an empty id to the client.
+    async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision;
+}
+
+/// Tool adapter that applies policy, permission, timeout, and result-size
+/// governance.
 pub(crate) struct GovernedTool {
     inner: Arc<dyn Tool>,
     harness: Arc<Harness>,
@@ -143,6 +191,7 @@ pub(crate) struct GovernedTool {
     timeout: Duration,
     timeout_guard: Arc<ToolTimeoutGuard>,
     result_guard: Arc<ResultSizeGuard>,
+    permission: Option<Arc<dyn ToolPermissionGate>>,
 }
 
 impl GovernedTool {
@@ -165,6 +214,100 @@ impl GovernedTool {
             timeout,
             timeout_guard,
             result_guard,
+            permission: None,
+        }
+    }
+
+    /// Attaches the optional approval gate for sensitive tools.
+    ///
+    /// The gate is consulted only for names accepted by
+    /// [`permission_required`]; other tools keep policy-only governance.
+    pub(crate) fn with_permission_gate(
+        mut self,
+        permission: Option<Arc<dyn ToolPermissionGate>>,
+    ) -> Self {
+        self.permission = permission;
+        self
+    }
+
+    /// Applies every pre-execution check and runs the tool under its timeout.
+    async fn execute_call(&self, call: &ToolCall) -> ToolResult {
+        if self.governance.tripped() {
+            return ToolResult::error(
+                String::new(),
+                "tool execution skipped because the session budget was exceeded",
+            );
+        }
+
+        if let Some(event) = self.harness.authorize_tool_call(call) {
+            self.governance.emit(event);
+            return ToolResult::error(
+                String::new(),
+                format!("tool `{}` was denied by policy", self.inner.name()),
+            );
+        }
+
+        if permission_required(self.inner.name())
+            && let Some(gate) = &self.permission
+        {
+            // ACP requires the provider's real tool-call id. A wrapper without
+            // one must fail closed instead of inventing an id for the client.
+            if call.id.is_empty() {
+                return ToolResult::error(
+                    String::new(),
+                    format!(
+                        "tool `{}` requires a provider tool-call id for permission",
+                        self.inner.name()
+                    ),
+                );
+            }
+            match gate.request_permission(call).await {
+                ToolPermissionDecision::Allow => {}
+                decision => {
+                    let outcome = match decision {
+                        ToolPermissionDecision::Reject => "was denied by the user",
+                        ToolPermissionDecision::Cancelled => "permission request was cancelled",
+                        ToolPermissionDecision::TimedOut => "permission request timed out",
+                        ToolPermissionDecision::TransportFailed => {
+                            "permission request could not be completed"
+                        }
+                        ToolPermissionDecision::Allow => unreachable!("allow is handled above"),
+                    };
+                    return ToolResult::error(
+                        String::new(),
+                        format!("tool `{}` {outcome}", self.inner.name()),
+                    );
+                }
+            }
+        }
+
+        // The permission wait is not tool time: the timeout starts only after
+        // every pre-execution checkpoint has allowed the call.
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(self.timeout, self.inner.execute_with_call(call)).await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Err(_) => {
+                // The guard compares elapsed time to the configured limit. Use
+                // a value strictly past the limit so the trip is guaranteed
+                // even if the timer fired a hair before `elapsed` crossed it.
+                let crossed = self.timeout + Duration::from_nanos(1);
+                self.timeout_result(call, elapsed.max(crossed))
+            }
+            Ok(result) => {
+                let context = GuardContext::new(0, self.governance.tokens_used(), "")
+                    .with_tool_result(&result, Some(elapsed));
+                if let GuardDecision::Exceeded { kind, reason } = self.result_guard.check(&context)
+                {
+                    self.governance.trip(AgentEvent::BudgetExceeded {
+                        kind,
+                        message: reason.clone(),
+                    });
+                    return ToolResult::error(String::new(), reason);
+                }
+                result
+            }
         }
     }
 
@@ -199,56 +342,22 @@ impl Tool for GovernedTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        if self.governance.tripped() {
-            return ToolResult::error(
-                String::new(),
-                "tool execution skipped because the session budget was exceeded",
-            );
-        }
+        // `Tool::execute` has no call id. Policy only needs the name and
+        // arguments; permission-gated tools fail closed in `execute_call`
+        // because ACP must never receive a synthetic id.
+        let call = ToolCall::new(String::new(), self.inner.name(), args);
+        self.execute_call(&call).await
+    }
 
-        // `Tool::execute` has no call id. The policy only needs name and
-        // arguments, so an empty id is sufficient for this checkpoint.
-        let call = ToolCall::new(String::new(), self.inner.name(), args.clone());
-        if let Some(event) = self.harness.authorize_tool_call(&call) {
-            self.governance.emit(event);
-            return ToolResult::error(
-                String::new(),
-                format!("tool `{}` was denied by policy", self.inner.name()),
-            );
-        }
-
-        let started = Instant::now();
-        let outcome = tokio::time::timeout(self.timeout, self.inner.execute(args)).await;
-        let elapsed = started.elapsed();
-
-        match outcome {
-            Err(_) => {
-                // The guard compares elapsed time to the configured limit. Use
-                // a value strictly past the limit so the trip is guaranteed
-                // even if the timer fired a hair before `elapsed` crossed it.
-                let crossed = self.timeout + Duration::from_nanos(1);
-                self.timeout_result(&call, elapsed.max(crossed))
-            }
-            Ok(result) => {
-                let context = GuardContext::new(0, self.governance.tokens_used(), "")
-                    .with_tool_result(&result, Some(elapsed));
-                if let GuardDecision::Exceeded { kind, reason } = self.result_guard.check(&context)
-                {
-                    self.governance.trip(AgentEvent::BudgetExceeded {
-                        kind,
-                        message: reason.clone(),
-                    });
-                    return ToolResult::error(String::new(), reason);
-                }
-                result
-            }
-        }
+    async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+        self.execute_call(call).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
 
     use jessica_core::types::{Message, TokenUsage};
@@ -468,5 +577,393 @@ mod tests {
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    /// Tool that records the full call it receives through `execute_with_call`.
+    struct RecordingTool {
+        name: &'static str,
+        calls: AtomicU32,
+        recorded: Mutex<Vec<ToolCall>>,
+    }
+
+    impl RecordingTool {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                calls: AtomicU32::new(0),
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_calls(&self) -> Vec<ToolCall> {
+            self.recorded
+                .lock()
+                .expect("recorded calls must not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn schema(&self) -> ToolSchema {
+            serde_json::json!({"type": "function", "function": {"name": self.name}})
+        }
+
+        async fn execute(&self, _args: Value) -> ToolResult {
+            ToolResult::error("unused", "execute must not be called")
+        }
+
+        async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.recorded
+                .lock()
+                .expect("recorded calls must not be poisoned")
+                .push(call.clone());
+            ToolResult::success(call.id.clone(), "ran")
+        }
+    }
+
+    /// Gate that records each request and returns a fixed decision after a
+    /// configurable delay.
+    struct MockGate {
+        decision: ToolPermissionDecision,
+        delay: Duration,
+        calls: Mutex<Vec<ToolCall>>,
+    }
+
+    impl MockGate {
+        fn new(decision: ToolPermissionDecision, delay: Duration) -> Self {
+            Self {
+                decision,
+                delay,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<ToolCall> {
+            self.calls
+                .lock()
+                .expect("gate calls must not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolPermissionGate for MockGate {
+        async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision {
+            self.calls
+                .lock()
+                .expect("gate calls must not be poisoned")
+                .push(call.clone());
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.decision
+        }
+    }
+
+    /// Builds a governed tool with one second of timeout and a 16 KiB result
+    /// limit, optionally attaching `gate`.
+    fn governed(
+        inner: Arc<dyn Tool>,
+        allowed: &[&str],
+        timeout: Duration,
+        gate: Option<Arc<dyn ToolPermissionGate>>,
+    ) -> GovernedTool {
+        GovernedTool::new(
+            inner,
+            harness(allowed),
+            Arc::new(GovernanceState::new(
+                broadcast::channel(16).0,
+                CancellationToken::new(),
+            )),
+            timeout,
+            Arc::new(ToolTimeoutGuard::new(timeout)),
+            Arc::new(ResultSizeGuard::new(16 * 1024)),
+        )
+        .with_permission_gate(gate)
+    }
+
+    #[test]
+    fn permission_required_is_a_fixed_native_set() {
+        for name in [
+            "bash",
+            "write_file",
+            jessica_runtime::DELEGATE_TASK_TOOL_NAME,
+        ] {
+            assert!(
+                permission_required(name),
+                "`{name}` must require permission"
+            );
+        }
+        for name in [
+            "read_file",
+            "wasm_echo",
+            "mcp__stub__echo",
+            "",
+            "Bash",
+            "bash ",
+        ] {
+            assert!(
+                !permission_required(name),
+                "`{name}` must remain policy-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approved_sensitive_tool_receives_the_original_call_and_runs() {
+        let inner = Arc::new(RecordingTool::new("bash"));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["bash"],
+            Duration::from_secs(1),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        );
+        let call = ToolCall::new("call-real", "bash", serde_json::json!({"command": "true"}));
+
+        let result = tool.execute_with_call(&call).await;
+
+        assert!(
+            !result.is_error,
+            "approved execution must succeed: {result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.recorded_calls(), vec![call.clone()]);
+        assert_eq!(gate.calls(), vec![call]);
+    }
+
+    #[tokio::test]
+    async fn non_allow_decisions_fail_closed_without_running_the_tool() {
+        let cases = [
+            (ToolPermissionDecision::Reject, "denied by the user"),
+            (ToolPermissionDecision::Cancelled, "was cancelled"),
+            (ToolPermissionDecision::TimedOut, "timed out"),
+            (
+                ToolPermissionDecision::TransportFailed,
+                "could not be completed",
+            ),
+        ];
+        for (decision, expected) in cases {
+            let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+            let gate = Arc::new(MockGate::new(decision, Duration::ZERO));
+            let tool = governed(
+                Arc::clone(&inner) as Arc<dyn Tool>,
+                &["bash"],
+                Duration::from_secs(1),
+                Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+            );
+            let call = ToolCall::new("call-1", "bash", serde_json::json!({"command": "touch x"}));
+
+            let result = tool.execute_with_call(&call).await;
+
+            assert!(result.is_error, "{decision:?} must fail the tool");
+            assert!(
+                result.content.contains(expected),
+                "{decision:?} error must explain the outcome: {}",
+                result.content
+            );
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                0,
+                "{decision:?} must never execute the tool"
+            );
+            assert_eq!(gate.calls().len(), 1, "{decision:?} must ask exactly once");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denial_precedes_permission_and_never_asks_the_client() {
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["read_file"],
+            Duration::from_secs(1),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        );
+        let call = ToolCall::new("call-1", "bash", serde_json::json!({"command": "true"}));
+
+        let result = tool.execute_with_call(&call).await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("denied by policy"));
+        assert!(
+            gate.calls().is_empty(),
+            "policy must reject before the client is asked"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_budget_skips_permission_entirely() {
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (governance, _cancel, _events) = governance();
+        assert!(governance.trip(AgentEvent::BudgetExceeded {
+            kind: BudgetKind::TokenLimit,
+            message: "exhausted".into(),
+        }));
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            governance,
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_permission_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-1",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(gate.calls().is_empty());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_permission_wait_does_not_consume_the_tool_timeout() {
+        let inner = Arc::new(RecordingTool::new("bash"));
+        let slow_gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Allow,
+            Duration::from_millis(60),
+        ));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["bash"],
+            Duration::from_millis(10),
+            Some(Arc::clone(&slow_gate) as Arc<dyn ToolPermissionGate>),
+        );
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-1",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(
+            !result.is_error,
+            "a slow approval must not trip the tool timeout: {result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_tool_timeout_still_starts_after_approval() {
+        let inner = Arc::new(MockTool::new("bash", "late", Duration::from_millis(80)));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (governance, cancel, mut events) = governance();
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            Arc::clone(&governance),
+            Duration::from_millis(10),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_millis(10))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_permission_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-1",
+                "bash",
+                serde_json::json!({"command": "sleep"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(governance.tripped());
+        assert!(cancel.is_cancelled());
+        let message = expect_budget_event(&mut events, BudgetKind::ToolTimeout);
+        assert!(message.contains("bash"));
+        assert_eq!(gate.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_only_tools_never_consult_the_gate() {
+        let inner = Arc::new(RecordingTool::new("read_file"));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["read_file"],
+            Duration::from_secs(1),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        );
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-read",
+                "read_file",
+                serde_json::json!({"path": "a"}),
+            ))
+            .await;
+
+        assert!(!result.is_error);
+        assert!(gate.calls().is_empty());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sensitive_call_without_a_provider_id_fails_closed() {
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["bash"],
+            Duration::from_secs(1),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        );
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("provider tool-call id"),
+            "the failure must explain the missing id: {}",
+            result.content
+        );
+        assert!(
+            gate.calls().is_empty(),
+            "an empty id must never reach the client"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sensitive_tools_run_policy_only_without_a_gate() {
+        let inner = Arc::new(MockTool::new("bash", "ran", Duration::ZERO));
+        let tool = governed(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            &["bash"],
+            Duration::from_secs(1),
+            None,
+        );
+
+        let result = tool.execute(serde_json::json!({"command": "true"})).await;
+
+        assert!(!result.is_error);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
     }
 }

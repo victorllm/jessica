@@ -29,6 +29,16 @@
 //! servers on `session/load` or `session/resume` remain unsupported and are
 //! rejected with `-32602`.
 //!
+//! Sensitive native tools (`bash`, `write_file`, `delegate_task`) ask through
+//! `session/request_permission` before they run. The pending `tool_call` update
+//! is queued first on the same FIFO writer, so the client always sees the call
+//! it is being asked about. Only one-shot `allow_once`/`reject_once` options
+//! are offered. An approval publishes `in_progress` with the same provider
+//! `toolCallId` and then executes; rejection, cancellation, the fixed
+//! five-minute answer deadline, and transport failures never execute the tool.
+//! Only the top-level `delegate_task` call is asked about; child tools run
+//! under that approval.
+//!
 //! Limits are copied from the `[acp]` section at startup. Session IDs remain
 //! bounded by `max_sessions`, prompt text by `max_prompt_bytes`, and history by
 //! its message and byte limits; trimming removes only the oldest complete user
@@ -44,6 +54,7 @@
 //! content-free: they never include prompt text, tool arguments, environment
 //! values, or credentials.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -56,16 +67,21 @@ use agent_client_protocol::v1::schema::{
     DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, McpCapabilities, McpServer, MessageId, NewSessionRequest,
-    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionDeleteCapabilities, SessionId as AcpSessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionResumeCapabilities, SessionUpdate, StopReason,
+    NewSessionResponse, Notice, NoticeSeverity, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+    SessionCloseCapabilities, SessionDeleteCapabilities, SessionId as AcpSessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    StopReason,
 };
-use agent_client_protocol::{Agent, Client, Error, ErrorCode, Stdio};
+use agent_client_protocol::{
+    Agent, Client, Error, ErrorCode, Stdio, is_connection_terminated, is_incoming_transport_closed,
+};
+use async_trait::async_trait;
 use jessica_core::tool::Tool;
-use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
+use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId, ToolCall};
 use serde_json::json;
-use tokio::sync::{OnceCell, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +95,7 @@ use crate::acp_session::{
 use crate::acp_store::{AcpLoadError, AcpPersistence, AcpSessionIndex};
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
 use crate::config::HarnessConfig;
+use crate::governance::{ToolPermissionDecision, ToolPermissionGate};
 use crate::hot_reload::ConfigWatcher;
 use crate::mcp::{MAX_MCP_SERVERS_PER_SESSION, McpError, McpSession, StdioServerConfig};
 use crate::pump::UpdateSink;
@@ -101,6 +118,18 @@ const SESSION_LIST_CURSOR_MAX_BYTES: usize = 512;
 
 /// Bounded wait for a closed or deleted session's active prompt to stop.
 const SESSION_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Fixed time a client has to answer one `session/request_permission`.
+///
+/// The deadline is not configurable: an unanswered request must never leave a
+/// prompt blocked indefinitely, and a timeout never authorizes the tool.
+const TOOL_PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Option id the client selects to approve one execution.
+const PERMISSION_ALLOW_ONCE: &str = "allow_once";
+
+/// Option id the client selects to reject one execution.
+const PERMISSION_REJECT_ONCE: &str = "reject_once";
 
 /// Serves stable ACP v1 over stdin/stdout until EOF or shutdown.
 ///
@@ -1239,13 +1268,24 @@ async fn run_prompt_worker(
 
     let observations = Arc::new(PromptObservations::default());
     let in_flight = Arc::new(InFlightTools::default());
+    let announced = Arc::new(AnnouncedToolCalls::default());
     let mapper = AcpEventMapper::new(cwd.clone(), MessageId::new(turn_id.to_string()));
+    let acp_session_id = AcpSessionId::new(session_id.clone());
     let sink: Arc<dyn UpdateSink> = Arc::new(AcpUpdateSink {
-        session_id: AcpSessionId::new(session_id.clone()),
-        mapper,
+        session_id: acp_session_id.clone(),
+        mapper: mapper.clone(),
         observations: Arc::clone(&observations),
         in_flight: Arc::clone(&in_flight),
+        announced: Arc::clone(&announced),
         updates: updates.clone(),
+    });
+    let permission_gate: Arc<dyn ToolPermissionGate> = Arc::new(AcpPermissionGate {
+        session_id: acp_session_id,
+        mapper,
+        updates: updates.clone(),
+        cancel: guard.token().clone(),
+        timeout: TOOL_PERMISSION_TIMEOUT,
+        announced,
     });
     let execution = execute_prompt(
         &service,
@@ -1258,6 +1298,7 @@ async fn run_prompt_worker(
             sink,
             observations: Arc::clone(&observations),
             extra_tools: mcp_tools,
+            permission_gate: Some(permission_gate),
         },
     )
     .await;
@@ -1363,6 +1404,10 @@ struct PromptExecutionRequest {
     observations: Arc<PromptObservations>,
     /// Session-scoped MCP tools to register for this turn.
     extra_tools: Vec<Arc<dyn Tool>>,
+    /// Approval gate for sensitive native tools.
+    ///
+    /// `None` keeps policy-only behavior for direct in-process test turns.
+    permission_gate: Option<Arc<dyn ToolPermissionGate>>,
 }
 
 /// Runs the agent loop and maps its terminal state.
@@ -1376,6 +1421,7 @@ async fn execute_prompt(service: &AcpService, request: PromptExecutionRequest) -
         sink,
         observations,
         extra_tools,
+        permission_gate,
     } = request;
     let runtime = match service.runtime().await {
         Ok(runtime) => runtime,
@@ -1395,6 +1441,7 @@ async fn execute_prompt(service: &AcpService, request: PromptExecutionRequest) -
             acceptance_retries: Some(0),
             session_id: Some(turn_id),
             extra_tools,
+            permission_gate,
         })
         .await
     {
@@ -1540,6 +1587,8 @@ struct AcpUpdateSink {
     observations: Arc<PromptObservations>,
     /// Tool calls announced but not yet finished.
     in_flight: Arc<InFlightTools>,
+    /// Tool calls whose announcement update has been queued.
+    announced: Arc<AnnouncedToolCalls>,
     /// FIFO writer queue.
     updates: mpsc::UnboundedSender<WriterMessage>,
 }
@@ -1555,18 +1604,236 @@ impl UpdateSink for AcpUpdateSink {
         let _ = self
             .updates
             .send(WriterMessage::Update(Box::new(notification)));
+        // Mark only after the queue received the update: a permission gate
+        // waiting on this id may then enqueue its request behind it.
+        if let AgentEvent::ToolCallStarted { call } = event {
+            self.announced.mark(&call.id);
+        }
     }
+}
+
+/// Tool calls whose `tool_call` update is already in the writer queue.
+///
+/// The event pump publishes asynchronously while the agent loop continues into
+/// tool execution, so a permission request could overtake the update that
+/// announced its own call id. The gate waits here before enqueueing the
+/// request. The writer queue is FIFO, so once the update is queued the request
+/// cannot be written first.
+#[derive(Default)]
+struct AnnouncedToolCalls {
+    /// Provider ids whose announcement is queued.
+    ids: Mutex<HashSet<String>>,
+    /// Wakes gates waiting for an announcement.
+    notify: Notify,
+}
+
+impl AnnouncedToolCalls {
+    /// Records that `id`'s announcement update is queued.
+    fn mark(&self, id: &str) {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned());
+        self.notify.notify_waiters();
+    }
+
+    /// Waits until `id` is announced or `cancel` fires.
+    ///
+    /// Returns whether the announcement was observed. A `false` result means
+    /// the prompt was cancelled first and no permission request may be sent.
+    async fn wait(&self, id: &str, cancel: &CancellationToken) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking the set so a `mark` between the check
+            // and the await cannot lose its wakeup.
+            notified.as_mut().enable();
+            if self
+                .ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(id)
+            {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                () = &mut notified => {}
+            }
+        }
+    }
+}
+
+/// Permission gate backed by ACP `session/request_permission`.
+struct AcpPermissionGate {
+    /// Session id carried by every request.
+    session_id: AcpSessionId,
+    /// Mapper shared with the update sink so request and update fields agree.
+    mapper: AcpEventMapper,
+    /// FIFO writer queue shared with session updates.
+    updates: mpsc::UnboundedSender<WriterMessage>,
+    /// Prompt cancellation token.
+    cancel: CancellationToken,
+    /// Fixed deadline for one client answer.
+    timeout: Duration,
+    /// Announcements already queued for this prompt.
+    announced: Arc<AnnouncedToolCalls>,
+}
+
+#[async_trait]
+impl ToolPermissionGate for AcpPermissionGate {
+    async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision {
+        // The client must know the id before it can be asked about it. This
+        // also guarantees the `tool_call` update precedes the request on the
+        // same writer queue.
+        if !self.announced.wait(&call.id, &self.cancel).await {
+            return ToolPermissionDecision::Cancelled;
+        }
+
+        let request = RequestPermissionRequest::new(
+            self.session_id.clone(),
+            self.mapper.permission_request_update(call),
+            permission_options(),
+        );
+        // The child token lets the writer drop this one request (and send
+        // `$/cancel_request`) without ending the writer task.
+        let cancel = self.cancel.child_token();
+        let (reply, response) = oneshot::channel();
+        if self
+            .updates
+            .send(WriterMessage::Permission {
+                request: Box::new(request),
+                cancel: cancel.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return ToolPermissionDecision::TransportFailed;
+        }
+
+        let outcome = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                cancel.cancel();
+                return ToolPermissionDecision::Cancelled;
+            }
+            _ = tokio::time::sleep(self.timeout) => {
+                cancel.cancel();
+                return ToolPermissionDecision::TimedOut;
+            }
+            outcome = response => outcome,
+        };
+
+        let outcome = match outcome {
+            // The writer task disappeared before answering.
+            Err(_) => return ToolPermissionDecision::TransportFailed,
+            Ok(PermissionReply::Cancelled) => {
+                // The prompt was cancelled while the request was pending; the
+                // ACP contract requires the turn to end cancelled.
+                return ToolPermissionDecision::Cancelled;
+            }
+            Ok(PermissionReply::Failed) => return ToolPermissionDecision::TransportFailed,
+            Ok(PermissionReply::Outcome(outcome)) => outcome,
+        };
+
+        match outcome {
+            RequestPermissionOutcome::Cancelled => {
+                // The client aborted the turn while answering. Ending the
+                // prompt is the only way to honour that cancellation.
+                self.cancel.cancel();
+                ToolPermissionDecision::Cancelled
+            }
+            RequestPermissionOutcome::Selected(selected) => {
+                match selected.option_id.0.as_ref() {
+                    PERMISSION_ALLOW_ONCE => {
+                        let update = self.mapper.permission_granted_update(call);
+                        let notification = SessionNotification::new(
+                            self.session_id.clone(),
+                            SessionUpdate::ToolCallUpdate(update),
+                        );
+                        if self
+                            .updates
+                            .send(WriterMessage::Update(Box::new(notification)))
+                            .is_err()
+                        {
+                            return ToolPermissionDecision::TransportFailed;
+                        }
+                        ToolPermissionDecision::Allow
+                    }
+                    PERMISSION_REJECT_ONCE => ToolPermissionDecision::Reject,
+                    _ => {
+                        // Only the two offered ids are valid. Anything else is
+                        // treated as a rejection so a malformed or unexpected
+                        // answer can never authorize execution.
+                        tracing::warn!("acp permission response selected an unknown option");
+                        ToolPermissionDecision::Reject
+                    }
+                }
+            }
+            // `RequestPermissionOutcome` is non-exhaustive; an unknown future
+            // outcome must fail closed.
+            _ => {
+                tracing::warn!("acp permission response used an unknown outcome");
+                ToolPermissionDecision::Reject
+            }
+        }
+    }
+}
+
+/// Options offered to the client for every permission request.
+///
+/// Only one-shot choices are offered: Jessica keeps no persistent approval
+/// state across calls or turns.
+fn permission_options() -> Vec<PermissionOption> {
+    vec![
+        PermissionOption::new(
+            PERMISSION_ALLOW_ONCE,
+            "Allow this execution",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            PERMISSION_REJECT_ONCE,
+            "Reject this execution",
+            PermissionOptionKind::RejectOnce,
+        ),
+    ]
 }
 
 /// Messages consumed by the dedicated protocol write task.
 enum WriterMessage {
     /// One session update notification.
     Update(Box<SessionNotification>),
+    /// One client permission request, answered through `reply`.
+    Permission {
+        /// Request sent as an agent-to-client JSON-RPC request.
+        request: Box<RequestPermissionRequest>,
+        /// Per-request cancellation from the permission gate.
+        cancel: CancellationToken,
+        /// Reply carrying the client's outcome or a failure.
+        reply: oneshot::Sender<PermissionReply>,
+    },
     /// Flush boundary; the bool reports whether every prior update was sent.
     Barrier(oneshot::Sender<bool>),
 }
 
+/// Result of delivering one permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PermissionReply {
+    /// The client answered with this outcome.
+    Outcome(RequestPermissionOutcome),
+    /// The request was cancelled before an answer arrived.
+    Cancelled,
+    /// The request could not be delivered or answered.
+    Failed,
+}
+
 /// Writes queued session updates in order and acknowledges the barrier.
+///
+/// Permission requests share the same FIFO queue, so every update enqueued
+/// before a request is written first. While a request is pending this task
+/// waits for the client; cancellation drops the request, which sends
+/// `$/cancel_request`, and the writer continues with later messages.
 async fn run_update_writer(
     connection: ConnectionTo<Client>,
     mut receiver: mpsc::UnboundedReceiver<WriterMessage>,
@@ -1581,6 +1848,54 @@ async fn run_update_writer(
                     // The client is gone. Stop every session instead of
                     // continuing tools whose output can never be delivered.
                     service.fail_transport();
+                }
+            }
+            WriterMessage::Permission {
+                request,
+                cancel,
+                reply,
+            } => {
+                if failed {
+                    let _ = reply.send(PermissionReply::Failed);
+                    continue;
+                }
+                if cancel.is_cancelled() {
+                    let _ = reply.send(PermissionReply::Cancelled);
+                    continue;
+                }
+
+                let sent = connection.send_request(*request);
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        // Dropping `sent` requests cancellation from the
+                        // client with the same JSON-RPC id.
+                        let _ = reply.send(PermissionReply::Cancelled);
+                        continue;
+                    }
+                    result = sent.block_task() => result,
+                };
+
+                match result {
+                    Ok(response) => {
+                        let _ = reply.send(PermissionReply::Outcome(response.outcome));
+                    }
+                    Err(error) => {
+                        // Local termination means every later write is
+                        // meaningless too; a peer error response fails only
+                        // this permission and leaves the transport usable.
+                        if is_connection_terminated(&error) || is_incoming_transport_closed(&error)
+                        {
+                            failed = true;
+                            service.fail_transport();
+                        } else {
+                            tracing::debug!(
+                                code = %error.code,
+                                "acp permission request received an error response"
+                            );
+                        }
+                        let _ = reply.send(PermissionReply::Failed);
+                    }
                 }
             }
             WriterMessage::Barrier(acknowledge) => {
@@ -1721,7 +2036,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
 
-    use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
+    use agent_client_protocol::v1::schema::{
+        ContentBlock, SelectedPermissionOutcome, TextContent, ToolCallStatus, ToolCallUpdate,
+    };
     use async_trait::async_trait;
     use futures::StreamExt;
     use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
@@ -1918,6 +2235,7 @@ mod tests {
                 sink: Arc::new(NullSink),
                 observations: Arc::new(PromptObservations::default()),
                 extra_tools: Vec::new(),
+                permission_gate: None,
             },
         )
         .await;
@@ -2532,5 +2850,273 @@ mod tests {
                 "the agent must answer with its latest supported version, not the requested one"
             );
         }
+    }
+
+    /// Creates a gate and the receiving end of its writer queue.
+    fn permission_gate(
+        timeout: Duration,
+    ) -> (
+        Arc<AcpPermissionGate>,
+        mpsc::UnboundedReceiver<WriterMessage>,
+        Arc<AnnouncedToolCalls>,
+        CancellationToken,
+    ) {
+        let (updates, receiver) = mpsc::unbounded_channel();
+        let announced = Arc::new(AnnouncedToolCalls::default());
+        let cancel = CancellationToken::new();
+        let gate = Arc::new(AcpPermissionGate {
+            session_id: AcpSessionId::new("sess-1"),
+            mapper: AcpEventMapper::new(PathBuf::from("/workspace"), MessageId::new("turn-1")),
+            updates,
+            cancel: cancel.clone(),
+            timeout,
+            announced: Arc::clone(&announced),
+        });
+        (gate, receiver, announced, cancel)
+    }
+
+    /// Replies to the next queued permission request.
+    async fn answer_permission(
+        receiver: &mut mpsc::UnboundedReceiver<WriterMessage>,
+        outcome: RequestPermissionOutcome,
+    ) -> RequestPermissionRequest {
+        let WriterMessage::Permission { request, reply, .. } = receiver
+            .recv()
+            .await
+            .expect("a permission request must be queued")
+        else {
+            panic!("expected a permission request");
+        };
+        let _ = reply.send(PermissionReply::Outcome(outcome));
+        *request
+    }
+
+    /// Waits for the next queued update and returns its tool update.
+    async fn next_tool_update(
+        receiver: &mut mpsc::UnboundedReceiver<WriterMessage>,
+    ) -> ToolCallUpdate {
+        let WriterMessage::Update(notification) =
+            receiver.recv().await.expect("an update must be queued")
+        else {
+            panic!("expected an update");
+        };
+        let SessionUpdate::ToolCallUpdate(update) = notification.update else {
+            panic!("expected a tool_call_update");
+        };
+        update
+    }
+
+    fn selected(option: &'static str) -> RequestPermissionOutcome {
+        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option))
+    }
+
+    #[tokio::test]
+    async fn permission_gate_waits_for_the_call_announcement_before_asking() {
+        let (gate, mut receiver, announced, _cancel) = permission_gate(Duration::from_secs(1));
+        let call = ToolCall::new("call-wait", "bash", json!({"command": "true"}));
+        let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+        assert!(
+            timeout(Duration::from_millis(30), receiver.recv())
+                .await
+                .is_err(),
+            "no permission request may be sent before the tool_call update is queued"
+        );
+
+        announced.mark("call-wait");
+        let request = answer_permission(&mut receiver, selected(PERMISSION_ALLOW_ONCE)).await;
+        assert_eq!(request.tool_call.tool_call_id.to_string(), "call-wait");
+        let update = next_tool_update(&mut receiver).await;
+        assert_eq!(update.fields.status, Some(ToolCallStatus::InProgress));
+        assert_eq!(
+            task.await.expect("gate task must finish"),
+            ToolPermissionDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prompt_wakes_a_gate_waiting_for_the_announcement() {
+        let (gate, mut receiver, _announced, cancel) = permission_gate(Duration::from_secs(60));
+        let call = ToolCall::new("call-cancel", "bash", json!({"command": "true"}));
+        cancel.cancel();
+
+        let decision = gate.request_permission(&call).await;
+
+        assert_eq!(decision, ToolPermissionDecision::Cancelled);
+        assert!(
+            receiver.try_recv().is_err(),
+            "no request may be queued after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_once_returns_allow_and_sends_the_in_progress_update() {
+        let (gate, mut receiver, announced, _cancel) = permission_gate(Duration::from_secs(1));
+        announced.mark("call-allow");
+        let call = ToolCall::new("call-allow", "bash", json!({"command": "true"}));
+        let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+        let request = answer_permission(&mut receiver, selected(PERMISSION_ALLOW_ONCE)).await;
+        assert_eq!(request.session_id.0.as_ref(), "sess-1");
+        assert_eq!(request.tool_call.tool_call_id.to_string(), "call-allow");
+        assert_eq!(
+            request.tool_call.fields.status,
+            Some(ToolCallStatus::Pending)
+        );
+        assert_eq!(
+            request.tool_call.fields.title.as_deref(),
+            Some("bash: true")
+        );
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .map(|option| (option.option_id.0.as_ref(), option.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (PERMISSION_ALLOW_ONCE, PermissionOptionKind::AllowOnce),
+                (PERMISSION_REJECT_ONCE, PermissionOptionKind::RejectOnce),
+            ]
+        );
+        let update = next_tool_update(&mut receiver).await;
+        assert_eq!(update.tool_call_id.to_string(), "call-allow");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::InProgress));
+
+        assert_eq!(
+            task.await.expect("gate task must finish"),
+            ToolPermissionDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_once_returns_reject_without_an_execution_update() {
+        let (gate, mut receiver, announced, cancel) = permission_gate(Duration::from_secs(1));
+        announced.mark("call-reject");
+        let call = ToolCall::new("call-reject", "write_file", json!({"path": "out.txt"}));
+        let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+        let request = answer_permission(&mut receiver, selected(PERMISSION_REJECT_ONCE)).await;
+        assert_eq!(request.tool_call.tool_call_id.to_string(), "call-reject");
+        assert_eq!(
+            task.await.expect("gate task must finish"),
+            ToolPermissionDecision::Reject
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a rejected call must not get an in_progress update"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "rejection must not cancel the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_outcome_ends_the_prompt_and_never_approves() {
+        let (gate, mut receiver, announced, cancel) = permission_gate(Duration::from_secs(1));
+        announced.mark("call-cancel-outcome");
+        let call = ToolCall::new("call-cancel-outcome", "bash", json!({"command": "true"}));
+        let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+        answer_permission(&mut receiver, RequestPermissionOutcome::Cancelled).await;
+
+        assert_eq!(
+            task.await.expect("gate task must finish"),
+            ToolPermissionDecision::Cancelled
+        );
+        assert!(cancel.is_cancelled(), "the prompt must end cancelled");
+        assert!(
+            receiver.try_recv().is_err(),
+            "a cancelled permission must not open an execution phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_or_future_outcomes_fail_closed() {
+        for outcome in [
+            selected("allow_always"),
+            selected("something_else"),
+            selected(""),
+        ] {
+            let (gate, mut receiver, announced, _cancel) = permission_gate(Duration::from_secs(1));
+            announced.mark("call-unknown");
+            let call = ToolCall::new("call-unknown", "bash", json!({"command": "true"}));
+            let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+            answer_permission(&mut receiver, outcome).await;
+
+            assert_eq!(
+                task.await.expect("gate task must finish"),
+                ToolPermissionDecision::Reject,
+                "an unoffered option must never authorize the tool"
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_times_out_and_cancels_only_that_request() {
+        let (gate, mut receiver, announced, cancel) = permission_gate(Duration::from_millis(10));
+        announced.mark("call-timeout");
+        let call = ToolCall::new("call-timeout", "bash", json!({"command": "true"}));
+
+        let decision = gate.request_permission(&call).await;
+
+        assert_eq!(decision, ToolPermissionDecision::TimedOut);
+        assert!(
+            !cancel.is_cancelled(),
+            "a timeout fails the tool but does not cancel the prompt"
+        );
+        let WriterMessage::Permission {
+            cancel: request_cancel,
+            ..
+        } = receiver.recv().await.expect("the request must be queued")
+        else {
+            panic!("expected a permission request");
+        };
+        assert!(
+            request_cancel.is_cancelled(),
+            "the abandoned request must be cancelled on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_cancel_while_the_request_is_pending_returns_cancelled() {
+        let (gate, mut receiver, announced, cancel) = permission_gate(Duration::from_secs(60));
+        announced.mark("call-pending-cancel");
+        let call = ToolCall::new("call-pending-cancel", "bash", json!({"command": "true"}));
+        let task = tokio::spawn(async move { gate.request_permission(&call).await });
+
+        let WriterMessage::Permission {
+            cancel: request_cancel,
+            ..
+        } = receiver.recv().await.expect("the request must be queued")
+        else {
+            panic!("expected a permission request");
+        };
+        cancel.cancel();
+
+        assert_eq!(
+            task.await.expect("gate task must finish"),
+            ToolPermissionDecision::Cancelled
+        );
+        assert!(
+            request_cancel.is_cancelled(),
+            "prompt cancellation must withdraw the pending request"
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_closed_writer_queue_fails_the_permission_request() {
+        let (gate, receiver, announced, _cancel) = permission_gate(Duration::from_secs(1));
+        announced.mark("call-closed");
+        drop(receiver);
+        let call = ToolCall::new("call-closed", "bash", json!({"command": "true"}));
+
+        assert_eq!(
+            gate.request_permission(&call).await,
+            ToolPermissionDecision::TransportFailed
+        );
     }
 }

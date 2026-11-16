@@ -32,7 +32,7 @@ use crate::acp_store::AcpStoreError;
 use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventRecorder, RecorderError};
-use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
+use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
 use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
@@ -208,6 +208,14 @@ pub(crate) struct TurnRequest {
     /// rules apply exactly as they do to native tools. The CLI and resume
     /// paths pass an empty slice.
     pub(crate) extra_tools: Vec<Arc<dyn Tool>>,
+    /// Optional approval gate for sensitive native tools.
+    ///
+    /// ACP supplies a gate that asks the client through
+    /// `session/request_permission`. The CLI and resume paths pass `None`,
+    /// leaving `bash`, `write_file`, and `delegate_task` governed by policy
+    /// alone. The fixed sensitive set is evaluated inside [`GovernedTool`];
+    /// configured WASM and MCP tools never request permission.
+    pub(crate) permission_gate: Option<Arc<dyn ToolPermissionGate>>,
 }
 
 /// Observable result of one reusable turn execution.
@@ -330,6 +338,7 @@ impl CliRuntime {
                 acceptance_retries: None,
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await?;
         Ok(outcome.reason)
@@ -356,13 +365,21 @@ impl CliRuntime {
             acceptance_retries,
             session_id,
             extra_tools,
+            permission_gate,
         } = request;
 
         // One snapshot for the whole turn. `build_turn` and
         // `initial_messages` must never mix a newer published config with an
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
-        let setup = self.build_turn(&scope, true, &config, update_sink, &extra_tools)?;
+        let setup = self.build_turn(
+            &scope,
+            true,
+            &config,
+            update_sink,
+            &extra_tools,
+            permission_gate,
+        )?;
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
         // skill recall, session recording, and every model request.
@@ -641,7 +658,7 @@ impl CliRuntime {
 
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
-        let setup = self.build_turn(&scope, false, &config, None, &[])?;
+        let setup = self.build_turn(&scope, false, &config, None, &[], None)?;
         if setup.cancel.is_cancelled() {
             setup.shutdown();
             return Ok(SessionEndReason::Cancelled);
@@ -693,6 +710,8 @@ impl CliRuntime {
     /// sink the pump keeps rendering to the terminal. `extra_tools` contains
     /// session-scoped tools such as MCP discoveries; each is still wrapped in
     /// [`GovernedTool`] by [`CliRuntime::build_tool_registry`].
+    /// `permission_gate` is attached to the sensitive native tools only; it is
+    /// `None` outside the ACP path.
     fn build_turn(
         &self,
         scope: &TurnScope,
@@ -700,6 +719,7 @@ impl CliRuntime {
         config: &HarnessConfig,
         update_sink: Option<Arc<dyn UpdateSink>>,
         extra_tools: &[Arc<dyn Tool>],
+        permission_gate: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Result<TurnSetup, CliError> {
         let timeout = config.budget.tool_timeout();
         let token_guard = Arc::new(TokenBudgetGuard::new(config.budget.max_tokens));
@@ -747,6 +767,7 @@ impl CliRuntime {
             Arc::clone(&result_guard),
             delegation,
             extra_tools,
+            permission_gate,
         )?;
         let agent = Arc::new(AgentLoop::new(
             provider,
@@ -827,6 +848,7 @@ impl CliRuntime {
         result_guard: Arc<ResultSizeGuard>,
         delegation: Option<Arc<AgentChildExecutor>>,
         extra_tools: &[Arc<dyn Tool>],
+        permission_gate: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
 
@@ -854,7 +876,8 @@ impl CliRuntime {
             timeout,
             Arc::clone(&timeout_guard),
             Arc::clone(&result_guard),
-        );
+        )
+        .with_permission_gate(permission_gate.clone());
         registry
             .register(Arc::new(write))
             .map_err(|source| CliError::RegisterTool {
@@ -901,7 +924,8 @@ impl CliRuntime {
             timeout,
             Arc::clone(&timeout_guard),
             Arc::clone(&result_guard),
-        );
+        )
+        .with_permission_gate(permission_gate.clone());
         registry
             .register(Arc::new(bash))
             .map_err(|source| CliError::RegisterTool {
@@ -918,7 +942,8 @@ impl CliRuntime {
                 timeout,
                 timeout_guard,
                 result_guard,
-            );
+            )
+            .with_permission_gate(permission_gate);
             registry
                 .register(Arc::new(delegate))
                 .map_err(|source| CliError::RegisterTool {
@@ -1651,6 +1676,7 @@ mod tests {
                 &enabled_config_snapshot,
                 None,
                 &[],
+                None,
             )
             .expect("turn should build");
         let reason = setup
@@ -1682,6 +1708,7 @@ mod tests {
                 &disabled_config_snapshot,
                 None,
                 &[],
+                None,
             )
             .expect("turn should build");
         setup
@@ -1708,6 +1735,7 @@ mod tests {
                 &resume_config_snapshot,
                 None,
                 &[],
+                None,
             )
             .expect("turn should build");
         setup
@@ -1739,7 +1767,7 @@ mod tests {
         let runtime = runtime_with(Arc::clone(&provider), enabled_config());
         let config = runtime.config_snapshot();
         let setup = runtime
-            .build_turn(&test_scope().await, true, &config, None, &[])
+            .build_turn(&test_scope().await, true, &config, None, &[], None)
             .expect("turn should build");
 
         let reason = setup
@@ -2209,6 +2237,7 @@ mod tests {
                     acceptance_retries: None,
                     session_id: None,
                     extra_tools: Vec::new(),
+                    permission_gate: None,
                 })
                 .await
                 .expect("turn must run");
@@ -2225,6 +2254,7 @@ mod tests {
                 acceptance_retries: None,
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await
             .expect("turn must run");
@@ -2300,10 +2330,10 @@ mod tests {
             .await
             .expect("scope b must build");
         let setup_a = runtime
-            .build_turn(&scope_a, false, &config, None, &[])
+            .build_turn(&scope_a, false, &config, None, &[], None)
             .expect("turn a must build");
         let setup_b = runtime
-            .build_turn(&scope_b, false, &config, None, &[])
+            .build_turn(&scope_b, false, &config, None, &[], None)
             .expect("turn b must build");
 
         parent_a.cancel();
@@ -2350,6 +2380,7 @@ mod tests {
             acceptance_retries: None,
             session_id: None,
             extra_tools: Vec::new(),
+            permission_gate: None,
         });
         let canceller = async move {
             started.notified().await;
@@ -2424,6 +2455,7 @@ mod tests {
                 acceptance_retries: None,
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await
             .expect("turn must run");
@@ -2482,6 +2514,7 @@ mod tests {
                 acceptance_retries: None,
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await
             .expect("turn must run");
@@ -2517,6 +2550,7 @@ mod tests {
                 acceptance_retries: None,
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await
             .expect("turn must run");
@@ -2566,6 +2600,7 @@ mod tests {
                 acceptance_retries: Some(0),
                 session_id: None,
                 extra_tools: Vec::new(),
+                permission_gate: None,
             })
             .await
             .expect("turn must run");
