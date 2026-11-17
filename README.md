@@ -18,6 +18,66 @@ event-sourced persistence.
 
 See `CLAUDE.md` for project rules and `DESIGN.md` for the architecture.
 
+## Install
+
+Build and install from a checkout:
+
+```bash
+./install.sh
+```
+
+The installer runs `cargo build --release --locked -p jessica-cli` and installs
+the resulting binary into `~/.local/bin`. It also prepares `~/.jessica`:
+
+- `harness.toml` configuration, created when absent (re-running keeps it;
+  `--force-config` backs it up and regenerates it);
+- `acp-state/` for ACP session indexes. The event log `~/.jessica/events.db`
+  is created on first run, and `memory.db` / `skills.db` stay there when those
+  optional features are enabled.
+
+To register Jessica with a local Paseo installation, run:
+
+```bash
+./install.sh --paseo
+```
+
+This creates a `~/.local/bin/jessica-paseo` launcher and merges a `jessica`
+provider into `~/.paseo/config.json`, keeping a timestamped backup. The
+launcher answers Paseo's `--version` probe, runs `jessica-cli acp` with
+`~/.jessica/harness.toml`, and reads provider credentials from
+`~/.jessica/paseo.env`. That file is created as a commented template with mode
+600; fill in one provider:
+
+```bash
+# ~/.jessica/paseo.env
+JESSICA_PROVIDER=openai
+OPENAI_API_KEY=...
+OPENAI_MODEL=...
+```
+
+Credentials stay in this file instead of `~/.paseo/config.json`. An existing
+custom `jessica-paseo` launcher is kept unchanged; the provider entry is
+updated to use it. If the launcher does not already pass `--config`, the
+installer adds `--config <home>/harness.toml` to the Paseo provider command so
+that ACP sessions are persisted and can be resumed. `--paseo-env-file` is
+ignored for a kept launcher. After editing `paseo.env`, run `paseo reload` and
+verify with `paseo provider diagnostic jessica`.
+
+Options include `--bin-dir <dir>`, `--home <dir>`, `--paseo-home <dir>`,
+`--paseo-env-file <path>`, `--no-config`, and `--force-config`; run
+`./install.sh --help` for the full list. Downloading a published release is
+not handled by this script yet.
+
+Run it with:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+export OPENAI_API_KEY=...
+
+jessica-cli --config ~/.jessica/harness.toml "your prompt"
+jessica-cli acp --config ~/.jessica/harness.toml
+```
+
 ## Governed CLI demo
 
 > The first sentence deliberately contains a misspelling. The example config
@@ -212,8 +272,10 @@ Zed `settings.json` (Linux path: `~/.config/zed/settings.json`):
 }
 ```
 
-Paseo: add this entry under `agents.providers` in `~/.paseo/config.json`
-(or the `config.json` inside the directory passed to `paseo --home`):
+`./install.sh --paseo` performs this integration automatically (see
+[Install](#install)). To configure Paseo manually, add this entry under
+`agents.providers` in `~/.paseo/config.json` (or the `config.json` inside the
+directory passed to `paseo --home`):
 
 ```json
 {
