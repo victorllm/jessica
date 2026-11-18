@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use jessica_core::events::EventSink;
 use jessica_core::llm::{LlmEvent, LlmProvider};
 use jessica_core::tool::{ToolRegistry, ToolSchema};
 use jessica_core::types::{
@@ -63,6 +64,7 @@ pub struct AgentLoop {
     tools: Arc<ToolRegistry>,
     budget: Budget,
     events: broadcast::Sender<AgentEvent>,
+    sink: Option<Arc<dyn EventSink>>,
 }
 
 impl AgentLoop {
@@ -82,7 +84,21 @@ impl AgentLoop {
             tools,
             budget,
             events,
+            sink: None,
         }
+    }
+
+    /// Attaches a producer-side event sink.
+    ///
+    /// When present, every event is offered to `sink` before it is broadcast.
+    /// A sink error stops the loop immediately: the rejected event and every
+    /// later event are neither recorded nor broadcast. The returned terminal
+    /// reason is [`SessionEndReason::Cancelled`] with
+    /// [`TranscriptRun::error`] set; the host is expected to inspect its own
+    /// sink for the authoritative integrity failure.
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Runs the loop until completion, budget exhaustion, cancellation or error.
@@ -185,10 +201,14 @@ impl AgentLoop {
     ) -> TranscriptRun {
         let mut state = RunState::default();
 
-        if emit_started {
-            self.emit(AgentEvent::SessionStarted {
-                session_id: session_id.clone(),
-            });
+        if emit_started
+            && !self
+                .emit(AgentEvent::SessionStarted {
+                    session_id: session_id.clone(),
+                })
+                .await
+        {
+            return aborted_run(messages, state);
         }
 
         let tool_schemas = self.tools.schemas();
@@ -196,30 +216,35 @@ impl AgentLoop {
 
         for _ in 0..remaining_rounds {
             if cancel.is_cancelled() {
-                return self.finish(session_id, SessionEndReason::Cancelled, messages, state);
+                return self
+                    .finish(session_id, SessionEndReason::Cancelled, messages, state)
+                    .await;
             }
 
-            let (content, tool_calls) = match self
-                .model_turn(&messages, &tool_schemas, &cancel)
-                .await
-            {
-                ModelTurn::Completed {
-                    content,
-                    tool_calls,
-                } => (content, tool_calls),
-                ModelTurn::Cancelled => {
-                    return self.finish(session_id, SessionEndReason::Cancelled, messages, state);
-                }
-                ModelTurn::Failed(message) => {
-                    return self.fail_run(session_id, message, messages, state);
-                }
-            };
+            let (content, tool_calls) =
+                match self.model_turn(&messages, &tool_schemas, &cancel).await {
+                    ModelTurn::Completed {
+                        content,
+                        tool_calls,
+                    } => (content, tool_calls),
+                    ModelTurn::Cancelled => {
+                        return self
+                            .finish(session_id, SessionEndReason::Cancelled, messages, state)
+                            .await;
+                    }
+                    ModelTurn::Failed(message) => {
+                        return self.fail_run(session_id, message, messages, state).await;
+                    }
+                    ModelTurn::SinkFailed => return aborted_run(messages, state),
+                };
 
             state.rounds += 1;
             messages.push(assistant_message(content, &tool_calls));
 
             if tool_calls.is_empty() {
-                return self.finish(session_id, SessionEndReason::Completed, messages, state);
+                return self
+                    .finish(session_id, SessionEndReason::Completed, messages, state)
+                    .await;
             }
 
             for call in tool_calls {
@@ -229,22 +254,29 @@ impl AgentLoop {
                 {
                     state.tool_call_limit_hit = true;
                     let message = format!("maximum tool calls ({max}) exceeded");
-                    return self.fail_run(session_id, message, messages, state);
+                    return self.fail_run(session_id, message, messages, state).await;
                 }
 
-                self.emit(AgentEvent::ToolCallStarted { call: call.clone() });
+                if !self
+                    .emit(AgentEvent::ToolCallStarted { call: call.clone() })
+                    .await
+                {
+                    return aborted_run(messages, state);
+                }
 
                 let result = match self.tools.get(&call.name) {
                     Some(tool) => {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
-                                return self.finish(
-                                    session_id,
-                                    SessionEndReason::Cancelled,
-                                    messages,
-                                    state,
-                                );
+                                return self
+                                    .finish(
+                                        session_id,
+                                        SessionEndReason::Cancelled,
+                                        messages,
+                                        state,
+                                    )
+                                    .await;
                             }
                             result = tool.execute_with_call(&call) => result,
                         }
@@ -267,23 +299,34 @@ impl AgentLoop {
                     }
                 }
 
-                self.emit(AgentEvent::ToolCallFinished {
-                    result: result.clone(),
-                });
+                if !self
+                    .emit(AgentEvent::ToolCallFinished {
+                        result: result.clone(),
+                    })
+                    .await
+                {
+                    return aborted_run(messages, state);
+                }
                 messages.push(tool_message(&call, &result));
             }
         }
 
-        self.emit(AgentEvent::BudgetExceeded {
-            kind: BudgetKind::MaxRounds,
-            message: format!("maximum rounds ({}) exceeded", self.budget.max_rounds),
-        });
+        if !self
+            .emit(AgentEvent::BudgetExceeded {
+                kind: BudgetKind::MaxRounds,
+                message: format!("maximum rounds ({}) exceeded", self.budget.max_rounds),
+            })
+            .await
+        {
+            return aborted_run(messages, state);
+        }
         self.finish(
             session_id,
             SessionEndReason::BudgetExceeded,
             messages,
             state,
         )
+        .await
     }
 
     /// Consumes one model response, emitting deltas as they arrive.
@@ -315,7 +358,9 @@ impl AgentLoop {
             match event {
                 Some(LlmEvent::TextDelta { text }) => {
                     content.push_str(&text);
-                    self.emit(AgentEvent::ModelDelta { text });
+                    if !self.emit(AgentEvent::ModelDelta { text }).await {
+                        return ModelTurn::SinkFailed;
+                    }
                 }
                 Some(LlmEvent::ToolCallRequested { call }) => tool_calls.push(call),
                 Some(LlmEvent::Done { .. }) => break,
@@ -332,35 +377,55 @@ impl AgentLoop {
         }
     }
 
-    /// Broadcasts `event`, ignoring the absence of subscribers.
-    fn emit(&self, event: AgentEvent) {
+    /// Offers `event` to the sink, then broadcasts it.
+    ///
+    /// Returns false when the sink rejected the event. The event is not
+    /// broadcast in that case, so observers never see an unrecorded event.
+    async fn emit(&self, event: AgentEvent) -> bool {
+        if let Some(sink) = &self.sink
+            && sink.emit(event.clone()).await.is_err()
+        {
+            return false;
+        }
         let _ = self.events.send(event);
+        true
     }
 
     /// Emits an error and the terminal event for that error.
-    fn fail_run(
+    async fn fail_run(
         &self,
         session_id: SessionId,
         message: String,
         messages: Vec<Message>,
         mut state: RunState,
     ) -> TranscriptRun {
-        self.emit(AgentEvent::Error {
-            message: message.clone(),
-        });
+        if !self
+            .emit(AgentEvent::Error {
+                message: message.clone(),
+            })
+            .await
+        {
+            return aborted_run(messages, state);
+        }
         state.error = Some(message);
         self.finish(session_id, SessionEndReason::Error, messages, state)
+            .await
     }
 
     /// Emits the terminal event and assembles the transcript result.
-    fn finish(
+    async fn finish(
         &self,
         session_id: SessionId,
         reason: SessionEndReason,
         messages: Vec<Message>,
         state: RunState,
     ) -> TranscriptRun {
-        self.emit(AgentEvent::SessionEnded { session_id, reason });
+        if !self
+            .emit(AgentEvent::SessionEnded { session_id, reason })
+            .await
+        {
+            return aborted_run(messages, state);
+        }
         TranscriptRun {
             reason,
             messages,
@@ -371,6 +436,23 @@ impl AgentLoop {
             error: state.error,
             tool_call_limit_hit: state.tool_call_limit_hit,
         }
+    }
+}
+
+/// Builds a transcript result for a run stopped by a sink failure.
+///
+/// No terminal event is emitted: the sink rejected it, and broadcasting it
+/// would create an observable event that is absent from the trace.
+fn aborted_run(messages: Vec<Message>, state: RunState) -> TranscriptRun {
+    TranscriptRun {
+        reason: SessionEndReason::Cancelled,
+        messages,
+        rounds: state.rounds,
+        tool_calls: state.tool_calls,
+        tool_errors: state.tool_errors,
+        first_tool_error: state.first_tool_error,
+        error: Some("event sink failed".to_owned()),
+        tool_call_limit_hit: state.tool_call_limit_hit,
     }
 }
 
@@ -432,6 +514,8 @@ enum ModelTurn {
     Cancelled,
     /// The provider or its stream failed.
     Failed(String),
+    /// The producer-side event sink rejected a model delta.
+    SinkFailed,
 }
 
 /// Builds the assistant message for a completed model turn.
