@@ -1208,3 +1208,126 @@ fn traces_from_a_future_schema_version_are_rejected_on_read() {
         "unexpected error: {error:?}"
     );
 }
+
+#[test]
+fn a_read_only_store_reads_complete_traces_but_rejects_writes() {
+    let database = TempDatabase::new("read-only");
+    let turn = TurnId::new("turn-read-only");
+    let session = SessionId::new("cli-read-only");
+    {
+        let mut store = EventStore::open(database.path()).expect("store should open");
+        store
+            .append_traced(&started(&turn, &session), None, Timestamp::from_millis(10))
+            .expect("turn_started should append");
+        store
+            .append_traced(
+                &ended(&turn, SessionEndReason::Completed),
+                None,
+                Timestamp::from_millis(11),
+            )
+            .expect("turn_ended should append");
+    }
+
+    let mut store =
+        EventStore::open_read_only(database.path()).expect("read-only open should succeed");
+    let trace = store
+        .trace_turn(&turn)
+        .expect("read should succeed")
+        .expect("the recorded turn should exist");
+    assert!(trace.closed());
+    assert_eq!(trace.events().len(), 2);
+
+    let error = store
+        .append(
+            &session,
+            &AgentEvent::ModelDelta {
+                text: "must not persist".to_owned(),
+            },
+            Timestamp::from_millis(12),
+        )
+        .expect_err("a read-only store must reject writes");
+    assert!(
+        matches!(error, EventStoreError::Append { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        store
+            .events(&session)
+            .expect("legacy read should still work")
+            .len(),
+        0,
+        "the rejected write must not create a legacy row"
+    );
+}
+
+#[test]
+fn a_read_only_open_does_not_create_a_missing_database() {
+    let database = TempDatabase::new("missing");
+    let error = EventStore::open_read_only(database.path())
+        .expect_err("an audit open must not create a database");
+    assert!(
+        matches!(error, EventStoreError::Open { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        !database.path().exists(),
+        "the failed open must not leave a database file behind"
+    );
+}
+
+#[test]
+fn a_read_only_open_rejects_a_database_without_the_trace_schema_without_migrating_it() {
+    let database = TempDatabase::new("legacy");
+    std::fs::write(database.path(), b"").expect("an empty database file should be created");
+
+    let error = EventStore::open_read_only(database.path())
+        .expect_err("a database without trace tables must be rejected");
+    assert!(
+        matches!(
+            error,
+            EventStoreError::TraceSchemaMissing { version: 0, .. }
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let connection = Connection::open(database.path()).expect("raw connection should open");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version should be readable");
+    let trace_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name IN ('trace_events', 'trace_heads')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema should be readable");
+    assert_eq!(version, 0, "the audit open must not migrate user_version");
+    assert_eq!(
+        trace_tables, 0,
+        "the audit open must not install the trace tables"
+    );
+}
+
+#[test]
+fn a_read_only_open_rejects_a_newer_schema_without_touching_it() {
+    let database = TempDatabase::new("future-open");
+    let connection = Connection::open(database.path()).expect("raw connection should open");
+    connection
+        .execute_batch("PRAGMA user_version = 2")
+        .expect("a future version should be recorded");
+    drop(connection);
+
+    let error =
+        EventStore::open_read_only(database.path()).expect_err("a future schema must be rejected");
+    assert!(
+        matches!(
+            error,
+            EventStoreError::UnsupportedVersion {
+                found: 2,
+                supported: 1
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
