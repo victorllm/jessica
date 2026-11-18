@@ -8,16 +8,48 @@
 //! The recorder is also the read side of `--resume`: it loads the immutable
 //! bootstrap messages plus the recorded events and converts the stored rows into
 //! the runtime's [`RecordedEvent`]s.
+//!
+//! [`EventJournal`] is the narrow write interface used by the pump and turn
+//! orchestration. Tests inject deterministic failures through it; production
+//! code uses [`EventRecorder`], which performs every database operation on the
+//! blocking pool.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
+use jessica_core::trace::TraceEvent;
 use jessica_core::types::{AgentEvent, Message, SessionId};
 use jessica_memory::{EventStore, EventStoreError, Timestamp};
 use jessica_runtime::RecordedEvent;
 use thiserror::Error;
 use tokio::task::JoinError;
+
+/// Write-only interface for session metadata and versioned traces.
+///
+/// The pump owns one implementation for a whole turn. Keeping the interface
+/// narrow lets behavior tests force storage failures without touching the
+/// filesystem, while production uses [`EventRecorder`].
+#[async_trait]
+pub(crate) trait EventJournal: Send + Sync {
+    /// Records the immutable bootstrap messages of a new session.
+    async fn record_session_start(
+        &self,
+        session_id: &SessionId,
+        messages: &[Message],
+    ) -> Result<(), RecorderError>;
+
+    /// Atomically appends one trace entry and its optional legacy mirror.
+    ///
+    /// `legacy` must be present for agent events that belong to a session,
+    /// except acceptance failures, which are trace-only.
+    async fn record_traced(
+        &self,
+        trace: TraceEvent,
+        legacy: Option<(SessionId, AgentEvent)>,
+    ) -> Result<(), RecorderError>;
+}
 
 /// A persisted session ready to be replayed.
 pub(crate) struct StoredSession {
@@ -69,6 +101,11 @@ impl EventRecorder {
     }
 
     /// Appends one event to its session's stream.
+    ///
+    /// Production writes go through [`EventJournal::record_traced`] so the
+    /// legacy mirror and the trace entry commit together. This direct helper
+    /// exists for recovery-focused tests that do not build a full turn.
+    #[cfg(test)]
     pub(crate) async fn append(
         &self,
         session_id: &SessionId,
@@ -117,6 +154,36 @@ impl EventRecorder {
     }
 }
 
+#[async_trait]
+impl EventJournal for EventRecorder {
+    async fn record_session_start(
+        &self,
+        session_id: &SessionId,
+        messages: &[Message],
+    ) -> Result<(), RecorderError> {
+        EventRecorder::record_session_start(self, session_id, messages).await
+    }
+
+    async fn record_traced(
+        &self,
+        trace: TraceEvent,
+        legacy: Option<(SessionId, AgentEvent)>,
+    ) -> Result<(), RecorderError> {
+        let store = Arc::clone(&self.store);
+        let timestamp = now();
+        tokio::task::spawn_blocking(move || {
+            let legacy = legacy
+                .as_ref()
+                .map(|(session_id, event)| (session_id, event));
+            lock_store(&store).append_traced(&trace, legacy, timestamp)?;
+            Ok(())
+        })
+        .await
+        .map_err(RecorderError::Task)?
+        .map_err(RecorderError::Store)
+    }
+}
+
 /// Locks the store, recovering from a poisoned mutex.
 fn lock_store(store: &Mutex<EventStore>) -> MutexGuard<'_, EventStore> {
     store
@@ -145,4 +212,13 @@ pub(crate) enum RecorderError {
     /// The blocking database task failed.
     #[error("event store task failed: {0}")]
     Task(#[source] JoinError),
+    /// A trace lifecycle or attribution rule was violated.
+    ///
+    /// This is always a failed turn: the trace cannot be completed without
+    /// guessing about missing or misattributed entries.
+    #[error("trace integrity failure: {message}")]
+    Integrity {
+        /// Description of the violated rule.
+        message: String,
+    },
 }

@@ -46,6 +46,7 @@ mod memory_log;
 mod memory_store;
 mod skill_jobs;
 mod skill_log;
+mod trace_store;
 mod workspace;
 
 use std::fmt;
@@ -72,6 +73,7 @@ pub use skill_log::{
     NewSkill, Skill, SkillId, SkillLog, SkillLogError, SkillSource, SkillStatus, SqliteSkillStore,
     SqliteSkillStoreError,
 };
+pub use trace_store::{StoredTraceEvent, StoredTraceTurn, TraceTurnSummary};
 
 /// SQLite schema and the append-only guards installed on every open.
 const SCHEMA: &str = r#"
@@ -117,6 +119,12 @@ END;
 
 /// How long SQLite waits for a competing writer before returning `Busy`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Schema version stored in the event database's `user_version` pragma.
+///
+/// Version 1 adds the versioned trace tables without changing or rewriting the
+/// legacy `events` and `sessions` tables.
+const SCHEMA_VERSION: i64 = 1;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
 ///
@@ -228,14 +236,16 @@ impl EventStore {
         Self::initialize(connection)
     }
 
-    /// Installs the schema and wraps the connection.
+    /// Installs or upgrades the schema and wraps the connection.
+    ///
+    /// Databases written before trace support report `user_version = 0`; they
+    /// gain the trace tables without any event rewrite. A database from a
+    /// newer build is rejected instead of being opened with unknown semantics.
     fn initialize(connection: Connection) -> Result<Self, EventStoreError> {
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(EventStoreError::Schema)?;
-        connection
-            .execute_batch(SCHEMA)
-            .map_err(EventStoreError::Schema)?;
+        install_schema(&connection)?;
         Ok(Self { connection })
     }
 
@@ -318,48 +328,15 @@ impl EventStore {
         event: &AgentEvent,
         timestamp: Timestamp,
     ) -> Result<StoredEvent, EventStoreError> {
-        let payload_json = serde_json::to_string(event)?;
-        let event_type = event_type_tag(event);
         let transaction = self
             .connection
             .transaction()
             .map_err(|source| append_error(session_id, source))?;
-        let next_seq: i64 = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
-                [session_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|source| append_error(session_id, source))?;
-        transaction
-            .execute(
-                "INSERT INTO events (session_id, seq, event_type, payload_json, timestamp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    session_id.as_str(),
-                    next_seq,
-                    event_type,
-                    payload_json,
-                    timestamp.as_millis()
-                ],
-            )
-            .map_err(|source| append_error(session_id, source))?;
+        let stored = append_in_transaction(&transaction, session_id, event, timestamp)?;
         transaction
             .commit()
             .map_err(|source| append_error(session_id, source))?;
-
-        let seq = u64::try_from(next_seq).map_err(|_| EventStoreError::Sequence {
-            session_id: session_id.to_string(),
-            value: next_seq,
-        })?;
-        Ok(StoredEvent {
-            session_id: session_id.clone(),
-            seq,
-            event_type: event_type.to_owned(),
-            payload_json,
-            timestamp,
-            event: event.clone(),
-        })
+        Ok(stored)
     }
 
     /// Returns every event for `session_id` in ascending sequence order.
@@ -451,8 +428,83 @@ impl EventStore {
     }
 }
 
+/// Installs the legacy schema, then the trace schema, and finally records the
+/// schema version.
+///
+/// The version is written last so an interrupted upgrade is retried on the
+/// next open instead of being mistaken for a completed one. A database from a
+/// newer build is rejected before any statement runs.
+fn install_schema(connection: &Connection) -> Result<(), EventStoreError> {
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(EventStoreError::Schema)?;
+    if version > SCHEMA_VERSION {
+        return Err(EventStoreError::UnsupportedVersion {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    connection
+        .execute_batch(SCHEMA)
+        .map_err(EventStoreError::Schema)?;
+    trace_store::install(connection)?;
+    if version < SCHEMA_VERSION {
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .map_err(EventStoreError::Schema)?;
+    }
+    Ok(())
+}
+
+/// Appends one legacy event through an already-open transaction.
+///
+/// Both [`EventStore::append`] and the trace dual-write path use this helper so
+/// legacy sequence allocation and payload encoding stay identical.
+pub(crate) fn append_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    event: &AgentEvent,
+    timestamp: Timestamp,
+) -> Result<StoredEvent, EventStoreError> {
+    let payload_json = serde_json::to_string(event)?;
+    let event_type = event_type_tag(event);
+    let next_seq: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|source| append_error(session_id, source))?;
+    transaction
+        .execute(
+            "INSERT INTO events (session_id, seq, event_type, payload_json, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id.as_str(),
+                next_seq,
+                event_type,
+                payload_json,
+                timestamp.as_millis()
+            ],
+        )
+        .map_err(|source| append_error(session_id, source))?;
+
+    let seq = u64::try_from(next_seq).map_err(|_| EventStoreError::Sequence {
+        session_id: session_id.to_string(),
+        value: next_seq,
+    })?;
+    Ok(StoredEvent {
+        session_id: session_id.clone(),
+        seq,
+        event_type: event_type.to_owned(),
+        payload_json,
+        timestamp,
+        event: event.clone(),
+    })
+}
+
 /// Returns the serde tag stored in the `event_type` column.
-fn event_type_tag(event: &AgentEvent) -> &'static str {
+pub(crate) fn event_type_tag(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::SessionStarted { .. } => "session_started",
         AgentEvent::ModelDelta { .. } => "model_delta",
@@ -508,6 +560,17 @@ pub enum EventStoreError {
     /// The schema or append-only triggers could not be installed.
     #[error("failed to initialize the event store schema: {0}")]
     Schema(#[source] rusqlite::Error),
+    /// The database was written by a build with a newer schema.
+    ///
+    /// The store refuses to open it rather than guessing at semantics it does
+    /// not know.
+    #[error("event store schema version {found} is newer than the supported version {supported}")]
+    UnsupportedVersion {
+        /// Version stored in the database's `user_version`.
+        found: i64,
+        /// Highest version this build supports.
+        supported: i64,
+    },
     /// The event could not be serialized to JSON.
     #[error("failed to serialize the agent event: {0}")]
     Serialize(#[from] serde_json::Error),
@@ -586,5 +649,72 @@ pub enum EventStoreError {
         session_id: String,
         /// Value read from SQLite.
         value: i64,
+    },
+    /// A trace envelope could not be serialized to JSON.
+    #[error("failed to serialize an entry for turn `{turn_id}`: {source}")]
+    TraceSerialize {
+        /// Turn whose envelope could not be serialized.
+        turn_id: String,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Trace rows could not be written or read for one turn.
+    #[error("failed to access trace turn `{turn_id}`: {source}")]
+    TraceStore {
+        /// Turn the operation targeted.
+        turn_id: String,
+        /// Underlying SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// The trace transaction could not be started, committed, or read.
+    #[error("failed to access stored traces: {source}")]
+    TraceDatabase {
+        /// Underlying SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+    /// A stored trace payload is not valid JSON for a [`jessica_core::trace::TraceEvent`].
+    #[error("trace entry {seq} for turn `{turn_id}` is not a valid trace event: {source}")]
+    TraceDecode {
+        /// Turn whose row is corrupt.
+        turn_id: String,
+        /// Sequence number of the corrupt row.
+        seq: u64,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A trace envelope or stored row violates the trace contract.
+    ///
+    /// `seq` is the offending entry, or `0` when the envelope as a whole is
+    /// invalid.
+    #[error("trace entry {seq} for turn `{turn_id}` is invalid: {message}")]
+    TraceInvalid {
+        /// Turn whose entry is invalid.
+        turn_id: String,
+        /// Offending sequence number, or `0` for an envelope-level problem.
+        seq: u64,
+        /// Description of the violated rule.
+        message: String,
+    },
+    /// Stored trace sequence numbers are not contiguous.
+    #[error("trace turn `{turn_id}` expected sequence {expected} but found {found}")]
+    TraceSequence {
+        /// Turn whose sequence is broken.
+        turn_id: String,
+        /// Next sequence number required for a complete trace.
+        expected: u64,
+        /// Sequence number found in the store.
+        found: u64,
+    },
+    /// A trace lifecycle invariant is broken.
+    #[error("trace turn `{turn_id}` has an invalid lifecycle: {message}")]
+    TraceLifecycle {
+        /// Turn whose lifecycle is invalid.
+        turn_id: String,
+        /// Description of the violated invariant.
+        message: String,
     },
 }

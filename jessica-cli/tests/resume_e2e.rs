@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jessica_core::trace::{TracePayload, TraceTurnMode};
 use jessica_core::types::{AgentEvent, Message, SessionEndReason, SessionId, ToolCall, ToolResult};
 use jessica_memory::{EventStore, Timestamp};
 use serde_json::json;
@@ -148,6 +149,49 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
             reason: SessionEndReason::Completed,
         }
     );
+
+    let summaries = store.trace_turns(10).expect("turn summaries should load");
+    assert_eq!(summaries.len(), 1, "the resume must record one turn");
+    assert!(summaries[0].closed(), "the resumed turn must close");
+    let trace = store
+        .trace_turn(summaries[0].turn_id())
+        .expect("turn trace should load")
+        .expect("the summarized turn must exist");
+    let traced = trace.events();
+    assert_eq!(
+        traced.len(),
+        4,
+        "turn start, two agent events, and turn end: {traced:?}"
+    );
+    assert!(
+        matches!(
+            &traced[0].event().payload,
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Resumed,
+                messages,
+            } if messages.len() == 4
+        ),
+        "a resumed trace must start with the recovered conversation"
+    );
+    assert_eq!(
+        traced[0].event().session_id.as_ref(),
+        Some(&session),
+        "the resumed turn must name the session it continues"
+    );
+    for entry in &traced[1..3] {
+        assert_eq!(entry.event().attempt, Some(1));
+        assert_eq!(entry.event().session_id.as_ref(), Some(&session));
+        assert!(
+            matches!(&entry.event().payload, TracePayload::Agent { .. }),
+            "the recovered batch must not be replayed into the trace"
+        );
+    }
+    assert!(matches!(
+        &traced[3].event().payload,
+        TracePayload::TurnEnded {
+            reason: SessionEndReason::Completed
+        }
+    ));
 }
 
 /// Writes a session that stopped after its first complete tool batch.

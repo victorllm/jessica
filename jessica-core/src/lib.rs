@@ -14,4 +14,5 @@ pub mod memory;
 pub mod policy;
 pub mod sensor;
 pub mod tool;
+pub mod trace;
 pub mod types;

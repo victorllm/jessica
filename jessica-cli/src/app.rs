@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jessica_core::acceptance::AcceptanceCheck;
 use jessica_core::guard::Guard;
@@ -12,6 +12,7 @@ use jessica_core::llm::{LlmError, LlmProvider};
 use jessica_core::policy::Policy;
 use jessica_core::sensor::Sensor;
 use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError};
+use jessica_core::trace::{TraceTurnMode, TurnId};
 use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, SessionId};
 use jessica_harness::{
     AcceptanceOutcome, AcceptanceRunner, AllowlistPolicy, CommandSensor, DEFAULT_EVENT_CAPACITY,
@@ -31,7 +32,7 @@ use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::acp_store::AcpStoreError;
 use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
 use crate::delegation::NativeChildToolFactory;
-use crate::events::{EventRecorder, RecorderError};
+use crate::events::{EventJournal, EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
 use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
@@ -101,15 +102,15 @@ struct AttemptContext {
     governance: Arc<GovernanceState>,
     /// Stateful stuck guard reset per attempt.
     stuck_guard: Arc<StuckDetectionGuard>,
-    /// Event recorder, when persistence is enabled.
-    recorder: Option<Arc<EventRecorder>>,
+    /// Event journal, when persistence is enabled.
+    recorder: Option<Arc<dyn EventJournal>>,
     /// Cancellation token for the turn.
     cancel: CancellationToken,
 }
 
 impl AttemptContext {
     /// Clones the per-turn handles into an attempt context.
-    fn from_setup(setup: &TurnSetup, recorder: Option<Arc<EventRecorder>>) -> Self {
+    fn from_setup(setup: &TurnSetup, recorder: Option<Arc<dyn EventJournal>>) -> Self {
         Self {
             agent: Arc::clone(&setup.agent),
             harness: Arc::clone(&setup.harness),
@@ -311,6 +312,13 @@ impl CliRuntime {
         self.config.borrow().clone()
     }
 
+    /// Returns the write-only journal shared by the pump and turn orchestration.
+    fn journal(&self) -> Option<Arc<dyn EventJournal>> {
+        self.recorder
+            .clone()
+            .map(|recorder| recorder as Arc<dyn EventJournal>)
+    }
+
     /// Drains the skill worker before the process exits.
     ///
     /// The drain is bounded by `drain_timeout_ms`; failures only warn and never
@@ -380,11 +388,24 @@ impl CliRuntime {
             &extra_tools,
             permission_gate,
         )?;
+        let first_session = session_id.unwrap_or_else(next_session_id);
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
-        // skill recall, session recording, and every model request.
+        // skill recall, session recording, and every model request. The turn
+        // still gets a complete start/end trace when persistence is enabled so
+        // every normal return has a closed trace.
         if setup.cancel.is_cancelled() {
+            let turn_id = next_turn_id();
+            let result = close_empty_turn(
+                &setup.pump,
+                turn_id,
+                TraceTurnMode::Fresh,
+                Vec::new(),
+                first_session,
+            )
+            .await;
             setup.shutdown();
+            result?;
             return Ok(TurnOutcome {
                 reason: SessionEndReason::Cancelled,
                 messages: Vec::new(),
@@ -392,7 +413,6 @@ impl CliRuntime {
                 lagged: false,
             });
         }
-        let first_session = session_id.unwrap_or_else(next_session_id);
         let initial = self
             .initial_messages(
                 &scope,
@@ -406,7 +426,22 @@ impl CliRuntime {
         // contributes to this turn's structured counts.
         let turn_start = initial.len();
 
-        let context = AttemptContext::from_setup(&setup, self.recorder.clone());
+        let turn_id = next_turn_id();
+        if let Err(error) = setup
+            .pump
+            .begin_turn(
+                turn_id.clone(),
+                TraceTurnMode::Fresh,
+                initial.clone(),
+                first_session.clone(),
+            )
+            .await
+        {
+            setup.shutdown();
+            return Err(CliError::Events(error));
+        }
+
+        let context = AttemptContext::from_setup(&setup, self.journal());
         let (
             reason,
             emit_outer,
@@ -431,9 +466,11 @@ impl CliRuntime {
             let mut next_session = Some(first_session.clone());
             let mut latest_session = None;
             let mut latest_attempt_start = turn_start;
+            let mut attempt_number = 0_u32;
             let outcome = runner
                 .run(initial, |messages| {
                     latest_attempt_start = messages.len();
+                    attempt_number = attempt_number.saturating_add(1);
                     let session_id = next_session.take().unwrap_or_else(next_session_id);
                     latest_session = Some(session_id.clone());
                     let context = context.clone();
@@ -444,6 +481,7 @@ impl CliRuntime {
                                 session_id,
                                 messages,
                             },
+                            attempt_number,
                         )
                         .await
                     }
@@ -467,6 +505,7 @@ impl CliRuntime {
                     session_id: first_session.clone(),
                     messages: initial,
                 },
+                1,
             )
             .await;
             let (tool_calls, rounds) = structured_counts(&attempt.messages, turn_start);
@@ -481,12 +520,49 @@ impl CliRuntime {
             )
         };
 
+        // A persistence failure or broadcast gap leaves the trace permanently
+        // incomplete. Do not emit further events or write `turn_ended`; the
+        // caller must observe an error instead of a normal turn result.
+        if let Some(cause) = setup.pump.integrity_failure() {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+
         // A budget trip overrides the runtime's Completed/Cancelled reason.
         // Emit an outer session event so the final observable reason is the
         // governed one rather than the last attempt's reason.
         if emit_outer {
-            emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
+            let journal = self.journal();
+            if let Err(error) =
+                emit_outer_session(&setup.pump, &setup.events, journal.as_deref(), reason).await
+            {
+                let cause = format!("failed to persist the outer session: {error}");
+                setup.pump.fail_integrity(cause.clone(), true);
+                setup.shutdown();
+                return Err(CliError::TraceIncomplete {
+                    turn_id: turn_id.to_string(),
+                    cause,
+                });
+            }
         }
+        if let Some(cause) = setup.pump.integrity_failure() {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+        if let Err(error) = setup.pump.finish_turn(reason).await {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause: error.to_string(),
+            });
+        }
+
         let governed_completed =
             reason == SessionEndReason::Completed && !setup.governance.tripped();
         let turn_index = stable_turn_index(&final_messages);
@@ -659,16 +735,77 @@ impl CliRuntime {
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
         let setup = self.build_turn(&scope, false, &config, None, &[], None)?;
+        let trace_messages = checkpoint.messages().to_vec();
         if setup.cancel.is_cancelled() {
+            let turn_id = next_turn_id();
+            let result = close_empty_turn(
+                &setup.pump,
+                turn_id,
+                TraceTurnMode::Resumed,
+                trace_messages,
+                session_id.clone(),
+            )
+            .await;
             setup.shutdown();
+            result?;
             return Ok(SessionEndReason::Cancelled);
         }
-        let context = AttemptContext::from_setup(&setup, self.recorder.clone());
-        let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }).await;
-        let reason = attempt.reason;
-        if setup.governance.tripped() {
-            emit_outer_session(&setup.pump, &setup.events, self.recorder.as_deref(), reason).await;
+
+        let turn_id = next_turn_id();
+        if let Err(error) = setup
+            .pump
+            .begin_turn(
+                turn_id.clone(),
+                TraceTurnMode::Resumed,
+                trace_messages,
+                session_id.clone(),
+            )
+            .await
+        {
+            setup.shutdown();
+            return Err(CliError::Events(error));
         }
+
+        let context = AttemptContext::from_setup(&setup, self.journal());
+        let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }, 1).await;
+        let reason = attempt.reason;
+
+        if let Some(cause) = setup.pump.integrity_failure() {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+        if setup.governance.tripped() {
+            let journal = self.journal();
+            if let Err(error) =
+                emit_outer_session(&setup.pump, &setup.events, journal.as_deref(), reason).await
+            {
+                let cause = format!("failed to persist the outer session: {error}");
+                setup.pump.fail_integrity(cause.clone(), true);
+                setup.shutdown();
+                return Err(CliError::TraceIncomplete {
+                    turn_id: turn_id.to_string(),
+                    cause,
+                });
+            }
+        }
+        if let Some(cause) = setup.pump.integrity_failure() {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+        if let Err(error) = setup.pump.finish_turn(reason).await {
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause: error.to_string(),
+            });
+        }
+
         let governed_completed =
             reason == SessionEndReason::Completed && !setup.governance.tripped();
         let turn_index = stable_turn_index(&attempt.messages);
@@ -783,7 +920,7 @@ impl CliRuntime {
         let pump = Arc::new(EventPump::new(
             Arc::clone(&harness),
             Arc::clone(&governance),
-            self.recorder.clone(),
+            self.journal(),
             output,
             update_sink,
         ));
@@ -998,7 +1135,11 @@ pub(crate) async fn load_wasm_tools(
 ///
 /// The stuck guard is stateful per session, so it is reset before every
 /// acceptance retry; token usage remains cumulative across the whole turn.
-async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAttempt {
+async fn run_attempt(
+    context: AttemptContext,
+    start: AttemptStart,
+    attempt_number: u32,
+) -> SessionAttempt {
     context.stuck_guard.reset();
     let (session_id, initial_messages) = match &start {
         AttemptStart::Fresh {
@@ -1010,20 +1151,51 @@ async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAtt
             checkpoint.messages().to_vec(),
         ),
     };
+    let fallback_messages = initial_messages.clone();
+
+    // Once the trace is broken, no further attempt may start: its events could
+    // not be attributed and the turn can never close successfully.
+    if let Some(cause) = context.pump.integrity_failure() {
+        context.pump.fail_integrity(cause, true);
+        return SessionAttempt {
+            messages: fallback_messages,
+            last_output: String::new(),
+            reason: SessionEndReason::Error,
+        };
+    }
 
     // A fresh session needs its immutable bootstrap messages before any event
-    // is appended. A resumed session already has them in the store.
+    // is appended. A resumed session already has them in the store. A metadata
+    // failure fails the turn: recovery would otherwise lack the user messages
+    // needed to replay the attempt.
     if let AttemptStart::Fresh { messages, .. } = &start
         && let Some(recorder) = &context.recorder
         && let Err(error) = recorder.record_session_start(&session_id, messages).await
     {
-        eprintln!("[warn] failed to record session metadata for {session_id}: {error}");
+        let cause = format!("failed to record session metadata for {session_id}: {error}");
+        context.pump.fail_integrity(cause, true);
+        return SessionAttempt {
+            messages: fallback_messages,
+            last_output: String::new(),
+            reason: SessionEndReason::Error,
+        };
+    }
+
+    if let Err(error) = context.pump.begin_attempt(attempt_number, &session_id) {
+        let cause = format!(
+            "failed to attribute attempt {attempt_number} to session {session_id}: {error}"
+        );
+        context.pump.fail_integrity(cause, true);
+        return SessionAttempt {
+            messages: fallback_messages,
+            last_output: String::new(),
+            reason: SessionEndReason::Error,
+        };
     }
 
     context
         .pump
         .register(session_id.clone(), initial_messages.clone());
-    let fallback_messages = initial_messages;
 
     let raw_reason = match start {
         AttemptStart::Fresh { messages, .. } => {
@@ -1081,7 +1253,7 @@ async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAtt
     SessionAttempt {
         messages: snapshot.messages,
         last_output: snapshot.last_output,
-        reason: if pump_failed {
+        reason: if pump_failed || context.pump.integrity_failure().is_some() {
             SessionEndReason::Error
         } else {
             reason
@@ -1098,14 +1270,14 @@ async fn run_attempt(context: AttemptContext, start: AttemptStart) -> SessionAtt
 async fn emit_outer_session(
     pump: &EventPump,
     events: &broadcast::Sender<AgentEvent>,
-    recorder: Option<&EventRecorder>,
+    journal: Option<&dyn EventJournal>,
     reason: SessionEndReason,
-) {
+) -> Result<(), RecorderError> {
     let session_id = next_session_id();
-    if let Some(recorder) = recorder
-        && let Err(error) = recorder.record_session_start(&session_id, &[]).await
-    {
-        eprintln!("[warn] failed to record session metadata for {session_id}: {error}");
+    if let Some(journal) = journal {
+        // Fail closed before broadcasting: an unrecorded bootstrap session
+        // cannot be recovered, so its events must not enter the trace.
+        journal.record_session_start(&session_id, &[]).await?;
     }
     pump.register(session_id.clone(), Vec::new());
     let _ = events.send(AgentEvent::SessionStarted {
@@ -1116,10 +1288,24 @@ async fn emit_outer_session(
         reason,
     });
 
-    match tokio::time::timeout(PUMP_TIMEOUT, pump.wait_for(&session_id)).await {
-        Ok(Some(_)) => {}
-        Ok(None) => eprintln!("[warn] outer session was not registered with the event pump"),
-        Err(_) => eprintln!("[warn] timed out while flushing the outer session event"),
+    let waited = tokio::time::timeout(PUMP_TIMEOUT, pump.wait_for(&session_id)).await;
+    if journal.is_some() {
+        match waited {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(RecorderError::Integrity {
+                message: "the event pump did not observe the outer session".to_owned(),
+            }),
+            Err(_) => Err(RecorderError::Integrity {
+                message: "timed out while flushing the outer session event".to_owned(),
+            }),
+        }
+    } else {
+        match waited {
+            Ok(Some(_)) => {}
+            Ok(None) => eprintln!("[warn] outer session was not registered with the event pump"),
+            Err(_) => eprintln!("[warn] timed out while flushing the outer session event"),
+        }
+        Ok(())
     }
 }
 
@@ -1212,11 +1398,48 @@ fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
 }
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generates a process-local session id.
 fn next_session_id() -> SessionId {
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     SessionId::new(format!("cli-{}-{counter}", std::process::id()))
+}
+
+/// Generates a process-unique turn id.
+///
+/// The timestamp, process id, and per-process counter make collisions
+/// practically impossible. The store rejects a duplicate id instead of
+/// silently merging two turns, so a collision still fails closed.
+fn next_turn_id() -> TurnId {
+    let counter = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    TurnId::new(format!("turn-{}-{nanos}-{counter}", std::process::id()))
+}
+
+/// Starts and immediately closes a turn that never ran an attempt.
+///
+/// A cancelled-before-start turn is still a normal return, so it must not
+/// leave an open trace when persistence is enabled.
+async fn close_empty_turn(
+    pump: &EventPump,
+    turn_id: TurnId,
+    mode: TraceTurnMode,
+    messages: Vec<Message>,
+    first_session: SessionId,
+) -> Result<(), CliError> {
+    pump.begin_turn(turn_id.clone(), mode, messages, first_session)
+        .await
+        .map_err(CliError::Events)?;
+    pump.finish_turn(SessionEndReason::Cancelled)
+        .await
+        .map_err(|error| CliError::TraceIncomplete {
+            turn_id: turn_id.to_string(),
+            cause: error.to_string(),
+        })
 }
 
 /// Errors produced while assembling or running a CLI turn.
@@ -1303,6 +1526,17 @@ pub(crate) enum CliError {
     /// Recording or loading events failed.
     #[error("event store failure: {0}")]
     Events(#[from] RecorderError),
+    /// The turn trace could not be completed or closed.
+    ///
+    /// The trace intentionally has no `turn_ended` marker; callers must not
+    /// present the turn as complete.
+    #[error("turn `{turn_id}` trace is incomplete: {cause}")]
+    TraceIncomplete {
+        /// Turn whose trace is incomplete.
+        turn_id: String,
+        /// Failure that prevented completion.
+        cause: String,
+    },
     /// ACP session recovery was configured without an event-store path.
     #[error("ACP session recovery requires an [events] path")]
     AcpPersistenceWithoutEvents,
@@ -1364,7 +1598,9 @@ mod tests {
     use futures::StreamExt;
     use jessica_core::llm::{LlmEvent, LlmStream};
     use jessica_core::tool::ToolSchema;
+    use jessica_core::trace::{TraceEvent, TracePayload};
     use jessica_core::types::{TokenUsage, ToolCall};
+    use jessica_memory::{EventStore, StoredTraceTurn, Timestamp};
     use jessica_runtime::CHILD_AGENT_SYSTEM_PROMPT;
     use serde_json::json;
 
@@ -1653,6 +1889,64 @@ mod tests {
         TurnScope::new(PathBuf::from("."), CancellationToken::new())
             .await
             .expect("the test workspace must canonicalize")
+    }
+
+    /// Builds a runtime over the given provider, config, and event database.
+    async fn runtime_with_recorder(
+        provider: Arc<ScriptedProvider>,
+        config: HarnessConfig,
+        database: PathBuf,
+    ) -> CliRuntime {
+        let recorder = Arc::new(
+            EventRecorder::open(database)
+                .await
+                .expect("event recorder must open"),
+        );
+        let (_sender, receiver) = watch::channel(Arc::new(config));
+        CliRuntime::new(
+            provider,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            Some(recorder),
+            None,
+            None,
+            Arc::new(ShutdownController::new()),
+        )
+    }
+
+    /// Reads the only turn trace in `database`.
+    async fn load_trace(database: PathBuf) -> StoredTraceTurn {
+        tokio::task::spawn_blocking(move || {
+            let store = EventStore::open(&database).expect("event store must open");
+            let summaries = store.trace_turns(10).expect("turn summaries must read");
+            assert_eq!(
+                summaries.len(),
+                1,
+                "exactly one turn must be recorded: {summaries:?}"
+            );
+            store
+                .trace_turn(summaries[0].turn_id())
+                .expect("turn trace must read")
+                .expect("the summarized turn must have a trace")
+        })
+        .await
+        .expect("trace read task must finish")
+    }
+
+    /// Reads the legacy event log for one session.
+    async fn load_legacy_events(database: PathBuf, session: SessionId) -> Vec<AgentEvent> {
+        tokio::task::spawn_blocking(move || {
+            EventStore::open(&database)
+                .expect("event store must open")
+                .events(&session)
+                .expect("legacy events must read")
+                .into_iter()
+                .map(|stored| stored.event().clone())
+                .collect()
+        })
+        .await
+        .expect("legacy read task must finish")
     }
 
     /// Returns the system prompt the provider observed for one call.
@@ -2610,6 +2904,339 @@ mod tests {
             provider.calls().len(),
             1,
             "a per-turn zero retry budget must override the configured retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_writes_one_closed_trace_with_mirrored_legacy_events() {
+        let temp = TempDir::new("trace-completed");
+        let database = temp.path().join("events.sqlite");
+        let session = SessionId::new("trace-completed-session");
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 1)]));
+        let runtime = runtime_with_recorder(
+            Arc::clone(&provider),
+            HarnessConfig::default(),
+            database.clone(),
+        )
+        .await;
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("turn must run");
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+        drop(runtime);
+
+        let trace = load_trace(database.clone()).await;
+        assert!(trace.closed(), "a completed turn must close its trace");
+        let events = trace.events();
+        assert_eq!(
+            events.len(),
+            5,
+            "turn start, three agent events, and turn end: {events:?}"
+        );
+        assert_eq!(events[0].seq(), 1);
+        assert!(
+            matches!(
+                &events[0].event().payload,
+                TracePayload::TurnStarted {
+                    mode: TraceTurnMode::Fresh,
+                    messages,
+                } if messages.first().is_some_and(|message| message.role == Role::System)
+                    && messages.last().is_some_and(|message| message.content == "question")
+            ),
+            "the trace must start with the supplied conversation"
+        );
+        assert_eq!(events[0].event().attempt, None);
+        assert_eq!(events[0].event().session_id.as_ref(), Some(&session));
+
+        let agent_payloads: Vec<AgentEvent> = events
+            .iter()
+            .filter_map(|stored| match &stored.event().payload {
+                TracePayload::Agent { event } => Some(event.clone()),
+                _ => None,
+            })
+            .collect();
+        for stored in &events[1..events.len() - 1] {
+            assert_eq!(
+                stored.event().attempt,
+                Some(1),
+                "every attempt event must name its attempt"
+            );
+            assert_eq!(
+                stored.event().session_id.as_ref(),
+                Some(&session),
+                "every attempt event must name its session"
+            );
+        }
+
+        let end = events.last().expect("the trace must have a terminal entry");
+        assert!(matches!(
+            &end.event().payload,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed
+            }
+        ));
+        assert_eq!(end.event().attempt, None);
+        assert_eq!(end.event().session_id, None);
+
+        let legacy = load_legacy_events(database, session.clone()).await;
+        assert_eq!(
+            legacy, agent_payloads,
+            "the legacy log must mirror the agent payloads exactly"
+        );
+        assert!(
+            matches!(
+                legacy.last(),
+                Some(AgentEvent::SessionEnded {
+                    reason: SessionEndReason::Completed,
+                    session_id,
+                }) if session_id == &session
+            ),
+            "the legacy log must end with the attempt's terminal event: {legacy:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_retry_trace_keeps_failures_trace_only_and_attributes_each_attempt() {
+        let temp = TempDir::new("trace-acceptance");
+        let database = temp.path().join("events.sqlite");
+        let first_session = SessionId::new("trace-acceptance-first");
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 1\n",
+        )
+        .expect("acceptance config must parse");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let runtime = runtime_with_recorder(Arc::clone(&provider), config, database.clone()).await;
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(first_session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("turn must run");
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "one retry must run one more attempt"
+        );
+        drop(runtime);
+
+        let trace = load_trace(database.clone()).await;
+        assert!(trace.closed(), "an exhausted acceptance turn still closes");
+        let events = trace.events();
+        assert_eq!(
+            events.len(),
+            12,
+            "start + two attempts, each with its failure + outer session + end: {events:?}"
+        );
+        assert!(matches!(
+            &events[0].event().payload,
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Fresh,
+                ..
+            }
+        ));
+        let end = events.last().expect("the trace must have a terminal entry");
+        assert!(matches!(
+            &end.event().payload,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::AcceptanceFailed
+            }
+        ));
+        assert_eq!(end.event().attempt, None);
+        assert_eq!(end.event().session_id, None);
+
+        let second_session = events
+            .iter()
+            .find_map(|stored| match &stored.event().payload {
+                TracePayload::Agent {
+                    event: AgentEvent::SessionStarted { session_id },
+                } if stored.event().attempt == Some(2) => Some(session_id.clone()),
+                _ => None,
+            })
+            .expect("the retry must have its own session");
+        assert_ne!(
+            second_session, first_session,
+            "an acceptance retry must not reuse the judged session"
+        );
+
+        let failures: Vec<(&TraceEvent, u32)> = events
+            .iter()
+            .filter_map(|stored| match &stored.event().payload {
+                TracePayload::Agent {
+                    event: AgentEvent::AcceptanceFailed { attempt, .. },
+                } => Some((stored.event(), *attempt)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failures.len(),
+            2,
+            "each failed attempt must contribute its own verdict"
+        );
+        for (stored, judged_attempt) in &failures {
+            assert_eq!(
+                stored.attempt,
+                Some(*judged_attempt),
+                "the failure must be attributed to the attempt it judged"
+            );
+        }
+        assert_eq!(failures[0].0.session_id.as_ref(), Some(&first_session));
+        assert_eq!(failures[1].0.session_id.as_ref(), Some(&second_session));
+
+        for (session, expected_text) in [
+            (&first_session, "first answer"),
+            (&second_session, "second answer"),
+        ] {
+            let legacy = load_legacy_events(database.clone(), session.clone()).await;
+            assert!(
+                !legacy
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::AcceptanceFailed { .. })),
+                "acceptance failures must stay trace-only for {session}: {legacy:?}"
+            );
+            let deltas: Vec<&str> = legacy
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ModelDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                deltas,
+                vec![expected_text],
+                "each attempt must persist only its own output"
+            );
+            assert!(
+                matches!(
+                    legacy.last(),
+                    Some(AgentEvent::SessionEnded {
+                        reason: SessionEndReason::Completed,
+                        ..
+                    })
+                ),
+                "the attempt session must end before the acceptance verdict: {legacy:?}"
+            );
+        }
+
+        let outer_sessions: Vec<SessionId> = events
+            .iter()
+            .filter_map(|stored| match &stored.event().payload {
+                TracePayload::Agent {
+                    event: AgentEvent::SessionStarted { session_id },
+                } if stored.event().attempt.is_none() => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outer_sessions.len(),
+            1,
+            "the governed verdict needs exactly one outer session: {events:?}"
+        );
+        assert_ne!(outer_sessions[0], first_session);
+        assert_ne!(outer_sessions[0], second_session);
+        let outer = load_legacy_events(database, outer_sessions[0].clone()).await;
+        assert!(
+            matches!(
+                outer.last(),
+                Some(AgentEvent::SessionEnded {
+                    reason: SessionEndReason::AcceptanceFailed,
+                    ..
+                })
+            ),
+            "the outer session must carry the governed verdict: {outer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_metadata_conflict_fails_closed_without_agent_events() {
+        let temp = TempDir::new("trace-metadata-conflict");
+        let database = temp.path().join("events.sqlite");
+        let session = SessionId::new("trace-conflicting-session");
+        {
+            let mut store = EventStore::open(&database).expect("event store must open");
+            store
+                .record_session(
+                    &session,
+                    &[Message::system("a different bootstrap")],
+                    Timestamp::from_millis(1),
+                )
+                .expect("the conflicting session must be seeded");
+        }
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let runtime = runtime_with_recorder(
+            Arc::clone(&provider),
+            HarnessConfig::default(),
+            database.clone(),
+        )
+        .await;
+
+        let error = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope().await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .err()
+            .expect("a metadata conflict must fail the turn");
+        assert!(
+            matches!(&error, CliError::TraceIncomplete { cause, .. } if cause.contains("metadata")),
+            "the failure must name the metadata write: {error}"
+        );
+        assert!(
+            provider.calls().is_empty(),
+            "a turn that cannot record its bootstrap must not call the model"
+        );
+        drop(runtime);
+
+        let trace = load_trace(database.clone()).await;
+        assert!(
+            !trace.closed(),
+            "a failed turn must be observable as incomplete"
+        );
+        assert_eq!(
+            trace.events().len(),
+            1,
+            "only turn_started may exist: {:?}",
+            trace.events()
+        );
+        assert!(matches!(
+            &trace.events()[0].event().payload,
+            TracePayload::TurnStarted { .. }
+        ));
+        assert!(
+            load_legacy_events(database, session).await.is_empty(),
+            "no event may be written for a session whose metadata failed"
         );
     }
 }

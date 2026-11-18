@@ -65,6 +65,15 @@ impl GovernanceState {
         let _ = self.events.send(event);
     }
 
+    /// Cancels the session because trace persistence failed.
+    ///
+    /// Unlike [`GovernanceState::trip`], this does not set the budget-trip flag
+    /// and emits no event: an integrity failure is not a budget decision, and
+    /// the caller returns an error instead of a governed reason.
+    pub(crate) fn cancel_for_integrity_failure(&self) {
+        self.cancel.cancel();
+    }
+
     /// Emits one budget event and cancels the session.
     ///
     /// Only the first trip emits; later trips are no-ops so the terminal trace
