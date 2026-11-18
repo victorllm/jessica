@@ -18,6 +18,19 @@ event-sourced persistence.
 
 See `CLAUDE.md` for project rules and `DESIGN.md` for the architecture.
 
+## Development checks
+
+CI runs the same checks as the local acceptance commands:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+sh -n install.sh
+```
+
+The workflow is defined in `.github/workflows/ci.yml` and uses no secrets.
+
 ## Install
 
 Build and install from a checkout:
