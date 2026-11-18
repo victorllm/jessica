@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod acceptance;
+pub mod events;
 pub mod guard;
 pub mod hook;
 pub mod llm;

@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use jessica_core::acceptance::{AcceptanceCheck, AcceptanceContext};
+use jessica_core::events::EventSink;
 use jessica_core::types::{AgentEvent, Message, SessionEndReason};
 use tokio::sync::broadcast;
 
@@ -50,6 +51,7 @@ pub struct AcceptanceRunner {
     check: Arc<dyn AcceptanceCheck>,
     max_retries: u32,
     events: broadcast::Sender<AgentEvent>,
+    sink: Option<Arc<dyn EventSink>>,
 }
 
 impl AcceptanceRunner {
@@ -63,7 +65,19 @@ impl AcceptanceRunner {
             check,
             max_retries,
             events,
+            sink: None,
         }
+    }
+
+    /// Attaches a producer-side event sink for acceptance failures.
+    ///
+    /// The sink receives [`AgentEvent::AcceptanceFailed`] before it is
+    /// broadcast. If the sink rejects the event, the runner returns
+    /// [`SessionEndReason::Error`] and does not start another attempt: the
+    /// failed check would otherwise be missing from the turn trace.
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Runs attempts until acceptance passes, the agent stops for another
@@ -120,10 +134,21 @@ impl AcceptanceRunner {
                 };
             }
 
-            let _ = self.events.send(AgentEvent::AcceptanceFailed {
+            let event = AgentEvent::AcceptanceFailed {
                 attempt: attempt_number,
                 feedback: result.feedback.clone(),
-            });
+            };
+            if let Some(sink) = &self.sink
+                && sink.emit(event.clone()).await.is_err()
+            {
+                return AcceptanceOutcome {
+                    reason: SessionEndReason::Error,
+                    messages: outcome.messages,
+                    last_output: outcome.last_output,
+                    attempts: attempt_number,
+                };
+            }
+            let _ = self.events.send(event);
 
             if attempt_number > self.max_retries || attempt_number == u32::MAX {
                 return AcceptanceOutcome {

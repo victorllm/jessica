@@ -1815,6 +1815,29 @@ Task 7.1：无损记录器与 turn 完整性不变量
 
 · 不修改 `AgentEvent` 或既有 EventStore 公共语义；不实现事件模型 v2（user/usage/round/permission/子会话）、EventStore v2 WAL/增量历史、trace verify CLI 或 replay parity；不新增第三方 crate；不顺手重构或改变 legacy recovery/replay 语义。
 
+Task 7.2：生产者侧无损记录器
+
+目标：把持久化从有损的 `EventPump` 消费侧移到事件生产侧。持久化启用时，“turn 成功返回 ⇒ 该 turn 的全部生产事件与 `TurnEnded` 已在返回前提交”成为可验证不变量；广播滞后只影响观察者，不再决定 trace 是否完整。
+
+操作：
+
+1. `jessica-core` 新增 additive `events` 模块：`EventSink`（异步 `emit(AgentEvent)`，满时必须等待容量而非丢事件）与结构化 `EventSinkError`；`lib.rs` 仅新增 `pub mod events;`。该 additive core 变更已由用户在设计确认时明确批准，其余冻结契约不变。
+2. `AgentLoop` 增加可选 `EventSink`：每个事件先 `emit`，成功后才广播；sink 拒绝时停止 run，被拒绝事件及其后的终态事件都不得广播。`AcceptanceRunner` 同样在广播 `AcceptanceFailed` 前 `emit`，拒绝即停止重试并按 `Error` 返回。
+3. CLI 新增 turn 级 `TurnJournal`：单写任务、容量 1024 的有界队列、`try_send` 快路径、队列满时 `send().await` 背压（即使 observation gap 已取消 token 也等待容量，不丢生产尾部）；写任务按 FIFO 调用 `EventJournal::record_traced`，在单个 SQLite 事务中写 legacy + trace。`begin_turn`、session 元数据、outer session 事件对与 `finish_turn` 使用 acked 命令；`finish_turn` 只有在全部先前事件与 `TurnEnded` 提交成功后才返回成功。
+4. 首个写失败保留原始原因、停止写入、取消 agent，并通过 `watch` 通知 attempt 编排；非停止型失败（观察者 lag）允许继续记录生产侧尾部，但所有生命周期命令与 `finish_turn` 仍拒绝关闭。`flush` 在失败后仍可等待已入队事件落盘，用于保留完整前缀/尾部。
+5. `EventPump` 降为纯观察者：不再写 trace、legacy 或 `Gap`。存在 recorder 时 lag 仍失败该 turn（transcript/sensor/hook 不完整），但生产者 trace 保留且 `closed=false`；不存在 recorder 时保持既有 Silent 失败 / HumanConsole warn-and-continue。
+6. 不修改 `AgentEvent`/`TraceEvent` schema，不新增 SQLite 迁移；`TracePayload::Gap`/`TraceGapReason::BroadcastLagged` 保留定义，但 CLI 不再产生 gap 条目。
+
+验收：
+
+· `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿。
+· 行为测试覆盖：成功 turn 的写入顺序与 FIFO（`TurnEnded` 最后）；写失败后拒绝后续事件、取消、无 `TurnEnded` 且轨迹保持未关闭；小容量 + 阻塞写任务下生产者背压且零丢失；acceptance 失败的 attempt 归属与 trace-only 语义；outer session 元数据与事件对先落盘再广播；关闭后拒绝迟到事件且不污染已提交轨迹；lag 后仍记录生产侧尾部、不写 `Gap`、不能关闭；runtime/harness 验证 sink 先于广播且拒绝后不广播、不重试。
+· 无 recorder 的 lag 行为与既有测试保持一致。
+
+禁止：
+
+· 不实现 EventStore v2/WAL/fsync 级掉电保证、子 Agent 轨迹、trace verify/replay parity、trace 保留/GC、hook/UI fan-out 的无损化；不新增第三方 crate；除已批准的 additive `events` 模块外不修改 `jessica-core` 冻结 API；不顺手重构或改变 legacy recovery/replay 语义。
+
 ---
 
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
@@ -1890,11 +1913,13 @@ Task 7.0c ☑ 约 30 分钟 — 发布自动化与仓库卫生，未修改 `jess
 
 Task 7.1 ☑ 耗时未精确计时（跨会话执行，含方案确认；未单独记录起止时间） — 按用户批准的四项决策完成 A+B：新增 `jessica-core/src/trace.rs`（`TRACE_SCHEMA_VERSION=1`、`TurnId`、`TraceEvent` 包络、`TracePayload::{Agent,Gap,TurnStarted,TurnEnded}`、`TraceTurnMode`、`TraceGapReason`），`lib.rs` 仅新增 `pub mod trace;`，既有 `AgentEvent` 与冻结契约未改；用户已明确批准该 additive core 变更。`jessica-memory` 新增 `trace_store.rs`：`trace_events`/`trace_heads` 表、`PRAGMA user_version` 0→1 迁移（未来版本 fail-closed）、append-only UPDATE/DELETE trigger、O(1) seq 分配；`append_traced` 在单个 SQLite 事务内写 legacy 与 trace，任一方失败整体回滚；读取校验序号连续、首条 `TurnStarted`、`TurnEnded` 后无条目、head `closed` 与终态一致，不完整轨迹可读且 `closed=false`。`EventStoreError` 增加 `UnsupportedVersion`、`TraceSerialize`、`TraceStore`、`TraceDatabase`、`TraceDecode`、`TraceInvalid`、`TraceSequence`、`TraceLifecycle`。CLI：新增 crate-private `EventJournal` seam（生产 `EventRecorder`、测试注入失败），`record_traced` 使用同一时间戳；新增 `GovernanceState::cancel_for_integrity_failure`；pump 维护 turn/attempt→session 归属，`AcceptanceFailed` 依据 payload attempt 归属被判 attempt 且只写 trace（避免落在 `SessionEnded` 之后破坏 recovery/replay）；metadata/trace/legacy 任一失败即 fail-closed：停止写入、取消 agent、禁止 `TurnEnded`，turn 返回 `CliError::TraceIncomplete`；存在 recorder 时 lag 写 `Gap{BroadcastLagged}`、取消并以非零退出，无 recorder 时保持既有 warn-and-continue；预取消 turn 也写完整空 turn；`--resume` 写 `TurnStarted{Resumed}` 且不重放已恢复批次。测试新增 23 个：core trace 4、memory trace_store 12（无损读取、未终止、生命周期回滚、包络校验、事务回滚、append-only trigger、v0 升级、未来版本拒绝、summary 排序、独立序号、JSON 字节重开、损坏拒绝）、pump 4（acceptance 归属与 legacy 镜像、存储失败停止写入/取消/不关闭、lag gap 阻止关闭、attempt 先于 turn 被拒）、app 3（完整 turn 的闭合 trace 与 legacy 镜像、acceptance 重试的 trace-only 失败与双 session、metadata 冲突 fail-closed 且 provider 零调用）；resume E2E 增加 Resumed 轨迹断言。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 52 suites, 781 passed, 0 failed, 2 ignored。偏离/说明：1) 为拒绝“存储失败后继续写”的不完整轨迹，`RecordingJournal` 测试替身只保留 trace 失败注入，metadata 失败改由 app 层真实 `EventRecorder` + `sessions` 冲突测试覆盖；2) 预取消 turn 通过 `close_empty_turn` 写 `TurnStarted`+`TurnEnded`，保证“正常返回即有闭合 trace”；3) acceptance 失败不入 legacy 是必要偏离（原计划未细化），否则 recovery/replay 会把失败事件放在 attempt 终态之后；4) resume 测试在原 E2E 上扩展，不新增独立测试文件；5) 未提交 DESIGN.md、未新增第三方 crate、未打 tag/发布 release。
 
+Task 7.2 ☑ 耗时未精确计时（跨上下文执行；含方案确认） — 按用户批准的方案把持久化迁到生产者侧。`jessica-core` 新增 additive `events` 模块（`EventSink`/`EventSinkError`、`pub mod events;`），用户已在设计阶段明确批准该 core 变更；其余冻结 API 未改。`jessica-runtime` 的 `AgentLoop` 增加可选 sink：事件先 `emit` 后广播，sink 拒绝即停止且不广播被拒事件或后续终态，`SessionEndReason::Cancelled` + `error="event sink failed"`；新增顺序 sink 与拒绝 sink 两个行为测试。`jessica-harness` 的 `AcceptanceRunner` 在广播 `AcceptanceFailed` 前 `emit`，拒绝时不重试、不广播并返回 `Error`；新增“先于广播”和“拒绝后停止重试”两个测试。CLI 新增 `jessica-cli/src/journal.rs`：turn 级 `TurnJournal` 单写任务、容量 1024、`try_send` 快路径、满队列 `send().await` 背压、FIFO 调 `EventJournal::record_traced`；`begin_turn`/session 元数据/outer session/`finish_turn` 全部 acked，`finish_turn` 只在先前的生产者事件与 `TurnEnded` 提交后成功；首个写失败保留原始原因、停止写入、取消 agent 并经 `watch` 通知 attempt；非停止型 lag 失败仍允许记录生产尾部但禁止关闭；关闭后迟到事件只拒绝、不污染已提交轨迹。`EventPump` 移除全部 trace/legacy/`Gap` 写入与归属状态，仅保留重建、sensor、guard 与 sink；存在 recorder 时 lag 调用 `fail_integrity(..., stop_writes=false)`，不写 `Gap` 且 turn 永不关闭；无 recorder 时行为不变。`GovernanceState` 的 `emit`/`trip`/`charge_tokens` 改为 async 并接入 sink，token 计费在 `Done` 产出前完成，保证预算事件顺序。`app` 在 `build_turn` 装配 journal、sink、pump，attempt 等待 pump 与 journal failure signal 的竞速，outer session 先落盘再广播，所有失败路径 flush 后返回 `CliError::TraceIncomplete`。新增 11 个行为测试：journal 7（成功 turn 的 FIFO/归属/`TurnEnded` 最后、写失败停止且不关闭、满队列背压零丢失、lag 后记录尾部无 `Gap` 且不关闭、非停止失败后满队列仍等待容量、pump lag 无 `Gap`、attempt 归属约束）、runtime 2、harness 2；既有 app trace/acceptance/metadata 测试与 pump 无 recorder lag 测试继续覆盖端到端路径。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 52 suites, 790 passed, 0 failed, 2 ignored。偏离/说明：1) 为通过 clippy 的 `large_enum_variant`，队列中的 `TraceEvent` 使用 `Box`，`prepare_event` 返回值改为私有 `PreparedEvent` 结构；2) lag 属于观察者失败而非存储失败：`writes_stopped=false`，生产尾部继续记录（队列满时也继续等待容量而非丢弃），但 `ensure_writable`/`finish_turn` 仍拒绝关闭，这是“trace 完整但 turn 不可闭合”的设计语义；3) `Gap` 变体保留用于读取兼容，但 CLI 不再产生；4) 未新增 app 层强制 broadcast lag 的独立 E2E，lag 的 pump+journal 集成由 journal 单测覆盖，app 层由既有真实 SQLite trace 测试覆盖生产者路径；5) 未实现 fsync/掉电保证、子 Agent trace、verify/replay parity、retention/GC；6) 未修改 `AgentEvent`/`TraceEvent` schema、未新增迁移、未新增第三方 crate；7) 未提交 DESIGN.md（保持未跟踪）、未打 tag/发布 release。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
 
-· Trace Integrity v2（2026-11-17 规划）的无损记录器部分已由 Task 7.1（2026-11-18）交付：新增 additive `TraceEvent` 包络、`trace_events`/`trace_heads`、事务内 legacy+trace 双写、fail-closed、broadcast lag 显式 gap、acceptance 事件归属与 `Resumed` 轨迹，未修改 `AgentEvent`。仍暂缓/未实现：事件模型 v2（user/usage/round/permission/子会话）、EventStore v2（WAL/增量历史，消除 O(n²)）、trace verify CLI/replay parity、子 Agent 轨迹持久化、trace 保留/GC；replay/resume 仍只读 legacy 事件流，trace 不是 recovery 的唯一来源。上述各项须单开 Task。
+· Trace Integrity v2（2026-11-17 规划）的包络与存储部分已由 Task 7.1（2026-11-18）交付，生产者侧无损记录由 Task 7.2（2026-11-18）交付：新增 additive `TraceEvent` 包络、`trace_events`/`trace_heads`、事务内 legacy+trace 双写、fail-closed、acceptance 事件归属与 `Resumed` 轨迹，未修改 `AgentEvent`；`EventSink` + `TurnJournal` 保证成功 turn 的全部生产事件与 `TurnEnded` 在返回前提交，pump 不再写 trace，`Gap` 变体保留但 CLI 不再产生。仍暂缓/未实现：事件模型 v2（user/usage/round/permission/子会话）、EventStore v2（WAL/增量历史，消除 O(n²)）、trace verify CLI/replay parity、子 Agent 轨迹持久化、trace 保留/GC、fsync/掉电级持久性；replay/resume 仍只读 legacy 事件流，trace 不是 recovery 的唯一来源。上述各项须单开 Task。
 · Phase 7 后续 P2 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：执行安全。bash/CommandSensor/CommandAcceptanceCheck/MCP 子进程的进程组终止与超时；文件工具 TOCTOU（openat2/cap-std 等需依赖审批）；Permission v2（allow_always/reject_always、作用域/撤销/审计）；WASI 确定性时钟/随机；密钥脱敏。
 · Phase 7 后续 P3 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：能力扩展。edit_file/apply_patch/grep/glob/list_dir；Anthropic prompt caching/thinking/image；MCP resume/HTTP-SSE、per-session workspace；memory/skills 显式写入与真实 embedder。
 · 可观测性仍按 2026-11-14 的决定暂缓，不因本次 Phase 7 规划重启。

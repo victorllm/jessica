@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use jessica_core::acceptance::{AcceptanceCheck, AcceptanceContext, AcceptanceResult};
+use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::sensor::{Sensor, SensorContext, SensorResult};
 use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, ToolCall, ToolResult};
 use jessica_harness::{AcceptanceRunner, CommandSensor, Harness, SensorPipeline, SessionAttempt};
@@ -400,4 +401,100 @@ async fn acceptance_is_skipped_when_the_attempt_does_not_complete() {
         receiver.try_recv(),
         Err(broadcast::error::TryRecvError::Empty)
     ));
+}
+
+/// Sink double that rejects every acceptance failure.
+struct RejectingAcceptanceSink;
+
+#[async_trait]
+impl EventSink for RejectingAcceptanceSink {
+    async fn emit(&self, _event: AgentEvent) -> Result<(), EventSinkError> {
+        Err(EventSinkError::new("injected acceptance sink failure"))
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_acceptance_failure_stops_without_retrying() {
+    let (events, mut receiver) = broadcast::channel(8);
+    let check = std::sync::Arc::new(ScriptedCheck::new(vec![AcceptanceResult::fail("bad")]));
+    let runner = AcceptanceRunner::new(
+        std::sync::Arc::clone(&check) as std::sync::Arc<dyn AcceptanceCheck>,
+        3,
+        events,
+    )
+    .with_event_sink(std::sync::Arc::new(RejectingAcceptanceSink));
+    let attempts = AtomicU32::new(0);
+
+    let outcome = runner
+        .run(vec![Message::user("fix it")], |messages| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                SessionAttempt {
+                    messages,
+                    last_output: "answer".to_owned(),
+                    reason: SessionEndReason::Completed,
+                }
+            }
+        })
+        .await;
+
+    assert_eq!(outcome.reason, SessionEndReason::Error);
+    assert_eq!(outcome.attempts, 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(check.calls(), 1);
+    assert!(
+        matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ),
+        "a rejected acceptance failure must not be broadcast"
+    );
+}
+
+/// Sink double that verifies no acceptance failure has been broadcast yet.
+struct BeforeBroadcastSink {
+    observer: Mutex<broadcast::Receiver<AgentEvent>>,
+    saw_broadcast: AtomicU32,
+}
+
+#[async_trait]
+impl EventSink for BeforeBroadcastSink {
+    async fn emit(&self, _event: AgentEvent) -> Result<(), EventSinkError> {
+        if !matches!(
+            lock(&self.observer).try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ) {
+            self.saw_broadcast.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_acceptance_failure_reaches_the_sink_before_the_broadcast() {
+    let (events, _receiver) = broadcast::channel(8);
+    let sink = std::sync::Arc::new(BeforeBroadcastSink {
+        observer: Mutex::new(events.subscribe()),
+        saw_broadcast: AtomicU32::new(0),
+    });
+    let check = std::sync::Arc::new(ScriptedCheck::new(vec![AcceptanceResult::fail("bad")]));
+    let runner = AcceptanceRunner::new(
+        std::sync::Arc::clone(&check) as std::sync::Arc<dyn AcceptanceCheck>,
+        0,
+        events,
+    )
+    .with_event_sink(std::sync::Arc::clone(&sink) as std::sync::Arc<dyn EventSink>);
+
+    let outcome = runner
+        .run(vec![Message::user("fix it")], |messages| async move {
+            SessionAttempt {
+                messages,
+                last_output: "answer".to_owned(),
+                reason: SessionEndReason::Completed,
+            }
+        })
+        .await;
+
+    assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+    assert_eq!(sink.saw_broadcast.load(Ordering::SeqCst), 0);
 }

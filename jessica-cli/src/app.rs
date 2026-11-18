@@ -34,6 +34,7 @@ use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventJournal, EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
+use crate::journal::TurnJournal;
 use crate::memory::MemoryAssembly;
 use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
@@ -71,6 +72,8 @@ struct TurnSetup {
     governance: Arc<GovernanceState>,
     /// Agent loop for this turn.
     agent: Arc<AgentLoop>,
+    /// Producer-side journal shared by every emitter and the turn lifecycle.
+    journal: Arc<TurnJournal>,
     /// Transcript renderer and guard checkpoint observer.
     pump: Arc<EventPump>,
     /// Background task draining the event channel into the pump.
@@ -86,6 +89,7 @@ impl TurnSetup {
     /// dropping this setup does not affect the shutdown controller.
     fn shutdown(self) {
         self.pump_task.abort();
+        self.journal.shutdown();
     }
 }
 
@@ -102,22 +106,22 @@ struct AttemptContext {
     governance: Arc<GovernanceState>,
     /// Stateful stuck guard reset per attempt.
     stuck_guard: Arc<StuckDetectionGuard>,
-    /// Event journal, when persistence is enabled.
-    recorder: Option<Arc<dyn EventJournal>>,
+    /// Producer-side journal for this turn.
+    journal: Arc<TurnJournal>,
     /// Cancellation token for the turn.
     cancel: CancellationToken,
 }
 
 impl AttemptContext {
     /// Clones the per-turn handles into an attempt context.
-    fn from_setup(setup: &TurnSetup, recorder: Option<Arc<dyn EventJournal>>) -> Self {
+    fn from_setup(setup: &TurnSetup) -> Self {
         Self {
             agent: Arc::clone(&setup.agent),
             harness: Arc::clone(&setup.harness),
             pump: Arc::clone(&setup.pump),
             governance: Arc::clone(&setup.governance),
             stuck_guard: Arc::clone(&setup.stuck_guard),
-            recorder,
+            journal: Arc::clone(&setup.journal),
             cancel: setup.cancel.clone(),
         }
     }
@@ -397,7 +401,7 @@ impl CliRuntime {
         if setup.cancel.is_cancelled() {
             let turn_id = next_turn_id();
             let result = close_empty_turn(
-                &setup.pump,
+                &setup.journal,
                 turn_id,
                 TraceTurnMode::Fresh,
                 Vec::new(),
@@ -428,7 +432,7 @@ impl CliRuntime {
 
         let turn_id = next_turn_id();
         if let Err(error) = setup
-            .pump
+            .journal
             .begin_turn(
                 turn_id.clone(),
                 TraceTurnMode::Fresh,
@@ -441,7 +445,7 @@ impl CliRuntime {
             return Err(CliError::Events(error));
         }
 
-        let context = AttemptContext::from_setup(&setup, self.journal());
+        let context = AttemptContext::from_setup(&setup);
         let (
             reason,
             emit_outer,
@@ -463,6 +467,10 @@ impl CliRuntime {
                 retries,
                 setup.events.clone(),
             );
+            let runner = match setup.journal.sink() {
+                Some(sink) => runner.with_event_sink(sink),
+                None => runner,
+            };
             let mut next_session = Some(first_session.clone());
             let mut latest_session = None;
             let mut latest_attempt_start = turn_start;
@@ -520,10 +528,12 @@ impl CliRuntime {
             )
         };
 
-        // A persistence failure or broadcast gap leaves the trace permanently
-        // incomplete. Do not emit further events or write `turn_ended`; the
-        // caller must observe an error instead of a normal turn result.
-        if let Some(cause) = setup.pump.integrity_failure() {
+        // A persistence failure or broadcast gap leaves the turn permanently
+        // incomplete. Flush what the producer already captured, but never emit
+        // further events or write `turn_ended`: the caller must observe an
+        // error instead of a normal turn result.
+        if let Some(cause) = setup.journal.integrity_failure() {
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
@@ -534,28 +544,29 @@ impl CliRuntime {
         // A budget trip overrides the runtime's Completed/Cancelled reason.
         // Emit an outer session event so the final observable reason is the
         // governed one rather than the last attempt's reason.
-        if emit_outer {
-            let journal = self.journal();
-            if let Err(error) =
-                emit_outer_session(&setup.pump, &setup.events, journal.as_deref(), reason).await
-            {
-                let cause = format!("failed to persist the outer session: {error}");
-                setup.pump.fail_integrity(cause.clone(), true);
-                setup.shutdown();
-                return Err(CliError::TraceIncomplete {
-                    turn_id: turn_id.to_string(),
-                    cause,
-                });
-            }
-        }
-        if let Some(cause) = setup.pump.integrity_failure() {
+        if emit_outer
+            && let Err(error) =
+                emit_outer_session(&setup.journal, &setup.pump, &setup.events, reason).await
+        {
+            let cause = format!("failed to persist the outer session: {error}");
+            setup.journal.fail_integrity(cause.clone(), true);
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
                 cause,
             });
         }
-        if let Err(error) = setup.pump.finish_turn(reason).await {
+        if let Some(cause) = setup.journal.integrity_failure() {
+            let _ = setup.journal.flush().await;
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+        if let Err(error) = setup.journal.finish_turn(reason).await {
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
@@ -739,7 +750,7 @@ impl CliRuntime {
         if setup.cancel.is_cancelled() {
             let turn_id = next_turn_id();
             let result = close_empty_turn(
-                &setup.pump,
+                &setup.journal,
                 turn_id,
                 TraceTurnMode::Resumed,
                 trace_messages,
@@ -753,7 +764,7 @@ impl CliRuntime {
 
         let turn_id = next_turn_id();
         if let Err(error) = setup
-            .pump
+            .journal
             .begin_turn(
                 turn_id.clone(),
                 TraceTurnMode::Resumed,
@@ -766,39 +777,41 @@ impl CliRuntime {
             return Err(CliError::Events(error));
         }
 
-        let context = AttemptContext::from_setup(&setup, self.journal());
+        let context = AttemptContext::from_setup(&setup);
         let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }, 1).await;
         let reason = attempt.reason;
 
-        if let Some(cause) = setup.pump.integrity_failure() {
+        if let Some(cause) = setup.journal.integrity_failure() {
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
                 cause,
             });
         }
-        if setup.governance.tripped() {
-            let journal = self.journal();
-            if let Err(error) =
-                emit_outer_session(&setup.pump, &setup.events, journal.as_deref(), reason).await
-            {
-                let cause = format!("failed to persist the outer session: {error}");
-                setup.pump.fail_integrity(cause.clone(), true);
-                setup.shutdown();
-                return Err(CliError::TraceIncomplete {
-                    turn_id: turn_id.to_string(),
-                    cause,
-                });
-            }
-        }
-        if let Some(cause) = setup.pump.integrity_failure() {
+        if setup.governance.tripped()
+            && let Err(error) =
+                emit_outer_session(&setup.journal, &setup.pump, &setup.events, reason).await
+        {
+            let cause = format!("failed to persist the outer session: {error}");
+            setup.journal.fail_integrity(cause.clone(), true);
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
                 cause,
             });
         }
-        if let Err(error) = setup.pump.finish_turn(reason).await {
+        if let Some(cause) = setup.journal.integrity_failure() {
+            let _ = setup.journal.flush().await;
+            setup.shutdown();
+            return Err(CliError::TraceIncomplete {
+                turn_id: turn_id.to_string(),
+                cause,
+            });
+        }
+        if let Err(error) = setup.journal.finish_turn(reason).await {
+            let _ = setup.journal.flush().await;
             setup.shutdown();
             return Err(CliError::TraceIncomplete {
                 turn_id: turn_id.to_string(),
@@ -884,7 +897,10 @@ impl CliRuntime {
         // Every turn derives its own child token; only the scope's parent and
         // this turn (through the loop) may cancel it.
         let cancel = scope.cancel_parent().child_token();
-        let governance = Arc::new(GovernanceState::new(events.clone(), cancel.clone()));
+        let journal = TurnJournal::new(self.journal(), cancel.clone());
+        let governance = Arc::new(
+            GovernanceState::new(events.clone(), cancel.clone()).with_event_sink(journal.sink()),
+        );
         let provider: Arc<dyn LlmProvider> = Arc::new(TokenCountingProvider::new(
             Arc::clone(&self.provider),
             Arc::clone(&governance),
@@ -906,12 +922,17 @@ impl CliRuntime {
             extra_tools,
             permission_gate,
         )?;
-        let agent = Arc::new(AgentLoop::new(
+        let agent = AgentLoop::new(
             provider,
             Arc::new(registry),
             config.budget.to_budget(),
             events.clone(),
-        ));
+        );
+        let agent = match journal.sink() {
+            Some(sink) => agent.with_event_sink(sink),
+            None => agent,
+        };
+        let agent = Arc::new(agent);
         let output = if update_sink.is_some() {
             PumpOutput::Silent
         } else {
@@ -920,7 +941,7 @@ impl CliRuntime {
         let pump = Arc::new(EventPump::new(
             Arc::clone(&harness),
             Arc::clone(&governance),
-            self.journal(),
+            Arc::clone(&journal),
             output,
             update_sink,
         ));
@@ -932,6 +953,7 @@ impl CliRuntime {
             cancel,
             governance,
             agent,
+            journal,
             pump,
             pump_task,
             stuck_guard,
@@ -1131,6 +1153,22 @@ pub(crate) async fn load_wasm_tools(
     .map_err(CliError::WasmTool)
 }
 
+/// Outcome of racing the pump wait against a journal failure.
+enum PumpWait {
+    /// The pump returned its session snapshot or lost the session.
+    Snapshot(Option<SessionSnapshot>),
+    /// The journal failed before the pump could observe a terminal event.
+    JournalFailed,
+}
+
+/// Builds the fallback snapshot used when the pump cannot complete a session.
+fn fallback_snapshot(messages: Vec<Message>) -> SessionSnapshot {
+    SessionSnapshot {
+        messages,
+        last_output: String::new(),
+    }
+}
+
 /// Runs one agent attempt and waits until its transcript is complete.
 ///
 /// The stuck guard is stateful per session, so it is reset before every
@@ -1155,8 +1193,8 @@ async fn run_attempt(
 
     // Once the trace is broken, no further attempt may start: its events could
     // not be attributed and the turn can never close successfully.
-    if let Some(cause) = context.pump.integrity_failure() {
-        context.pump.fail_integrity(cause, true);
+    if let Some(cause) = context.journal.integrity_failure() {
+        context.journal.fail_integrity(cause, true);
         return SessionAttempt {
             messages: fallback_messages,
             last_output: String::new(),
@@ -1167,13 +1205,15 @@ async fn run_attempt(
     // A fresh session needs its immutable bootstrap messages before any event
     // is appended. A resumed session already has them in the store. A metadata
     // failure fails the turn: recovery would otherwise lack the user messages
-    // needed to replay the attempt.
+    // needed to replay the attempt. With persistence disabled this is a no-op.
     if let AttemptStart::Fresh { messages, .. } = &start
-        && let Some(recorder) = &context.recorder
-        && let Err(error) = recorder.record_session_start(&session_id, messages).await
+        && let Err(error) = context
+            .journal
+            .record_session_start(&session_id, messages)
+            .await
     {
         let cause = format!("failed to record session metadata for {session_id}: {error}");
-        context.pump.fail_integrity(cause, true);
+        context.journal.fail_integrity(cause, true);
         return SessionAttempt {
             messages: fallback_messages,
             last_output: String::new(),
@@ -1181,11 +1221,11 @@ async fn run_attempt(
         };
     }
 
-    if let Err(error) = context.pump.begin_attempt(attempt_number, &session_id) {
+    if let Err(error) = context.journal.begin_attempt(attempt_number, &session_id) {
         let cause = format!(
             "failed to attribute attempt {attempt_number} to session {session_id}: {error}"
         );
-        context.pump.fail_integrity(cause, true);
+        context.journal.fail_integrity(cause, true);
         return SessionAttempt {
             messages: fallback_messages,
             last_output: String::new(),
@@ -1225,35 +1265,39 @@ async fn run_attempt(
         raw_reason
     };
 
-    let (snapshot, pump_failed) =
-        match tokio::time::timeout(PUMP_TIMEOUT, context.pump.wait_for(&session_id)).await {
-            Ok(Some(snapshot)) => (snapshot, false),
-            Ok(None) => {
-                eprintln!("[warn] event pump lost session {session_id}");
-                (
-                    SessionSnapshot {
-                        messages: fallback_messages,
-                        last_output: String::new(),
-                    },
-                    true,
-                )
-            }
-            Err(_) => {
-                eprintln!("[warn] event pump timed out for session {session_id}");
-                (
-                    SessionSnapshot {
-                        messages: fallback_messages,
-                        last_output: String::new(),
-                    },
-                    true,
-                )
-            }
-        };
+    // A sink failure suppresses the terminal broadcast, so the pump may never
+    // see `SessionEnded`. Race its wait against the journal's failure signal
+    // instead of waiting for the full timeout.
+    let waited = tokio::time::timeout(PUMP_TIMEOUT, async {
+        tokio::select! {
+            snapshot = context.pump.wait_for(&session_id) => PumpWait::Snapshot(snapshot),
+            _ = context.journal.failure_signal() => PumpWait::JournalFailed,
+        }
+    })
+    .await;
+    let (snapshot, pump_failed) = match waited {
+        Ok(PumpWait::Snapshot(Some(snapshot))) => (snapshot, false),
+        Ok(PumpWait::Snapshot(None)) => {
+            eprintln!("[warn] event pump lost session {session_id}");
+            (fallback_snapshot(fallback_messages), true)
+        }
+        Ok(PumpWait::JournalFailed) => (fallback_snapshot(fallback_messages), true),
+        Err(_) => {
+            eprintln!("[warn] event pump timed out for session {session_id}");
+            (fallback_snapshot(fallback_messages), true)
+        }
+    };
+    if pump_failed {
+        context.journal.fail_integrity(
+            format!("the event pump did not complete session {session_id}"),
+            true,
+        );
+    }
 
     SessionAttempt {
         messages: snapshot.messages,
         last_output: snapshot.last_output,
-        reason: if pump_failed || context.pump.integrity_failure().is_some() {
+        reason: if pump_failed || context.journal.integrity_failure().is_some() {
             SessionEndReason::Error
         } else {
             reason
@@ -1268,16 +1312,16 @@ async fn run_attempt(
 /// observable as [`SessionEndReason::AcceptanceFailed`] rather than ending with
 /// the last attempt's [`SessionEndReason::Completed`].
 async fn emit_outer_session(
+    journal: &TurnJournal,
     pump: &EventPump,
     events: &broadcast::Sender<AgentEvent>,
-    journal: Option<&dyn EventJournal>,
     reason: SessionEndReason,
 ) -> Result<(), RecorderError> {
     let session_id = next_session_id();
-    if let Some(journal) = journal {
-        // Fail closed before broadcasting: an unrecorded bootstrap session
-        // cannot be recovered, so its events must not enter the trace.
-        journal.record_session_start(&session_id, &[]).await?;
+    if journal.enabled() {
+        // Fail closed before broadcasting: the outer session's metadata and
+        // terminal pair must be durable before any observer sees them.
+        journal.record_outer_session(&session_id, reason).await?;
     }
     pump.register(session_id.clone(), Vec::new());
     let _ = events.send(AgentEvent::SessionStarted {
@@ -1289,7 +1333,7 @@ async fn emit_outer_session(
     });
 
     let waited = tokio::time::timeout(PUMP_TIMEOUT, pump.wait_for(&session_id)).await;
-    if journal.is_some() {
+    if journal.enabled() {
         match waited {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(RecorderError::Integrity {
@@ -1425,16 +1469,18 @@ fn next_turn_id() -> TurnId {
 /// A cancelled-before-start turn is still a normal return, so it must not
 /// leave an open trace when persistence is enabled.
 async fn close_empty_turn(
-    pump: &EventPump,
+    journal: &TurnJournal,
     turn_id: TurnId,
     mode: TraceTurnMode,
     messages: Vec<Message>,
     first_session: SessionId,
 ) -> Result<(), CliError> {
-    pump.begin_turn(turn_id.clone(), mode, messages, first_session)
+    journal
+        .begin_turn(turn_id.clone(), mode, messages, first_session)
         .await
         .map_err(CliError::Events)?;
-    pump.finish_turn(SessionEndReason::Cancelled)
+    journal
+        .finish_turn(SessionEndReason::Cancelled)
         .await
         .map_err(|error| CliError::TraceIncomplete {
             turn_id: turn_id.to_string(),

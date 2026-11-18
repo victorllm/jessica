@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use jessica_core::events::EventSink;
 use jessica_core::guard::{Guard, GuardContext, GuardDecision};
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolSchema};
@@ -34,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 /// Shared budget state for one CLI turn.
 pub(crate) struct GovernanceState {
     events: broadcast::Sender<AgentEvent>,
+    sink: Option<Arc<dyn EventSink>>,
     cancel: CancellationToken,
     tokens_used: AtomicU64,
     tripped: AtomicBool,
@@ -44,10 +46,21 @@ impl GovernanceState {
     pub(crate) fn new(events: broadcast::Sender<AgentEvent>, cancel: CancellationToken) -> Self {
         Self {
             events,
+            sink: None,
             cancel,
             tokens_used: AtomicU64::new(0),
             tripped: AtomicBool::new(false),
         }
+    }
+
+    /// Attaches the producer-side sink used before broadcasting.
+    ///
+    /// Governance events are part of a turn's trace, so they must reach the
+    /// sink before any observer. If the sink rejects one, the event is not
+    /// broadcast and the turn's cancellation token is fired.
+    pub(crate) fn with_event_sink(mut self, sink: Option<Arc<dyn EventSink>>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// Returns whether a budget trip has already occurred.
@@ -61,25 +74,33 @@ impl GovernanceState {
     }
 
     /// Sends an event without stopping the session.
-    pub(crate) fn emit(&self, event: AgentEvent) {
-        let _ = self.events.send(event);
-    }
-
-    /// Cancels the session because trace persistence failed.
     ///
-    /// Unlike [`GovernanceState::trip`], this does not set the budget-trip flag
-    /// and emits no event: an integrity failure is not a budget decision, and
-    /// the caller returns an error instead of a governed reason.
-    pub(crate) fn cancel_for_integrity_failure(&self) {
-        self.cancel.cancel();
+    /// Returns false when the producer-side sink rejected the event. In that
+    /// case nothing is broadcast and the turn is cancelled by the sink's
+    /// integrity failure.
+    pub(crate) async fn emit(&self, event: AgentEvent) -> bool {
+        if let Some(sink) = &self.sink
+            && sink.emit(event.clone()).await.is_err()
+        {
+            self.cancel.cancel();
+            return false;
+        }
+        let _ = self.events.send(event);
+        true
     }
 
     /// Emits one budget event and cancels the session.
     ///
     /// Only the first trip emits; later trips are no-ops so the terminal trace
     /// contains exactly one budget failure.
-    pub(crate) fn trip(&self, event: AgentEvent) -> bool {
+    pub(crate) async fn trip(&self, event: AgentEvent) -> bool {
         if self.tripped.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if let Some(sink) = &self.sink
+            && sink.emit(event.clone()).await.is_err()
+        {
+            self.cancel.cancel();
             return false;
         }
         let _ = self.events.send(event);
@@ -88,7 +109,7 @@ impl GovernanceState {
     }
 
     /// Charges `tokens` and trips `guard` once the configured limit is crossed.
-    fn charge_tokens(&self, tokens: u64, guard: &TokenBudgetGuard) {
+    async fn charge_tokens(&self, tokens: u64, guard: &TokenBudgetGuard) {
         let previous = self.tokens_used.fetch_add(tokens, Ordering::SeqCst);
         let used = previous.saturating_add(tokens);
         if let GuardDecision::Exceeded { kind, reason } =
@@ -97,7 +118,8 @@ impl GovernanceState {
             self.trip(AgentEvent::BudgetExceeded {
                 kind,
                 message: reason,
-            });
+            })
+            .await;
         }
     }
 }
@@ -136,11 +158,15 @@ impl LlmProvider for TokenCountingProvider {
         let guard = Arc::clone(&self.guard);
 
         Ok(stream
-            .map(move |event| {
-                if let LlmEvent::Done { usage: Some(usage) } = &event {
-                    governance.charge_tokens(usage.total(), &guard);
+            .then(move |event| {
+                let governance = Arc::clone(&governance);
+                let guard = Arc::clone(&guard);
+                async move {
+                    if let LlmEvent::Done { usage: Some(usage) } = &event {
+                        governance.charge_tokens(usage.total(), &guard).await;
+                    }
+                    event
                 }
-                event
             })
             .boxed())
     }
@@ -249,7 +275,7 @@ impl GovernedTool {
         }
 
         if let Some(event) = self.harness.authorize_tool_call(call) {
-            self.governance.emit(event);
+            self.governance.emit(event).await;
             return ToolResult::error(
                 String::new(),
                 format!("tool `{}` was denied by policy", self.inner.name()),
@@ -302,17 +328,19 @@ impl GovernedTool {
                 // a value strictly past the limit so the trip is guaranteed
                 // even if the timer fired a hair before `elapsed` crossed it.
                 let crossed = self.timeout + Duration::from_nanos(1);
-                self.timeout_result(call, elapsed.max(crossed))
+                self.timeout_result(call, elapsed.max(crossed)).await
             }
             Ok(result) => {
                 let context = GuardContext::new(0, self.governance.tokens_used(), "")
                     .with_tool_result(&result, Some(elapsed));
                 if let GuardDecision::Exceeded { kind, reason } = self.result_guard.check(&context)
                 {
-                    self.governance.trip(AgentEvent::BudgetExceeded {
-                        kind,
-                        message: reason.clone(),
-                    });
+                    self.governance
+                        .trip(AgentEvent::BudgetExceeded {
+                            kind,
+                            message: reason.clone(),
+                        })
+                        .await;
                     return ToolResult::error(String::new(), reason);
                 }
                 result
@@ -321,7 +349,7 @@ impl GovernedTool {
     }
 
     /// Reports a timeout and returns the model-facing error result.
-    fn timeout_result(&self, call: &ToolCall, elapsed: Duration) -> ToolResult {
+    async fn timeout_result(&self, call: &ToolCall, elapsed: Duration) -> ToolResult {
         let mut context =
             GuardContext::new(0, self.governance.tokens_used(), "").with_tool_call(call);
         context.tool_elapsed = Some(elapsed);
@@ -332,10 +360,12 @@ impl GovernedTool {
                 format!("tool `{}` exceeded its timeout", self.inner.name())
             }
         };
-        self.governance.trip(AgentEvent::BudgetExceeded {
-            kind: BudgetKind::ToolTimeout,
-            message: message.clone(),
-        });
+        self.governance
+            .trip(AgentEvent::BudgetExceeded {
+                kind: BudgetKind::ToolTimeout,
+                message: message.clone(),
+            })
+            .await;
         ToolResult::error(String::new(), message)
     }
 }
@@ -577,8 +607,8 @@ mod tests {
             message: "second".into(),
         };
 
-        assert!(governance.trip(first));
-        assert!(!governance.trip(second));
+        assert!(governance.trip(first).await);
+        assert!(!governance.trip(second).await);
 
         let message = expect_budget_event(&mut events, BudgetKind::TokenLimit);
         assert_eq!(message, "first");
@@ -814,10 +844,14 @@ mod tests {
         let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
         let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
         let (governance, _cancel, _events) = governance();
-        assert!(governance.trip(AgentEvent::BudgetExceeded {
-            kind: BudgetKind::TokenLimit,
-            message: "exhausted".into(),
-        }));
+        assert!(
+            governance
+                .trip(AgentEvent::BudgetExceeded {
+                    kind: BudgetKind::TokenLimit,
+                    message: "exhausted".into(),
+                })
+                .await
+        );
         let tool = GovernedTool::new(
             Arc::clone(&inner) as Arc<dyn Tool>,
             harness(&["bash"]),

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
@@ -777,5 +778,190 @@ async fn failed_tool_results_are_prefixed_and_fed_back() {
             Message::assistant_with_tool_calls("", vec![call]),
             Message::tool("call-1", "tool error: boom"),
         ]
+    );
+}
+
+/// Sink that records how many events were already observable before accepting
+/// each new event.
+struct OrderingSink {
+    observer: Mutex<broadcast::Receiver<AgentEvent>>,
+    accepted: Mutex<Vec<AgentEvent>>,
+    already_broadcast: Mutex<Vec<usize>>,
+    observed_total: Mutex<usize>,
+}
+
+impl OrderingSink {
+    fn new(observer: broadcast::Receiver<AgentEvent>) -> Self {
+        Self {
+            observer: Mutex::new(observer),
+            accepted: Mutex::new(Vec::new()),
+            already_broadcast: Mutex::new(Vec::new()),
+            observed_total: Mutex::new(0),
+        }
+    }
+
+    fn accepted(&self) -> Vec<AgentEvent> {
+        self.accepted
+            .lock()
+            .expect("accepted mutex poisoned")
+            .clone()
+    }
+
+    fn already_broadcast(&self) -> Vec<usize> {
+        self.already_broadcast
+            .lock()
+            .expect("ordering mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for OrderingSink {
+    async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+        let visible = {
+            let mut observer = self.observer.lock().expect("observer mutex poisoned");
+            let mut visible = 0;
+            loop {
+                match observer.try_recv() {
+                    Ok(_) => visible += 1,
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    Err(TryRecvError::Lagged(skipped)) => {
+                        panic!("sink observer lagged by {skipped} events");
+                    }
+                }
+            }
+            visible
+        };
+        let total = {
+            let mut total = self.observed_total.lock().expect("total mutex poisoned");
+            *total += visible;
+            *total
+        };
+        self.already_broadcast
+            .lock()
+            .expect("ordering mutex poisoned")
+            .push(total);
+        self.accepted
+            .lock()
+            .expect("accepted mutex poisoned")
+            .push(event);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_event_reaches_the_sink_before_it_is_broadcast() {
+    let (sender, receiver) = broadcast::channel(16);
+    let observer = sender.subscribe();
+    let sink = Arc::new(OrderingSink::new(observer));
+    let provider = Arc::new(MockProvider::new(vec![text_response("done")]));
+    let agent = AgentLoop::new(
+        provider,
+        Arc::new(ToolRegistry::new()),
+        test_budget(2),
+        sender.clone(),
+    )
+    .with_event_sink(Arc::clone(&sink) as Arc<dyn EventSink>);
+
+    let run = agent
+        .run_with_transcript(
+            session_id(),
+            vec![Message::user("go")],
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(run.reason, SessionEndReason::Completed);
+    assert_eq!(
+        sink.already_broadcast(),
+        vec![0, 1, 2],
+        "each sink call must happen before its event is observable"
+    );
+    let mut observer = receiver;
+    let mut broadcast = Vec::new();
+    while let Ok(event) = observer.try_recv() {
+        broadcast.push(event);
+    }
+    assert_eq!(
+        sink.accepted(),
+        broadcast,
+        "accepted events and observer events must have the same order"
+    );
+    assert_eq!(broadcast.len(), 3);
+}
+
+/// Sink that rejects one exact event after accepting the ones before it.
+struct RejectingSink {
+    reject: AgentEvent,
+    accepted: Mutex<Vec<AgentEvent>>,
+}
+
+impl RejectingSink {
+    fn accepted(&self) -> Vec<AgentEvent> {
+        self.accepted
+            .lock()
+            .expect("accepted mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for RejectingSink {
+    async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+        if event == self.reject {
+            return Err(EventSinkError::new("injected sink failure"));
+        }
+        self.accepted
+            .lock()
+            .expect("accepted mutex poisoned")
+            .push(event);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_event_and_the_rest_of_the_run_are_never_broadcast() {
+    let rejected = AgentEvent::ModelDelta {
+        text: "must not escape".to_owned(),
+    };
+    let sink = Arc::new(RejectingSink {
+        reject: rejected.clone(),
+        accepted: Mutex::new(Vec::new()),
+    });
+    let (events, mut receiver) = broadcast::channel(16);
+    let provider = Arc::new(MockProvider::new(vec![text_response("must not escape")]));
+    let agent = AgentLoop::new(
+        provider,
+        Arc::new(ToolRegistry::new()),
+        test_budget(2),
+        events,
+    )
+    .with_event_sink(Arc::clone(&sink) as Arc<dyn EventSink>);
+
+    let run = agent
+        .run_with_transcript(
+            session_id(),
+            vec![Message::user("go")],
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(run.reason, SessionEndReason::Cancelled);
+    assert_eq!(run.error.as_deref(), Some("event sink failed"));
+    let observed = drain(&mut receiver);
+    assert_eq!(
+        observed,
+        vec![started()],
+        "the rejected delta and every later event must stay unobservable"
+    );
+    assert!(
+        sink.accepted() == vec![started()],
+        "the sink accepted only the event before the rejection"
+    );
+    assert!(
+        !observed.contains(&rejected),
+        "the rejected event must not appear on the observer channel"
     );
 }
