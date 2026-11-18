@@ -904,9 +904,16 @@ mod tests {
         let acceptance = config
             .acceptance
             .expect("example must configure acceptance");
-        assert_eq!(acceptance.name, "readme-spelling");
+        assert_eq!(acceptance.name, "fixture-spelling");
         assert_eq!(acceptance.command, "sh");
         assert_eq!(acceptance.max_retries, 2);
+        assert!(
+            acceptance
+                .args
+                .iter()
+                .any(|arg| arg.contains("examples/typo.md")),
+            "example acceptance must target the dedicated fixture"
+        );
     }
 
     #[test]

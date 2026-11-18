@@ -2,13 +2,13 @@
 #
 # Run from the workspace root:
 #
-#   cargo run -p jessica-cli -- --config examples/harness.toml \
-#     "修改 README 中的拼写错误并验证"
+#   cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml \
+#     "修改 examples/typo.md 中的拼写错误并验证"
 #
 # The tool policy intentionally omits `bash`: calls to it reach the policy,
 # are denied, and return an error result to the model.
 #
-# The acceptance command intentionally fails until README.md contains the
+# The acceptance command intentionally fails until examples/typo.md contains the
 # correct spelling. The first model attempt can therefore fail acceptance and
 # force a feedback-driven retry.
 
@@ -33,10 +33,10 @@ command = "git"
 args = ["diff", "--check"]
 
 [acceptance]
-name = "readme-spelling"
+name = "fixture-spelling"
 command = "sh"
 args = [
   "-c",
-  "grep -q 'deterministic Rust agent runtime' README.md || { echo 'README.md still contains the misspelled word; expected phrase: deterministic Rust agent runtime'; exit 1; }",
+  "grep -q 'deterministic Rust agent runtime' examples/typo.md || { echo 'examples/typo.md still contains the misspelled word; expected phrase: deterministic Rust agent runtime'; exit 1; }",
 ]
 max_retries = 2

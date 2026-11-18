@@ -1,0 +1,98 @@
+# Release for Jessica.
+#
+# Triggered by v* tags only. Builds the Linux x86_64 binary, verifies that the
+# tag matches the version embedded in the binary, packages it with a SHA-256
+# checksum, and creates or updates the GitHub Release.
+#
+# The workflow uses only GitHub-owned actions and the preinstalled `gh` CLI.
+# It never calls a model API and needs no repository secrets beyond the
+# automatic GITHUB_TOKEN (contents: write).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  GH_TOKEN: ${{ github.token }}
+  ASSET: jessica-linux-x86_64.tar.gz
+
+jobs:
+  linux-x86_64:
+    name: build and publish linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal
+
+      - name: Cache Cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: >-
+            ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked -p jessica-cli
+
+      - name: Verify tag matches the built version
+        run: |
+          expected="jessica ${GITHUB_REF_NAME#v}"
+          actual="$(target/release/jessica --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match built version: expected '$expected', got '$actual'"
+            exit 1
+          fi
+          echo "Verified $actual"
+
+      - name: Package and checksum
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/$ASSET" jessica
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          cat "dist/$ASSET.sha256"
+
+      - name: Publish GitHub Release
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "dist/$ASSET" "dist/$ASSET.sha256" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/$ASSET" "dist/$ASSET.sha256" \
+              --verify-tag \
+              --title "Jessica $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+      - name: Verify assets from the release
+        run: |
+          mkdir -p verify
+          gh release download "$GITHUB_REF_NAME" --dir verify --pattern "$ASSET*"
+          (cd verify && sha256sum -c "$ASSET.sha256")
+          tar -xzf "verify/$ASSET" -C verify jessica
+          expected="jessica ${GITHUB_REF_NAME#v}"
+          actual="$(verify/jessica --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::downloaded asset reports '$actual', expected '$expected'"
+            exit 1
+          fi
+          echo "Verified downloaded release asset: $actual"

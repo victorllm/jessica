@@ -1,6 +1,6 @@
 # Jessica
 
-Jessica is a determinstic Rust agent runtime with WASM sandbox extensions and
+Jessica is a deterministic Rust agent runtime with WASM sandbox extensions and
 event-sourced persistence.
 
 > 不信模型自述，只信可验证轨迹。
@@ -16,7 +16,7 @@ event-sourced persistence.
 | `jessica-tools` | Native file and bash tools |
 | `jessica-cli` | Governed executable entry point |
 
-See `CLAUDE.md` for project rules and `DESIGN.md` for the architecture.
+See `CLAUDE.md` for project rules and `PLAN.md` for the delivery plan.
 
 ## Development checks
 
@@ -33,15 +33,30 @@ The workflow is defined in `.github/workflows/ci.yml` and uses no secrets.
 
 ## Install
 
-Build and install from a checkout:
+Choose one of two install modes.
+
+Build and install from a checkout (requires a Rust toolchain):
 
 ```bash
 ./install.sh
 ```
 
-The installer runs `cargo build --release --locked -p jessica-cli`, installs
-the resulting `jessica` binary into `~/.local/bin`, and creates a `jessica-cli`
-compatibility symlink for one release cycle. It also prepares `~/.jessica`:
+Or install the latest prebuilt release (currently Linux x86_64; no Rust
+toolchain required):
+
+```bash
+./install.sh --from-release
+```
+
+Release mode downloads `jessica-linux-x86_64.tar.gz` and its `.sha256` file
+from this project's GitHub Releases, verifies the SHA-256 checksum, and only
+then installs the binary. The checksum detects corrupted or tampered downloads;
+it is not a signature. If downloading or verification fails, the installer
+stops with an error and suggests rebuilding from source with `./install.sh`.
+
+Both modes install the `jessica` binary into `~/.local/bin` and create a
+`jessica-cli` compatibility symlink for one release cycle. They also prepare
+`~/.jessica`:
 
 - `harness.toml` configuration, created when absent (re-running keeps it;
   `--force-config` backs it up and regenerates it);
@@ -79,10 +94,11 @@ ignored for a kept launcher. A kept custom launcher must still answer Paseo's
 `jessica --version`. After editing `paseo.env`, run `paseo reload` and verify
 with `paseo provider diagnostic jessica`.
 
-Options include `--bin-dir <dir>`, `--home <dir>`, `--paseo-home <dir>`,
-`--paseo-env-file <path>`, `--no-config`, and `--force-config`; run
-`./install.sh --help` for the full list. Downloading a published release is
-not handled by this script yet.
+Options include `--from-release`, `--bin-dir <dir>`, `--home <dir>`,
+`--paseo-home <dir>`, `--paseo-env-file <path>`, `--no-config`, and
+`--force-config`; run `./install.sh --help` for the full list.
+`JESSICA_RELEASE_BASE_URL` overrides the release download base URL, for mirrors
+or local testing.
 
 Run it with:
 
@@ -96,14 +112,14 @@ jessica acp --config ~/.jessica/harness.toml
 
 ## Governed CLI demo
 
-> The first sentence deliberately contains a misspelling. The example config
+> `examples/typo.md` deliberately contains a misspelling. The example config
 > in `examples/harness.toml` verifies that it is corrected, which makes the
 > acceptance-failure retry path observable.
 
 Run the example from the workspace root:
 
 ```bash
-cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml "修改 README 中的拼写错误并验证"
+cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml "修改 examples/typo.md 中的拼写错误并验证"
 ```
 
 `OPENAI_API_KEY` is required. `OPENAI_BASE_URL` and `OPENAI_MODEL` select an
