@@ -1285,6 +1285,7 @@ fn seed_interrupted_delegation(database: &Path, session: &SessionId) {
     for (index, event) in [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted { call },
     ]

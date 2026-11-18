@@ -869,6 +869,7 @@ mod tests {
             for event in [
                 AgentEvent::SessionStarted {
                     session_id: turn_id.clone(),
+                    messages: Vec::new(),
                 },
                 AgentEvent::ModelDelta {
                     text: answer.to_owned(),

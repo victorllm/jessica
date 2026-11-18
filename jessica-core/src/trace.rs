@@ -10,18 +10,34 @@
 //! without a terminal marker is intentionally readable and explicitly
 //! incomplete; it is never silently treated as complete.
 //!
-//! The envelope is additive: [`AgentEvent`] and every existing core contract
-//! remain unchanged.
+//! Schema version 2 adds no envelope field and no new [`TracePayload`] variant:
+//! it marks the expanded [`AgentEvent`] vocabulary (session input, rounds,
+//! usage, permissions, and child-session lifecycle). Version-1 traces remain
+//! readable, but a version-1 trace must not contain a version-2-only event.
+//! Readers reject versions newer than [`TRACE_SCHEMA_VERSION`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::types::{AgentEvent, Message, SessionEndReason, SessionId};
 
-/// Version of the trace envelope produced and accepted by this build.
+/// Version of the trace envelope produced by this build.
 ///
 /// A reader must reject envelopes whose version it does not understand rather
-/// than guessing at their semantics.
-pub const TRACE_SCHEMA_VERSION: u16 = 1;
+/// than guessing at their semantics. See
+/// [`MIN_SUPPORTED_TRACE_SCHEMA_VERSION`] for the oldest readable version.
+pub const TRACE_SCHEMA_VERSION: u16 = 2;
+
+/// Oldest trace schema version this build can read.
+///
+/// Version-1 traces predate the explicit round, usage, permission, and
+/// child-session events. Their smaller event vocabulary is still valid; absent
+/// facts are not synthesized during decoding.
+pub const MIN_SUPPORTED_TRACE_SCHEMA_VERSION: u16 = 1;
+
+/// Returns whether `version` is readable by this build.
+pub fn is_supported_trace_schema_version(version: u16) -> bool {
+    (MIN_SUPPORTED_TRACE_SCHEMA_VERSION..=TRACE_SCHEMA_VERSION).contains(&version)
+}
 
 /// Opaque identifier for one user-visible turn.
 ///
@@ -152,6 +168,17 @@ impl TracePayload {
             Self::TurnEnded { .. } => "turn_ended",
         }
     }
+
+    /// Returns the minimum trace schema version that can carry this payload.
+    ///
+    /// Only agent payloads can require version 2; the trace envelope itself is
+    /// unchanged from version 1.
+    pub fn required_trace_schema_version(&self) -> u16 {
+        match self {
+            Self::Agent { event } => event.required_trace_schema_version(),
+            Self::Gap { .. } | Self::TurnStarted { .. } | Self::TurnEnded { .. } => 1,
+        }
+    }
 }
 
 /// How a turn obtained its initial conversation.
@@ -194,7 +221,11 @@ mod tests {
         );
 
         assert_eq!(event.schema_version, TRACE_SCHEMA_VERSION);
-        assert_eq!(event.schema_version, 1);
+        assert_eq!(event.schema_version, 2);
+        assert!(is_supported_trace_schema_version(1));
+        assert!(is_supported_trace_schema_version(2));
+        assert!(!is_supported_trace_schema_version(0));
+        assert!(!is_supported_trace_schema_version(3));
     }
 
     #[test]
@@ -262,7 +293,7 @@ mod tests {
         );
 
         let json = serde_json::to_value(&event).expect("trace event must serialize");
-        assert_eq!(json["schema_version"], json!(1));
+        assert_eq!(json["schema_version"], json!(2));
         assert_eq!(json["turn_id"], json!("turn-9"));
         assert_eq!(json["attempt"], json!(1));
         assert_eq!(json["session_id"], json!("cli-9"));
@@ -271,6 +302,58 @@ mod tests {
             json["payload"]["event"]["type"],
             json!("tool_call_finished")
         );
+    }
+
+    #[test]
+    fn payload_versions_follow_the_agent_event_vocabulary() {
+        let v1_payloads = [
+            TracePayload::Gap {
+                skipped: 1,
+                reason: TraceGapReason::BroadcastLagged,
+            },
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Fresh,
+                messages: vec![Message::user("hi")],
+            },
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed,
+            },
+            TracePayload::Agent {
+                event: AgentEvent::ModelDelta {
+                    text: "hello".to_owned(),
+                },
+            },
+            TracePayload::Agent {
+                event: AgentEvent::SessionStarted {
+                    session_id: SessionId::new("cli-1"),
+                    messages: Vec::new(),
+                },
+            },
+        ];
+        for payload in v1_payloads {
+            assert_eq!(payload.required_trace_schema_version(), 1);
+        }
+
+        let v2_payloads = [
+            TracePayload::Agent {
+                event: AgentEvent::SessionStarted {
+                    session_id: SessionId::new("cli-2"),
+                    messages: vec![Message::user("hello")],
+                },
+            },
+            TracePayload::Agent {
+                event: AgentEvent::RoundStarted { round: 1 },
+            },
+            TracePayload::Agent {
+                event: AgentEvent::RoundFinished {
+                    round: 1,
+                    usage: None,
+                },
+            },
+        ];
+        for payload in v2_payloads {
+            assert_eq!(payload.required_trace_schema_version(), 2);
+        }
     }
 
     #[test]

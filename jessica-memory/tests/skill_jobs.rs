@@ -400,6 +400,7 @@ fn success_and_failure_transitions_do_not_write_events() {
             &session,
             &AgentEvent::SessionStarted {
                 session_id: session.clone(),
+                messages: Vec::new(),
             },
             Timestamp::from_millis(1),
         )

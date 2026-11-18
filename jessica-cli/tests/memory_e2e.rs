@@ -340,6 +340,7 @@ fn seed_interrupted_session(database: &Path, session: &SessionId) {
     for (index, event) in [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted { call },
         AgentEvent::ToolCallFinished {
@@ -373,6 +374,7 @@ fn seed_completed_session(database: &Path, session: &SessionId) {
     let events = [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ModelDelta {
             text: "reading the manifest".to_owned(),

@@ -353,6 +353,7 @@ impl TurnJournal {
             .ok_or_else(|| integrity("the turn trace was never started"))?;
         let started = AgentEvent::SessionStarted {
             session_id: session_id.clone(),
+            messages: Vec::new(),
         };
         let ended = AgentEvent::SessionEnded {
             session_id: session_id.clone(),
@@ -521,7 +522,7 @@ impl TurnJournal {
                     clear_current: false,
                 })
             }
-            AgentEvent::SessionStarted { session_id } => {
+            AgentEvent::SessionStarted { session_id, .. } => {
                 let attempt = attempt_for_session(&state, session_id).ok_or_else(|| {
                     format!("session `{session_id}` started without an attributed attempt")
                 })?;
@@ -573,6 +574,30 @@ impl TurnJournal {
                     ),
                     legacy: Some((session_id.clone(), event.clone())),
                     clear_current: true,
+                })
+            }
+            // Audit facts describe work whose observable effects already reach
+            // the legacy log through the surrounding tool events. Replay does
+            // not re-run permission gates or child sessions, so mirroring these
+            // would make the legacy stream impossible to reproduce exactly.
+            AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. } => {
+                let current = state
+                    .current
+                    .clone()
+                    .ok_or_else(|| "an event arrived with no active session".to_owned())?;
+                Ok(PreparedEvent {
+                    trace: TraceEvent::new(
+                        turn_id,
+                        Some(current.attempt),
+                        Some(current.session_id),
+                        TracePayload::Agent {
+                            event: event.clone(),
+                        },
+                    ),
+                    legacy: None,
+                    clear_current: false,
                 })
             }
             _ => {
@@ -833,6 +858,7 @@ fn integrity(message: impl Into<String>) -> RecorderError {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use jessica_core::types::{PermissionDecision, ToolCall};
     use jessica_harness::Harness;
     use tokio::sync::Notify;
     use tokio::time::timeout;
@@ -973,6 +999,7 @@ mod tests {
 
         sink.emit(AgentEvent::SessionStarted {
             session_id: first.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("first start");
@@ -997,6 +1024,7 @@ mod tests {
             .expect("second metadata");
         sink.emit(AgentEvent::SessionStarted {
             session_id: second.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("second start");
@@ -1103,6 +1131,7 @@ mod tests {
             .expect("metadata");
         sink.emit(AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("the failing write is enqueued asynchronously");
@@ -1162,6 +1191,7 @@ mod tests {
         let sink = journal.sink().expect("sink");
         sink.emit(AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("start must be recorded");
@@ -1250,6 +1280,7 @@ mod tests {
         let sink = journal.sink().expect("sink");
         sink.emit(AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("start");
@@ -1375,6 +1406,7 @@ mod tests {
         let sink = journal.sink().expect("sink");
         sink.emit(AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         })
         .await
         .expect("start");
@@ -1477,5 +1509,116 @@ mod tests {
         journal.begin_attempt(1, &first).expect("idempotent");
         journal.shutdown();
         assert_eq!(recorder.records().len(), 1, "only turn_started was written");
+    }
+
+    #[tokio::test]
+    async fn audit_only_events_are_trace_only_and_attributed_to_the_active_session() {
+        let recorder = Arc::new(RecordingJournal::default());
+        let (journal, _cancel) = active_journal(&recorder, 16);
+        let session = SessionId::new("attempt-audit");
+        let turn = TurnId::new("turn-audit");
+        let messages = vec![Message::system("system"), Message::user("go")];
+
+        journal
+            .begin_turn(
+                turn,
+                TraceTurnMode::Fresh,
+                messages.clone(),
+                session.clone(),
+            )
+            .await
+            .expect("turn must start");
+        journal.begin_attempt(1, &session).expect("attempt one");
+        journal
+            .record_session_start(&session, &messages)
+            .await
+            .expect("metadata");
+        let sink = journal.sink().expect("persistence must expose a sink");
+        sink.emit(AgentEvent::SessionStarted {
+            session_id: session.clone(),
+            messages,
+        })
+        .await
+        .expect("session start");
+
+        let call = ToolCall::new("call-1", "bash", serde_json::json!({"command": "true"}));
+        let child = SessionId::new("child-audit");
+        sink.emit(AgentEvent::PermissionDecided {
+            call: call.clone(),
+            decision: PermissionDecision::Deny,
+        })
+        .await
+        .expect("permission decision");
+        sink.emit(AgentEvent::ChildSessionStarted {
+            child_session_id: child.clone(),
+            call_id: "call-parent".to_owned(),
+        })
+        .await
+        .expect("child start");
+        sink.emit(AgentEvent::ChildSessionEnded {
+            child_session_id: child,
+            call_id: "call-parent".to_owned(),
+            reason: SessionEndReason::Completed,
+            rounds: 1,
+            tool_calls: 0,
+            tool_errors: 0,
+        })
+        .await
+        .expect("child end");
+        sink.emit(AgentEvent::SessionEnded {
+            session_id: session.clone(),
+            reason: SessionEndReason::Completed,
+        })
+        .await
+        .expect("session end");
+        journal
+            .finish_turn(SessionEndReason::Completed)
+            .await
+            .expect("turn must close");
+        journal.shutdown();
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 7, "start, five events, end: {records:?}");
+        for record in &records[1..6] {
+            assert_eq!(record.0.attempt, Some(1));
+            assert_eq!(record.0.session_id.as_ref(), Some(&session));
+        }
+        assert!(
+            records[1].1.is_some(),
+            "session_started keeps its legacy mirror"
+        );
+        let audit_payloads = [
+            &records[2].0.payload,
+            &records[3].0.payload,
+            &records[4].0.payload,
+        ];
+        assert!(matches!(
+            audit_payloads[0],
+            TracePayload::Agent {
+                event: AgentEvent::PermissionDecided { .. }
+            }
+        ));
+        assert!(matches!(
+            audit_payloads[1],
+            TracePayload::Agent {
+                event: AgentEvent::ChildSessionStarted { .. }
+            }
+        ));
+        assert!(matches!(
+            audit_payloads[2],
+            TracePayload::Agent {
+                event: AgentEvent::ChildSessionEnded { .. }
+            }
+        ));
+        for record in &records[2..5] {
+            assert!(
+                record.1.is_none(),
+                "permission and child lifecycle facts must be trace-only"
+            );
+        }
+        assert!(
+            records[5].1.is_some(),
+            "session_ended keeps its legacy mirror"
+        );
     }
 }

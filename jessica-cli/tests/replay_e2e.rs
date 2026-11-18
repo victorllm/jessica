@@ -150,6 +150,7 @@ fn seed_completed_session(database: &Path, session: &SessionId) -> Vec<AgentEven
     let events = vec![
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ModelDelta {
             text: "reading the manifest".to_owned(),

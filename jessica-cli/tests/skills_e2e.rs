@@ -199,10 +199,29 @@ fn threshold_turn_stores_a_draft_but_never_injects_it_and_writes_no_skill_events
         .expect("recorded events should load");
     assert!(!events.is_empty());
     for event in events {
-        let declared = format!("{} {}", event.event_type(), event.payload_json());
+        // Bootstrap messages legitimately carry the workspace path, which can
+        // contain "skills"; only the skill-job event vocabulary or payload is
+        // forbidden here.
         assert!(
-            !declared.to_ascii_lowercase().contains("skill"),
-            "skill-job state must never enter the agent event stream: {declared}"
+            !event.event_type().to_ascii_lowercase().contains("skill"),
+            "skill-job state must never enter the agent event stream: {}",
+            event.event_type()
+        );
+        let payload = event.payload_json();
+        for marker in [
+            SKILL_NAME,
+            SKILL_DESCRIPTION,
+            SKILL_INSTRUCTIONS,
+            SKILL_TITLE,
+        ] {
+            assert!(
+                !payload.contains(marker),
+                "skill-job state must never enter the agent event stream: {payload}"
+            );
+        }
+        assert!(
+            !payload.contains("\"tool_call_count\"") && !payload.contains("\"assistant_rounds\""),
+            "skill-job source state must never enter the agent event stream: {payload}"
         );
     }
 
@@ -1152,6 +1171,7 @@ fn seed_interrupted_session(database: &Path, session: &SessionId) {
     for (index, event) in [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted { call },
         AgentEvent::ToolCallFinished {
@@ -1185,6 +1205,7 @@ fn seed_completed_session(database: &Path, session: &SessionId) {
     let events = [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ModelDelta {
             text: "reading the manifest".to_owned(),

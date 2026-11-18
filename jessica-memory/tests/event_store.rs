@@ -51,6 +51,7 @@ fn sample_events(session: &SessionId) -> Vec<AgentEvent> {
     vec![
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ModelDelta {
             text: "hello".to_owned(),
@@ -225,6 +226,7 @@ fn the_schema_has_the_required_columns_and_rejects_mutation() {
             &session,
             &AgentEvent::SessionStarted {
                 session_id: session.clone(),
+                messages: Vec::new(),
             },
             Timestamp::from_millis(99),
         )

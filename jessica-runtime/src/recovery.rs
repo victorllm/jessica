@@ -10,9 +10,15 @@
 //! result ([`RecoveryError::IncompleteRound`]) cannot be continued without
 //! replaying the missing work, so recovery rejects it instead of guessing.
 //!
-//! [`AgentEvent`] has no user-message variant. The caller supplies the
-//! session's bootstrap messages (system/user prompts) from the store's session
-//! metadata; recovery appends everything the model and tools produced.
+//! Bootstrap messages come from [`AgentEvent::SessionStarted`] when the event
+//! carries them; version-1 streams leave that field empty and fall back to the
+//! caller's copy from the store's session metadata. A non-empty event value is
+//! authoritative, so a caller that disagrees fails the recovery instead of
+//! continuing with a different conversation.
+//!
+//! Version-2 streams also carry explicit model-round boundaries. Recovery uses
+//! them when present and retains the version-1 text/tool heuristic only for
+//! streams that predate the round vocabulary.
 
 use jessica_core::types::{AgentEvent, Message, SessionEndReason, SessionId, ToolCall, ToolResult};
 use thiserror::Error;
@@ -80,12 +86,13 @@ impl SessionCheckpoint {
     /// interrupted session keeps the same total round budget as an
     /// uninterrupted one.
     ///
-    /// The event model has no explicit round boundary: a round is observable
-    /// only through its model text and tool calls. Consecutive model turns that
-    /// emit tool calls without any text are therefore indistinguishable from a
-    /// single turn requesting several tools, and are counted as one round.
-    /// Recovery prefers this deterministic undercount over inventing boundaries
-    /// that the log does not contain.
+    /// Version-2 streams count every explicit [`AgentEvent::RoundStarted`].
+    /// Version-1 streams have no round boundary: a round is observable only
+    /// through its model text and tool calls, so consecutive model turns that
+    /// emit tool calls without any text are indistinguishable from a single
+    /// turn requesting several tools and are counted as one round. Recovery
+    /// prefers this deterministic undercount over inventing boundaries that
+    /// the log does not contain.
     pub fn rounds_completed(&self) -> u32 {
         self.rounds_completed
     }
@@ -113,8 +120,10 @@ impl SessionCheckpoint {
 
 /// Rebuilds a session checkpoint by replaying `events` through `through_seq`.
 ///
-/// `initial_messages` are the messages the session started with, as recorded in
-/// the store's session metadata. Events are included while
+/// `initial_messages` are the messages the session started with, normally
+/// loaded from the store's session metadata. A non-empty
+/// [`AgentEvent::SessionStarted::messages`] overrides them and must agree with
+/// any non-empty caller value. Events are included while
 /// `event.seq() <= through_seq`; pass `None` to include the whole stream. The
 /// slice must begin with [`AgentEvent::SessionStarted`], sequence numbers must
 /// strictly increase, and the session id in `SessionStarted`/`SessionEnded`
@@ -148,7 +157,7 @@ struct RecoveryBuilder<'a> {
     session_id: &'a SessionId,
     /// Conversation rebuilt so far.
     messages: Vec<Message>,
-    /// Model rounds begun so far.
+    /// Model rounds begun so far, using the version-1 heuristic.
     rounds_completed: u32,
     /// Whether a round is currently accumulating output.
     round_open: bool,
@@ -156,6 +165,21 @@ struct RecoveryBuilder<'a> {
     round_output: String,
     /// Tool calls of the open round.
     pending: Vec<PendingCall>,
+    /// Explicit round between `RoundStarted` and `RoundFinished`.
+    explicit_round: Option<u32>,
+    /// Explicit round whose model response finished but whose tools may still
+    /// be running.
+    explicit_finished_round: Option<u32>,
+    /// Index of the assistant message pushed for the finished explicit round.
+    assistant_index: Option<usize>,
+    /// Highest round number observed with `RoundFinished`.
+    last_finished_round: u32,
+    /// Whether any version-2 round boundary has been observed.
+    saw_explicit_round: bool,
+    /// Whether bootstrap messages were supplied by the caller.
+    caller_messages_present: bool,
+    /// Whether a non-empty `SessionStarted.messages` has been observed.
+    stream_messages_seen: bool,
     /// Terminal reason observed so far.
     end_reason: Option<SessionEndReason>,
     /// Sequence number of the last event included.
@@ -167,6 +191,7 @@ struct RecoveryBuilder<'a> {
 impl<'a> RecoveryBuilder<'a> {
     /// Creates a builder seeded with the session's bootstrap messages.
     fn new(session_id: &'a SessionId, messages: Vec<Message>) -> Self {
+        let caller_messages_present = !messages.is_empty();
         Self {
             session_id,
             messages,
@@ -174,6 +199,13 @@ impl<'a> RecoveryBuilder<'a> {
             round_open: false,
             round_output: String::new(),
             pending: Vec::new(),
+            explicit_round: None,
+            explicit_finished_round: None,
+            assistant_index: None,
+            last_finished_round: 0,
+            saw_explicit_round: false,
+            caller_messages_present,
+            stream_messages_seen: false,
             end_reason: None,
             last_seq: 0,
             started: false,
@@ -219,7 +251,10 @@ impl<'a> RecoveryBuilder<'a> {
     /// Dispatches one event to the matching reducer step.
     fn on_event(&mut self, seq: u64, event: &AgentEvent) -> Result<(), RecoveryError> {
         match event {
-            AgentEvent::SessionStarted { session_id } => self.on_session_started(seq, session_id),
+            AgentEvent::SessionStarted {
+                session_id,
+                messages,
+            } => self.on_session_started(seq, session_id, messages),
             AgentEvent::ModelDelta { text } => {
                 self.ensure_running(seq)?;
                 self.on_model_delta(seq, text)
@@ -235,9 +270,20 @@ impl<'a> RecoveryBuilder<'a> {
             AgentEvent::SessionEnded { session_id, reason } => {
                 self.on_session_ended(seq, session_id, *reason)
             }
+            AgentEvent::RoundStarted { round } => {
+                self.ensure_running(seq)?;
+                self.on_round_started(seq, *round)
+            }
+            AgentEvent::RoundFinished { round, .. } => {
+                self.ensure_running(seq)?;
+                self.on_round_finished(seq, *round)
+            }
             AgentEvent::PolicyDenied { .. }
             | AgentEvent::BudgetExceeded { .. }
             | AgentEvent::AcceptanceFailed { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. }
             | AgentEvent::Error { .. } => {
                 self.ensure_running(seq)?;
                 Ok(())
@@ -250,6 +296,7 @@ impl<'a> RecoveryBuilder<'a> {
         &mut self,
         seq: u64,
         session_id: &SessionId,
+        messages: &[Message],
     ) -> Result<(), RecoveryError> {
         if session_id != self.session_id {
             return Err(RecoveryError::SessionMismatch {
@@ -259,6 +306,16 @@ impl<'a> RecoveryBuilder<'a> {
         }
         if self.started && self.end_reason.is_none() {
             return Err(RecoveryError::UnexpectedSessionStart { seq });
+        }
+        if !messages.is_empty() {
+            if self.stream_messages_seen && self.messages.as_slice() != messages {
+                return Err(RecoveryError::InputMismatch { seq });
+            }
+            if self.caller_messages_present && self.messages.as_slice() != messages {
+                return Err(RecoveryError::InputMismatch { seq });
+            }
+            self.messages = messages.to_vec();
+            self.stream_messages_seen = true;
         }
         self.started = true;
         self.end_reason = None;
@@ -273,8 +330,101 @@ impl<'a> RecoveryBuilder<'a> {
         Ok(())
     }
 
+    /// Opens an explicit version-2 model round.
+    fn on_round_started(&mut self, seq: u64, round: u32) -> Result<(), RecoveryError> {
+        if self.explicit_round.is_some() {
+            return Err(RecoveryError::UnexpectedRoundStart { seq, round });
+        }
+
+        let expected = if self.saw_explicit_round {
+            self.last_finished_round.saturating_add(1)
+        } else {
+            self.rounds_completed.saturating_add(1)
+        };
+        if round != expected {
+            return Err(RecoveryError::RoundSequence {
+                seq,
+                expected,
+                found: round,
+            });
+        }
+
+        if self.explicit_finished_round.is_some() {
+            self.settle_pending_tools(seq, false)?;
+            self.explicit_finished_round = None;
+            self.assistant_index = None;
+        } else if !self.pending.is_empty() {
+            // A version-1 tool batch immediately before a version-2 round.
+            self.flush_completed(seq)?;
+        } else if self.round_open {
+            return Err(RecoveryError::IncompleteModelTurn { seq });
+        }
+
+        self.saw_explicit_round = true;
+        self.explicit_round = Some(round);
+        self.round_open = true;
+        self.round_output.clear();
+        self.assistant_index = None;
+        Ok(())
+    }
+
+    /// Closes an explicit model round and stores its assistant message.
+    fn on_round_finished(&mut self, seq: u64, round: u32) -> Result<(), RecoveryError> {
+        if self.explicit_round != Some(round) {
+            return Err(RecoveryError::UnexpectedRoundFinish { seq, round });
+        }
+        if !self.pending.is_empty() {
+            // The runtime emits RoundFinished before tool calls. Calls before
+            // the finish boundary are ambiguous, so fail instead of guessing.
+            return Err(RecoveryError::MissingRoundFinish { seq });
+        }
+
+        let output = std::mem::take(&mut self.round_output);
+        self.messages.push(Message::assistant(output));
+        self.assistant_index = Some(self.messages.len().saturating_sub(1));
+        self.explicit_round = None;
+        self.explicit_finished_round = Some(round);
+        self.last_finished_round = round;
+        self.round_open = false;
+        Ok(())
+    }
+
+    /// Appends tool messages for an explicit round whose model response is
+    /// already stored.
+    ///
+    /// A stable checkpoint requires every result. A cancelled or errored
+    /// terminal may leave calls without results; those become the same
+    /// synthetic interrupted results used by the version-1 path.
+    fn settle_pending_tools(&mut self, seq: u64, allow_missing: bool) -> Result<(), RecoveryError> {
+        if !allow_missing
+            && let Some(missing) = self.pending.iter().find(|pending| pending.result.is_none())
+        {
+            return Err(RecoveryError::IncompleteRound {
+                seq,
+                tool_call_id: missing.call.id.clone(),
+            });
+        }
+
+        for pending in self.pending.drain(..) {
+            let content = match pending.result {
+                Some(result) if result.is_error => format!("tool error: {}", result.content),
+                Some(result) => result.content,
+                None => "tool error: tool execution was interrupted".to_owned(),
+            };
+            self.messages.push(Message::tool(pending.call.id, content));
+        }
+        Ok(())
+    }
+
     /// Appends text to the current round, opening or rotating rounds as needed.
     fn on_model_delta(&mut self, seq: u64, text: &str) -> Result<(), RecoveryError> {
+        if self.saw_explicit_round {
+            if self.explicit_round.is_none() {
+                return Err(RecoveryError::MissingRoundStart { seq });
+            }
+            self.round_output.push_str(text);
+            return Ok(());
+        }
         if !self.round_open {
             self.begin_round();
         } else if !self.pending.is_empty() {
@@ -295,6 +445,37 @@ impl<'a> RecoveryBuilder<'a> {
 
     /// Records a tool call, opening a round when it is the first event.
     fn on_tool_started(&mut self, seq: u64, call: &ToolCall) -> Result<(), RecoveryError> {
+        if self.saw_explicit_round {
+            if self.explicit_round.is_some() {
+                return Err(RecoveryError::MissingRoundFinish { seq });
+            }
+            let Some(index) = self.assistant_index else {
+                return Err(RecoveryError::MissingRoundStart { seq });
+            };
+            if let Some(missing) = self.pending.iter().find(|pending| pending.result.is_none()) {
+                return Err(RecoveryError::IncompleteRound {
+                    seq,
+                    tool_call_id: missing.call.id.clone(),
+                });
+            }
+            if self
+                .pending
+                .iter()
+                .any(|pending| pending.call.id == call.id)
+            {
+                return Err(RecoveryError::DuplicateToolCall {
+                    seq,
+                    tool_call_id: call.id.clone(),
+                });
+            }
+            self.messages[index].tool_calls.push(call.clone());
+            self.pending.push(PendingCall {
+                call: call.clone(),
+                result: None,
+            });
+            return Ok(());
+        }
+
         if !self.round_open {
             self.begin_round();
         }
@@ -355,6 +536,30 @@ impl<'a> RecoveryBuilder<'a> {
             });
         }
         self.ensure_running(seq)?;
+
+        if self.explicit_round.is_some() {
+            if matches!(
+                reason,
+                SessionEndReason::Completed | SessionEndReason::BudgetExceeded
+            ) {
+                return Err(RecoveryError::IncompleteModelTurn { seq });
+            }
+            // The model call itself was interrupted, so there is no completed
+            // assistant response to keep.
+            self.explicit_round = None;
+            self.round_output.clear();
+            self.round_open = false;
+        }
+
+        if self.explicit_finished_round.is_some() {
+            let allow_missing = !matches!(
+                reason,
+                SessionEndReason::Completed | SessionEndReason::BudgetExceeded
+            );
+            self.settle_pending_tools(seq, allow_missing)?;
+            self.explicit_finished_round = None;
+            self.assistant_index = None;
+        }
 
         if reason == SessionEndReason::Completed {
             if self.pending.is_empty() {
@@ -431,6 +636,16 @@ impl<'a> RecoveryBuilder<'a> {
     /// Validates that a slice without a terminal event ends at a stable point.
     fn finish_slice(self) -> Result<SessionCheckpoint, RecoveryError> {
         let mut builder = self;
+        if builder.explicit_round.is_some() {
+            return Err(RecoveryError::IncompleteModelTurn {
+                seq: builder.last_seq,
+            });
+        }
+        if builder.explicit_finished_round.is_some() {
+            builder.settle_pending_tools(builder.last_seq, false)?;
+            builder.explicit_finished_round = None;
+            builder.assistant_index = None;
+        }
         if !builder.pending.is_empty() {
             if let Some(missing) = builder
                 .pending
@@ -449,10 +664,11 @@ impl<'a> RecoveryBuilder<'a> {
             });
         }
 
+        let rounds_completed = builder.rounds_completed.max(builder.last_finished_round);
         Ok(SessionCheckpoint {
             session_id: builder.session_id.clone(),
             messages: builder.messages,
-            rounds_completed: builder.rounds_completed,
+            rounds_completed,
             last_seq: builder.last_seq,
             end_reason: builder.end_reason,
         })
@@ -529,6 +745,52 @@ pub enum RecoveryError {
     #[error("event {seq} ends in the middle of a model turn")]
     IncompleteModelTurn {
         /// Sequence number of the last included event.
+        seq: u64,
+    },
+    /// The event stream's bootstrap messages disagree with the caller's.
+    #[error(
+        "event {seq} carries session input that disagrees with the supplied bootstrap messages"
+    )]
+    InputMismatch {
+        /// Sequence number of the offending `SessionStarted`.
+        seq: u64,
+    },
+    /// An explicit round number skipped or repeated a value.
+    #[error("event {seq} starts round {found}, but round {expected} was expected")]
+    RoundSequence {
+        /// Sequence number of the offending `RoundStarted`.
+        seq: u64,
+        /// Expected one-based round number.
+        expected: u32,
+        /// Round number found in the event.
+        found: u32,
+    },
+    /// A second explicit round started before the current one finished.
+    #[error("event {seq} starts explicit round {round} before the previous round finished")]
+    UnexpectedRoundStart {
+        /// Sequence number of the offending `RoundStarted`.
+        seq: u64,
+        /// Round number that was started.
+        round: u32,
+    },
+    /// A round finished without a matching `RoundStarted`.
+    #[error("event {seq} finishes explicit round {round} without a matching start")]
+    UnexpectedRoundFinish {
+        /// Sequence number of the offending `RoundFinished`.
+        seq: u64,
+        /// Round number that was finished.
+        round: u32,
+    },
+    /// A model event appeared outside an explicit round.
+    #[error("event {seq} appears outside an explicit model round")]
+    MissingRoundStart {
+        /// Sequence number of the offending event.
+        seq: u64,
+    },
+    /// A tool call appeared before the current model round finished.
+    #[error("event {seq} starts a tool call before its explicit model round finished")]
+    MissingRoundFinish {
+        /// Sequence number of the offending event.
         seq: u64,
     },
 }

@@ -11,7 +11,8 @@ use jessica_core::events::EventSink;
 use jessica_core::llm::{LlmEvent, LlmProvider};
 use jessica_core::tool::{ToolRegistry, ToolSchema};
 use jessica_core::types::{
-    AgentEvent, Budget, BudgetKind, Message, SessionEndReason, SessionId, ToolCall, ToolResult,
+    AgentEvent, Budget, BudgetKind, Message, SessionEndReason, SessionId, TokenUsage, ToolCall,
+    ToolResult,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -105,13 +106,19 @@ impl AgentLoop {
     ///
     /// The emitted sequence is:
     ///
-    /// 1. [`AgentEvent::SessionStarted`]
-    /// 2. per round: [`AgentEvent::ModelDelta`]s, then for every requested tool
-    ///    an [`AgentEvent::ToolCallStarted`] followed by
+    /// 1. [`AgentEvent::SessionStarted`] carrying the initial messages
+    /// 2. per round: [`AgentEvent::RoundStarted`], zero or more
+    ///    [`AgentEvent::ModelDelta`]s, [`AgentEvent::RoundFinished`] with the
+    ///    provider's usage, then for every requested tool an
+    ///    [`AgentEvent::ToolCallStarted`] followed by
     ///    [`AgentEvent::ToolCallFinished`]
     /// 3. exactly one terminal sequence: [`AgentEvent::SessionEnded`], preceded
     ///    by [`AgentEvent::BudgetExceeded`] or [`AgentEvent::Error`] on those
     ///    paths.
+    ///
+    /// A round is one model call. Tool calls requested by that call execute
+    /// after `RoundFinished` and before the next `RoundStarted`. A model call
+    /// that fails or is cancelled emits no `RoundFinished`.
     ///
     /// Cancellation is checked before each model call, while waiting for the
     /// next model event, and while a tool runs. When it fires the session ends
@@ -205,6 +212,7 @@ impl AgentLoop {
             && !self
                 .emit(AgentEvent::SessionStarted {
                     session_id: session_id.clone(),
+                    messages: messages.clone(),
                 })
                 .await
         {
@@ -221,12 +229,18 @@ impl AgentLoop {
                     .await;
             }
 
-            let (content, tool_calls) =
+            let round = rounds_used + state.rounds + 1;
+            if !self.emit(AgentEvent::RoundStarted { round }).await {
+                return aborted_run(messages, state);
+            }
+
+            let (content, tool_calls, usage) =
                 match self.model_turn(&messages, &tool_schemas, &cancel).await {
                     ModelTurn::Completed {
                         content,
                         tool_calls,
-                    } => (content, tool_calls),
+                        usage,
+                    } => (content, tool_calls, usage),
                     ModelTurn::Cancelled => {
                         return self
                             .finish(session_id, SessionEndReason::Cancelled, messages, state)
@@ -240,6 +254,9 @@ impl AgentLoop {
 
             state.rounds += 1;
             messages.push(assistant_message(content, &tool_calls));
+            if !self.emit(AgentEvent::RoundFinished { round, usage }).await {
+                return aborted_run(messages, state);
+            }
 
             if tool_calls.is_empty() {
                 return self
@@ -347,6 +364,7 @@ impl AgentLoop {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let usage: Option<TokenUsage>;
 
         loop {
             let event = tokio::select! {
@@ -363,7 +381,10 @@ impl AgentLoop {
                     }
                 }
                 Some(LlmEvent::ToolCallRequested { call }) => tool_calls.push(call),
-                Some(LlmEvent::Done { .. }) => break,
+                Some(LlmEvent::Done { usage: done_usage }) => {
+                    usage = done_usage;
+                    break;
+                }
                 Some(LlmEvent::Error { message }) => return ModelTurn::Failed(message),
                 None => {
                     return ModelTurn::Failed("LLM stream ended without a Done event".to_owned());
@@ -374,6 +395,7 @@ impl AgentLoop {
         ModelTurn::Completed {
             content,
             tool_calls,
+            usage,
         }
     }
 
@@ -509,6 +531,8 @@ enum ModelTurn {
         content: String,
         /// Tool calls requested by the model, in arrival order.
         tool_calls: Vec<ToolCall>,
+        /// Token usage reported by the closing `Done` event.
+        usage: Option<TokenUsage>,
     },
     /// Cancellation interrupted the turn.
     Cancelled,

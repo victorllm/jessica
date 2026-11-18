@@ -12,7 +12,10 @@
 //! readable and reports `closed = false`; it is never silently upgraded to a
 //! complete trace.
 
-use jessica_core::trace::{TRACE_SCHEMA_VERSION, TraceEvent, TracePayload, TurnId};
+use jessica_core::trace::{
+    MIN_SUPPORTED_TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION, TraceEvent, TracePayload, TurnId,
+    is_supported_trace_schema_version,
+};
 use jessica_core::types::{AgentEvent, SessionId};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -196,9 +199,12 @@ impl EventStore {
     /// The first entry for a turn must be [`TracePayload::TurnStarted`], the
     /// last may be [`TracePayload::TurnEnded`], and no entry may follow the
     /// terminal marker. `legacy` is required for agent payloads that belong to
-    /// a session, except [`AgentEvent::AcceptanceFailed`], which is deliberately
-    /// trace-only: writing it to the legacy stream would place an event after
-    /// that attempt's `session_ended` and break recovery. When a legacy event is
+    /// a session, except audit-only facts that replay cannot reconstruct:
+    /// [`AgentEvent::AcceptanceFailed`] is trace-only because writing it would
+    /// place an event after that attempt's `session_ended` and break recovery;
+    /// [`AgentEvent::PermissionDecided`], [`AgentEvent::ChildSessionStarted`],
+    /// and [`AgentEvent::ChildSessionEnded`] are trace-only because replay does
+    /// not re-run permission gates or child sessions. When a legacy event is
     /// supplied, both writes commit in one transaction or neither does.
     ///
     /// The returned entry carries the allocated sequence number and the exact
@@ -237,6 +243,26 @@ impl EventStore {
             )
             .optional()
             .map_err(|source| store_error(&turn_id, source))?;
+
+        if head.is_some() {
+            let previous_version: Option<i64> = transaction
+                .query_row(
+                    "SELECT schema_version FROM trace_events \
+                     WHERE turn_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    [turn_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|source| store_error(&turn_id, source))?;
+            if let Some(previous_version) = previous_version
+                && previous_version != i64::from(trace.schema_version)
+            {
+                return Err(lifecycle_error(
+                    &turn_id,
+                    "every entry in a turn trace must use the same schema version",
+                ));
+            }
+        }
 
         let (seq, closed) = match head {
             None => {
@@ -385,6 +411,7 @@ impl EventStore {
         let mut events = Vec::new();
         let mut expected = 1_u64;
         let mut ended_at: Option<u64> = None;
+        let mut turn_version: Option<u16> = None;
         while let Some(row) = rows.next().map_err(|source| store_error(turn, source))? {
             let seq_value: i64 = row.get(0).map_err(|source| store_error(turn, source))?;
             let seq = u64::try_from(seq_value)
@@ -429,6 +456,13 @@ impl EventStore {
                     seq,
                     "the stored schema version disagrees with the payload",
                 ));
+            }
+            match turn_version {
+                None => turn_version = Some(event.schema_version),
+                Some(version) if version != event.schema_version => {
+                    return Err(invalid_error(turn, seq, "the trace mixes schema versions"));
+                }
+                Some(_) => {}
             }
             if event.turn_id.as_str() != turn {
                 return Err(invalid_error(
@@ -614,13 +648,24 @@ fn validate_envelope(trace: &TraceEvent) -> Result<(), EventStoreError> {
     if turn_id.is_empty() {
         return Err(invalid_error(&turn_id, 0, "the turn id must not be empty"));
     }
-    if trace.schema_version != TRACE_SCHEMA_VERSION {
+    if !is_supported_trace_schema_version(trace.schema_version) {
         return Err(invalid_error(
             &turn_id,
             0,
             &format!(
-                "unsupported trace schema version {}; this build supports {}",
-                trace.schema_version, TRACE_SCHEMA_VERSION
+                "unsupported trace schema version {}; this build supports {}..={}",
+                trace.schema_version, MIN_SUPPORTED_TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION
+            ),
+        ));
+    }
+    let required = trace.payload.required_trace_schema_version();
+    if required > trace.schema_version {
+        return Err(invalid_error(
+            &turn_id,
+            0,
+            &format!(
+                "payload requires trace schema version {required} but the envelope is version {}",
+                trace.schema_version
             ),
         ));
     }
@@ -706,14 +751,20 @@ fn validate_legacy_mirror(
             Ok(())
         }
         (TracePayload::Agent { event }, None) => {
-            if matches!(event, AgentEvent::AcceptanceFailed { .. }) {
+            if matches!(
+                event,
+                AgentEvent::AcceptanceFailed { .. }
+                    | AgentEvent::PermissionDecided { .. }
+                    | AgentEvent::ChildSessionStarted { .. }
+                    | AgentEvent::ChildSessionEnded { .. }
+            ) {
                 return Ok(());
             }
             if trace.session_id.is_some() {
                 return Err(invalid_error(
                     &turn_id,
                     0,
-                    "an agent payload that names a session must be mirrored into the legacy log",
+                    "an agent payload that names a session must be mirrored into the legacy log unless it is trace-only",
                 ));
             }
             Ok(())
