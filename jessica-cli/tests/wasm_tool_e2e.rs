@@ -34,7 +34,7 @@ fn cli_calls_a_wasm_tool_and_policy_denies_an_unlisted_native_tool() {
     let address = listener.local_addr().expect("mock server address");
     let server = thread::spawn(move || serve(listener));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace_root())
         .env("OPENAI_API_KEY", "test-key")
         .env("OPENAI_BASE_URL", format!("http://{address}/v1"))

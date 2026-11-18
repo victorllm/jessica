@@ -39,8 +39,9 @@ Build and install from a checkout:
 ./install.sh
 ```
 
-The installer runs `cargo build --release --locked -p jessica-cli` and installs
-the resulting binary into `~/.local/bin`. It also prepares `~/.jessica`:
+The installer runs `cargo build --release --locked -p jessica-cli`, installs
+the resulting `jessica` binary into `~/.local/bin`, and creates a `jessica-cli`
+compatibility symlink for one release cycle. It also prepares `~/.jessica`:
 
 - `harness.toml` configuration, created when absent (re-running keeps it;
   `--force-config` backs it up and regenerates it);
@@ -56,8 +57,8 @@ To register Jessica with a local Paseo installation, run:
 
 This creates a `~/.local/bin/jessica-paseo` launcher and merges a `jessica`
 provider into `~/.paseo/config.json`, keeping a timestamped backup. The
-launcher answers Paseo's `--version` probe, runs `jessica-cli acp` with
-`~/.jessica/harness.toml`, and reads provider credentials from
+launcher answers Paseo's `--version` probe by running `jessica --version`, runs
+`jessica acp` with `~/.jessica/harness.toml`, and reads provider credentials from
 `~/.jessica/paseo.env`. That file is created as a commented template with mode
 600; fill in one provider:
 
@@ -73,8 +74,10 @@ custom `jessica-paseo` launcher is kept unchanged; the provider entry is
 updated to use it. If the launcher does not already pass `--config`, the
 installer adds `--config <home>/harness.toml` to the Paseo provider command so
 that ACP sessions are persisted and can be resumed. `--paseo-env-file` is
-ignored for a kept launcher. After editing `paseo.env`, run `paseo reload` and
-verify with `paseo provider diagnostic jessica`.
+ignored for a kept launcher. A kept custom launcher must still answer Paseo's
+`--version` probe itself; the generated launcher delegates to
+`jessica --version`. After editing `paseo.env`, run `paseo reload` and verify
+with `paseo provider diagnostic jessica`.
 
 Options include `--bin-dir <dir>`, `--home <dir>`, `--paseo-home <dir>`,
 `--paseo-env-file <path>`, `--no-config`, and `--force-config`; run
@@ -87,8 +90,8 @@ Run it with:
 export PATH="$HOME/.local/bin:$PATH"
 export OPENAI_API_KEY=...
 
-jessica-cli --config ~/.jessica/harness.toml "your prompt"
-jessica-cli acp --config ~/.jessica/harness.toml
+jessica --config ~/.jessica/harness.toml "your prompt"
+jessica acp --config ~/.jessica/harness.toml
 ```
 
 ## Governed CLI demo
@@ -100,7 +103,7 @@ jessica-cli acp --config ~/.jessica/harness.toml
 Run the example from the workspace root:
 
 ```bash
-cargo run -p jessica-cli -- --config examples/harness.toml "修改 README 中的拼写错误并验证"
+cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml "修改 README 中的拼写错误并验证"
 ```
 
 `OPENAI_API_KEY` is required. `OPENAI_BASE_URL` and `OPENAI_MODEL` select an
@@ -113,7 +116,7 @@ Start it directly or through an ACP client:
 
 ```bash
 cargo build -p jessica-cli
-./target/debug/jessica-cli acp --config /absolute/path/harness.toml
+./target/debug/jessica acp --config /absolute/path/harness.toml
 ```
 
 `--config` is optional. Provider credentials come from the process environment:
@@ -273,7 +276,7 @@ Zed `settings.json` (Linux path: `~/.config/zed/settings.json`):
   "agent_servers": {
     "Jessica": {
       "type": "custom",
-      "command": "/absolute/path/to/jessica-cli",
+      "command": "/absolute/path/to/jessica",
       "args": ["acp", "--config", "/absolute/path/harness.toml"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
@@ -299,7 +302,7 @@ directory passed to `paseo --home`):
         "label": "Jessica",
         "description": "Deterministic Rust agent runtime",
         "command": [
-          "/absolute/path/to/jessica-cli",
+          "/absolute/path/to/jessica",
           "acp",
           "--config",
           "/absolute/path/harness.toml"

@@ -209,7 +209,7 @@ impl CliRun {
 fn run_cli(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> CliRun {
     let server = ScriptedServer::start(plans);
     let address = server.address();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -242,7 +242,7 @@ fn run_cli(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> C
 fn run_cli_repl(workspace: &Path, config: &Path, lines: &[&str], plans: Vec<Plan>) -> CliRun {
     let server = ScriptedServer::start(plans);
     let address = server.address();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")

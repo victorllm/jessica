@@ -106,7 +106,7 @@ fn replay_writes_byte_identical_jsonl_without_a_provider_or_tools() {
 
 /// Runs the real CLI in replay mode without any provider configuration.
 fn run_replay(config: &Path, session: &SessionId, output_path: &Path) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace_root())
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENAI_BASE_URL")

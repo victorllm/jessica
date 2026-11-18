@@ -287,7 +287,7 @@ impl TurnRun {
 fn run_turn(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> TurnRun {
     let server = ScriptedServer::start(plans);
     let address = server.address();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -320,7 +320,7 @@ fn run_turn(workspace: &Path, config: &Path, prompt: &str, plans: Vec<Plan>) -> 
 fn run_resume(workspace: &Path, config: &Path, session: &SessionId) -> (Output, Vec<String>) {
     let server = ScriptedServer::start(Vec::new());
     let address = server.address();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -347,7 +347,7 @@ fn run_resume(workspace: &Path, config: &Path, session: &SessionId) -> (Output, 
 
 /// Runs replay without any provider configuration.
 fn run_replay(workspace: &Path, config: &Path, session: &SessionId, output_path: &Path) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env_remove("OPENAI_API_KEY")

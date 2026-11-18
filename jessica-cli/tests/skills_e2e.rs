@@ -941,7 +941,7 @@ fn prepare_notes(workspace: &Path) {
 
 /// Runs one prompt turn against the scripted server.
 fn run_cli(address: SocketAddr, workspace: &Path, config: &Path, args: &[&str]) -> Output {
-    let child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -979,7 +979,7 @@ fn run_without_provider(
     args: &[&[&str]],
     subcommand: &str,
 ) -> Output {
-    let child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENAI_BASE_URL")

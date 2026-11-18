@@ -1,7 +1,13 @@
 [package]
 name = "jessica-cli"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+
+# Task 7.0b: the installed command is `jessica`. The package name stays
+# `jessica-cli` so existing `-p jessica-cli` build/test commands keep working.
+[[bin]]
+name = "jessica"
+path = "src/main.rs"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }

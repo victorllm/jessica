@@ -225,7 +225,7 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
 
 /// Spawns the CLI in REPL mode with piped stdin and output.
 fn spawn_repl(workspace: &Path, config: &Path, address: SocketAddr) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
