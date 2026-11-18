@@ -1692,6 +1692,102 @@ Phase 6 已知限制（同时记录到文末 Deferred）：
 
 ---
 
+Phase 7：交付地基（2026-11-17 新增；仅 7.0a/7.0b/7.0c）
+
+背景：Phase 0–6 与 ACP-0..7b 已完成，功能面已足够。当前主要风险从“缺功能”转为“不可交付、不可复现、不可信”：仓库没有 CI；8 个 crate 版本仍为 `0.1.0`，而 tag 已到 `v0.9.0`；二进制名为 `jessica-cli` 且没有 `--version`；发布只能本地编译；README 引用的 `DESIGN.md` 仍未入库。Phase 7 先只做三个不修改 `jessica-core` 的交付 Task；Trace Integrity、执行安全与能力扩展全部暂缓，记录到文末 Deferred，由用户单开 Task。
+
+Phase 7 全局约束：
+
+· 三个 Task 均不得修改 `jessica-core` 的公共 API；不得提前实现 Deferred 中的 Trace Integrity、安全加固或能力扩展。
+· 需要新增第三方 crate 或其他依赖（如 GitHub Action）时，先在 Task 中说明用途、版本与替代方案，并由用户批准；不得顺手升级无关依赖。
+· 每个 Task 独立验收；验收命令失败不得声明完成；完成后更新进度追踪与偏离说明。
+· 不顺手重构、不改 ACP 协议行为、不改现有测试语义来“让 CI 变绿”。
+
+依赖关系：7.0a 可独立执行；7.0b 不依赖 7.0a；7.0c 依赖 7.0b 的版本号与二进制命名。建议按 7.0a → 7.0b → 7.0c 顺序执行。
+
+Task 7.0a：CI 基线
+
+目标：把现有测试套件变成 push/PR 的强制门禁，防止后续改动回归；不引入任何 secrets 或外部服务依赖。
+
+操作：
+
+1. 新建 `.github/workflows/ci.yml`（仓库托管在 GitHub；若用户实际使用其他平台，则创建等价配置，不新增付费服务）。
+2. 触发条件：push 到 main、pull_request、workflow_dispatch；同一分支/PR 的并发运行取消旧任务。
+3. 步骤：
+   · checkout；
+   · 按 `rust-toolchain.toml` 安装工具链（含 rustfmt/clippy 组件）；
+   · 缓存 Cargo registry/git 与 target（key 含 `Cargo.lock`、工具链版本、OS）；
+   · `cargo fmt --check`；
+   · `cargo clippy --workspace --all-targets -- -D warnings`；
+   · `cargo test --workspace --locked`；
+   · `sh -n install.sh`。
+4. 不配置 API key；测试必须继续使用现有 mock/scripted provider。若测试需要 `wasm-tools`，确认仓库中的预编译 `.wasm` 足够，不在 CI 中临时安装未固定版本的工具。
+5. 在 workflow 注释或 README 中写明本地等价命令。
+
+验收：
+
+· PR 上 CI 全绿；日志中 `cargo test` 为 0 failed（测试总数可随代码变化）。
+· 本地故意加入一个失败断言并推送临时分支，CI 必须红；回滚后必须绿（不把该提交合入 main）。
+· `cargo fmt --check`、clippy、test 与本地执行结果一致；`sh -n install.sh` 通过。
+
+禁止：
+
+· 不设置 `continue-on-error`；不跳过 clippy/test；不通过删改测试让 CI 变绿；不引入需要 secrets 的步骤；不在 CI 中访问真实模型 API。
+
+Task 7.0b：版本与二进制命名统一
+
+目标：让 crate 版本、tag、安装产物和用户命令名一致；提供真实 `--version`。
+
+现状：8 个 crate 全部 `version = "0.1.0"`，tag 已到 `v0.9.0`；可执行文件名为 `jessica-cli`；自定义参数解析没有 `--version`；Paseo launcher 自行应答 `--version`。
+
+操作：
+
+1. 版本单一来源：workspace 使用 `[workspace.package] version = "0.10.0"`（最终版本号在 Task 开始时由用户确认），成员 crate 改为 `version.workspace = true`；更新 `Cargo.lock`。
+2. 二进制命名：在 `jessica-cli/Cargo.toml` 增加 `[[bin]] name = "jessica"`。兼容策略二选一并在 Task 记录中选择：
+   · 推荐：安装 `jessica` 主二进制，同时由 `install.sh` 创建 `jessica-cli` 兼容符号链接（或副本），至少保留一个发布周期；
+   · 或全量改名，并同步更新 `install.sh`、README、Paseo launcher、examples、测试与脚本，提供迁移说明。
+3. 在 `jessica-cli/src/main.rs` 的自定义参数解析中识别 `--version`/`-V`，输出 `jessica <CARGO_PKG_VERSION>` 并退出 0；不新增 clap 依赖。
+4. 更新 `install.sh`：安装目标名改为 `jessica`；`--paseo` 生成的 launcher 调用 `jessica acp ...`；保留自定义 launcher 的 `--config` 注入与重复检测逻辑。
+5. 对 `install.sh` 生成的 Paseo launcher，`--version` 不应再硬编码版本，应执行 `jessica --version`；保留的用户自定义 launcher 不覆盖，只在 README 说明版本探测要求。更新 README、示例命令和测试中的二进制路径。
+6. 不修改 `jessica-core`；不自行打 tag 或发布 release。
+
+验收：
+
+· `cargo build --workspace --locked` 通过；`cargo run -p jessica-cli --bin jessica -- --version` 输出 `jessica 0.10.0` 且退出码 0。
+· 临时 HOME 安装后 `~/.local/bin/jessica --version` 正确；若保留兼容入口，`jessica-cli --version` 输出一致。
+· `./install.sh --paseo` 在临时 HOME 下生成的 launcher 使用新命令；真实 Paseo 的 `paseo provider diagnostic jessica` 仍为 Ready（如环境可用，人工验收）。
+· `cargo test --workspace --locked` 全绿。
+
+禁止：
+
+· 不硬编码版本号到多个文件；不删除 `jessica-cli` 兼容入口而不提供迁移说明；不改 ACP 协议行为；不改 `jessica-core` 公共 API；不在未询问用户时打 tag。
+
+Task 7.0c：发布自动化与仓库卫生
+
+目标：让用户不依赖本地 Rust 工具链即可安装；让 README 引用的文件真实存在；保留本地编译安装路径。
+
+操作：
+
+1. 新增 tag 驱动的 release workflow：`v*` tag 触发，构建 release 二进制（至少 Linux x86_64；条件允许时增加 aarch64/macOS），生成 SHA-256 校验和，创建 GitHub Release 并上传产物。
+2. `install.sh` 增加下载安装模式（如 `--from-release`）：按平台选择产物，下载后校验 SHA-256，校验通过再原子安装；网络失败时给出清晰错误并提示 `./install.sh` 本地编译。保留现有 `--paseo` 集成。
+3. 确保 `DESIGN.md` 已入库且 README 第 19 行的引用有效；若仍未入库则提交。若设计文档暂不公开，则修改 README 删除引用；二选一，必须让链接有效。
+4. 处理 README 首行 `determinstic`：把 acceptance 夹具移到独立文件（如 `examples/typo.md`），修正 README，并更新 `examples/harness.toml` 指向新夹具，保证“首次验收失败→重试→修正”的演示仍可复现。
+5. 可选：增加 `CHANGELOG.md` 或 release notes 模板；不强制。
+
+验收：
+
+· 在没有本地 Rust 构建产物的临时目录中，用 release 产物安装成功；`jessica --version` 正确；篡改产物后校验失败并中止安装。
+· `git status` 干净；README 的 `DESIGN.md` 链接有效；`examples/harness.toml` 的 acceptance 演示仍能失败→重试→通过。
+· `sh -n install.sh`、`cargo fmt --check`、clippy、test 全绿。
+
+禁止：
+
+· 不跳过校验和；不把未签名产物说成已签名；不删除本地编译安装路径；不提交 `target/`、临时文件或无关改动；不在未询问用户时打 tag/发布 release。
+
+Phase 7 完成标准：7.0a/7.0b/7.0c 全部勾选，PR 上 CI 全绿，安装产物可复现；Trace Integrity 等后续项仍留在 Deferred，不得在本 Phase 顺手实现。
+
+---
+
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
 
 1. 一次会话只做一个 Task，完成后主动运行该 Task 的所有验收命令，把结果贴出来。
@@ -1759,9 +1855,21 @@ Task ACP-6a ☑ 约 25 分钟 仅完成 ACP-6 的 core/runtime 前置：`jessica
 Task ACP-6 ☑ 约 90 分钟（跨上下文恢复，未精确计时） 实现 ACP `session/request_permission`，范围按用户确认：敏感固定集 `bash`/`write_file`/`delegate_task`（`read_file`、WASM、MCP 仍仅受 policy）；仅顶层 `delegate_task` 询问，子工具在该次批准下运行；答复超时固定 5 分钟；敏感工具先 `pending`，`allow_once` 后先发同一 `toolCallId` 的 `in_progress` 再执行。`governance` 新增 `ToolPermissionDecision`/`ToolPermissionGate` 与 `GovernedTool::with_permission_gate`；顺序固定为预算触发 → policy → permission → 工具超时启动 → `execute_with_call` → 结果大小；空 `call.id` 不询问客户端直接失败；Reject/Cancelled/TimedOut/TransportFailed 全部 fail-closed、不执行工具；权限等待不计入 `budget.tool_timeout_ms`。`app` 的 `TurnRequest.permission_gate` 只传给 `write_file`/`bash`/`delegate_task`，CLI/resume 传 `None`。`acp_events` 敏感工具 `tool_call` 为 `Pending`（ACP wire 省略默认 status），新增 permission request/in-progress 更新并复用 provider id/title/kind/rawInput/locations。`acp` 新增 `AcpPermissionGate` 与 `AnnouncedToolCalls`：确认 pending `tool_call` 已进入同一 writer FIFO 后才入队请求；仅提供 `allow_once`/`reject_once`；固定 `TOOL_PERMISSION_TIMEOUT=300s`；客户端 `cancelled` 取消整个 prompt，超时/传输失败只失败当前工具；每请求 child token 取消时 writer 丢弃 `SentRequest` 并发 `$/cancel_request`；本地连接终止与 peer JSON-RPC 错误区分；未知 option/outcome 一律 Reject。测试：governance 17（含顺序、策略/预算先于权限、超时隔离、空 id、非 Allow 不执行、policy-only 不询问）；acp_events 14（pending/in_progress、同 id 复用）；acp 28（新增 9 个 gate 单测）；`tests/acp_stdio.rs` 42（新增 5 个真实进程 E2E：allow_once 顺序/选项/同 id/副作用、reject_once 不执行且模型可见原因、客户端 cancelled 结束 turn 且 session 可继续、pending 时 session/cancel 不执行且 session 可继续、delegation 仅父级询问且子 bash 执行；既有 bash 用例改为 pending→in_progress，close/delete/cancel 容忍 `$/cancel_request`）。README 新增 Permission requests 章节并移除“No permission requests”。偏离/说明：固定集与 5 分钟期限无配置项；只支持一次性批准、不持久化；超时只失败工具，只有客户端 cancelled/prompt 取消/close/delete/disconnect 结束 turn；子代理工具不二次询问；未改 jessica-core（ACP-6a 已完成前置）、jessica-memory、Cargo.toml，未新增第三方 crate。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 757 passed, 0 failed, 2 ignored（50 suites）；`cargo test -p jessica-cli --test acp_stdio` 42 passed；`cargo test -p jessica-cli --bin jessica-cli acp::tests` 28 passed；governance 17；acp_events 14。
 Task ACP-7b ☑ 约 30 分钟（含实现、8 个 E2E、官方 TypeScript ACP SDK 与 Paseo 0.15.3 验收） 仅实现 `session/list`/`delete`/`resume`/`close` 与索引枚举/删除；未实现 ACP-5/6、MCP、权限请求、archive/fork/status/set_title、ACP v2，未修改 jessica-core/jessica-memory/Cargo.toml，未新增第三方 crate。能力：`loadSession` 与 `sessionCapabilities.list/delete/resume` 仅在 `[events].path` + `[acp].state_dir` 成功打开时声明；`close` 始终声明，因为只释放内存 session。list：只枚举 canonical state_dir 中 stem 为小写十六进制、version=1/非空 id/绝对 cwd/非空 turn id、文件名与 id 一致的普通 `.json`；损坏/版本不符/错名/目录/符号链接跳过并 warn；过滤启动 root，可选 cwd 精确匹配；按 updatedAt 降序、session id 升序；固定页 100；游标 `acp-list-v1:{updatedAtMillis}:{sessionId}`（≤512B，非法 `-32602`）；只返回 sessionId/cwd/UTC RFC 3339 毫秒 updatedAt，无 title/内容/turn id。resume：拒绝非空 mcpServers/additionalDirectories/systemPrompt；同 cwd 校验；未知 `-32002`；历史重建复用 load，但零 replay；live 同 cwd 幂等。close：不要求持久化；live 先 remove、取消 lifetime token、经 per-session watch 最多等 5s；索引保留，close 后仍 list/load/resume；索引存在但未 live 幂等；无持久化/未知 `-32002`。delete：逻辑删除，先 mutation 锁下删索引，再 remove live 并最多等 5s；事件库不删不改；索引不存在但 live 成功；两者皆无 `-32002`；mutation 锁串行化 create/record/delete，晚到 prompt commit 不会重建索引。store 新增 list/exists/delete/read_index；exists 用 symlink_metadata，delete remove_file 幂等；load 对损坏直查 fail-closed，list 跳过；原子写保留。`AcpSession` 新增 watch 活动信号，finish_prompt 广播，wait_idle 先订阅再检查避免丢失唤醒。错误映射：未知 `-32002`、非法 `-32602`、无持久化 `-32601`、内部固定消息 `-32603`，不泄露路径/内容。测试：acp_store 新增 2（list 跳过无关/损坏/版本/错名；delete 只删索引且幂等），当前 9；ACP 服务单测新增能力矩阵/游标/UTC 日期/lifecycle 拒绝；`tests/acp_stdio.rs` 新增 8（list 元数据与损坏跳过；close 释放 live 且保留索引可 reload；close 取消 active 并等停止；resume 零 replay；delete 逻辑删除且事件库仍在；delete active 不重建索引；101 session 分页 100+1 无重复/丢失；无持久化 load/list/delete/resume `-32601` 而 close 成功），E2E 23→31。真实客户端（2026-11-16 UTC）：官方 `@agentclientprotocol/sdk` 2.7.0 临时脚本验证两 live session 的 list 元数据/cwd 过滤/非法游标、close 保留索引、delete 后 events.db 大小不变且 load `-32002`、重启后 list、resume 零 replay 且后续 provider 请求包含恢复上下文、live resume 幂等、再次重启 load 响应前 replay 且不含已删除 session；Paseo 0.15.3 隔离 home `/tmp/jessica-acp7b-paseo/home`、daemon `127.0.0.1:6769`、workspace `/home/ubuntu/jessica-acp7b-paseo-workspace`、临时 wrapper + 本地 mock `127.0.0.1:46669`，provider diagnostic Ready，首轮 run 成功，daemon stop/start 后 agent closed，`agent send` 经 load 保留首轮上下文并更新索引为 2 turns，`paseo delete` 后 ACP 子进程退出但索引仍保留，`paseo import <sessionId>` 恢复两轮历史且未新增 provider 请求；Paseo CLI 无直接 listImportableSessions 命令，list/delete/resume 由官方 SDK 覆盖。偏离/说明：close/delete drain 上限 5s，超时仍确认；list 包含零 turn 空索引（Paseo probe 会创建）；load/resume 与 delete/close 无全局串行化；list 是目录快照、跨页并发会漂移；RFC3339 手写无新依赖；未改部署 `~/.local/bin/jessica-cli`。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 713 passed, 0 failed, 2 ignored（50 suites）；`cargo test -p jessica-cli acp` 61 unit + 31 E2E 全通过。
 
+Task 7.0a ☑ 约 45 分钟（含远端 CI 与三次失败探针验证） — 新增 `.github/workflows/ci.yml`：push(main)/pull_request/workflow_dispatch，同一 workflow+ref 并发取消旧任务，`permissions: contents: read`；rustup 按 `rust-toolchain.toml` 安装 1.99.1 + rustfmt/clippy，缓存 `~/.cargo/registry`/`~/.cargo/git`/`target`（key 含 `Cargo.lock` 与 `rust-toolchain.toml`）；依次执行 fmt/clippy/test --locked/sh -n install.sh；仅使用 GitHub 官方 `actions/checkout@v4` 与 `actions/cache@v4`，无 secrets、不访问真实模型 API。README 增加“Development checks”。本地验收：YAML 解析通过；`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --locked`（50 suites, 757 passed, 0 failed, 2 ignored）、`sh -n install.sh`、`git diff --check` 全绿。远端验收：PR #29（https://github.com/victorllm/jessica/pull/29，head 649cf001）run 44300376015 全绿，fmt/clippy/test/installer 四步均 success。失败探针：临时分支 `ci/failure-probe` + draft PR #30（未合并，验证后关闭并删除分支）；最终探针 `jessica-cli/tests/aa_ci_failure_probe.rs` 在 run 44303163964 中 `Check formatting` 与 `Run Clippy` success，`Run tests` failure，日志显示 `ci_failure_probe` panic 于该文件第 3 行，确认测试门禁真实生效。偏离/说明：1) 本机 `github.com:443` 不可达（TLS recv error/连接超时），分支与提交改由 GitHub Git Data API 创建，本地提交 1553df1 与远端 649cf001 内容相同（tree 均为 add2dbaf4abe63054287483871dbc85a6789dbda）但 SHA 不同；PAT 需要 Workflows 写权限才能创建 `.github/workflows/ci.yml`。2) 首次探针 0b488c6 的断言未通过 rustfmt，run 44301798032 先在 `Check formatting` 变红，只证明格式门禁；第二次探针 ec44b333 位于 jessica-core，但 `cargo test --workspace` 先运行 jessica-cli，run 44302009658 因既有 shutdown 测试间歇失败而在探针执行前终止；第三次把探针移到 jessica-cli 并排在 shutdown 测试之前，才观察到预期的 `Run tests` 失败。3) run 44302009658 暴露既有测试 `shutdown_e2e::sigint_on_an_idle_repl_exits_130_without_creating_a_turn` 在 CI 中间歇失败（同分支绿色 run 44300376015 通过），已记入 Deferred，未在本次 Task 修改。4) 本 Task 未修改 `jessica-core`（探针文件仅存在于已删除的临时分支）。
+Task 7.0b ☐ 未开始 — 计划：workspace 版本单一来源（建议 0.10.0，用户确认）；二进制改名 jessica 并提供 jessica-cli 兼容别名；新增 --version；同步 install.sh/README/Paseo。
+Task 7.0c ☐ 未开始 — 计划：tag 驱动 release + SHA-256 校验 + install.sh 下载模式；提交 DESIGN.md；README 拼写夹具迁移；不自行打 tag。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
+
+· Phase 7 后续 P1 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：Trace Integrity v2。把“turn 成功返回 ⇒ 轨迹已完整持久化”变成不变量；先写 RFC，再决定是否修改冻结的 `AgentEvent`/EventStore。范围包括无损记录器（持久化失败 fail-closed、broadcast lag 显式 gap、acceptance 事件归属）、事件模型 v2（user/usage/round/permission/子会话）、EventStore v2（WAL/user_version/迁移/增量历史，消除 O(n²)）、trace verify/replay parity/子轨迹。任何 core 变更必须先经用户批准并单开 Task。
+· Phase 7 后续 P2 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：执行安全。bash/CommandSensor/CommandAcceptanceCheck/MCP 子进程的进程组终止与超时；文件工具 TOCTOU（openat2/cap-std 等需依赖审批）；Permission v2（allow_always/reject_always、作用域/撤销/审计）；WASI 确定性时钟/随机；密钥脱敏。
+· Phase 7 后续 P3 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：能力扩展。edit_file/apply_patch/grep/glob/list_dir；Anthropic prompt caching/thinking/image；MCP resume/HTTP-SSE、per-session workspace；memory/skills 显式写入与真实 embedder。
+· 可观测性仍按 2026-11-14 的决定暂缓，不因本次 Phase 7 规划重启。
+· 说明：以上三块只做优先级归组；与下方既有 Deferred 条目重复之处，以既有条目为准，且各项仍须单开 Task。
+
+· Task 7.0a CI 观察到既有测试 `jessica-cli/tests/shutdown_e2e.rs::sigint_on_an_idle_repl_exits_130_without_creating_a_turn` 间歇失败（run 44302009658：退出码 130 正确，但 stderr 未捕获到 `SIGINT received; stopping new turns and draining`；同一工作流 run 44300376015 通过）。疑似信号处理输出与进程退出/管道收集的时序竞态，会随机让 CI 变红；建议单开 Task 重现并修复（例如退出前同步 flush stderr，或让测试先等待该诊断行再断言退出码），不属于 7.0a 的 CI 配置范围。
 
 · Anthropic Provider 暂不支持 Prompt caching（cache_control）、thinking block 与多模态 image block；未知 content block 目前按 Other 忽略（thinking/image 内容不会进入 LlmEvent），若需要这些能力须单开 Task。
 · TokenBudgetGuard 的计数已由 CLI 的 TokenCountingProvider 接入，但依赖 Provider 在 LlmEvent::Done 报告 usage；Provider 未报告 usage 时无法计费或限额。若需在 runtime 内强制，必须先单开 Task 修改冻结契约或事件模型。

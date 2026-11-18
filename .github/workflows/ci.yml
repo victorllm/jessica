@@ -1,0 +1,68 @@
+# CI for Jessica.
+#
+# Local equivalent (also listed in README.md):
+#   cargo fmt --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo test --workspace --locked
+#   sh -n install.sh
+#
+# The workflow uses only GitHub-owned actions, requires no secrets, and never
+# calls a real model API. Tests use the repository's mock/scripted providers.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  checks:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: >-
+          rustup toolchain install
+          --profile minimal
+          --component rustfmt
+          --component clippy
+
+      - name: Cache Cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: >-
+            ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Check installer syntax
+        run: sh -n install.sh
