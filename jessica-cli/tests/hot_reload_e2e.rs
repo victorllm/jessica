@@ -96,7 +96,7 @@ impl Drop for TempDir {
 
 /// Spawns one one-shot CLI turn against `address`.
 fn spawn_one_shot(workspace: &Path, config: &Path, address: SocketAddr, prompt: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -317,7 +317,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, label: &str) {
 
 /// Spawns the CLI in REPL mode with piped stdin and output.
 fn spawn_repl(workspace: &Path, config: &Path, address: SocketAddr) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")

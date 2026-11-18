@@ -1,9 +1,9 @@
 #!/bin/sh
 # Jessica installer.
 #
-# Builds jessica-cli from this checkout, installs it into ~/.local/bin (or
-# --bin-dir), prepares ~/.jessica (or --home), and can register a Jessica ACP
-# provider with a local Paseo daemon.
+# Installs jessica from a prebuilt release or builds it from this checkout,
+# installs it into ~/.local/bin (or --bin-dir), prepares ~/.jessica (or
+# --home), and can register a Jessica ACP provider with a local Paseo daemon.
 #
 # Usage: ./install.sh [options]
 # Run with --help for the full option list.
@@ -14,6 +14,11 @@ BIN_DIR="${JESSICA_BIN_DIR:-}"
 DATA_DIR="${JESSICA_HOME:-}"
 FORCE_CONFIG=0
 WRITE_CONFIG=1
+FROM_RELEASE=0
+RELEASE_BASE_URL="${JESSICA_RELEASE_BASE_URL:-https://github.com/victorllm/jessica/releases/latest/download}"
+RELEASE_PLATFORM=""
+DOWNLOAD_DIR=""
+INSTALL_SOURCE=""
 PASEO=0
 PASEO_HOME="${PASEO_HOME:-}"
 PASEO_ENV_FILE=""
@@ -21,17 +26,26 @@ PASEO_ENV_CREATED=0
 PASEO_LAUNCHER_KIND=""
 PASEO_BACKUP=""
 TMP_BIN=""
+TMP_COMPAT=""
 TMP_PASEO_CONFIG=""
 TMP_PASEO_LAUNCHER=""
+source_bin=""
+source_version=""
 
 usage() {
     cat <<'EOF'
 Usage: install.sh [options]
 
-Builds jessica-cli from this checkout and prepares ~/.jessica.
+Installs jessica, then prepares ~/.jessica. By default jessica is built from
+this checkout; --from-release installs a prebuilt release instead.
+
+The installer also creates a `jessica-cli` compatibility symlink next to the
+installed `jessica` binary.
 
 Options:
-  --bin-dir <dir>          Install jessica-cli here (default: ~/.local/bin)
+  --from-release           Download and install the latest prebuilt release
+                           instead of building from this checkout
+  --bin-dir <dir>          Install jessica here (default: ~/.local/bin)
   --home <dir>             Store configuration and runtime data here
                            (default: ~/.jessica)
   --force-config           Overwrite harness.toml, keeping a timestamped backup
@@ -44,9 +58,17 @@ Options:
 
 Environment:
   JESSICA_BIN_DIR, JESSICA_HOME, PASEO_HOME
+  JESSICA_RELEASE_BASE_URL Override the release download base URL
+                           (default: https://github.com/victorllm/jessica/releases/latest/download)
 
-The build uses `cargo build --release --locked -p jessica-cli`. The generated
-harness.toml keeps runtime files under ~/.jessica:
+Without --from-release, the build uses `cargo build --release --locked -p
+jessica-cli`. With --from-release, the installer downloads
+jessica-<platform>.tar.gz and its .sha256 file, verifies the checksum before
+installing, and currently supports linux-x86_64. A checksum detects corrupted
+or tampered downloads; it is not a signature. If the download fails, run
+./install.sh (without --from-release) to build from source.
+
+The generated harness.toml keeps runtime files under ~/.jessica:
 
   harness.toml       configuration (created by this installer)
   events.db          append-only event log (created on first run)
@@ -83,6 +105,103 @@ absolute_path() {
         /*) printf '%s\n' "$1" ;;
         *) printf '%s/%s\n' "$PWD" "$1" ;;
     esac
+}
+
+fetch_url() {
+    url=$1
+    out=$2
+    if command -v curl >/dev/null 2>&1; then
+        case "$url" in
+            https://*)
+                curl -fsSL --proto '=https' --proto-redir '=https' \
+                    --connect-timeout 15 --max-time 300 --retry 2 \
+                    -o "$out" "$url"
+                ;;
+            *)
+                curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 \
+                    -o "$out" "$url"
+                ;;
+        esac
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=2 --timeout=30 -O "$out" "$url"
+    else
+        die "curl or wget is required for --from-release"
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "sha256sum or shasum is required to verify the release download"
+    fi
+}
+
+detect_release_platform() {
+    os_name=$(uname -s 2>/dev/null) || die "failed to detect the operating system with uname"
+    arch_name=$(uname -m 2>/dev/null) || die "failed to detect the CPU architecture with uname"
+    case "$os_name/$arch_name" in
+        Linux/x86_64|Linux/amd64)
+            printf '%s\n' "linux-x86_64"
+            ;;
+        *)
+            die "no prebuilt release for $os_name/$arch_name; run ./install.sh (without --from-release) to build from source"
+            ;;
+    esac
+}
+
+verify_checksum() {
+    archive=$1
+    checksum_file=$2
+    [ -f "$checksum_file" ] || die "checksum file not found: $checksum_file"
+
+    expected=$(awk 'NR == 1 { print $1 }' "$checksum_file")
+    [ -n "$expected" ] || die "checksum file is empty: $checksum_file"
+    case "$expected" in
+        *[!0-9a-fA-F]*) die "invalid SHA-256 checksum in $checksum_file" ;;
+    esac
+    [ "${#expected}" -eq 64 ] || die "invalid SHA-256 checksum in $checksum_file"
+
+    expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+    actual=$(sha256_of "$archive")
+    actual=$(printf '%s' "$actual" | tr 'A-F' 'a-f')
+    if [ "$actual" != "$expected" ]; then
+        die "SHA-256 mismatch for $(basename "$archive"): expected $expected, got $actual; refusing to install"
+    fi
+    note "Verified SHA-256: $actual"
+}
+
+prepare_release() {
+    RELEASE_PLATFORM=$(detect_release_platform)
+    release_asset="jessica-$RELEASE_PLATFORM.tar.gz"
+    DOWNLOAD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/jessica-release.XXXXXX") \
+        || die "failed to create a temporary directory for the release download"
+    release_archive="$DOWNLOAD_DIR/$release_asset"
+    release_checksum="$DOWNLOAD_DIR/$release_asset.sha256"
+    release_url="$RELEASE_BASE_URL/$release_asset"
+
+    note "Downloading $release_url"
+    if ! fetch_url "$release_url" "$release_archive"; then
+        die "failed to download $release_url; check your network, or run ./install.sh (without --from-release) to build from source"
+    fi
+    if ! fetch_url "$release_url.sha256" "$release_checksum"; then
+        die "failed to download $release_url.sha256; refusing to install without a checksum; run ./install.sh (without --from-release) to build from source"
+    fi
+
+    verify_checksum "$release_archive" "$release_checksum"
+
+    tar -xzf "$release_archive" -C "$DOWNLOAD_DIR" jessica \
+        || die "failed to extract $release_asset"
+    if [ -L "$DOWNLOAD_DIR/jessica" ]; then
+        die "$release_asset contains a symbolic link instead of a binary"
+    fi
+    [ -f "$DOWNLOAD_DIR/jessica" ] || die "$release_asset does not contain a jessica binary"
+    chmod 0755 "$DOWNLOAD_DIR/jessica" || die "failed to make the downloaded jessica executable"
+
+    source_bin="$DOWNLOAD_DIR/jessica"
+    INSTALL_SOURCE="prebuilt release ($RELEASE_PLATFORM, SHA-256 verified)"
 }
 
 toml_string() {
@@ -141,17 +260,16 @@ EOF
 
 render_paseo_launcher() {
     out=$1
-    sed "s/@JESSICA_VERSION@/$paseo_version/" > "$out" <<'WRAPPER'
+    cat > "$out" <<'WRAPPER'
 #!/bin/sh
 # Generated by Jessica's install.sh. Re-run `install.sh --paseo` to update.
 set -eu
 
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
-    printf '%s\n' '@JESSICA_VERSION@'
-    exit 0
+    exec "$self_dir/jessica" --version
 fi
 
-self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 jessica_home=${JESSICA_HOME:-$HOME/.jessica}
 env_file=${JESSICA_PASEO_ENV_FILE:-$jessica_home/paseo.env}
 
@@ -184,7 +302,7 @@ if [ -r "$env_file" ]; then
     done < "$env_file"
 fi
 
-exec "$self_dir/jessica-cli" acp --config "$jessica_home/harness.toml" "$@"
+exec "$self_dir/jessica" acp --config "$jessica_home/harness.toml" "$@"
 WRAPPER
 }
 
@@ -272,11 +390,17 @@ cleanup() {
     if [ -n "$TMP_BIN" ] && [ -f "$TMP_BIN" ]; then
         rm -f "$TMP_BIN"
     fi
+    if [ -n "$TMP_COMPAT" ] && { [ -L "$TMP_COMPAT" ] || [ -e "$TMP_COMPAT" ]; }; then
+        rm -f "$TMP_COMPAT"
+    fi
     if [ -n "$TMP_PASEO_CONFIG" ] && [ -f "$TMP_PASEO_CONFIG" ]; then
         rm -f "$TMP_PASEO_CONFIG"
     fi
     if [ -n "$TMP_PASEO_LAUNCHER" ] && [ -f "$TMP_PASEO_LAUNCHER" ]; then
         rm -f "$TMP_PASEO_LAUNCHER"
+    fi
+    if [ -n "$DOWNLOAD_DIR" ] && [ -d "$DOWNLOAD_DIR" ]; then
+        rm -rf "$DOWNLOAD_DIR"
     fi
 }
 
@@ -303,6 +427,10 @@ while [ $# -gt 0 ]; do
             ;;
         --home=*)
             DATA_DIR=${1#*=}
+            shift
+            ;;
+        --from-release)
+            FROM_RELEASE=1
             shift
             ;;
         --force-config)
@@ -388,49 +516,60 @@ if [ "$PASEO" -eq 1 ]; then
     fi
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || die "cannot resolve the installer directory"
-REPO_ROOT=$script_dir
-[ -f "$REPO_ROOT/Cargo.toml" ] || die "install.sh must be run from the Jessica checkout (Cargo.toml not found)"
-[ -f "$REPO_ROOT/jessica-cli/Cargo.toml" ] || die "install.sh must be run from the Jessica checkout (jessica-cli not found)"
+RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
+[ -n "$RELEASE_BASE_URL" ] || die "JESSICA_RELEASE_BASE_URL must not be empty"
+case "$RELEASE_BASE_URL" in
+    *'
+'*) die "JESSICA_RELEASE_BASE_URL must not contain newlines" ;;
+esac
 
-find_cargo() {
-    if command -v cargo >/dev/null 2>&1; then
-        return 0
+if [ "$FROM_RELEASE" -eq 1 ]; then
+    prepare_release
+else
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || die "cannot resolve the installer directory"
+    REPO_ROOT=$script_dir
+    [ -f "$REPO_ROOT/Cargo.toml" ] || die "install.sh must be run from the Jessica checkout (Cargo.toml not found)"
+    [ -f "$REPO_ROOT/jessica-cli/Cargo.toml" ] || die "install.sh must be run from the Jessica checkout (jessica-cli not found)"
+
+    find_cargo() {
+        if command -v cargo >/dev/null 2>&1; then
+            return 0
+        fi
+        if [ -f "$HOME/.cargo/env" ]; then
+            . "$HOME/.cargo/env"
+        fi
+        command -v cargo >/dev/null 2>&1 || die "cargo was not found; install Rust from https://rustup.rs or add cargo to PATH"
+    }
+
+    find_cargo
+
+    note "Building jessica (release) from $REPO_ROOT"
+    if ! ( cd "$REPO_ROOT" && cargo build --release --locked -p jessica-cli ); then
+        die "cargo build failed"
     fi
-    if [ -f "$HOME/.cargo/env" ]; then
-        . "$HOME/.cargo/env"
-    fi
-    command -v cargo >/dev/null 2>&1 || die "cargo was not found; install Rust from https://rustup.rs or add cargo to PATH"
-}
 
-find_cargo
+    target_dir=$(
+        cd "$REPO_ROOT" || exit 1
+        cargo metadata --format-version 1 --no-deps --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null \
+            | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' \
+            | head -n 1
+    ) || true
+    [ -n "$target_dir" ] || target_dir="$REPO_ROOT/target"
+    source_bin="$target_dir/release/jessica"
 
-paseo_version=$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || true)
-if [ -z "$paseo_version" ]; then
-    paseo_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' "$REPO_ROOT/jessica-cli/Cargo.toml" | head -n 1)
-fi
-paseo_version=$(printf '%s' "$paseo_version" | tr -cd 'A-Za-z0-9._+-')
-[ -n "$paseo_version" ] || paseo_version="0.1.0"
-
-note "Building jessica-cli (release) from $REPO_ROOT"
-if ! ( cd "$REPO_ROOT" && cargo build --release --locked -p jessica-cli ); then
-    die "cargo build failed"
+    [ -f "$source_bin" ] || die "build did not produce $source_bin"
+    [ -x "$source_bin" ] || chmod 0755 "$source_bin"
+    INSTALL_SOURCE="local build"
 fi
 
-target_dir=$(
-    cd "$REPO_ROOT" || exit 1
-    cargo metadata --format-version 1 --no-deps --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null \
-        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' \
-        | head -n 1
-) || true
-[ -n "$target_dir" ] || target_dir="$REPO_ROOT/target"
-source_bin="$target_dir/release/jessica-cli"
-
-[ -f "$source_bin" ] || die "build did not produce $source_bin"
-[ -x "$source_bin" ] || chmod 0755 "$source_bin"
-if ! "$source_bin" --help >/dev/null 2>&1; then
-    die "the built jessica-cli cannot run on this system"
+if ! source_version=$("$source_bin" --version 2>/dev/null); then
+    die "the jessica binary from the $INSTALL_SOURCE cannot run on this system"
 fi
+case "$source_version" in
+    "jessica "*) ;;
+    *) die "unexpected --version output from the $INSTALL_SOURCE: $source_version" ;;
+esac
+note "Using $source_version from the $INSTALL_SOURCE"
 
 # --- Prepare ~/.jessica and the configuration -----------------------------
 
@@ -469,13 +608,23 @@ fi
 # --- Install the binary atomically ----------------------------------------
 
 mkdir -p "$BIN_DIR" || die "failed to create $BIN_DIR"
-installed_bin="$BIN_DIR/jessica-cli"
-TMP_BIN="$BIN_DIR/.jessica-cli.$$"
+installed_bin="$BIN_DIR/jessica"
+TMP_BIN="$BIN_DIR/.jessica.$$"
 
-cp "$source_bin" "$TMP_BIN" || die "failed to copy jessica-cli into $BIN_DIR"
+cp "$source_bin" "$TMP_BIN" || die "failed to copy jessica into $BIN_DIR"
 chmod 0755 "$TMP_BIN" || die "failed to make $TMP_BIN executable"
 mv -f "$TMP_BIN" "$installed_bin" || die "failed to install $installed_bin"
 TMP_BIN=""
+
+# Task 7.0b: keep the old command name as a compatibility entry for at least
+# one release cycle. The relative target keeps the pair working if BIN_DIR is
+# moved as a whole.
+compat_bin="$BIN_DIR/jessica-cli"
+TMP_COMPAT="$BIN_DIR/.jessica-cli.$$"
+rm -f "$TMP_COMPAT"
+ln -s jessica "$TMP_COMPAT" || die "failed to create $compat_bin"
+mv -f "$TMP_COMPAT" "$compat_bin" || die "failed to install $compat_bin"
+TMP_COMPAT=""
 
 # --- Optional local Paseo integration -------------------------------------
 
@@ -556,8 +705,10 @@ fi
 # --- Report ---------------------------------------------------------------
 
 note ""
-note "Installed Jessica (local build)"
+note "Installed $source_version"
+note "  source: $INSTALL_SOURCE"
 note "  binary: $installed_bin"
+note "  compatibility: $compat_bin -> jessica"
 if [ "$WRITE_CONFIG" -eq 1 ]; then
     note "  config: $config_path"
 fi
@@ -575,11 +726,11 @@ esac
 note ""
 note "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL / OPENAI_MODEL), then:"
 if [ "$WRITE_CONFIG" -eq 1 ]; then
-    note "  jessica-cli --config \"$config_path\" \"your prompt\""
-    note "  jessica-cli acp --config \"$config_path\""
+    note "  jessica --config \"$config_path\" \"your prompt\""
+    note "  jessica acp --config \"$config_path\""
 else
-    note "  jessica-cli --config <your-config> \"your prompt\""
-    note "  jessica-cli acp --config <your-config>"
+    note "  jessica --config <your-config> \"your prompt\""
+    note "  jessica acp --config <your-config>"
 fi
 
 if [ "$PASEO" -eq 1 ]; then

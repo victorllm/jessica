@@ -104,7 +104,7 @@ impl AcpProcess {
         environment: &[(&str, String)],
         extra_args: &[&str],
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_jessica-cli"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jessica"));
         command
             .arg("acp")
             .args(extra_args)

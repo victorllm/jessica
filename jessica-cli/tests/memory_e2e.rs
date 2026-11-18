@@ -418,7 +418,7 @@ fn run_cli(
     let body = text_response(response);
     let server = thread::spawn(move || serve_once(listener, body));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("JESSICA_PROVIDER")
         .env("OPENAI_API_KEY", "test-key")
@@ -444,7 +444,7 @@ fn run_cli(
 
 /// Runs the real CLI in replay mode without any provider configuration.
 fn run_replay(workspace: &Path, config: &Path, session: &SessionId, output_path: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica-cli"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace)
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENAI_BASE_URL")

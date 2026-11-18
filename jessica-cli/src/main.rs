@@ -402,6 +402,12 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                 print_usage();
                 return Ok(None);
             }
+            "--version" | "-V" => {
+                // The workspace version is the single source: the package
+                // inherits it, so this reports the same value as the manifests.
+                println!("jessica {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
             "--config" => {
                 let path = args.next().ok_or(CliError::MissingConfigPath)?;
                 set_config(&mut config, PathBuf::from(path))?;
