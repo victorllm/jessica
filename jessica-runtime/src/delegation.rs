@@ -25,18 +25,24 @@
 //!
 //! [`AgentChildExecutor`] builds a fresh tool registry and transcript for every
 //! delegation. It shares only the parent provider (and therefore the parent's
-//! token budget); child events go to a private bounded broadcast channel that is
-//! never forwarded or persisted. The child is a bare [`crate::AgentLoop`], so it
-//! has no harness, memory, skills, sensors, or acceptance checks.
+//! token budget); child model and tool events go to a private bounded broadcast
+//! channel that is never forwarded or persisted. Only the parent-side
+//! [`AgentEvent::ChildSessionStarted`] and [`AgentEvent::ChildSessionEnded`]
+//! lifecycle events are offered to the parent sink and broadcast. The child is a
+//! bare [`crate::AgentLoop`], so it has no harness, memory, skills, sensors, or
+//! acceptance checks.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use jessica_core::events::EventSink;
 use jessica_core::llm::LlmProvider;
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
-use jessica_core::types::{Budget, Message, Role, SessionEndReason, SessionId, ToolResult};
+use jessica_core::types::{
+    AgentEvent, Budget, Message, Role, SessionEndReason, SessionId, ToolCall, ToolResult,
+};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -922,6 +928,10 @@ pub struct AgentChildExecutor {
     parent: ParentCapabilities,
     /// Limits for every child run.
     limits: DelegationLimits,
+    /// Optional producer-side sink for child lifecycle events.
+    sink: Option<Arc<dyn EventSink>>,
+    /// Optional parent broadcast sender for child lifecycle events.
+    events: Option<broadcast::Sender<AgentEvent>>,
 }
 
 impl AgentChildExecutor {
@@ -942,7 +952,42 @@ impl AgentChildExecutor {
             factory,
             parent,
             limits,
+            sink: None,
+            events: None,
         })
+    }
+
+    /// Attaches the parent's producer-side sink for child lifecycle events.
+    ///
+    /// The child's own model and tool events remain private. Only
+    /// [`AgentEvent::ChildSessionStarted`] and
+    /// [`AgentEvent::ChildSessionEnded`] are offered to the sink, before they
+    /// are broadcast. A sink failure prevents the child from starting (for the
+    /// start event) or turns the delegation into an error result (for the end
+    /// event).
+    pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Attaches the parent's broadcast sender for child lifecycle events.
+    ///
+    /// The sender is used only after the optional sink accepts the event, so
+    /// observers never see an event that the recorder rejected. A closed
+    /// receiver is ignored, matching [`AgentLoop`] behaviour.
+    pub fn with_event_sender(mut self, events: broadcast::Sender<AgentEvent>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Runs one child agent without an originating call id.
+    ///
+    /// This is the compatibility wrapper used when a caller has only the
+    /// arguments. The child lifecycle events it emits carry an empty `call_id`;
+    /// [`Tool::execute_with_call`] callers should use
+    /// [`execute_with_call`](Self::execute_with_call) instead.
+    pub async fn execute(&self, args: Value) -> ToolResult {
+        self.execute_with_call(args, "").await
     }
 
     /// Runs one child agent and renders its outcome as `delegate_task` JSON.
@@ -952,9 +997,16 @@ impl AgentChildExecutor {
     /// `tool_call_id` is left empty because the parent loop stamps the
     /// originating call id.
     ///
+    /// When a sink or event sender is attached, the child's lifecycle is
+    /// recorded as [`AgentEvent::ChildSessionStarted`] before the child model
+    /// is called and as [`AgentEvent::ChildSessionEnded`] when it finishes or
+    /// times out. A sink rejection before the child starts prevents the run; a
+    /// rejection when recording the end turns the delegation into an error
+    /// result. Child-internal events are never recorded on the parent stream.
+    ///
     /// A delegation timeout drops the child future. Because no final transcript
     /// exists, that result reports zero rounds and zero tool calls.
-    pub async fn execute(&self, args: Value) -> ToolResult {
+    pub async fn execute_with_call(&self, args: Value, call_id: &str) -> ToolResult {
         let fallback_hash = best_effort_child_session_hash(&args);
         let parsed = match parse_delegate_task_args(&args, self.limits.max_task_bytes) {
             Ok(parsed) => parsed,
@@ -976,6 +1028,22 @@ impl AgentChildExecutor {
             Err(error) => return self.error_result(0, 0, error, child_session_hash),
         };
 
+        let child_session_id = SessionId::new(child_session_hash.clone());
+        if !self
+            .emit_child_event(AgentEvent::ChildSessionStarted {
+                child_session_id: child_session_id.clone(),
+                call_id: call_id.to_owned(),
+            })
+            .await
+        {
+            return self.error_result(
+                0,
+                0,
+                "event sink failed while recording child session start".to_owned(),
+                child_session_hash,
+            );
+        }
+
         let messages = vec![
             Message::system(CHILD_AGENT_SYSTEM_PROMPT),
             Message::user(parsed.task()),
@@ -988,11 +1056,10 @@ impl AgentChildExecutor {
             events,
         );
         let cancel = CancellationToken::new();
-        let child_session_id = SessionId::new(child_session_hash.clone());
         let run = tokio::time::timeout(
             self.limits.timeout,
             child.run_with_transcript(
-                child_session_id,
+                child_session_id.clone(),
                 messages,
                 Some(self.limits.max_child_tool_calls),
                 cancel.clone(),
@@ -1004,6 +1071,24 @@ impl AgentChildExecutor {
             Ok(transcript) => transcript,
             Err(_) => {
                 cancel.cancel();
+                if !self
+                    .emit_child_event(AgentEvent::ChildSessionEnded {
+                        child_session_id,
+                        call_id: call_id.to_owned(),
+                        reason: SessionEndReason::Cancelled,
+                        rounds: 0,
+                        tool_calls: 0,
+                        tool_errors: 0,
+                    })
+                    .await
+                {
+                    return self.error_result(
+                        0,
+                        0,
+                        "event sink failed while recording child session end".to_owned(),
+                        child_session_hash,
+                    );
+                }
                 return self.error_result(
                     0,
                     0,
@@ -1016,10 +1101,50 @@ impl AgentChildExecutor {
             }
         };
 
-        render_child_outcome(
-            self.outcome(transcript, child_session_hash),
-            self.limits.max_result_bytes,
-        )
+        let rounds = transcript.rounds;
+        let tool_calls = transcript.tool_calls;
+        let tool_errors = transcript.tool_errors;
+        let reason = transcript.reason;
+        let outcome = self.outcome(transcript, child_session_hash.clone());
+        if !self
+            .emit_child_event(AgentEvent::ChildSessionEnded {
+                child_session_id,
+                call_id: call_id.to_owned(),
+                reason,
+                rounds,
+                tool_calls,
+                tool_errors,
+            })
+            .await
+        {
+            return render_child_outcome(
+                ChildOutcome::Error {
+                    rounds,
+                    tool_calls,
+                    error: "event sink failed while recording child session end".to_owned(),
+                    child_session_hash,
+                },
+                self.limits.max_result_bytes,
+            );
+        }
+        render_child_outcome(outcome, self.limits.max_result_bytes)
+    }
+
+    /// Offers a child lifecycle event to the sink, then broadcasts it.
+    ///
+    /// Returns false when the sink rejected the event; the event is not
+    /// broadcast in that case, so observers never see an event the recorder
+    /// refused.
+    async fn emit_child_event(&self, event: AgentEvent) -> bool {
+        if let Some(sink) = &self.sink
+            && sink.emit(event.clone()).await.is_err()
+        {
+            return false;
+        }
+        if let Some(events) = &self.events {
+            let _ = events.send(event);
+        }
+        true
     }
 
     /// Maps a finished child transcript to the fixed outcome contract.
@@ -1228,6 +1353,20 @@ impl DelegateTaskTool {
     pub fn new(executor: Arc<AgentChildExecutor>) -> Self {
         Self { executor }
     }
+
+    /// Marks the rendered result as an error unless the child succeeded.
+    fn rendered(&self, mut result: ToolResult) -> ToolResult {
+        let status = serde_json::from_str::<Value>(&result.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        result.is_error = !matches!(status.as_deref(), Some("ok" | "truncated"));
+        result
+    }
 }
 
 #[async_trait]
@@ -1241,17 +1380,15 @@ impl Tool for DelegateTaskTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        let mut result = self.executor.execute(args).await;
-        let status = serde_json::from_str::<Value>(&result.content)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        result.is_error = !matches!(status.as_deref(), Some("ok" | "truncated"));
-        result
+        self.rendered(self.executor.execute(args).await)
+    }
+
+    async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
+        self.rendered(
+            self.executor
+                .execute_with_call(call.arguments.clone(), &call.id)
+                .await,
+        )
     }
 }
 

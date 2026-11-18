@@ -86,6 +86,7 @@ fn a_complete_turn_is_written_losslessly_and_reads_back_closed() {
     let started_event = started(&turn, &session);
     let session_started = AgentEvent::SessionStarted {
         session_id: session.clone(),
+        messages: Vec::new(),
     };
     let delta = AgentEvent::ModelDelta {
         text: "hi".to_owned(),
@@ -203,7 +204,7 @@ fn a_complete_turn_is_written_losslessly_and_reads_back_closed() {
 
     let raw: String = appended[3].payload_json().to_owned();
     let raw: serde_json::Value = serde_json::from_str(&raw).expect("payload must be JSON");
-    assert_eq!(raw["schema_version"], json!(1));
+    assert_eq!(raw["schema_version"], json!(2));
     assert_eq!(raw["attempt"], json!(1));
     assert_eq!(raw["session_id"], json!("cli-complete"));
     assert_eq!(raw["payload"]["kind"], json!("agent"));
@@ -342,7 +343,7 @@ fn envelope_context_is_validated_before_storage() {
     ));
 
     let mut future = started(&turn, &session);
-    future.schema_version = 2;
+    future.schema_version = 3;
     let error = store
         .append_traced(&future, None, Timestamp::from_millis(2))
         .expect_err("an unknown schema version must be rejected");
@@ -490,6 +491,7 @@ fn a_trace_append_and_its_legacy_mirror_roll_back_together() {
     let turn = TurnId::new("turn-atomic");
     let session_started = AgentEvent::SessionStarted {
         session_id: session.clone(),
+        messages: Vec::new(),
     };
     let delta = AgentEvent::ModelDelta {
         text: "must roll back".to_owned(),
@@ -512,7 +514,7 @@ fn a_trace_append_and_its_legacy_mirror_roll_back_together() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, payload_json, timestamp) \
-             VALUES (?1, 3, 1, 'gap', '{}', 0)",
+             VALUES (?1, 3, 2, 'gap', '{}', 0)",
             [turn.as_str()],
         )
         .expect("the competing row should insert");
@@ -844,7 +846,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, payload_json, timestamp) \
-             VALUES (?1, 1, 1, 'agent', 'model_delta', ?2, 0)",
+             VALUES (?1, 1, 2, 'agent', 'model_delta', ?2, 0)",
             params![missing_start.as_str(), agent_payload],
         )
         .expect("row should insert");
@@ -865,7 +867,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
                 "INSERT INTO trace_events \
                  (turn_id, seq, schema_version, payload_kind, event_type, attempt, session_id, \
                   payload_json, timestamp) \
-                 VALUES (?1, ?2, 1, ?3, ?4, NULL, ?5, ?6, 0)",
+                 VALUES (?1, ?2, 2, ?3, ?4, NULL, ?5, ?6, 0)",
                 params![
                     gap_turn.as_str(),
                     seq,
@@ -898,7 +900,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, payload_json, timestamp) \
-             VALUES (?1, 1, 1, 'gap', NULL, ?2, 0)",
+             VALUES (?1, 1, 2, 'gap', NULL, ?2, 0)",
             params![wrong_kind_turn.as_str(), wrong_kind_payload],
         )
         .expect("row should insert");
@@ -916,7 +918,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, session_id, payload_json, \
               timestamp) \
-             VALUES (?1, 1, 1, 'turn_started', NULL, ?2, ?3, 0)",
+             VALUES (?1, 1, 2, 'turn_started', NULL, ?2, ?3, 0)",
             params![
                 wrong_closed_turn.as_str(),
                 session.as_str(),
@@ -953,4 +955,256 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
         .trace_turn(&wrong_closed_turn)
         .expect_err("closed must agree with the terminal entry");
     assert!(matches!(error, EventStoreError::TraceLifecycle { .. }));
+}
+
+#[test]
+fn version_one_traces_remain_readable_without_new_vocabulary() {
+    let mut store = EventStore::open_in_memory().expect("store should open");
+    let turn = TurnId::new("turn-v1");
+    let session = SessionId::new("cli-v1");
+    let delta = AgentEvent::ModelDelta {
+        text: "legacy".to_owned(),
+    };
+
+    let mut start = started(&turn, &session);
+    start.schema_version = 1;
+    let mut agent = agent(&turn, 1, &session, delta.clone());
+    agent.schema_version = 1;
+    let mut end = ended(&turn, SessionEndReason::Completed);
+    end.schema_version = 1;
+
+    store
+        .append_traced(&start, None, Timestamp::from_millis(1))
+        .expect("a version-1 turn_started must append");
+    store
+        .append_traced(&agent, Some((&session, &delta)), Timestamp::from_millis(2))
+        .expect("a version-1 agent event must append");
+    store
+        .append_traced(&end, None, Timestamp::from_millis(3))
+        .expect("a version-1 turn_ended must append");
+
+    let trace = store
+        .trace_turn(&turn)
+        .expect("a version-1 trace must read")
+        .expect("the trace must exist");
+    assert!(trace.closed());
+    assert_eq!(
+        trace
+            .events()
+            .iter()
+            .map(|entry| entry.event().schema_version)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1],
+        "reading must not rewrite the stored version"
+    );
+    assert_eq!(
+        trace.events()[1].event().payload,
+        TracePayload::Agent { event: delta }
+    );
+}
+
+#[test]
+fn version_one_envelopes_reject_version_two_events() {
+    let mut store = EventStore::open_in_memory().expect("store should open");
+    let turn = TurnId::new("turn-v1-reject");
+    let session = SessionId::new("cli-v1-reject");
+
+    let mut start = started(&turn, &session);
+    start.schema_version = 1;
+    store
+        .append_traced(&start, None, Timestamp::from_millis(1))
+        .expect("turn_started should append");
+
+    let mut round = agent(&turn, 1, &session, AgentEvent::RoundStarted { round: 1 });
+    round.schema_version = 1;
+    let error = store
+        .append_traced(&round, None, Timestamp::from_millis(2))
+        .expect_err("a version-1 envelope cannot carry a round event");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { seq: 0, message, .. }
+                if message.contains("requires trace schema version 2")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let started_with_messages = AgentEvent::SessionStarted {
+        session_id: session.clone(),
+        messages: vec![Message::user("new input")],
+    };
+    let mut messages = agent(&turn, 1, &session, started_with_messages.clone());
+    messages.schema_version = 1;
+    let error = store
+        .append_traced(
+            &messages,
+            Some((&session, &started_with_messages)),
+            Timestamp::from_millis(2),
+        )
+        .expect_err("a version-1 envelope cannot carry bootstrap messages");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { seq: 0, message, .. }
+                if message.contains("requires trace schema version 2")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    assert_eq!(
+        store
+            .trace_turn(&turn)
+            .expect("trace should read")
+            .expect("trace should exist")
+            .events()
+            .len(),
+        1,
+        "rejected version-1 entries must not be stored"
+    );
+}
+
+#[test]
+fn mixed_schema_versions_are_rejected_at_append_and_read() {
+    let mut store = EventStore::open_in_memory().expect("store should open");
+    let turn = TurnId::new("turn-mixed-append");
+    let session = SessionId::new("cli-mixed-append");
+    let mut start = started(&turn, &session);
+    start.schema_version = 1;
+    store
+        .append_traced(&start, None, Timestamp::from_millis(1))
+        .expect("turn_started should append");
+
+    let delta = AgentEvent::ModelDelta {
+        text: "v2".to_owned(),
+    };
+    let error = store
+        .append_traced(
+            &agent(&turn, 1, &session, delta.clone()),
+            Some((&session, &delta)),
+            Timestamp::from_millis(2),
+        )
+        .expect_err("a version-2 entry cannot join a version-1 turn");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceLifecycle { message, .. }
+                if message.contains("same schema version")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let database = TempDatabase::new("mixed-read");
+    EventStore::open(database.path()).expect("store should install the schema");
+    let connection = Connection::open(database.path()).expect("raw connection should open");
+    let read_turn = TurnId::new("turn-mixed-read");
+    let read_session = SessionId::new("cli-mixed-read");
+    let mut v1_start = started(&read_turn, &read_session);
+    v1_start.schema_version = 1;
+    let mut v2_agent = agent(
+        &read_turn,
+        1,
+        &read_session,
+        AgentEvent::ModelDelta {
+            text: "mixed".to_owned(),
+        },
+    );
+    v2_agent.schema_version = 2;
+    connection
+        .execute(
+            "INSERT INTO trace_heads (turn_id, last_seq, closed, created_at) VALUES (?1, 2, 0, 0)",
+            [read_turn.as_str()],
+        )
+        .expect("head should insert");
+    for (seq, version, kind, event_type, payload) in [
+        (
+            1_i64,
+            1_i64,
+            "turn_started",
+            None,
+            serde_json::to_string(&v1_start).expect("start should serialize"),
+        ),
+        (
+            2_i64,
+            2_i64,
+            "agent",
+            Some("model_delta"),
+            serde_json::to_string(&v2_agent).expect("agent should serialize"),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO trace_events \
+                 (turn_id, seq, schema_version, payload_kind, event_type, session_id, payload_json, \
+                  timestamp) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                params![
+                    read_turn.as_str(),
+                    seq,
+                    version,
+                    kind,
+                    event_type,
+                    read_session.as_str(),
+                    payload
+                ],
+            )
+            .expect("trace row should insert");
+    }
+    drop(connection);
+
+    let store = EventStore::open(database.path()).expect("store should reopen");
+    let error = store
+        .trace_turn(&read_turn)
+        .expect_err("a turn that mixes schema versions is corrupt");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("mixes schema versions")
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn traces_from_a_future_schema_version_are_rejected_on_read() {
+    let database = TempDatabase::new("future-read");
+    EventStore::open(database.path()).expect("store should install the schema");
+    let connection = Connection::open(database.path()).expect("raw connection should open");
+    let turn = TurnId::new("turn-future-read");
+    let session = SessionId::new("cli-future-read");
+    let mut start = started(&turn, &session);
+    start.schema_version = 3;
+    connection
+        .execute(
+            "INSERT INTO trace_heads (turn_id, last_seq, closed, created_at) VALUES (?1, 1, 0, 0)",
+            [turn.as_str()],
+        )
+        .expect("head should insert");
+    connection
+        .execute(
+            "INSERT INTO trace_events \
+             (turn_id, seq, schema_version, payload_kind, event_type, session_id, payload_json, \
+              timestamp) \
+             VALUES (?1, 1, 3, 'turn_started', NULL, ?2, ?3, 0)",
+            params![
+                turn.as_str(),
+                session.as_str(),
+                serde_json::to_string(&start).expect("start should serialize")
+            ],
+        )
+        .expect("trace row should insert");
+    drop(connection);
+
+    let store = EventStore::open(database.path()).expect("store should reopen");
+    let error = store
+        .trace_turn(&turn)
+        .expect_err("a future schema version must be rejected");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("unsupported trace schema version 3")
+        ),
+        "unexpected error: {error:?}"
+    );
 }

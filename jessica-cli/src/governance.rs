@@ -26,7 +26,7 @@ use jessica_core::events::EventSink;
 use jessica_core::guard::{Guard, GuardContext, GuardDecision};
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolSchema};
-use jessica_core::types::{AgentEvent, BudgetKind, ToolCall, ToolResult};
+use jessica_core::types::{AgentEvent, BudgetKind, PermissionDecision, ToolCall, ToolResult};
 use jessica_harness::{Harness, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -200,6 +200,17 @@ pub(crate) enum ToolPermissionDecision {
     TransportFailed,
 }
 
+/// Maps a gate decision to the persisted permission outcome.
+pub(crate) fn permission_decision(decision: ToolPermissionDecision) -> PermissionDecision {
+    match decision {
+        ToolPermissionDecision::Allow => PermissionDecision::Allow,
+        ToolPermissionDecision::Reject => PermissionDecision::Deny,
+        ToolPermissionDecision::Cancelled => PermissionDecision::Cancelled,
+        ToolPermissionDecision::TimedOut => PermissionDecision::TimedOut,
+        ToolPermissionDecision::TransportFailed => PermissionDecision::Failed,
+    }
+}
+
 /// Asks a client for approval before a sensitive tool runs.
 ///
 /// Implementations run after policy authorization and before the tool timeout
@@ -296,8 +307,28 @@ impl GovernedTool {
                     ),
                 );
             }
-            match gate.request_permission(call).await {
-                ToolPermissionDecision::Allow => {}
+            let decision = gate.request_permission(call).await;
+            // The decision is recorded before the tool runs and before a
+            // denial is returned. An `Allow` whose event cannot be persisted
+            // must not execute: the trace would claim an unexplained run.
+            let recorded = self
+                .governance
+                .emit(AgentEvent::PermissionDecided {
+                    call: call.clone(),
+                    decision: permission_decision(decision),
+                })
+                .await;
+            match decision {
+                ToolPermissionDecision::Allow if recorded => {}
+                ToolPermissionDecision::Allow => {
+                    return ToolResult::error(
+                        String::new(),
+                        format!(
+                            "tool `{}` was not executed because the permission decision could not be recorded",
+                            self.inner.name()
+                        ),
+                    );
+                }
                 decision => {
                     let outcome = match decision {
                         ToolPermissionDecision::Reject => "was denied by the user",
@@ -399,6 +430,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
 
+    use jessica_core::events::EventSinkError;
     use jessica_core::types::{Message, TokenUsage};
     use jessica_harness::AllowlistPolicy;
 
@@ -930,6 +962,13 @@ mod tests {
         assert!(result.is_error);
         assert!(governance.tripped());
         assert!(cancel.is_cancelled());
+        match events.try_recv() {
+            Ok(AgentEvent::PermissionDecided { call, decision }) => {
+                assert_eq!(call.id, "call-1");
+                assert_eq!(decision, PermissionDecision::Allow);
+            }
+            other => panic!("expected PermissionDecided(Allow), got {other:?}"),
+        }
         let message = expect_budget_event(&mut events, BudgetKind::ToolTimeout);
         assert!(message.contains("bash"));
         assert_eq!(gate.calls().len(), 1);
@@ -1008,5 +1047,162 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    }
+    /// Sink that records every offered event.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<AgentEvent> {
+            self.events
+                .lock()
+                .expect("sink events mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl EventSink for RecordingSink {
+        async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+            self.events
+                .lock()
+                .expect("sink events mutex poisoned")
+                .push(event);
+            Ok(())
+        }
+    }
+
+    /// Sink that rejects every event.
+    struct RejectingSink;
+
+    #[async_trait]
+    impl EventSink for RejectingSink {
+        async fn emit(&self, _event: AgentEvent) -> Result<(), EventSinkError> {
+            Err(EventSinkError::new("recorder unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn every_permission_decision_is_recorded_before_it_takes_effect() {
+        let cases = [
+            (ToolPermissionDecision::Allow, PermissionDecision::Allow),
+            (ToolPermissionDecision::Reject, PermissionDecision::Deny),
+            (
+                ToolPermissionDecision::Cancelled,
+                PermissionDecision::Cancelled,
+            ),
+            (
+                ToolPermissionDecision::TimedOut,
+                PermissionDecision::TimedOut,
+            ),
+            (
+                ToolPermissionDecision::TransportFailed,
+                PermissionDecision::Failed,
+            ),
+        ];
+        for (gate_decision, expected) in cases {
+            let inner = Arc::new(MockTool::new("bash", "ran", Duration::ZERO));
+            let gate = Arc::new(MockGate::new(gate_decision, Duration::ZERO));
+            let sink = Arc::new(RecordingSink::default());
+            let (events, mut receiver) = broadcast::channel(16);
+            let cancel = CancellationToken::new();
+            let governance = Arc::new(
+                GovernanceState::new(events, cancel.clone())
+                    .with_event_sink(Some(Arc::clone(&sink) as Arc<dyn EventSink>)),
+            );
+            let tool = GovernedTool::new(
+                Arc::clone(&inner) as Arc<dyn Tool>,
+                harness(&["bash"]),
+                Arc::clone(&governance),
+                Duration::from_secs(1),
+                Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+                Arc::new(ResultSizeGuard::new(1024)),
+            )
+            .with_permission_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+            let call = ToolCall::new("call-1", "bash", serde_json::json!({"command": "true"}));
+
+            let result = tool.execute_with_call(&call).await;
+
+            let recorded = sink.events();
+            assert_eq!(
+                recorded.len(),
+                1,
+                "{gate_decision:?} must record exactly one decision"
+            );
+            match &recorded[0] {
+                AgentEvent::PermissionDecided {
+                    call: recorded_call,
+                    decision,
+                } => {
+                    assert_eq!(recorded_call, &call);
+                    assert_eq!(*decision, expected);
+                }
+                other => panic!("expected PermissionDecided, got {other:?}"),
+            }
+            assert_eq!(
+                receiver.try_recv(),
+                Ok(recorded[0].clone()),
+                "an accepted decision must broadcast after the sink"
+            );
+            if expected == PermissionDecision::Allow {
+                assert!(!result.is_error);
+                assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(result.is_error);
+                assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allow_that_cannot_be_recorded_never_executes_the_tool() {
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (events, mut receiver) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let governance = Arc::new(
+            GovernanceState::new(events, cancel.clone())
+                .with_event_sink(Some(Arc::new(RejectingSink) as Arc<dyn EventSink>)),
+        );
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            Arc::clone(&governance),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_permission_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-1",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("could not be recorded"),
+            "the error must explain the failed record: {}",
+            result.content
+        );
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "an unrecorded allow must not run the tool"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "the turn must stop after a sink failure"
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty),
+            "a rejected event must not be broadcast"
+        );
     }
 }

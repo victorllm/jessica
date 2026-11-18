@@ -81,6 +81,7 @@ fn sample_events(session_id: &SessionId) -> Vec<AgentEvent> {
     vec![
         AgentEvent::SessionStarted {
             session_id: session_id.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ModelDelta {
             text: "hel".to_owned(),
@@ -305,9 +306,14 @@ async fn logging_hook_emits_one_tracing_event_per_callback() {
 fn event_name(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::SessionStarted { .. } => "session_started",
+        AgentEvent::RoundStarted { .. } => "round_started",
+        AgentEvent::RoundFinished { .. } => "round_finished",
         AgentEvent::ModelDelta { .. } => "model_delta",
         AgentEvent::ToolCallStarted { .. } => "tool_call_started",
         AgentEvent::ToolCallFinished { .. } => "tool_call_finished",
+        AgentEvent::PermissionDecided { .. } => "permission_decided",
+        AgentEvent::ChildSessionStarted { .. } => "child_session_started",
+        AgentEvent::ChildSessionEnded { .. } => "child_session_ended",
         AgentEvent::PolicyDenied { .. } => "policy_denied",
         AgentEvent::BudgetExceeded { .. } => "budget_exceeded",
         AgentEvent::AcceptanceFailed { .. } => "acceptance_failed",

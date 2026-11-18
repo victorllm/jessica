@@ -43,7 +43,8 @@ pub(crate) trait EventJournal: Send + Sync {
     /// Atomically appends one trace entry and its optional legacy mirror.
     ///
     /// `legacy` must be present for agent events that belong to a session,
-    /// except acceptance failures, which are trace-only.
+    /// except audit-only facts that replay cannot reconstruct: acceptance
+    /// failures, permission decisions, and child-session lifecycle.
     async fn record_traced(
         &self,
         trace: TraceEvent,
@@ -126,8 +127,14 @@ impl EventRecorder {
 
     /// Loads a session's bootstrap messages and events.
     ///
-    /// Returns `None` when the session has no metadata row; such a session
-    /// cannot be replayed because the user messages are unknown.
+    /// The event-first source is the non-empty `messages` field on
+    /// [`AgentEvent::SessionStarted`]. Version-1 recordings have an empty field
+    /// and fall back to the `sessions.messages_json` metadata row written by
+    /// older builds. When both sources are present they must agree; a conflict
+    /// is an integrity failure, because resuming with either value would change
+    /// the conversation the model originally received.
+    ///
+    /// Returns `None` only when neither source has messages.
     pub(crate) async fn load(
         &self,
         session_id: SessionId,
@@ -135,11 +142,26 @@ impl EventRecorder {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
             let store = lock_store(&store);
-            let Some(initial_messages) = store.session_messages(&session_id)? else {
-                return Ok(None);
+            let stored_events = store.events(&session_id)?;
+            let event_messages = session_start_messages(&session_id, &stored_events)?;
+            let metadata_messages = store.session_messages(&session_id)?;
+
+            let initial_messages = match (event_messages, metadata_messages) {
+                (Some(event_messages), Some(metadata_messages))
+                    if event_messages != metadata_messages =>
+                {
+                    return Err(RecorderError::Integrity {
+                        message: format!(
+                            "session `{session_id}` has conflicting bootstrap messages in \
+                                 its session_started event and metadata row"
+                        ),
+                    });
+                }
+                (Some(event_messages), _) => event_messages,
+                (None, Some(metadata_messages)) => metadata_messages,
+                (None, None) => return Ok(None),
             };
-            let events = store
-                .events(&session_id)?
+            let events = stored_events
                 .into_iter()
                 .map(|stored| RecordedEvent::new(stored.seq(), stored.event().clone()))
                 .collect();
@@ -150,8 +172,51 @@ impl EventRecorder {
         })
         .await
         .map_err(RecorderError::Task)?
-        .map_err(RecorderError::Store)
     }
+}
+
+/// Returns the bootstrap messages carried by the event stream, if any.
+///
+/// Version-1 streams store an empty vector, so this returns `None` and lets the
+/// caller fall back to metadata. Multiple non-empty `SessionStarted` events
+/// must carry identical messages; anything else cannot be resumed
+/// deterministically.
+fn session_start_messages(
+    session_id: &SessionId,
+    events: &[jessica_memory::StoredEvent],
+) -> Result<Option<Vec<Message>>, RecorderError> {
+    let mut found: Option<Vec<Message>> = None;
+    for stored in events {
+        let AgentEvent::SessionStarted {
+            session_id: event_session,
+            messages,
+        } = stored.event()
+        else {
+            continue;
+        };
+        if event_session != session_id {
+            return Err(RecorderError::Integrity {
+                message: format!(
+                    "session `{session_id}` contains a session_started event for `{event_session}`"
+                ),
+            });
+        }
+        if messages.is_empty() {
+            continue;
+        }
+        match &found {
+            Some(existing) if existing != messages => {
+                return Err(RecorderError::Integrity {
+                    message: format!(
+                        "session `{session_id}` has conflicting session_started messages"
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => found = Some(messages.clone()),
+        }
+    }
+    Ok(found)
 }
 
 #[async_trait]
@@ -221,4 +286,146 @@ pub(crate) enum RecorderError {
         /// Description of the violated rule.
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Database path removed together with its SQLite sidecars.
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "jessica-events-{label}-{}-{unique}.sqlite",
+                std::process::id()
+            )))
+        }
+
+        fn as_path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut sidecar = self.0.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(sidecar));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_started_messages_supply_the_bootstrap_without_metadata() {
+        let database = TempPath::new("event-first");
+        let recorder = EventRecorder::open(database.as_path().to_path_buf())
+            .await
+            .expect("recorder should open");
+        let session = SessionId::new("events-event-first");
+        let messages = vec![Message::system("event system"), Message::user("event user")];
+        recorder
+            .append(
+                &session,
+                &AgentEvent::SessionStarted {
+                    session_id: session.clone(),
+                    messages: messages.clone(),
+                },
+            )
+            .await
+            .expect("session_started should append");
+
+        let stored = recorder
+            .load(session.clone())
+            .await
+            .expect("load should succeed")
+            .expect("the session should exist");
+        assert_eq!(
+            stored.initial_messages, messages,
+            "a version-2 session_started must provide the bootstrap messages"
+        );
+        assert_eq!(stored.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_session_started_falls_back_to_metadata() {
+        let database = TempPath::new("metadata-fallback");
+        let recorder = EventRecorder::open(database.as_path().to_path_buf())
+            .await
+            .expect("recorder should open");
+        let session = SessionId::new("events-fallback");
+        let metadata = vec![
+            Message::system("metadata system"),
+            Message::user("metadata user"),
+        ];
+        recorder
+            .record_session_start(&session, &metadata)
+            .await
+            .expect("metadata should record");
+        recorder
+            .append(
+                &session,
+                &AgentEvent::SessionStarted {
+                    session_id: session.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("version-1 session_started should append");
+
+        let stored = recorder
+            .load(session.clone())
+            .await
+            .expect("load should succeed")
+            .expect("the session should exist");
+        assert_eq!(
+            stored.initial_messages, metadata,
+            "an empty version-1 field must fall back to metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_bootstrap_sources_fail_closed() {
+        let database = TempPath::new("conflict");
+        let recorder = EventRecorder::open(database.as_path().to_path_buf())
+            .await
+            .expect("recorder should open");
+        let session = SessionId::new("events-conflict");
+        recorder
+            .record_session_start(
+                &session,
+                &[
+                    Message::system("metadata system"),
+                    Message::user("metadata user"),
+                ],
+            )
+            .await
+            .expect("metadata should record");
+        recorder
+            .append(
+                &session,
+                &AgentEvent::SessionStarted {
+                    session_id: session.clone(),
+                    messages: vec![Message::system("event system"), Message::user("event user")],
+                },
+            )
+            .await
+            .expect("session_started should append");
+
+        let error = match recorder.load(session.clone()).await {
+            Ok(_) => panic!("conflicting bootstrap messages must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, RecorderError::Integrity { message } if message.contains("conflicting bootstrap messages")),
+            "unexpected error: {error:?}"
+        );
+    }
 }

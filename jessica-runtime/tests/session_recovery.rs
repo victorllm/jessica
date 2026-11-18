@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
-    AgentEvent, Budget, Message, SessionEndReason, SessionId, ToolCall, ToolResult,
+    AgentEvent, Budget, Message, SessionEndReason, SessionId, TokenUsage, ToolCall, ToolResult,
 };
 use jessica_runtime::{AgentLoop, RecordedEvent, RecoveryError, recover_session};
 use serde_json::{Value, json};
@@ -314,6 +314,7 @@ async fn checkpoints_in_the_middle_of_a_turn_are_rejected() {
     let events = recorded(&[
         AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted {
             call: ToolCall::new("call-1", "echo", json!({"step": 1})),
@@ -330,6 +331,7 @@ async fn checkpoints_in_the_middle_of_a_turn_are_rejected() {
     let events = recorded(&[
         AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted {
             call: ToolCall::new("call-1", "echo", json!({})),
@@ -360,10 +362,9 @@ async fn an_ended_checkpoint_returns_the_recorded_reason_without_calling_anythin
     )
     .expect("the complete stream must recover");
     assert_eq!(checkpoint.end_reason(), Some(SessionEndReason::Completed));
-    // The first two model turns emitted tool calls without text, so the event
-    // stream cannot separate them from one turn requesting two tools; they
-    // count as one observable round, followed by the text round.
-    assert_eq!(checkpoint.rounds_completed(), 2);
+    // Explicit round boundaries separate the two tool-only model calls from
+    // the final text round even though the text-only heuristic could not.
+    assert_eq!(checkpoint.rounds_completed(), 3);
     assert_eq!(
         checkpoint.messages().last(),
         Some(&Message::assistant("finished"))
@@ -398,6 +399,7 @@ async fn cancelled_rounds_keep_their_interrupted_tool_and_stop_resuming() {
     let events = recorded(&[
         AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted {
             call: ToolCall::new("call-1", "echo", json!({"step": 1})),
@@ -430,6 +432,7 @@ async fn policy_and_budget_events_are_informational_during_replay() {
     let events = recorded(&[
         AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted { call: call.clone() },
         AgentEvent::PolicyDenied {
@@ -470,6 +473,7 @@ async fn inconsistent_streams_are_rejected() {
     let other = SessionId::new("other-session");
     let events = recorded(&[AgentEvent::SessionStarted {
         session_id: other.clone(),
+        messages: Vec::new(),
     }]);
     match recover_session(&session_id(), Vec::new(), &events, None) {
         Err(RecoveryError::SessionMismatch { expected, found }) => {
@@ -484,6 +488,7 @@ async fn inconsistent_streams_are_rejected() {
             2,
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: Vec::new(),
             },
         ),
         RecordedEvent::new(
@@ -504,6 +509,7 @@ async fn inconsistent_streams_are_rejected() {
     let events = recorded(&[
         AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         },
         AgentEvent::SessionEnded {
             session_id: session_id(),
@@ -525,4 +531,188 @@ async fn inconsistent_streams_are_rejected() {
         recover_session(&session_id(), Vec::new(), &events, None),
         Err(RecoveryError::MissingSessionStart)
     );
+}
+
+/// Builds a complete explicit-round transcript with the given round usage.
+fn explicit_round_events(usage: Option<TokenUsage>) -> Vec<AgentEvent> {
+    let messages = vec![Message::system("system"), Message::user("go")];
+    let call = ToolCall::new("call-1", "echo", json!({"step": 1}));
+    vec![
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages,
+        },
+        AgentEvent::RoundStarted { round: 1 },
+        AgentEvent::ModelDelta {
+            text: "thinking".to_owned(),
+        },
+        AgentEvent::RoundFinished { round: 1, usage },
+        AgentEvent::RoundStarted { round: 2 },
+        AgentEvent::RoundFinished { round: 2, usage },
+        AgentEvent::ToolCallStarted { call: call.clone() },
+        AgentEvent::ToolCallFinished {
+            result: ToolResult::success("call-1", "tool output"),
+        },
+        AgentEvent::RoundStarted { round: 3 },
+        AgentEvent::ModelDelta {
+            text: "done".to_owned(),
+        },
+        AgentEvent::RoundFinished { round: 3, usage },
+        AgentEvent::SessionEnded {
+            session_id: session_id(),
+            reason: SessionEndReason::Completed,
+        },
+    ]
+}
+
+#[test]
+fn explicit_rounds_rebuild_the_transcript_without_using_usage() {
+    let with_usage = explicit_round_events(Some(TokenUsage::new(11, 7)));
+    let checkpoint = recover_session(&session_id(), Vec::new(), &recorded(&with_usage), None)
+        .expect("explicit rounds must recover");
+    assert_eq!(checkpoint.rounds_completed(), 3);
+    assert_eq!(checkpoint.end_reason(), Some(SessionEndReason::Completed));
+    assert_eq!(
+        checkpoint.messages(),
+        &[
+            Message::system("system"),
+            Message::user("go"),
+            Message::assistant("thinking"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall::new("call-1", "echo", json!({"step": 1}))]
+            ),
+            Message::tool("call-1", "tool output"),
+            Message::assistant("done"),
+        ]
+    );
+
+    let without_usage = explicit_round_events(None);
+    let usage_free = recover_session(&session_id(), Vec::new(), &recorded(&without_usage), None)
+        .expect("usage-free explicit rounds must recover identically");
+    assert_eq!(
+        usage_free, checkpoint,
+        "token usage is informational and must not change recovery"
+    );
+}
+
+#[test]
+fn session_started_messages_are_authoritative_and_must_match_the_caller() {
+    let messages = vec![Message::system("event system"), Message::user("event user")];
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: messages.clone(),
+        },
+        AgentEvent::RoundStarted { round: 1 },
+        AgentEvent::RoundFinished {
+            round: 1,
+            usage: None,
+        },
+        AgentEvent::SessionEnded {
+            session_id: session_id(),
+            reason: SessionEndReason::Completed,
+        },
+    ]);
+
+    let checkpoint = recover_session(&session_id(), Vec::new(), &events, None)
+        .expect("the event must supply bootstrap messages when the caller has none");
+    assert_eq!(&checkpoint.messages()[..2], messages.as_slice());
+
+    let checkpoint = recover_session(&session_id(), messages.clone(), &events, None)
+        .expect("agreeing caller and event messages must recover");
+    assert_eq!(&checkpoint.messages()[..2], messages.as_slice());
+
+    let conflicting = vec![Message::system("metadata"), Message::user("metadata")];
+    match recover_session(&session_id(), conflicting, &events, None) {
+        Err(RecoveryError::InputMismatch { seq }) => assert_eq!(seq, 1),
+        other => panic!("expected InputMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_explicit_rounds_are_rejected() {
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: Vec::new(),
+        },
+        AgentEvent::RoundStarted { round: 2 },
+    ]);
+    match recover_session(&session_id(), Vec::new(), &events, None) {
+        Err(RecoveryError::RoundSequence {
+            seq,
+            expected,
+            found,
+        }) => {
+            assert_eq!((seq, expected, found), (2, 1, 2));
+        }
+        other => panic!("expected RoundSequence, got {other:?}"),
+    }
+
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: Vec::new(),
+        },
+        AgentEvent::RoundFinished {
+            round: 1,
+            usage: None,
+        },
+    ]);
+    match recover_session(&session_id(), Vec::new(), &events, None) {
+        Err(RecoveryError::UnexpectedRoundFinish { seq, round }) => {
+            assert_eq!((seq, round), (2, 1));
+        }
+        other => panic!("expected UnexpectedRoundFinish, got {other:?}"),
+    }
+
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: Vec::new(),
+        },
+        AgentEvent::RoundStarted { round: 1 },
+        AgentEvent::RoundStarted { round: 2 },
+    ]);
+    match recover_session(&session_id(), Vec::new(), &events, None) {
+        Err(RecoveryError::UnexpectedRoundStart { seq, round }) => {
+            assert_eq!((seq, round), (3, 2));
+        }
+        other => panic!("expected UnexpectedRoundStart, got {other:?}"),
+    }
+
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: Vec::new(),
+        },
+        AgentEvent::RoundStarted { round: 1 },
+        AgentEvent::ToolCallStarted {
+            call: ToolCall::new("call-1", "echo", json!({})),
+        },
+    ]);
+    match recover_session(&session_id(), Vec::new(), &events, None) {
+        Err(RecoveryError::MissingRoundFinish { seq }) => assert_eq!(seq, 3),
+        other => panic!("expected MissingRoundFinish, got {other:?}"),
+    }
+
+    let events = recorded(&[
+        AgentEvent::SessionStarted {
+            session_id: session_id(),
+            messages: Vec::new(),
+        },
+        AgentEvent::RoundStarted { round: 1 },
+        AgentEvent::ModelDelta {
+            text: "unfinished".to_owned(),
+        },
+        AgentEvent::SessionEnded {
+            session_id: session_id(),
+            reason: SessionEndReason::Completed,
+        },
+    ]);
+    match recover_session(&session_id(), Vec::new(), &events, None) {
+        Err(RecoveryError::IncompleteModelTurn { seq }) => assert_eq!(seq, 4),
+        other => panic!("expected IncompleteModelTurn, got {other:?}"),
+    }
 }

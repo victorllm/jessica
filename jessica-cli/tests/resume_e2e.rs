@@ -133,17 +133,27 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
     let events = store.events(&session).expect("events should load");
     assert_eq!(
         events.iter().map(|event| event.seq()).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4, 5],
+        vec![1, 2, 3, 4, 5, 6, 7],
         "the resumed run must append to the same session stream"
     );
+    // The version-1 prefix already completed round one, so the resumed model
+    // call continues at round two and records the full version-2 vocabulary.
+    assert_eq!(events[3].event(), &AgentEvent::RoundStarted { round: 2 });
     assert_eq!(
-        events[3].event(),
+        events[4].event(),
         &AgentEvent::ModelDelta {
             text: "resumed done".to_owned(),
         }
     );
     assert_eq!(
-        events[4].event(),
+        events[5].event(),
+        &AgentEvent::RoundFinished {
+            round: 2,
+            usage: None,
+        }
+    );
+    assert_eq!(
+        events[6].event(),
         &AgentEvent::SessionEnded {
             session_id: session.clone(),
             reason: SessionEndReason::Completed,
@@ -160,8 +170,8 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
     let traced = trace.events();
     assert_eq!(
         traced.len(),
-        4,
-        "turn start, two agent events, and turn end: {traced:?}"
+        6,
+        "turn start, four agent events, and turn end: {traced:?}"
     );
     assert!(
         matches!(
@@ -178,7 +188,7 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
         Some(&session),
         "the resumed turn must name the session it continues"
     );
-    for entry in &traced[1..3] {
+    for entry in &traced[1..5] {
         assert_eq!(entry.event().attempt, Some(1));
         assert_eq!(entry.event().session_id.as_ref(), Some(&session));
         assert!(
@@ -187,7 +197,7 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
         );
     }
     assert!(matches!(
-        &traced[3].event().payload,
+        &traced[5].event().payload,
         TracePayload::TurnEnded {
             reason: SessionEndReason::Completed
         }
@@ -212,6 +222,7 @@ fn seed_interrupted_session(database: &Path, session: &SessionId) {
     for (index, event) in [
         AgentEvent::SessionStarted {
             session_id: session.clone(),
+            messages: Vec::new(),
         },
         AgentEvent::ToolCallStarted { call },
         AgentEvent::ToolCallFinished {

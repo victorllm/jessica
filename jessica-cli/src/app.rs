@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jessica_core::acceptance::AcceptanceCheck;
+use jessica_core::events::EventSink;
 use jessica_core::guard::Guard;
 use jessica_core::llm::{LlmError, LlmProvider};
 use jessica_core::policy::Policy;
@@ -908,8 +909,14 @@ impl CliRuntime {
         ));
         // The child executor receives the same counting provider, so every
         // child call charges the parent token guard and can cancel the turn.
-        let delegation =
-            self.build_child_executor(scope, allow_delegation, Arc::clone(&provider), config)?;
+        let delegation = self.build_child_executor(
+            scope,
+            allow_delegation,
+            Arc::clone(&provider),
+            config,
+            journal.sink(),
+            events.clone(),
+        )?;
 
         let registry = self.build_tool_registry(
             scope,
@@ -974,12 +981,17 @@ impl CliRuntime {
     ///
     /// Returns `None` when delegation is disabled or when `allow_delegation`
     /// is false, and in that case does not construct the factory or executor.
+    /// The executor receives the turn's sink and broadcast sender so the
+    /// parent-side child session lifecycle is traced alongside the parent;
+    /// child-internal events stay private.
     fn build_child_executor(
         &self,
         scope: &TurnScope,
         allow_delegation: bool,
         provider: Arc<dyn LlmProvider>,
         config: &HarnessConfig,
+        sink: Option<Arc<dyn EventSink>>,
+        events: broadcast::Sender<AgentEvent>,
     ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
         if !allow_delegation || !config.delegation.enabled {
             return Ok(None);
@@ -991,8 +1003,12 @@ impl CliRuntime {
             config.policy.allowed_tools.clone(),
             NATIVE_CHILD_TOOLS.iter().map(|name| (*name).to_owned()),
         );
-        let executor =
+        let mut executor =
             AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
+        if let Some(sink) = sink {
+            executor = executor.with_event_sink(sink);
+        }
+        executor = executor.with_event_sender(events);
         Ok(Some(Arc::new(executor)))
     }
 
@@ -1326,6 +1342,7 @@ async fn emit_outer_session(
     pump.register(session_id.clone(), Vec::new());
     let _ = events.send(AgentEvent::SessionStarted {
         session_id: session_id.clone(),
+        messages: Vec::new(),
     });
     let _ = events.send(AgentEvent::SessionEnded {
         session_id: session_id.clone(),
@@ -2987,8 +3004,8 @@ mod tests {
         let events = trace.events();
         assert_eq!(
             events.len(),
-            5,
-            "turn start, three agent events, and turn end: {events:?}"
+            7,
+            "turn start, five agent events, and turn end: {events:?}"
         );
         assert_eq!(events[0].seq(), 1);
         assert!(
@@ -3096,8 +3113,8 @@ mod tests {
         let events = trace.events();
         assert_eq!(
             events.len(),
-            12,
-            "start + two attempts, each with its failure + outer session + end: {events:?}"
+            16,
+            "start + two complete attempts (with rounds) + their failures + outer session + end: {events:?}"
         );
         assert!(matches!(
             &events[0].event().payload,
@@ -3120,7 +3137,7 @@ mod tests {
             .iter()
             .find_map(|stored| match &stored.event().payload {
                 TracePayload::Agent {
-                    event: AgentEvent::SessionStarted { session_id },
+                    event: AgentEvent::SessionStarted { session_id, .. },
                 } if stored.event().attempt == Some(2) => Some(session_id.clone()),
                 _ => None,
             })
@@ -3193,7 +3210,7 @@ mod tests {
             .iter()
             .filter_map(|stored| match &stored.event().payload {
                 TracePayload::Agent {
-                    event: AgentEvent::SessionStarted { session_id },
+                    event: AgentEvent::SessionStarted { session_id, .. },
                 } if stored.event().attempt.is_none() => Some(session_id.clone()),
                 _ => None,
             })

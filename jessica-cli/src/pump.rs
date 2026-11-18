@@ -112,6 +112,18 @@ impl Transcript {
         self.round_open = true;
     }
 
+    /// Starts the explicitly numbered model round.
+    ///
+    /// The event stream carries the runtime's round number, which may continue
+    /// past one when a checkpoint is resumed. Trusting it keeps guard context
+    /// aligned without double-counting tool batches.
+    fn on_round_started(&mut self, round: u32) {
+        self.flush_pending();
+        self.round = round;
+        self.round_output.clear();
+        self.round_open = true;
+    }
+
     /// Appends model text to the current round.
     ///
     /// A delta arriving after tool results belongs to the next model turn; the
@@ -379,13 +391,22 @@ impl EventPump {
         }
 
         match event {
-            AgentEvent::SessionStarted { session_id } => {
+            AgentEvent::SessionStarted {
+                session_id,
+                messages,
+            } => {
                 let mut state = self.lock_state();
                 state
                     .active
                     .entry(session_id.clone())
-                    .or_insert_with(|| Transcript::new(Vec::new()));
+                    .or_insert_with(|| Transcript::new(messages));
                 state.current = Some(session_id);
+            }
+            AgentEvent::RoundStarted { round } => {
+                let mut state = self.lock_state();
+                if let Some(transcript) = state.current_transcript_mut() {
+                    transcript.on_round_started(round);
+                }
             }
             AgentEvent::ModelDelta { text } => {
                 let mut state = self.lock_state();
@@ -441,7 +462,11 @@ impl EventPump {
                 }
                 self.notify.notify_waiters();
             }
-            AgentEvent::PolicyDenied { .. }
+            AgentEvent::RoundFinished { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. }
+            | AgentEvent::PolicyDenied { .. }
             | AgentEvent::BudgetExceeded { .. }
             | AgentEvent::AcceptanceFailed { .. }
             | AgentEvent::Error { .. } => {}
@@ -465,9 +490,17 @@ impl EventPump {
             return;
         };
         match event {
-            AgentEvent::SessionStarted { session_id } => {
+            AgentEvent::SessionStarted { session_id, .. } => {
                 console.line(&format!("[session] started {session_id}"));
             }
+            // Round boundaries, permission decisions, and child lifecycle are
+            // structured trace facts; the existing delta/tool/session lines
+            // already render the user-observable progress.
+            AgentEvent::RoundStarted { .. }
+            | AgentEvent::RoundFinished { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. } => {}
             AgentEvent::ModelDelta { text } => {
                 console.inline(text);
             }
@@ -771,6 +804,7 @@ mod tests {
         events
             .send(AgentEvent::SessionStarted {
                 session_id: session.clone(),
+                messages: Vec::new(),
             })
             .expect("the pump receiver must stay open");
         events
@@ -822,6 +856,7 @@ mod tests {
         events
             .send(AgentEvent::SessionStarted {
                 session_id: session.clone(),
+                messages: Vec::new(),
             })
             .expect("the pump receiver must stay open");
         events
@@ -923,6 +958,7 @@ mod tests {
         sender
             .send(AgentEvent::SessionStarted {
                 session_id: session.clone(),
+                messages: Vec::new(),
             })
             .expect("the pump receiver must stay open");
         sender

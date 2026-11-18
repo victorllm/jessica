@@ -1,10 +1,12 @@
 //! Behaviour tests for the single-level child agent executor.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
@@ -769,6 +771,12 @@ async fn run_with_transcript_counts_rounds_calls_and_first_tool_error() {
         vec![
             AgentEvent::SessionStarted {
                 session_id: SessionId::new("child"),
+                messages: vec![Message::user("go")],
+            },
+            AgentEvent::RoundStarted { round: 1 },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: None,
             },
             AgentEvent::ToolCallStarted {
                 call: ToolCall::new("call-x", "missing", json!({})),
@@ -776,8 +784,13 @@ async fn run_with_transcript_counts_rounds_calls_and_first_tool_error() {
             AgentEvent::ToolCallFinished {
                 result: ToolResult::error("call-x", "unknown tool `missing`"),
             },
+            AgentEvent::RoundStarted { round: 2 },
             AgentEvent::ModelDelta {
                 text: "recovered".to_owned(),
+            },
+            AgentEvent::RoundFinished {
+                round: 2,
+                usage: None,
             },
             AgentEvent::SessionEnded {
                 session_id: SessionId::new("child"),
@@ -1251,5 +1264,184 @@ async fn child_session_hash_is_stable_and_trace_only() {
         first_hash
             .chars()
             .all(|character| character.is_ascii_hexdigit())
+    );
+}
+
+/// Producer-side sink that records every attempt and can reject one by index.
+struct RecordingSink {
+    /// Events offered in call order, including a rejected attempt.
+    events: Mutex<Vec<AgentEvent>>,
+    /// Number of `emit` calls observed.
+    calls: AtomicUsize,
+    /// Zero-based emit call that returns an error.
+    reject_at: Option<usize>,
+}
+
+impl RecordingSink {
+    /// Creates a sink that optionally rejects one emit call.
+    fn new(reject_at: Option<usize>) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            reject_at,
+        }
+    }
+
+    /// Returns the events offered so far.
+    fn events(&self) -> Vec<AgentEvent> {
+        self.events
+            .lock()
+            .expect("sink events mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for RecordingSink {
+    async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.events
+            .lock()
+            .expect("sink events mutex poisoned")
+            .push(event);
+        if self.reject_at == Some(index) {
+            return Err(EventSinkError::new("sink rejected the event"));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn child_lifecycle_events_reach_the_sink_and_parent_broadcast() {
+    let provider = Arc::new(MockProvider::new(vec![text_response("child answer")]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let sink = Arc::new(RecordingSink::new(None));
+    let (events, mut receiver) = broadcast::channel(8);
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+    .with_event_sender(events);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": ["echo"]}), "parent-call-1")
+        .await;
+    assert!(!result.is_error, "the child must succeed: {result:?}");
+    assert_eq!(result.tool_call_id, "");
+
+    let offered = sink.events();
+    assert_eq!(offered.len(), 2, "one start and one end event");
+    let started = match &offered[0] {
+        AgentEvent::ChildSessionStarted {
+            child_session_id,
+            call_id,
+        } => (child_session_id.clone(), call_id.clone()),
+        other => panic!("expected ChildSessionStarted, got {other:?}"),
+    };
+    assert_eq!(started.1, "parent-call-1");
+    match &offered[1] {
+        AgentEvent::ChildSessionEnded {
+            child_session_id,
+            call_id,
+            reason,
+            rounds,
+            tool_calls,
+            tool_errors,
+        } => {
+            assert_eq!(child_session_id, &started.0);
+            assert_eq!(call_id, "parent-call-1");
+            assert_eq!(*reason, SessionEndReason::Completed);
+            assert_eq!((*rounds, *tool_calls, *tool_errors), (1, 0, 0));
+        }
+        other => panic!("expected ChildSessionEnded, got {other:?}"),
+    }
+
+    assert_eq!(receiver.try_recv(), Ok(offered[0].clone()));
+    assert_eq!(receiver.try_recv(), Ok(offered[1].clone()));
+    assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn a_rejected_child_start_prevents_the_child_from_running() {
+    let provider = Arc::new(MockProvider::new(vec![text_response("must not run")]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let sink = Arc::new(RecordingSink::new(Some(0)));
+    let (events, mut receiver) = broadcast::channel(8);
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+    .with_event_sender(events);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": ["echo"]}), "call-1")
+        .await;
+
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("child session start"),
+        "the error must name the rejected start: {}",
+        result.content
+    );
+    assert!(
+        provider.calls().is_empty(),
+        "a rejected start must not call the child model"
+    );
+    assert!(
+        factory.executions().is_empty(),
+        "a rejected start must not execute child tools"
+    );
+    assert_eq!(sink.events().len(), 1);
+    assert_eq!(
+        receiver.try_recv(),
+        Err(TryRecvError::Empty),
+        "a rejected event must not be broadcast"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_child_end_turns_the_delegation_into_an_error() {
+    let provider = Arc::new(MockProvider::new(vec![text_response("child answer")]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let sink = Arc::new(RecordingSink::new(Some(1)));
+    let (events, mut receiver) = broadcast::channel(8);
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+    .with_event_sender(events);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": ["echo"]}), "call-1")
+        .await;
+
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("child session end"),
+        "the error must name the rejected end: {}",
+        result.content
+    );
+    assert_eq!(
+        sink.events().len(),
+        2,
+        "both lifecycle events must be offered before failure"
+    );
+    match receiver.try_recv() {
+        Ok(AgentEvent::ChildSessionStarted { .. }) => {}
+        other => panic!("the accepted start must still broadcast: {other:?}"),
+    }
+    assert_eq!(
+        receiver.try_recv(),
+        Err(TryRecvError::Empty),
+        "a rejected end must not be broadcast"
     );
 }

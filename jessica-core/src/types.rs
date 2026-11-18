@@ -262,6 +262,26 @@ impl TokenUsage {
     }
 }
 
+/// A permission decision attached to one tool call.
+///
+/// The CLI permission gate returns this decision before a gated tool executes.
+/// It is persisted in the event stream so a trace can distinguish an approved
+/// call from a rejected, cancelled, timed-out, or failed permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// The call may execute.
+    Allow,
+    /// The user rejected the call.
+    Deny,
+    /// The permission request was cancelled.
+    Cancelled,
+    /// The permission request timed out.
+    TimedOut,
+    /// The permission transport failed before a decision was obtained.
+    Failed,
+}
+
 /// Structured event emitted by the agent loop.
 ///
 /// Events are the observable trace of a session and must remain serializable:
@@ -273,6 +293,15 @@ pub enum AgentEvent {
     SessionStarted {
         /// Identifier of the session.
         session_id: SessionId,
+        /// Conversation supplied to the first model call.
+        ///
+        /// A fresh session records its system, user, and recovered history
+        /// messages here so the event stream alone can reconstruct the input.
+        /// Resumed sessions do not emit a second `SessionStarted`; an outer
+        /// turn-level session may leave this empty. Old v1 JSON omits the field
+        /// and decodes as an empty vector.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        messages: Vec<Message>,
     },
     /// The model produced a text delta.
     ModelDelta {
@@ -322,6 +351,89 @@ pub enum AgentEvent {
         /// Why the session ended.
         reason: SessionEndReason,
     },
+    /// One model round started.
+    ///
+    /// A round is one model call. The runtime emits this event immediately
+    /// before asking the provider for a response. Tool calls requested by the
+    /// response execute after [`AgentEvent::RoundFinished`] and before the next
+    /// `RoundStarted`.
+    RoundStarted {
+        /// One-based model-round number within the session.
+        round: u32,
+    },
+    /// One model round finished.
+    ///
+    /// This event is emitted as soon as the provider stream completes and
+    /// before any requested tool executes, so usage is not lost when tool
+    /// execution is interrupted. A model call that fails or is cancelled emits
+    /// no `RoundFinished`; the terminal `Error` or `SessionEnded` event closes
+    /// the stream instead.
+    RoundFinished {
+        /// One-based model-round number within the session.
+        round: u32,
+        /// Token usage reported by the provider, when available.
+        usage: Option<TokenUsage>,
+    },
+    /// A permission gate returned a decision for a tool call.
+    ///
+    /// Emitted before the tool executes (for [`PermissionDecision::Allow`]) or
+    /// before the rejection result is returned. A run without a permission
+    /// gate emits no such event.
+    PermissionDecided {
+        /// Tool call whose permission was requested.
+        call: ToolCall,
+        /// Decision returned by the gate.
+        decision: PermissionDecision,
+    },
+    /// A parent session observed a delegated child session start.
+    ChildSessionStarted {
+        /// Deterministic child session identifier.
+        child_session_id: SessionId,
+        /// Provider tool-call id that triggered the delegation.
+        call_id: String,
+    },
+    /// A parent session observed a delegated child session end.
+    ChildSessionEnded {
+        /// Deterministic child session identifier.
+        child_session_id: SessionId,
+        /// Provider tool-call id that triggered the delegation.
+        call_id: String,
+        /// Why the child stopped.
+        reason: SessionEndReason,
+        /// Model rounds the child completed.
+        rounds: u32,
+        /// Tool calls the child requested, including unknown tools.
+        tool_calls: u32,
+        /// Child tool calls whose result was an error.
+        tool_errors: u32,
+    },
+}
+
+impl AgentEvent {
+    /// Returns the minimum trace schema version needed to persist this event.
+    ///
+    /// A version-2 event cannot appear in a version-1 trace. An empty
+    /// [`AgentEvent::SessionStarted`] remains version-1 compatible because old
+    /// JSON simply omitted its `messages` field.
+    pub fn required_trace_schema_version(&self) -> u16 {
+        match self {
+            Self::SessionStarted { messages, .. } if messages.is_empty() => 1,
+            Self::SessionStarted { .. }
+            | Self::RoundStarted { .. }
+            | Self::RoundFinished { .. }
+            | Self::PermissionDecided { .. }
+            | Self::ChildSessionStarted { .. }
+            | Self::ChildSessionEnded { .. } => 2,
+            Self::ModelDelta { .. }
+            | Self::ToolCallStarted { .. }
+            | Self::ToolCallFinished { .. }
+            | Self::PolicyDenied { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::AcceptanceFailed { .. }
+            | Self::Error { .. }
+            | Self::SessionEnded { .. } => 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +577,7 @@ mod tests {
             (
                 AgentEvent::SessionStarted {
                     session_id: session_id.clone(),
+                    messages: Vec::new(),
                 },
                 "session_started",
             ),
@@ -508,10 +621,43 @@ mod tests {
             ),
             (
                 AgentEvent::SessionEnded {
-                    session_id,
+                    session_id: session_id.clone(),
                     reason: SessionEndReason::Completed,
                 },
                 "session_ended",
+            ),
+            (AgentEvent::RoundStarted { round: 1 }, "round_started"),
+            (
+                AgentEvent::RoundFinished {
+                    round: 1,
+                    usage: Some(TokenUsage::new(12, 3)),
+                },
+                "round_finished",
+            ),
+            (
+                AgentEvent::PermissionDecided {
+                    call: call.clone(),
+                    decision: PermissionDecision::Allow,
+                },
+                "permission_decided",
+            ),
+            (
+                AgentEvent::ChildSessionStarted {
+                    child_session_id: SessionId::new("child-1"),
+                    call_id: "call-1".into(),
+                },
+                "child_session_started",
+            ),
+            (
+                AgentEvent::ChildSessionEnded {
+                    child_session_id: SessionId::new("child-1"),
+                    call_id: "call-1".into(),
+                    reason: SessionEndReason::Completed,
+                    rounds: 1,
+                    tool_calls: 2,
+                    tool_errors: 0,
+                },
+                "child_session_ended",
             ),
         ];
 
@@ -519,6 +665,127 @@ mod tests {
             let encoded = serde_json::to_value(&event).unwrap();
             assert_eq!(encoded.get("type").and_then(|v| v.as_str()), Some(tag));
             assert_round_trip(&event);
+        }
+    }
+
+    #[test]
+    fn session_started_without_messages_decodes_as_an_old_v1_event() {
+        let decoded: AgentEvent = serde_json::from_value(json!({
+            "type": "session_started",
+            "session_id": "session-v1"
+        }))
+        .expect("old session_started JSON must decode");
+
+        assert_eq!(
+            decoded,
+            AgentEvent::SessionStarted {
+                session_id: SessionId::new("session-v1"),
+                messages: Vec::new(),
+            }
+        );
+        assert_eq!(decoded.required_trace_schema_version(), 1);
+
+        let encoded = serde_json::to_value(AgentEvent::SessionStarted {
+            session_id: SessionId::new("session-v1"),
+            messages: Vec::new(),
+        })
+        .expect("empty input must serialize");
+        assert!(
+            encoded.get("messages").is_none(),
+            "empty bootstrap messages must stay omitted from v1-compatible JSON"
+        );
+    }
+
+    #[test]
+    fn session_started_with_messages_requires_trace_v2() {
+        let event = AgentEvent::SessionStarted {
+            session_id: SessionId::new("session-v2"),
+            messages: vec![Message::system("system"), Message::user("fix it")],
+        };
+        let encoded = serde_json::to_value(&event).expect("event must serialize");
+
+        assert_eq!(encoded["messages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(event.required_trace_schema_version(), 2);
+        assert_round_trip(&event);
+    }
+
+    #[test]
+    fn event_vocabulary_drives_the_required_trace_version() {
+        let v1 = [
+            AgentEvent::ModelDelta {
+                text: "delta".into(),
+            },
+            AgentEvent::PolicyDenied {
+                call: ToolCall::new("call-1", "bash", json!({})),
+                reason: "denied".into(),
+            },
+            AgentEvent::BudgetExceeded {
+                kind: BudgetKind::MaxRounds,
+                message: "limit".into(),
+            },
+            AgentEvent::AcceptanceFailed {
+                attempt: 1,
+                feedback: "retry".into(),
+            },
+            AgentEvent::Error {
+                message: "failed".into(),
+            },
+            AgentEvent::SessionEnded {
+                session_id: SessionId::new("session-1"),
+                reason: SessionEndReason::Completed,
+            },
+        ];
+        for event in v1 {
+            assert_eq!(
+                event.required_trace_schema_version(),
+                1,
+                "{event:?} must stay readable in a v1 trace"
+            );
+        }
+
+        let v2 = [
+            AgentEvent::RoundStarted { round: 1 },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: None,
+            },
+            AgentEvent::PermissionDecided {
+                call: ToolCall::new("call-1", "read_file", json!({})),
+                decision: PermissionDecision::Deny,
+            },
+            AgentEvent::ChildSessionStarted {
+                child_session_id: SessionId::new("child"),
+                call_id: "call-1".into(),
+            },
+            AgentEvent::ChildSessionEnded {
+                child_session_id: SessionId::new("child"),
+                call_id: "call-1".into(),
+                reason: SessionEndReason::Error,
+                rounds: 1,
+                tool_calls: 0,
+                tool_errors: 0,
+            },
+        ];
+        for event in v2 {
+            assert_eq!(
+                event.required_trace_schema_version(),
+                2,
+                "{event:?} must be rejected by a v1 trace"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_decisions_use_stable_names() {
+        for (decision, name) in [
+            (PermissionDecision::Allow, "allow"),
+            (PermissionDecision::Deny, "deny"),
+            (PermissionDecision::Cancelled, "cancelled"),
+            (PermissionDecision::TimedOut, "timed_out"),
+            (PermissionDecision::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(decision).unwrap(), json!(name));
+            assert_round_trip(&decision);
         }
     }
 }

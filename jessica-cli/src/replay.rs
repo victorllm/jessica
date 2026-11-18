@@ -20,7 +20,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError, ToolSchema};
-use jessica_core::types::{AgentEvent, Budget, SessionEndReason, SessionId, ToolCall, ToolResult};
+use jessica_core::types::{
+    AgentEvent, Budget, SessionEndReason, SessionId, TokenUsage, ToolCall, ToolResult,
+};
 use jessica_runtime::{AgentLoop, RecordedEvent};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -39,6 +41,11 @@ const EVENT_BUFFER: usize = 1024;
 /// that do not influence the loop (`PolicyDenied`, `AcceptanceFailed`, and a
 /// `BudgetExceeded` preceding the terminal event) are not re-emitted; the tool
 /// result or terminal reason they explain is already part of the script.
+///
+/// The loop always emits the version-2 round vocabulary and attaches bootstrap
+/// messages to `SessionStarted`. Version-1 recordings contain neither, so those
+/// synthesized fields are removed before returning to keep the replay output
+/// byte-identical to the stream it reproduces.
 pub(crate) async fn replay_session(
     session_id: &SessionId,
     stored: &StoredSession,
@@ -49,6 +56,8 @@ pub(crate) async fn replay_session(
         tool_results,
         end_reason,
         max_rounds,
+        explicit_rounds,
+        started_with_messages,
     } = script;
 
     let results = Arc::new(RecordedResults::new(tool_results));
@@ -94,7 +103,41 @@ pub(crate) async fn replay_session(
         });
     }
 
-    Ok(events)
+    Ok(restore_recorded_vocabulary(
+        events,
+        explicit_rounds,
+        started_with_messages,
+    ))
+}
+
+/// Removes version-2 fields that the recorded stream did not contain.
+///
+/// A version-1 stream has no round lifecycle and carries no bootstrap messages
+/// in `SessionStarted`. The loop under replay always produces both, so they are
+/// stripped to keep the output faithful to the source vocabulary.
+fn restore_recorded_vocabulary(
+    events: Vec<AgentEvent>,
+    explicit_rounds: bool,
+    started_with_messages: bool,
+) -> Vec<AgentEvent> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::RoundStarted { .. } | AgentEvent::RoundFinished { .. }
+                if !explicit_rounds =>
+            {
+                None
+            }
+            AgentEvent::SessionStarted {
+                session_id,
+                messages: _,
+            } if !started_with_messages => Some(AgentEvent::SessionStarted {
+                session_id,
+                messages: Vec::new(),
+            }),
+            event => Some(event),
+        })
+        .collect()
 }
 
 /// Serializes events as JSONL, one compact event object per line.
@@ -322,6 +365,10 @@ struct Script {
     end_reason: SessionEndReason,
     /// Round budget that makes the loop reproduce `end_reason`.
     max_rounds: u32,
+    /// Whether the recorded stream used explicit round events.
+    explicit_rounds: bool,
+    /// Whether the recorded `SessionStarted` carried bootstrap messages.
+    started_with_messages: bool,
 }
 
 impl Script {
@@ -342,6 +389,10 @@ struct ReplayRound {
     results: Vec<Option<ToolResult>>,
     /// Whether the turn ended with a provider error.
     failed: bool,
+    /// Usage reported by the explicit `RoundFinished` event, when present.
+    ///
+    /// Version-1 streams have no usage and leave this as `None`.
+    usage: Option<TokenUsage>,
 }
 
 impl ReplayRound {
@@ -374,6 +425,15 @@ struct ScriptBuilder<'a> {
     ended: Option<SessionEndReason>,
     /// Previous sequence number for monotonicity checks.
     previous_seq: Option<u64>,
+    /// Highest explicit round started in this stream, if any.
+    ///
+    /// `None` means the stream predates explicit round events and the original
+    /// heuristic round reconstruction is used.
+    explicit_round: Option<u32>,
+    /// Whether the explicit round is still waiting for `RoundFinished`.
+    explicit_open: bool,
+    /// Whether the recorded `SessionStarted` carried bootstrap messages.
+    started_with_messages: bool,
 }
 
 impl<'a> ScriptBuilder<'a> {
@@ -386,6 +446,9 @@ impl<'a> ScriptBuilder<'a> {
             started: false,
             ended: None,
             previous_seq: None,
+            explicit_round: None,
+            explicit_open: false,
+            started_with_messages: false,
         }
     }
 
@@ -418,7 +481,14 @@ impl<'a> ScriptBuilder<'a> {
     /// Dispatches one event to its parser step.
     fn on_event(&mut self, seq: u64, event: &AgentEvent) -> Result<(), ReplayError> {
         match event {
-            AgentEvent::SessionStarted { session_id } => self.on_started(seq, session_id),
+            AgentEvent::SessionStarted {
+                session_id,
+                messages,
+            } => self.on_started(seq, session_id, !messages.is_empty()),
+            AgentEvent::RoundStarted { round } => self.on_round_started(seq, *round),
+            AgentEvent::RoundFinished { round, usage } => {
+                self.on_round_finished(seq, *round, *usage)
+            }
             AgentEvent::ModelDelta { text } => self.on_delta(seq, text),
             AgentEvent::ToolCallStarted { call } => self.on_call(seq, call),
             AgentEvent::ToolCallFinished { result } => self.on_result(seq, result),
@@ -426,14 +496,86 @@ impl<'a> ScriptBuilder<'a> {
             AgentEvent::SessionEnded { session_id, reason } => {
                 self.on_end(seq, session_id, *reason)
             }
-            AgentEvent::PolicyDenied { .. }
+            AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. }
+            | AgentEvent::PolicyDenied { .. }
             | AgentEvent::BudgetExceeded { .. }
             | AgentEvent::AcceptanceFailed { .. } => Ok(()),
         }
     }
 
+    /// Starts an explicitly numbered model round.
+    fn on_round_started(&mut self, seq: u64, round: u32) -> Result<(), ReplayError> {
+        if round == 0 {
+            return Err(ReplayError::InvalidRoundNumber { seq, round });
+        }
+        if self.explicit_open {
+            return Err(ReplayError::UnexpectedRoundStart { seq, round });
+        }
+        if let Some(previous) = self.explicit_round {
+            let expected = previous.checked_add(1).ok_or(ReplayError::TooManyRounds)?;
+            if round != expected {
+                return Err(ReplayError::RoundSequence {
+                    seq,
+                    expected,
+                    found: round,
+                });
+            }
+            if let Some(tool_call_id) = self.current.pending() {
+                return Err(ReplayError::IncompleteRound {
+                    seq,
+                    tool_call_id: tool_call_id.to_owned(),
+                });
+            }
+            // The finished round includes tool calls and results that arrive
+            // after `RoundFinished`; rotate it now, even when it produced no
+            // text or calls, because every explicit round is a model call.
+            self.rounds.push(std::mem::take(&mut self.current));
+        } else if !self.current.is_empty() {
+            return Err(ReplayError::RoundVocabulary {
+                seq,
+                message: "`round_started` follows events outside an explicit round".to_owned(),
+            });
+        }
+        self.explicit_round = Some(round);
+        self.explicit_open = true;
+        Ok(())
+    }
+
+    /// Closes the explicit round and records its usage.
+    fn on_round_finished(
+        &mut self,
+        seq: u64,
+        round: u32,
+        usage: Option<TokenUsage>,
+    ) -> Result<(), ReplayError> {
+        match self.explicit_round {
+            Some(started) if started == round => {}
+            Some(started) => {
+                return Err(ReplayError::RoundSequence {
+                    seq,
+                    expected: started,
+                    found: round,
+                });
+            }
+            None => return Err(ReplayError::UnexpectedRoundFinish { seq, round }),
+        }
+        if !self.explicit_open {
+            return Err(ReplayError::UnexpectedRoundFinish { seq, round });
+        }
+        self.current.usage = usage;
+        self.explicit_open = false;
+        Ok(())
+    }
+
     /// Validates the initial session start.
-    fn on_started(&mut self, seq: u64, session_id: &SessionId) -> Result<(), ReplayError> {
+    fn on_started(
+        &mut self,
+        seq: u64,
+        session_id: &SessionId,
+        with_messages: bool,
+    ) -> Result<(), ReplayError> {
         if session_id != self.session_id {
             return Err(ReplayError::SessionMismatch {
                 expected: self.session_id.to_string(),
@@ -444,12 +586,19 @@ impl<'a> ScriptBuilder<'a> {
             return Err(ReplayError::UnexpectedSessionStart { seq });
         }
         self.started = true;
+        self.started_with_messages = with_messages;
         Ok(())
     }
 
     /// Appends model text, rotating rounds after a complete tool batch.
     fn on_delta(&mut self, seq: u64, text: &str) -> Result<(), ReplayError> {
-        self.prepare_turn(seq)?;
+        if let Some(round) = self.explicit_round {
+            if !self.explicit_open {
+                return Err(ReplayError::RoundNotOpen { seq, round });
+            }
+        } else {
+            self.prepare_turn(seq)?;
+        }
         self.current.events.push(LlmEvent::TextDelta {
             text: text.to_owned(),
         });
@@ -458,7 +607,14 @@ impl<'a> ScriptBuilder<'a> {
 
     /// Records a requested tool call.
     fn on_call(&mut self, seq: u64, call: &ToolCall) -> Result<(), ReplayError> {
-        self.prepare_turn(seq)?;
+        if let Some(round) = self.explicit_round {
+            if self.explicit_open {
+                // The runtime emits `RoundFinished` before executing tools.
+                return Err(ReplayError::RoundNotFinished { seq, round });
+            }
+        } else {
+            self.prepare_turn(seq)?;
+        }
         if self
             .current
             .calls
@@ -504,7 +660,13 @@ impl<'a> ScriptBuilder<'a> {
 
     /// Appends a provider error event that will terminate the model turn.
     fn on_error(&mut self, seq: u64, message: &str) -> Result<(), ReplayError> {
-        self.prepare_turn(seq)?;
+        if let Some(round) = self.explicit_round {
+            if !self.explicit_open {
+                return Err(ReplayError::RoundNotOpen { seq, round });
+            }
+        } else {
+            self.prepare_turn(seq)?;
+        }
         self.current.events.push(LlmEvent::Error {
             message: message.to_owned(),
         });
@@ -531,6 +693,9 @@ impl<'a> ScriptBuilder<'a> {
                 tool_call_id: tool_call_id.to_owned(),
             });
         }
+        if self.explicit_round.is_some() {
+            return self.finish_explicit(seq, reason);
+        }
         match reason {
             SessionEndReason::Completed => self.finish_completed()?,
             SessionEndReason::Error => self.finish_error()?,
@@ -539,6 +704,49 @@ impl<'a> ScriptBuilder<'a> {
                 return Err(ReplayError::UnsupportedEndReason { reason });
             }
         }
+        self.ended = Some(reason);
+        Ok(())
+    }
+
+    /// Finalizes the last explicit round without v1 heuristic padding.
+    fn finish_explicit(&mut self, seq: u64, reason: SessionEndReason) -> Result<(), ReplayError> {
+        let Some(round) = self.explicit_round else {
+            return Err(ReplayError::RoundVocabulary {
+                seq,
+                message: "an explicit round ended without a `round_started` event".to_owned(),
+            });
+        };
+        match reason {
+            SessionEndReason::Completed => {
+                if self.explicit_open {
+                    return Err(ReplayError::MissingRoundFinish { seq, round });
+                }
+                if self.current.failed {
+                    return Err(ReplayError::InconsistentEndReason { reason });
+                }
+            }
+            SessionEndReason::BudgetExceeded => {
+                if self.explicit_open {
+                    return Err(ReplayError::MissingRoundFinish { seq, round });
+                }
+                if self.current.failed
+                    || (!self.current.is_empty() && self.current.calls.is_empty())
+                {
+                    return Err(ReplayError::InconsistentEndReason { reason });
+                }
+            }
+            SessionEndReason::Error => {
+                if !self.current.failed {
+                    return Err(ReplayError::InconsistentEndReason { reason });
+                }
+            }
+            SessionEndReason::Cancelled | SessionEndReason::AcceptanceFailed => {
+                return Err(ReplayError::UnsupportedEndReason { reason });
+            }
+        }
+        // Every explicit `round_started` is a model call, including one with an
+        // empty response, so the terminal round is rotated unconditionally.
+        self.rounds.push(std::mem::take(&mut self.current));
         self.ended = Some(reason);
         Ok(())
     }
@@ -618,13 +826,17 @@ impl<'a> ScriptBuilder<'a> {
         let Some(end_reason) = self.ended else {
             return Err(ReplayError::MissingSessionEnd);
         };
+        let explicit_rounds = self.explicit_round.is_some();
+        let started_with_messages = self.started_with_messages;
         let mut provider_rounds = Vec::with_capacity(self.rounds.len());
         let mut tool_results: BTreeMap<String, VecDeque<ToolResult>> = BTreeMap::new();
 
         for mut round in self.rounds {
             if !round.failed {
-                // Recorded events do not carry `Done` or token usage.
-                round.events.push(LlmEvent::Done { usage: None });
+                // Version-1 recorded streams carry no usage; explicit
+                // `RoundFinished` events preserve the provider's value.
+                let usage = round.usage;
+                round.events.push(LlmEvent::Done { usage });
             }
             for (call, result) in round.calls.iter().zip(round.results.iter()) {
                 let Some(result) = result else {
@@ -647,6 +859,8 @@ impl<'a> ScriptBuilder<'a> {
             tool_results,
             end_reason,
             max_rounds,
+            explicit_rounds,
+            started_with_messages,
         })
     }
 }
@@ -678,6 +892,75 @@ pub(crate) enum ReplayError {
     UnexpectedSessionStart {
         /// Sequence number of the offending event.
         seq: u64,
+    },
+    /// A round number is zero.
+    #[error("event {seq} starts invalid round {round}; rounds are one-based")]
+    InvalidRoundNumber {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Reported round number.
+        round: u32,
+    },
+    /// Two explicit rounds are not consecutive.
+    ///
+    /// A resumed session may start at a number above one, but every following
+    /// round must increment by exactly one.
+    #[error("event {seq} reports round {found}, but the expected round is {expected}")]
+    RoundSequence {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Expected round number.
+        expected: u32,
+        /// Reported round number.
+        found: u32,
+    },
+    /// A `RoundStarted` arrived while the previous explicit round was open.
+    #[error("event {seq} starts round {round} while another round is still open")]
+    UnexpectedRoundStart {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Reported round number.
+        round: u32,
+    },
+    /// A `RoundFinished` has no matching open round.
+    #[error("event {seq} finishes round {round} without a matching open round")]
+    UnexpectedRoundFinish {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Reported round number.
+        round: u32,
+    },
+    /// Model output arrived outside an open explicit round.
+    #[error("event {seq} belongs to round {round}, which is not open")]
+    RoundNotOpen {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Round number of the closed round.
+        round: u32,
+    },
+    /// Tool execution started before the model round finished.
+    #[error("event {seq} starts a tool before round {round} finished")]
+    RoundNotFinished {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Still-open round number.
+        round: u32,
+    },
+    /// An explicit round has no `RoundFinished` at the terminal boundary.
+    #[error("event {seq} ends round {round} without a `round_finished` event")]
+    MissingRoundFinish {
+        /// Sequence number of the terminal event.
+        seq: u64,
+        /// Round that never finished.
+        round: u32,
+    },
+    /// Explicit and legacy round vocabulary are mixed in one stream.
+    #[error("event {seq} has inconsistent round vocabulary: {message}")]
+    RoundVocabulary {
+        /// Sequence number of the offending event.
+        seq: u64,
+        /// Description of the inconsistency.
+        message: String,
     },
     /// An event appears after the terminal event.
     #[error("event {seq} appears after the session ended")]
@@ -844,19 +1127,31 @@ mod tests {
     #[tokio::test]
     async fn replay_reproduces_recorded_events_without_running_tools_or_the_model() {
         let call = ToolCall::new("call-1", "read_file", json!({"path": "Cargo.toml"}));
+        let usage = TokenUsage::new(11, 7);
         assert_replays_exactly(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: vec![Message::user("replay this")],
             },
+            AgentEvent::RoundStarted { round: 1 },
             AgentEvent::ModelDelta {
                 text: "reading".to_owned(),
+            },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: Some(usage),
             },
             AgentEvent::ToolCallStarted { call: call.clone() },
             AgentEvent::ToolCallFinished {
                 result: ToolResult::success("call-1", "recorded output"),
             },
+            AgentEvent::RoundStarted { round: 2 },
             AgentEvent::ModelDelta {
                 text: "done".to_owned(),
+            },
+            AgentEvent::RoundFinished {
+                round: 2,
+                usage: None,
             },
             AgentEvent::SessionEnded {
                 session_id: session_id(),
@@ -869,16 +1164,27 @@ mod tests {
     #[tokio::test]
     async fn replay_covers_empty_final_turns_budget_and_error_terminals() {
         // A completed session whose final model response emitted nothing: the
-        // recorded stream ends right after a tool batch.
+        // explicit final round has no text or calls.
         assert_replays_exactly(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: vec![Message::user("replay this")],
+            },
+            AgentEvent::RoundStarted { round: 1 },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: None,
             },
             AgentEvent::ToolCallStarted {
                 call: ToolCall::new("call-1", "echo", json!({})),
             },
             AgentEvent::ToolCallFinished {
                 result: ToolResult::success("call-1", "ok"),
+            },
+            AgentEvent::RoundStarted { round: 2 },
+            AgentEvent::RoundFinished {
+                round: 2,
+                usage: None,
             },
             AgentEvent::SessionEnded {
                 session_id: session_id(),
@@ -891,6 +1197,12 @@ mod tests {
         assert_replays_exactly(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: vec![Message::user("replay this")],
+            },
+            AgentEvent::RoundStarted { round: 1 },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: None,
             },
             AgentEvent::ToolCallStarted {
                 call: ToolCall::new("call-1", "echo", json!({})),
@@ -909,11 +1221,14 @@ mod tests {
         ])
         .await;
 
-        // Provider errors are scripted back into the model stream.
+        // Provider errors are scripted back into the model stream. The failed
+        // round never emits `RoundFinished`.
         assert_replays_exactly(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: vec![Message::user("replay this")],
             },
+            AgentEvent::RoundStarted { round: 1 },
             AgentEvent::ModelDelta {
                 text: "partial".to_owned(),
             },
@@ -933,6 +1248,7 @@ mod tests {
         let incomplete = stored(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: Vec::new(),
             },
             AgentEvent::ToolCallStarted {
                 call: ToolCall::new("call-1", "echo", json!({})),
@@ -950,6 +1266,7 @@ mod tests {
         let cancelled = stored(vec![
             AgentEvent::SessionStarted {
                 session_id: session_id(),
+                messages: Vec::new(),
             },
             AgentEvent::SessionEnded {
                 session_id: session_id(),
@@ -965,10 +1282,51 @@ mod tests {
 
         let unterminated = stored(vec![AgentEvent::SessionStarted {
             session_id: session_id(),
+            messages: Vec::new(),
         }]);
         assert!(matches!(
             replay_session(&session_id(), &unterminated).await,
             Err(ReplayError::MissingSessionEnd)
         ));
+    }
+
+    #[tokio::test]
+    async fn version_one_streams_use_the_heuristic_and_replay_without_usage() {
+        let call = ToolCall::new("call-1", "read_file", json!({"path": "Cargo.toml"}));
+        let events = vec![
+            AgentEvent::SessionStarted {
+                session_id: session_id(),
+                messages: Vec::new(),
+            },
+            AgentEvent::ModelDelta {
+                text: "reading".to_owned(),
+            },
+            AgentEvent::ToolCallStarted { call: call.clone() },
+            AgentEvent::ToolCallFinished {
+                result: ToolResult::success("call-1", "recorded output"),
+            },
+            AgentEvent::ModelDelta {
+                text: "done".to_owned(),
+            },
+            AgentEvent::SessionEnded {
+                session_id: session_id(),
+                reason: SessionEndReason::Completed,
+            },
+        ];
+
+        let stored = stored(events.clone());
+        let script = Script::build(&session_id(), &stored.events)
+            .expect("a version-1 stream must build the heuristic script");
+        assert!(!script.explicit_rounds);
+        assert!(!script.started_with_messages);
+        assert_eq!(script.provider_rounds.len(), 2);
+        for round in &script.provider_rounds {
+            assert!(
+                matches!(round.last(), Some(LlmEvent::Done { usage: None })),
+                "a version-1 stream has no usage: {round:?}"
+            );
+        }
+
+        assert_replays_exactly(events).await;
     }
 }

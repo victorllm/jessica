@@ -10,7 +10,8 @@ use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
-    AgentEvent, Budget, BudgetKind, Message, SessionEndReason, SessionId, ToolCall, ToolResult,
+    AgentEvent, Budget, BudgetKind, Message, SessionEndReason, SessionId, TokenUsage, ToolCall,
+    ToolResult,
 };
 use jessica_runtime::AgentLoop;
 use serde_json::{Value, json};
@@ -22,10 +23,19 @@ fn session_id() -> SessionId {
     SessionId::new("session-1")
 }
 
-fn started() -> AgentEvent {
+fn started(messages: Vec<Message>) -> AgentEvent {
     AgentEvent::SessionStarted {
         session_id: session_id(),
+        messages,
     }
+}
+
+fn round_started(round: u32) -> AgentEvent {
+    AgentEvent::RoundStarted { round }
+}
+
+fn round_finished(round: u32) -> AgentEvent {
+    AgentEvent::RoundFinished { round, usage: None }
 }
 
 fn ended(reason: SessionEndReason) -> AgentEvent {
@@ -234,6 +244,7 @@ fn text_response(text: &str) -> Response {
 
 #[tokio::test]
 async fn text_only_response_completes() {
+    let usage = TokenUsage::new(3, 4);
     let provider = Arc::new(MockProvider::new(vec![Response::Events(vec![
         LlmEvent::TextDelta {
             text: "Hello".to_owned(),
@@ -241,7 +252,7 @@ async fn text_only_response_completes() {
         LlmEvent::TextDelta {
             text: " world".to_owned(),
         },
-        LlmEvent::Done { usage: None },
+        LlmEvent::Done { usage: Some(usage) },
     ])]));
 
     let (reason, events) = run(
@@ -257,12 +268,17 @@ async fn text_only_response_completes() {
     assert_eq!(
         events,
         vec![
-            started(),
+            started(vec![Message::user("hi")]),
+            round_started(1),
             AgentEvent::ModelDelta {
                 text: "Hello".to_owned(),
             },
             AgentEvent::ModelDelta {
                 text: " world".to_owned(),
+            },
+            AgentEvent::RoundFinished {
+                round: 1,
+                usage: Some(usage),
             },
             ended(SessionEndReason::Completed),
         ]
@@ -310,14 +326,18 @@ async fn single_tool_call_is_executed_and_result_is_fed_back() {
     assert_eq!(
         events,
         vec![
-            started(),
+            started(vec![Message::user("go")]),
+            round_started(1),
+            round_finished(1),
             AgentEvent::ToolCallStarted { call: call.clone() },
             AgentEvent::ToolCallFinished {
                 result: ToolResult::success("call-1", "tool output"),
             },
+            round_started(2),
             AgentEvent::ModelDelta {
                 text: "done".to_owned(),
             },
+            round_finished(2),
             ended(SessionEndReason::Completed),
         ]
     );
@@ -524,7 +544,13 @@ async fn pre_cancelled_token_stops_before_any_model_call() {
     .await;
 
     assert_eq!(reason, SessionEndReason::Cancelled);
-    assert_eq!(events, vec![started(), ended(SessionEndReason::Cancelled)]);
+    assert_eq!(
+        events,
+        vec![
+            started(vec![Message::user("go")]),
+            ended(SessionEndReason::Cancelled)
+        ]
+    );
     assert!(provider.calls().is_empty());
 }
 
@@ -576,7 +602,8 @@ async fn cancellation_interrupts_an_in_flight_model_stream() {
     assert_eq!(
         observed,
         vec![
-            started(),
+            started(vec![Message::user("go")]),
+            round_started(1),
             AgentEvent::ModelDelta {
                 text: "partial".to_owned(),
             },
@@ -603,9 +630,10 @@ async fn provider_request_error_becomes_an_error_event_and_ends() {
     .await;
 
     assert_eq!(reason, SessionEndReason::Error);
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0], started());
-    match &events[1] {
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0], started(vec![Message::user("go")]));
+    assert_eq!(events[1], round_started(1));
+    match &events[2] {
         AgentEvent::Error { message } => {
             assert!(
                 message.contains("network down"),
@@ -614,7 +642,7 @@ async fn provider_request_error_becomes_an_error_event_and_ends() {
         }
         other => panic!("expected an error event, got {other:?}"),
     }
-    assert_eq!(events[2], ended(SessionEndReason::Error));
+    assert_eq!(events[3], ended(SessionEndReason::Error));
     assert_eq!(provider.calls().len(), 1);
 }
 
@@ -636,9 +664,10 @@ async fn stream_error_event_becomes_an_error_event_and_ends() {
     .await;
 
     assert_eq!(reason, SessionEndReason::Error);
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0], started());
-    match &events[1] {
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0], started(vec![Message::user("go")]));
+    assert_eq!(events[1], round_started(1));
+    match &events[2] {
         AgentEvent::Error { message } => {
             assert!(
                 message.contains("stream broke"),
@@ -647,7 +676,7 @@ async fn stream_error_event_becomes_an_error_event_and_ends() {
         }
         other => panic!("expected an error event, got {other:?}"),
     }
-    assert_eq!(events[2], ended(SessionEndReason::Error));
+    assert_eq!(events[3], ended(SessionEndReason::Error));
 }
 
 #[tokio::test]
@@ -668,15 +697,16 @@ async fn stream_ending_without_done_is_an_error() {
     .await;
 
     assert_eq!(reason, SessionEndReason::Error);
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[0], started());
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[0], started(vec![Message::user("go")]));
+    assert_eq!(events[1], round_started(1));
     assert_eq!(
-        events[1],
+        events[2],
         AgentEvent::ModelDelta {
             text: "partial".to_owned(),
         }
     );
-    match &events[2] {
+    match &events[3] {
         AgentEvent::Error { message } => {
             assert!(
                 message.contains("without a Done event"),
@@ -685,7 +715,7 @@ async fn stream_ending_without_done_is_an_error() {
         }
         other => panic!("expected an error event, got {other:?}"),
     }
-    assert_eq!(events[3], ended(SessionEndReason::Error));
+    assert_eq!(events[4], ended(SessionEndReason::Error));
 }
 
 #[tokio::test]
@@ -875,7 +905,7 @@ async fn every_event_reaches_the_sink_before_it_is_broadcast() {
     assert_eq!(run.reason, SessionEndReason::Completed);
     assert_eq!(
         sink.already_broadcast(),
-        vec![0, 1, 2],
+        vec![0, 1, 2, 3, 4],
         "each sink call must happen before its event is observable"
     );
     let mut observer = receiver;
@@ -888,7 +918,7 @@ async fn every_event_reaches_the_sink_before_it_is_broadcast() {
         broadcast,
         "accepted events and observer events must have the same order"
     );
-    assert_eq!(broadcast.len(), 3);
+    assert_eq!(broadcast.len(), 5);
 }
 
 /// Sink that rejects one exact event after accepting the ones before it.
@@ -953,12 +983,12 @@ async fn a_rejected_event_and_the_rest_of_the_run_are_never_broadcast() {
     let observed = drain(&mut receiver);
     assert_eq!(
         observed,
-        vec![started()],
+        vec![started(vec![Message::user("go")]), round_started(1)],
         "the rejected delta and every later event must stay unobservable"
     );
     assert!(
-        sink.accepted() == vec![started()],
-        "the sink accepted only the event before the rejection"
+        sink.accepted() == vec![started(vec![Message::user("go")]), round_started(1)],
+        "the sink accepted only the events before the rejection"
     );
     assert!(
         !observed.contains(&rejected),

@@ -94,10 +94,17 @@ impl AcpEventMapper {
             // Policy denial is followed by a failed ToolCallFinished event,
             // which is the single failed update for that call.
             AgentEvent::PolicyDenied { .. }
-            // Session lifecycle stays internal; the prompt response carries
-            // the final reason.
+            // Session and round lifecycle stays internal; the prompt response
+            // carries the final reason.
             | AgentEvent::SessionStarted { .. }
+            | AgentEvent::RoundStarted { .. }
+            | AgentEvent::RoundFinished { .. }
             | AgentEvent::SessionEnded { .. }
+            // Permission outcomes are reflected by the failed tool result, and
+            // child sessions never cross the protocol boundary.
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. }
             // Errors, acceptance failures, and budget boundaries are mapped
             // to prompt errors or stop reasons, not streamed text.
             | AgentEvent::BudgetExceeded { .. }
@@ -572,7 +579,8 @@ mod tests {
         assert!(
             mapper
                 .map(&AgentEvent::SessionStarted {
-                    session_id: jessica_core::types::SessionId::new("s")
+                    session_id: jessica_core::types::SessionId::new("s"),
+                    messages: Vec::new(),
                 })
                 .is_none()
         );
