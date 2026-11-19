@@ -127,11 +127,13 @@ OpenAI-compatible endpoint and model.
 
 ## Trace verification
 
-`jessica trace verify` audits recorded turn traces without executing a replay
-and without creating or migrating the `[events]` database:
+`jessica trace verify` audits recorded turn traces without creating or
+migrating the `[events]` database. It does not execute a replay unless
+`--replay` is requested:
 
 ```bash
 jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id>
+jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --replay
 jessica --config ~/.jessica/harness.toml trace verify --all --json
 jessica --config ~/.jessica/harness.toml trace verify --all --allow-open
 ```
@@ -140,10 +142,17 @@ It checks structural completeness, v2 round/permission/child-session semantics,
 and that every mirrored agent event still exists in the legacy event stream with
 the same session, timestamp, and payload. `--turn` and `--all` are mutually
 exclusive; `--allow-open` accepts traces without a `turn_ended` marker but never
-accepts an invalid trace. Exit code `0` means every selected trace passed; `1`
-means an invalid trace, an unallowed open trace, an unknown turn, or a
+accepts an invalid trace. `--replay` requires `--turn`: it rebuilds each fresh
+attempt from the trace's own bootstrap messages and recorded runtime events,
+drives the deterministic replay engine, and requires the produced event
+sequence to match. It covers closed v2 fresh traces ending `completed`, `error`,
+or on the max-rounds budget; traces outside that subset report `unsupported`
+and exit `1` instead of being silently skipped. Exit code `0` means every
+selected trace passed; `1` means an invalid trace, an unallowed open trace, an
+unknown turn, a replay mismatch, an unreplayable trace, or a
 storage/configuration error. `--json` emits a stable report with
-`report_version`, per-turn statuses, and machine-readable problem kinds.
+`report_version`, per-turn statuses, optional replay results, and
+machine-readable problem kinds.
 
 ## ACP (Agent Client Protocol)
 
