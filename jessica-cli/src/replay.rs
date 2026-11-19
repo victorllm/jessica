@@ -23,7 +23,7 @@ use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError, ToolSchema};
 use jessica_core::types::{
     AgentEvent, Budget, SessionEndReason, SessionId, TokenUsage, ToolCall, ToolResult,
 };
-use jessica_runtime::{AgentLoop, RecordedEvent};
+use jessica_runtime::{AgentLoop, RecordedEvent, SessionCheckpoint};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -50,7 +50,56 @@ pub(crate) async fn replay_session(
     session_id: &SessionId,
     stored: &StoredSession,
 ) -> Result<Vec<AgentEvent>, ReplayError> {
-    let script = Script::build(session_id, &stored.events)?;
+    replay_from(session_id, stored, ReplayStart::Fresh).await
+}
+
+/// Replays a resumed session from its recorded checkpoint state.
+///
+/// Resumed traces contain no `SessionStarted`; they begin directly with the
+/// model rounds that followed the checkpoint. `stored.initial_messages` is the
+/// checkpoint conversation, and `rounds_completed` is the number of rounds the
+/// original session had already spent before resuming. The replay drives
+/// [`jessica_runtime::AgentLoop::resume`] instead of a fresh run and gives the
+/// loop the same total round budget as the original session.
+pub(crate) async fn replay_resumed_session(
+    session_id: &SessionId,
+    stored: &StoredSession,
+    rounds_completed: u32,
+) -> Result<Vec<AgentEvent>, ReplayError> {
+    replay_from(
+        session_id,
+        stored,
+        ReplayStart::Resumed { rounds_completed },
+    )
+    .await
+}
+
+/// How a replay begins relative to the recorded stream.
+#[derive(Debug, Clone, Copy)]
+enum ReplayStart {
+    /// A fresh session that begins with `SessionStarted`.
+    Fresh,
+    /// A session resumed from a checkpoint recorded outside the trace.
+    Resumed {
+        /// Rounds the original session completed before resuming.
+        rounds_completed: u32,
+    },
+}
+
+/// Shared implementation for fresh and resumed replays.
+async fn replay_from(
+    session_id: &SessionId,
+    stored: &StoredSession,
+    start: ReplayStart,
+) -> Result<Vec<AgentEvent>, ReplayError> {
+    let resumed_rounds = match start {
+        ReplayStart::Fresh => None,
+        ReplayStart::Resumed { rounds_completed } => Some(rounds_completed),
+    };
+    let script = match resumed_rounds {
+        Some(_) => Script::build_resumed(session_id, &stored.events)?,
+        None => Script::build(session_id, &stored.events)?,
+    };
     let Script {
         provider_rounds,
         tool_results,
@@ -60,6 +109,13 @@ pub(crate) async fn replay_session(
         started_with_messages,
     } = script;
 
+    let total_rounds = match resumed_rounds {
+        Some(rounds_completed) => rounds_completed
+            .checked_add(max_rounds)
+            .ok_or(ReplayError::TooManyRounds)?,
+        None => max_rounds,
+    };
+
     let results = Arc::new(RecordedResults::new(tool_results));
     let registry = Arc::new(build_registry(&results)?);
     let provider = Arc::new(ScriptedProvider::new(provider_rounds));
@@ -67,18 +123,30 @@ pub(crate) async fn replay_session(
     let agent = AgentLoop::new(
         Arc::clone(&provider) as Arc<dyn LlmProvider>,
         registry,
-        Budget::new(u64::MAX, Duration::ZERO, max_rounds),
+        Budget::new(u64::MAX, Duration::ZERO, total_rounds),
         sender,
     );
 
     let collector = tokio::spawn(collect_events(receiver));
-    let reason = agent
-        .run(
-            session_id.clone(),
-            stored.initial_messages.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+    let reason = match resumed_rounds {
+        Some(rounds_completed) => {
+            let checkpoint = SessionCheckpoint::from_recorded_state(
+                session_id.clone(),
+                stored.initial_messages.clone(),
+                rounds_completed,
+            );
+            agent.resume(checkpoint, CancellationToken::new()).await
+        }
+        None => {
+            agent
+                .run(
+                    session_id.clone(),
+                    stored.initial_messages.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    };
     drop(agent);
     let events = collector.await.map_err(ReplayError::Task)??;
 
@@ -376,6 +444,16 @@ impl Script {
     fn build(session_id: &SessionId, events: &[RecordedEvent]) -> Result<Self, ReplayError> {
         ScriptBuilder::new(session_id).apply(events)
     }
+
+    /// Parses a resumed stream that has no `SessionStarted`.
+    fn build_resumed(
+        session_id: &SessionId,
+        events: &[RecordedEvent],
+    ) -> Result<Self, ReplayError> {
+        ScriptBuilder::new(session_id)
+            .without_session_start()
+            .apply(events)
+    }
 }
 
 /// One model turn being reconstructed.
@@ -421,6 +499,8 @@ struct ScriptBuilder<'a> {
     current: ReplayRound,
     /// Whether the initial `SessionStarted` was seen.
     started: bool,
+    /// Whether the stream must begin with `SessionStarted`.
+    requires_session_start: bool,
     /// Terminal reason once observed.
     ended: Option<SessionEndReason>,
     /// Previous sequence number for monotonicity checks.
@@ -444,12 +524,20 @@ impl<'a> ScriptBuilder<'a> {
             rounds: Vec::new(),
             current: ReplayRound::default(),
             started: false,
+            requires_session_start: true,
             ended: None,
             previous_seq: None,
             explicit_round: None,
             explicit_open: false,
             started_with_messages: false,
         }
+    }
+
+    /// Configures a resumed stream that begins directly with model rounds.
+    fn without_session_start(mut self) -> Self {
+        self.started = true;
+        self.requires_session_start = false;
+        self
     }
 
     /// Parses `events` into a replay script.
@@ -470,7 +558,10 @@ impl<'a> ScriptBuilder<'a> {
                 return Err(ReplayError::EventAfterSessionEnd { seq });
             }
             let event = recorded.event();
-            if !self.started && !matches!(event, AgentEvent::SessionStarted { .. }) {
+            if self.requires_session_start
+                && !self.started
+                && !matches!(event, AgentEvent::SessionStarted { .. })
+            {
                 return Err(ReplayError::MissingSessionStart);
             }
             self.on_event(seq, event)?;
@@ -1328,5 +1419,89 @@ mod tests {
         }
 
         assert_replays_exactly(events).await;
+    }
+
+    fn resumed_stored(events: Vec<AgentEvent>) -> StoredSession {
+        let recorded = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| RecordedEvent::new(index as u64 + 1, event))
+            .collect();
+        StoredSession {
+            initial_messages: vec![
+                Message::user("checkpoint question"),
+                Message::assistant("checkpoint answer"),
+            ],
+            events: recorded,
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_replay_continues_from_the_recorded_round() {
+        let events = vec![
+            AgentEvent::RoundStarted { round: 3 },
+            AgentEvent::ModelDelta {
+                text: "continuing".to_owned(),
+            },
+            AgentEvent::RoundFinished {
+                round: 3,
+                usage: None,
+            },
+            AgentEvent::SessionEnded {
+                session_id: session_id(),
+                reason: SessionEndReason::Completed,
+            },
+        ];
+        let stored = resumed_stored(events.clone());
+
+        let replayed = replay_resumed_session(&session_id(), &stored, 2)
+            .await
+            .expect("a resumed stream must continue from its checkpoint");
+        assert_eq!(replayed, events);
+        assert!(
+            !replayed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SessionStarted { .. })),
+            "a resumed loop must not invent a session start"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_replay_preserves_the_original_round_budget() {
+        let call = ToolCall::new("call-1", "echo", json!({}));
+        let events = vec![
+            AgentEvent::RoundStarted { round: 3 },
+            AgentEvent::RoundFinished {
+                round: 3,
+                usage: None,
+            },
+            AgentEvent::ToolCallStarted { call: call.clone() },
+            AgentEvent::ToolCallFinished {
+                result: ToolResult::success("call-1", "ok"),
+            },
+            AgentEvent::RoundStarted { round: 4 },
+            AgentEvent::RoundFinished {
+                round: 4,
+                usage: None,
+            },
+            AgentEvent::ToolCallStarted { call: call.clone() },
+            AgentEvent::ToolCallFinished {
+                result: ToolResult::success("call-1", "ok"),
+            },
+            AgentEvent::BudgetExceeded {
+                kind: BudgetKind::MaxRounds,
+                message: "maximum rounds (4) exceeded".to_owned(),
+            },
+            AgentEvent::SessionEnded {
+                session_id: session_id(),
+                reason: SessionEndReason::BudgetExceeded,
+            },
+        ];
+        let stored = resumed_stored(events.clone());
+
+        let replayed = replay_resumed_session(&session_id(), &stored, 2)
+            .await
+            .expect("resumed replay must reproduce budget exhaustion");
+        assert_eq!(replayed, events);
     }
 }

@@ -16,7 +16,9 @@ use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
     AgentEvent, Budget, Message, SessionEndReason, SessionId, TokenUsage, ToolCall, ToolResult,
 };
-use jessica_runtime::{AgentLoop, RecordedEvent, RecoveryError, recover_session};
+use jessica_runtime::{
+    AgentLoop, RecordedEvent, RecoveryError, SessionCheckpoint, recover_session,
+};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -715,4 +717,16 @@ fn malformed_explicit_rounds_are_rejected() {
         Err(RecoveryError::IncompleteModelTurn { seq }) => assert_eq!(seq, 4),
         other => panic!("expected IncompleteModelTurn, got {other:?}"),
     }
+}
+
+#[test]
+fn a_checkpoint_can_be_built_from_recorded_state_without_a_terminal_event() {
+    let messages = vec![Message::user("continue"), Message::assistant("ready")];
+    let checkpoint = SessionCheckpoint::from_recorded_state(session_id(), messages.clone(), 4);
+
+    assert_eq!(checkpoint.session_id(), &session_id());
+    assert_eq!(checkpoint.messages(), messages.as_slice());
+    assert_eq!(checkpoint.rounds_completed(), 4);
+    assert_eq!(checkpoint.last_seq(), 0);
+    assert_eq!(checkpoint.end_reason(), None);
 }

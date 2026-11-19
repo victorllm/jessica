@@ -1907,9 +1907,9 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
-Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3、8.4 已完成，8.5–8.7 待逐项确认）
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3、8.4、8.5 已完成，8.6–8.7 待逐项确认）
 
-背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`）与 8.4（可移植证据包 export 与离线 verify），其余按依赖顺序逐 Task 确认。
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`）、8.4（可移植证据包 export 与离线 verify）与 8.5（`--all --replay` 及 v1/Resumed 覆盖扩展），其余按依赖顺序逐 Task 确认。
 
 Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
@@ -1987,9 +1987,26 @@ Task 8.4（2026-11-19 确认并完成）：可移植证据包 export 与离线 v
 
 偏离/说明：1) 离线校验复用私有内存 `EventStore` + `trace_turn`，而不是另写一套结构校验，保证与在线 verify 逐项同源；该内存库不接触用户数据库；2) 聚合只覆盖 turn digest，legacy 证据通过 mirror 校验绑定到 digest 覆盖的 trace payload，不单独纳入聚合；3) 导出只接受可验证的正面证据，invalid trace 不能作为“失败证据”导出，遗漏某 turn 本身不可证伪，除非外部锚定 turn 集合/聚合；4) `verify-bundle` 不支持 `--replay`，离线重放语义未定义，已在解析层拒绝；5) bundle 不是签名，能重写整个 bundle 者可重算全部摘要，必须用 `--expect` 与库外记录锚定；6) 既有 `trace digest --all` 输出契约不变，未加入聚合；7) 导出用 `std::fs::write` 一次性写文件，未做临时文件 + fsync 的原子替换；8) 本地 `DESIGN.md` 保持未跟踪；未改 `jessica-core`，未新增第三方 crate。
 
+Task 8.5（2026-11-19 确认并完成）：`--all --replay` 与 v1/Resumed 覆盖扩展
+
+目标：让 `trace verify --replay` 覆盖批量选择、version-1 fresh trace 与 version-2 resumed trace，同时保持只读、确定性、逐 turn 内存有界与既有报告契约。
+
+操作：
+
+1. `jessica-runtime/src/recovery.rs`：新增 additive 公共构造器 `SessionCheckpoint::from_recorded_state(session_id, messages, rounds_completed)`，用于 trace 只记录 checkpoint 会话与已完成轮数、不保留产生它们的事件时重建 resume 起点；`last_seq=0`、`end_reason=None`。新增行为测试断言四个可观察字段。
+2. `jessica-cli/src/replay.rs`：抽出 fresh/resumed 共用的 `replay_from`；新增 `replay_resumed_session(session_id, stored, rounds_completed)`，用上述 checkpoint 调用真实 `AgentLoop::resume`，预算设为 `rounds_completed + 脚本轮数`，从而复现 resumed 原始 `MaxRounds` 消息；`ScriptBuilder` 增加 no-`SessionStarted` 模式，resumed 流直接解析 `RoundStarted` 及后续显式轮次。保留 v1 heuristic 与 `restore_recorded_vocabulary` 行为。
+3. `jessica-cli/src/trace_replay.rs`：`prepare` 接受 schema v1/v2。fresh v1 单 attempt 使用 `turn_started.messages` 作为 bootstrap，并要求 `SessionStarted.messages` 为空；fresh v2 继续使用每个 attempt 的 `SessionStarted.messages`。resumed 单 attempt 要求无 `SessionStarted`、首事件为 `RoundStarted`，以 `round - 1` 作为 checkpoint 的 `rounds_completed`，并用 `turn_started.messages` 作为会话；无模型轮的 resumed 流与 v1/resumed 多 attempt 流显式 unsupported。其余结构性、终态与 trace-only/governance 过滤规则不变。
+4. `jessica-cli/src/trace_verify.rs`：`--all --replay` 先只读枚举 turn id，再逐个 `spawn_blocking` 打开只读库、加载并完整验证单 turn，异步 replay 后立即丢弃该 turn entries；报告累积后统一输出，内存由最大单 trace 而非全库决定。mismatch 仍把该 turn 标为 invalid 并继续批量；unsupported 合法 trace 保持 `ok`，但命令退出 1。新增 `CliError::TraceReplayUnsupportedBatch { count, turns }`；验证失败优先于 unsupported。`report_version` 保持 3，单 turn 与非 replay `--all` 行为不变。
+5. `jessica-cli/src/main.rs`：允许 `--all --replay`，拒绝 `--all --replay --allow-open`（replay 要求 closed trace）、继续拒绝 `--expect` 搭配 `--all`；usage 与 `--replay` 说明更新。README 更新命令、v1/resumed 语义、批量内存模型与退出语义。`jessica-core` 未改，SQLite schema 未改，未新增第三方 crate。
+
+测试：runtime checkpoint 构造 1；`replay` 单测 2（resumed 完成流从 round 3 继续且不伪造 `SessionStarted`、resumed 预算耗尽保留原始 `MaxRounds(4)` 消息）；`trace_replay` 测试更新/新增 3（v1 fresh 从 turn bootstrap 重放、resumed 从 checkpoint 重放、无模型轮 resumed unsupported）；CLI 解析 2（`--all --replay` 接受、`--all --replay --allow-open` 拒绝）；`trace_verify_e2e` 8（v1 成功、fresh/v1/resumed 批量全 ok、mismatch 后继续、unsupported 不 invalidate、拒绝 allow-open、空库批量成功，以及既有 v1/batch 期望更新）；`resume_e2e` 在真实 `--resume` 后追加真实 CLI `trace verify --turn --replay`，断言 4 个 resumed 事件逐一对齐。
+
+验收：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`。
+
+偏离/说明：1) resumed 的原始 `Budget.max_rounds` 未写入 trace，批量 replay 以 `rounds_completed + 脚本轮数` 作为总预算；这对 `Completed`/`Error` 足以复现，对 `BudgetExceeded` 恰好等于原始总预算，但无法验证未达到预算时的原始上限数值；2) `--all --replay` 顺序执行而非并发，以换取内存有界与明确错误顺序；3) v1 与 resumed 均只支持单 attempt，多 attempt 缺少逐 attempt 的 bootstrap/checkpoint 归属；4) resumed 无 `RoundStarted` 时无法可靠推导 `rounds_completed`，记录为 Deferred；5) 批量执行期间若外部写入新 turn，本次枚举不会包含它（只读快照语义与既有 `--all` 一致）；6) 未改 `jessica-core`、schema、既有 `replay --session` 或 bundle replay 语义；7) 本地 `DESIGN.md` 保持未跟踪；未提交、未推送。
+
 后续候选（未确认，不执行）：
 
-- 8.5 `--all --replay` 与 Resumed/v1 覆盖扩展。
 - 8.6 子 Agent 轨迹证据（需先设计，可能需 core 批准）。
 - 8.7 保留期/隐私删除（需先确认 append-only 契约变更）。
 
@@ -2085,6 +2102,8 @@ Task 8.3 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实�
 
 Task 8.4 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付可移植证据包 export 与离线 verify。`jessica-memory`：`trace_chain.rs` 新增 `jessica.trace.bundle.v1` 领域与 `bundle_digest`（长度前缀、turn 计数、turn_id 升序、raw 32-byte digest），golden vector 锁定聚合/空聚合；新增 `TraceEvidenceEntry`（私有字段 + 访问器）、`trace_bundle_digest`（排序、拒绝重复 turn、规范 hex 解码）与 `verify_exported_trace`（要求非空/seq 连续/包络有效/payload turn 一致，写入私有内存 EventStore 的 trace_events/chain/heads，再调用 `trace_turn` 复用 8.3 结构、生命周期与链校验，返回重算 digest）；未改 schema、既有 API 或 `jessica-core`。`jessica-cli`：新增 `trace_bundle` 模块与 `trace export --turn|--all --out [--allow-open]`、`trace verify-bundle --bundle [--json] [--allow-open] [--expect]`；export 只读打开并逐 turn 重验，invalid 拒绝、open 仅 `--all --allow-open` 允许、拒绝不写文件，evidence 含精确 trace entry 与 mirror 消费的 legacy 行，同库重复导出字节一致；verify-bundle 不读 `[events]`、不打开/创建/迁移事件库，读前强制 64 MiB 上限，校验 version/format/规范 digest/重复 turn，离线重建并比较逐 turn digest、aggregate 与 `--expect`，`--replay` 显式拒绝；`trace_verify` 暴露复用内部项并新增 `exported_legacy_rows`，参数解析/usage/结构化错误/README 同步。测试新增 19 个：trace_chain 聚合 golden 单测 1、`tests/trace_evidence.rs` 6、CLI 解析 3、`tests/trace_bundle_e2e.rs` 9（无 `[events]` 离线往返、确定性/排序、open 两种路径、invalid 不落盘、trace/legacy/aggregate 篡改、turn digest 与 expect、畸形/超限 bundle、空库、缺失库不创建）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 910 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) 离线校验复用内存 EventStore + `trace_turn`，与在线 verify 同源；2) 聚合只覆盖 turn digest，legacy 通过 mirror 校验绑定；3) 只导出正面证据，invalid trace 与遗漏 turn 不可作为失败/省略证据，除非外部锚定；4) 不支持 `verify-bundle --replay`；5) 不是签名，必须用 `--expect` 锚定库外记录；6) 既有 `trace digest --all` 输出不变；7) 导出使用 `std::fs::write`，未做临时文件 + fsync 原子替换；8) 未提交、未推送，`DESIGN.md` 保持未跟踪。
 
+Task 8.5 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付 `--all --replay` 与 v1/Resumed 覆盖扩展。`jessica-runtime`：新增 additive `SessionCheckpoint::from_recorded_state(session_id, messages, rounds_completed)`（`last_seq=0`、无终态），供 trace 只记录 checkpoint 状态时重建 resume 起点。`jessica-cli`：`replay` 抽出 fresh/resumed 共用路径，新增 `replay_resumed_session`（真实 `AgentLoop::resume`、总预算 `rounds_completed + 脚本轮数`）与 no-`SessionStarted` 的 resumed script 模式；`trace_replay` 接受 v1/v2，fresh v1 用 `turn_started.messages` bootstrap、resumed 用首 `RoundStarted.round - 1` 推导已完成轮数并禁止 `SessionStarted`，无轮 resumed 与 v1/resumed 多 attempt 显式 unsupported；`trace_verify` 新增逐 turn 加载/验证/重放的批量路径（单 trace 内存有界）、`TraceReplayUnsupportedBatch`、拒绝 `--allow-open --replay`，`report_version` 保持 3；解析器/usage/README 同步。测试新增/更新 18 个：runtime checkpoint 1、replay 2、trace_replay 3、CLI 解析 2、trace_verify E2E 8、真实 resume E2E 1，以及既有 v1/batch 期望更新。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 918 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) resumed 原始 `Budget.max_rounds` 未入 trace，以 `rounds_completed + 脚本轮数` 复现；2) `--all --replay` 顺序执行并逐 turn 重开只读库；3) v1/resumed 均仅单 attempt；4) 无模型轮 resumed 与批量外部新增 turn 等已记入 Deferred；5) 未改 `jessica-core`、schema、既有 `replay --session` 或 bundle replay；6) 未提交、未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
@@ -2177,6 +2196,12 @@ Deferred（待办，由用户决定是否单开 Task）
 · Task 8.4 的 bundle 含完整 trace payload 与 legacy 行，可能包含提示、模型输出、工具参数和路径等敏感数据；当前没有脱敏、字段裁剪或过期删除机制。隐私删除/保留期须与 append-only 契约一并通过单开 Task 设计，不能静默改写已导出 bundle。
 · Task 8.4 的 export 使用一次性 `std::fs::write`，进程在写入中途崩溃或被强杀时可能留下截断文件（不会留下部分验证通过的 bundle，但需要重新导出）。若要求原子发布，须单开 Task 改为同目录临时文件 + fsync + rename，并定义跨文件系统行为。
 · Task 8.4 未把 bundle 聚合暴露到数据库侧 `trace digest --all`；若需要 CI 直接对在线库输出聚合而不导出文件，须单开 Task 定义命令面与兼容性（不得改变既有 digest 文本/JSON 契约）。
+· Task 8.5 的 v1 replay 只支持单 attempt：version-1 trace 没有逐 attempt 的 bootstrap 字段，多个 attempt 可能从不同会话开始，无法从单个 `turn_started.messages` 重建。若要支持，须先扩展 trace v2 或定义可验证的 attempt 级 bootstrap 记录，不能猜测。
+· Task 8.5 的 resumed replay 只支持单 attempt：trace 只有一个 `turn_started` checkpoint 会话与首轮编号，多个 attempt 可能从不同 checkpoint 或不同预算恢复。若需支持，须单开 Task 定义每 attempt 的 checkpoint、rounds_completed 与预算来源。
+· Task 8.5 的 resumed replay 要求首个事件是 `RoundStarted`；若 resumed 会话在产生任何模型轮之前结束，trace 无法区分 `rounds_completed` 的具体值。若要支持无轮 resumed trace，须在 trace 中显式记录 checkpoint 轮数或恢复边界，不能从缺失信息推断。
+· Task 8.5 的 resumed replay 无法核对原始 `Budget.max_rounds`：trace 未记录该配置。当前以 `rounds_completed + 脚本轮数` 作为总预算，可复现 `Completed`/`Error`，并在 `BudgetExceeded` 时恰好还原消息中的原始总值；但无法证明未耗尽时的原始上限。若需严格核对，须扩展 trace schema 记录预算配置并单独迁移/兼容。
+· Task 8.5 的 `--all --replay` 顺序执行并逐 turn 重新打开只读库；枚举后外部新增的 turn 不会进入本次运行，且大库的逐 turn 建连成本为 O(turns)。若要并发、单连接复用或稳定快照，须单开 Task 定义只读隔离、连接生命周期与错误顺序。
+· Task 8.5 的批量 unsupported 错误只列出受影响的 turn id 与数量，具体原因在每 turn 的 JSON/text `replay.reason` 中；若需错误消息本身携带逐 turn 原因，须定义稳定的多行错误格式并考虑 CLI 机器消费兼容性。
 
 ---
 

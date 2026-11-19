@@ -107,6 +107,26 @@ impl SessionCheckpoint {
         self.end_reason
     }
 
+    /// Rebuilds a checkpoint from state recorded outside the event stream.
+    ///
+    /// Trace replay uses this constructor when the trace records only the
+    /// checkpoint conversation and the number of completed rounds, not the
+    /// events that produced them. The returned checkpoint has no terminal
+    /// reason and a `last_seq` of zero.
+    pub fn from_recorded_state(
+        session_id: SessionId,
+        messages: Vec<Message>,
+        rounds_completed: u32,
+    ) -> Self {
+        Self {
+            session_id,
+            messages,
+            rounds_completed,
+            last_seq: 0,
+            end_reason: None,
+        }
+    }
+
     /// Decomposes the checkpoint into the values needed to continue the loop.
     pub(crate) fn into_parts(self) -> (SessionId, Vec<Message>, u32, Option<SessionEndReason>) {
         (

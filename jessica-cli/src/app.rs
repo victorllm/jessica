@@ -1647,6 +1647,14 @@ pub(crate) enum CliError {
         /// Why the trace is outside the replayable subset.
         reason: String,
     },
+    /// Multiple valid traces cannot be exercised by the replay engine.
+    #[error("{count} turn(s) cannot be replay-verified: {turns}")]
+    TraceReplayUnsupportedBatch {
+        /// Number of affected turns.
+        count: usize,
+        /// Comma-separated affected turn ids.
+        turns: String,
+    },
     /// A trace could not be exported as portable evidence.
     #[error("trace export failed: {summary}")]
     TraceExportFailed {
