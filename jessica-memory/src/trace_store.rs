@@ -130,6 +130,48 @@ impl StoredTraceEvent {
     }
 }
 
+/// One trace entry supplied by a portable evidence bundle.
+///
+/// The bundle carries only the sequence number, timestamp, and exact JSON text.
+/// Mirrored storage columns are derived from the decoded envelope during
+/// [`verify_exported_trace`], so an offline reader cannot claim a column value
+/// that disagrees with the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEvidenceEntry {
+    /// One-based position within the turn.
+    seq: u64,
+    /// Caller-supplied entry timestamp.
+    timestamp: Timestamp,
+    /// Exact JSON text carried by the bundle.
+    payload_json: String,
+}
+
+impl TraceEvidenceEntry {
+    /// Creates one entry from a decoded bundle row.
+    pub fn new(seq: u64, timestamp: Timestamp, payload_json: String) -> Self {
+        Self {
+            seq,
+            timestamp,
+            payload_json,
+        }
+    }
+
+    /// Returns the one-based position within the turn.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Returns the caller-supplied entry timestamp.
+    pub fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    /// Returns the exact JSON text carried by the bundle.
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+}
+
 /// A complete, validated read of one turn trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredTraceTurn {
@@ -722,6 +764,186 @@ impl EventStore {
         }
         Ok(turns)
     }
+}
+
+/// Computes the aggregate digest of a portable trace evidence bundle.
+///
+/// Turns are sorted by turn id before hashing, so caller order does not affect
+/// the result. Every turn must be unique and its digest must be the canonical
+/// lowercase hexadecimal form produced by [`StoredTraceTurn::digest`].
+///
+/// The digest covers the validated trace chains only. Legacy mirror evidence is
+/// not hashed directly; offline verification binds those rows to the trace
+/// payloads through the mirror check, and the payload bytes are covered by the
+/// per-turn chains.
+pub fn trace_bundle_digest(turns: &[&StoredTraceTurn]) -> Result<String, EventStoreError> {
+    let mut sorted = turns.to_vec();
+    sorted.sort_by(|left, right| left.turn_id().as_str().cmp(right.turn_id().as_str()));
+    for pair in sorted.windows(2) {
+        if pair[0].turn_id() == pair[1].turn_id() {
+            return Err(invalid_error(
+                pair[0].turn_id().as_str(),
+                0,
+                "a bundle must not contain the same turn twice",
+            ));
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(sorted.len());
+    for turn in sorted {
+        let digest = decode_hex_32(turn.digest()).ok_or_else(|| {
+            invalid_error(
+                turn.turn_id().as_str(),
+                0,
+                "the turn digest is not canonical lowercase hexadecimal",
+            )
+        })?;
+        decoded.push((turn.turn_id().as_str(), digest));
+    }
+    Ok(crate::trace_chain::bundle_digest(&decoded))
+}
+
+/// Validates a turn trace reconstructed from portable bundle entries.
+///
+/// The entries are inserted into a private in-memory event store and validated
+/// by the same [`EventStore::trace_turn`] path used for stored traces. This
+/// reuses the structural, lifecycle, mirrored-column, and hash-chain checks
+/// instead of duplicating them offline.
+///
+/// The returned trace carries the recomputed digest. The caller is responsible
+/// for comparing it with the digest declared by the bundle. No legacy mirror is
+/// available here; the caller must run the semantic and mirror checks against
+/// the bundle's exported legacy rows.
+pub fn verify_exported_trace(
+    turn_id: &TurnId,
+    closed: bool,
+    entries: &[TraceEvidenceEntry],
+) -> Result<StoredTraceTurn, EventStoreError> {
+    let turn = turn_id.as_str();
+    if turn.is_empty() {
+        return Err(invalid_error(turn, 0, "the turn id must not be empty"));
+    }
+    if entries.is_empty() {
+        return Err(lifecycle_error(
+            turn,
+            "the trace does not begin with `turn_started`",
+        ));
+    }
+
+    let mut store = EventStore::open_in_memory()?;
+    let transaction = store
+        .connection
+        .transaction()
+        .map_err(|source| EventStoreError::TraceDatabase { source })?;
+    let mut previous_hash = GENESIS_HASH;
+    for (index, entry) in entries.iter().enumerate() {
+        let expected = u64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| lifecycle_error(turn, "the trace has too many entries to count"))?;
+        if entry.seq != expected {
+            return Err(EventStoreError::TraceSequence {
+                turn_id: turn.to_owned(),
+                expected,
+                found: entry.seq,
+            });
+        }
+        let seq_value = i64::try_from(entry.seq)
+            .map_err(|_| lifecycle_error(turn, "the trace sequence is out of range"))?;
+        let event: TraceEvent = serde_json::from_str(&entry.payload_json).map_err(|source| {
+            EventStoreError::TraceDecode {
+                turn_id: turn.to_owned(),
+                seq: entry.seq,
+                source,
+            }
+        })?;
+        validate_envelope(&event)?;
+        if event.turn_id.as_str() != turn {
+            return Err(invalid_error(
+                turn,
+                entry.seq,
+                "the exported turn id disagrees with the payload",
+            ));
+        }
+        let payload_kind = event.payload.kind();
+        let event_type = match &event.payload {
+            TracePayload::Agent { event } => Some(event_type_tag(event)),
+            TracePayload::Gap { .. }
+            | TracePayload::TurnStarted { .. }
+            | TracePayload::TurnEnded { .. } => None,
+        };
+        let attempt_value = event.attempt.map(i64::from);
+        let session_value = event.session_id.as_ref().map(SessionId::as_str);
+        let timestamp_value = entry.timestamp.as_millis();
+        transaction
+            .execute(
+                "INSERT INTO trace_events (\
+                     turn_id, seq, schema_version, payload_kind, event_type, attempt, session_id, \
+                     payload_json, timestamp\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    turn,
+                    seq_value,
+                    i64::from(event.schema_version),
+                    payload_kind,
+                    event_type,
+                    attempt_value,
+                    session_value,
+                    entry.payload_json.as_str(),
+                    timestamp_value,
+                ],
+            )
+            .map_err(|source| store_error(turn, source))?;
+        let hash = entry_hash(
+            &previous_hash,
+            &ChainEntry {
+                turn_id: turn,
+                seq: seq_value,
+                schema_version: i64::from(event.schema_version),
+                payload_kind,
+                event_type,
+                attempt: attempt_value,
+                session_id: session_value,
+                payload_json: &entry.payload_json,
+                timestamp: timestamp_value,
+            },
+        );
+        transaction
+            .execute(
+                "INSERT INTO trace_chain (turn_id, seq, prev_hash, entry_hash) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    turn,
+                    seq_value,
+                    encode_hex(&previous_hash),
+                    encode_hex(&hash)
+                ],
+            )
+            .map_err(|source| store_error(turn, source))?;
+        previous_hash = hash;
+    }
+
+    let last_seq = i64::try_from(entries.len())
+        .map_err(|_| lifecycle_error(turn, "the trace has too many entries to count"))?;
+    transaction
+        .execute(
+            "INSERT INTO trace_heads (turn_id, last_seq, closed, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                turn,
+                last_seq,
+                i64::from(closed),
+                entries[0].timestamp.as_millis()
+            ],
+        )
+        .map_err(|source| store_error(turn, source))?;
+    transaction
+        .commit()
+        .map_err(|source| EventStoreError::TraceDatabase { source })?;
+
+    store
+        .trace_turn(turn_id)?
+        .ok_or_else(|| invalid_error(turn, 0, "the exported trace disappeared after validation"))
 }
 
 /// Recomputes and validates the hash chain for one structurally valid turn.

@@ -55,6 +55,26 @@ pub(crate) enum TraceCommand {
         /// Whether to render the report as JSON.
         json: bool,
     },
+    /// Exports selected verified traces as a portable evidence bundle.
+    Export {
+        /// Turn selection.
+        selection: TraceSelection,
+        /// Destination bundle path.
+        out: PathBuf,
+        /// Whether open traces are accepted in an `--all` export.
+        allow_open: bool,
+    },
+    /// Verifies a portable evidence bundle without opening an event store.
+    VerifyBundle {
+        /// Bundle file to verify.
+        bundle: PathBuf,
+        /// Whether to render the report as JSON.
+        json: bool,
+        /// Whether open traces are accepted as verified.
+        allow_open: bool,
+        /// Optional externally recorded aggregate digest to require.
+        expect: Option<String>,
+    },
 }
 
 /// Which turns a verification run covers.
@@ -87,6 +107,17 @@ pub(crate) async fn run_command(
         TraceCommand::Digest { selection, json } => {
             crate::trace_digest::run_command(config, root, selection, json).await
         }
+        TraceCommand::Export {
+            selection,
+            out,
+            allow_open,
+        } => crate::trace_bundle::run_export(config, root, selection, out, allow_open).await,
+        TraceCommand::VerifyBundle {
+            bundle,
+            json,
+            allow_open,
+            expect,
+        } => crate::trace_bundle::run_verify_bundle(bundle, json, allow_open, expect).await,
     }
 }
 
@@ -332,7 +363,7 @@ pub(crate) fn is_structural_trace_error(error: &EventStoreError) -> bool {
 }
 
 /// Builds an invalid report entry for a trace that could not be decoded.
-fn structural_failure(turn_id: String, message: String) -> TurnVerification {
+pub(crate) fn structural_failure(turn_id: String, message: String) -> TurnVerification {
     TurnVerification {
         turn_id,
         schema_version: None,
@@ -344,15 +375,9 @@ fn structural_failure(turn_id: String, message: String) -> TurnVerification {
     }
 }
 
-/// Verifies one structurally valid stored trace.
-///
-/// Returns the verification and the raw entries so an opt-in replay can use
-/// the trace as its own source of truth.
-fn verify_stored_turn(
-    store: &EventStore,
-    trace: &StoredTraceTurn,
-) -> (TurnVerification, Vec<(u64, TraceEvent)>) {
-    let entries: Vec<Entry> = trace
+/// Projects a validated stored trace into the pure verifier's entry shape.
+pub(crate) fn entries_for_trace(trace: &StoredTraceTurn) -> Vec<Entry> {
+    trace
         .events()
         .iter()
         .map(|stored| Entry {
@@ -360,7 +385,18 @@ fn verify_stored_turn(
             timestamp: stored.timestamp(),
             event: stored.event().clone(),
         })
-        .collect();
+        .collect()
+}
+
+/// Verifies one structurally valid stored trace.
+///
+/// Returns the verification and the raw entries so an opt-in replay can use
+/// the trace as its own source of truth.
+pub(crate) fn verify_stored_turn(
+    store: &EventStore,
+    trace: &StoredTraceTurn,
+) -> (TurnVerification, Vec<(u64, TraceEvent)>) {
+    let entries = entries_for_trace(trace);
     let turn_id = trace.turn_id().to_string();
 
     let mut initial_problems = Vec::new();
@@ -384,6 +420,50 @@ fn verify_stored_turn(
         .map(|entry| (entry.seq, entry.event))
         .collect();
     (verification, replay_entries)
+}
+
+/// Returns the legacy mirror rows that a verified trace actually consumed.
+///
+/// The result is ordered like the trace entries and contains only the
+/// `(session, timestamp, payload_json)` key required by the mirror check. A
+/// missing row is evidence corruption; the stored trace should already have
+/// failed verification before this helper is called.
+pub(crate) fn exported_legacy_rows(
+    store: &EventStore,
+    trace: &StoredTraceTurn,
+) -> Result<Vec<(SessionId, Timestamp, String)>, String> {
+    let entries = entries_for_trace(trace);
+    let mut legacy = load_legacy_index(store, &entries)?;
+    let mut rows = Vec::new();
+    for entry in &entries {
+        let TracePayload::Agent { event } = &entry.event.payload else {
+            continue;
+        };
+        if is_trace_only(event) {
+            continue;
+        }
+        let Some(session) = entry.event.session_id.as_ref() else {
+            continue;
+        };
+        let payload = serde_json::to_string(event).map_err(|error| error.to_string())?;
+        let key = (session.clone(), entry.timestamp, payload.clone());
+        let matched = match legacy.get_mut(&key) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !matched {
+            return Err(format!(
+                "agent event `{}` for session `{session}` has no matching legacy row at timestamp {}",
+                agent_event_kind(event),
+                entry.timestamp
+            ));
+        }
+        rows.push((session.clone(), entry.timestamp, payload));
+    }
+    Ok(rows)
 }
 
 /// Loads the legacy rows needed by the trace-to-legacy mirror check.
@@ -419,44 +499,44 @@ fn load_legacy_index(store: &EventStore, entries: &[Entry]) -> Result<LegacyInde
 
 /// One trace entry used by the pure verifier.
 #[derive(Debug, Clone)]
-struct Entry {
+pub(crate) struct Entry {
     /// Stored one-based sequence number.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Stored timestamp, shared by the legacy mirror row.
-    timestamp: Timestamp,
+    pub(crate) timestamp: Timestamp,
     /// Decoded envelope.
-    event: TraceEvent,
+    pub(crate) event: TraceEvent,
 }
 
 /// Multiset of legacy `(session, timestamp, payload)` rows.
-type LegacyIndex = BTreeMap<(SessionId, Timestamp, String), usize>;
+pub(crate) type LegacyIndex = BTreeMap<(SessionId, Timestamp, String), usize>;
 
 /// Attempt and session that own one agent event.
 type Attribution = (u32, SessionId);
 
 /// Result of verifying one turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TurnVerification {
+pub(crate) struct TurnVerification {
     /// Turn that was verified.
-    turn_id: String,
+    pub(crate) turn_id: String,
     /// Trace schema version, or `None` when stored rows are corrupt.
-    schema_version: Option<u16>,
+    pub(crate) schema_version: Option<u16>,
     /// Number of trace entries, or `None` when stored rows are corrupt.
-    entries: Option<u64>,
+    pub(crate) entries: Option<u64>,
     /// Lowercase hex chain digest, or `None` when the chain is unavailable.
-    digest: Option<String>,
+    pub(crate) digest: Option<String>,
     /// Verification status.
-    status: TraceStatus,
+    pub(crate) status: TraceStatus,
     /// Findings that make an invalid trace invalid.
-    problems: Vec<TraceProblem>,
+    pub(crate) problems: Vec<TraceProblem>,
     /// Execution-parity result, present only when `--replay` was requested.
-    replay: Option<ReplayVerification>,
+    pub(crate) replay: Option<ReplayVerification>,
 }
 
 /// Status of one turn trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum TraceStatus {
+pub(crate) enum TraceStatus {
     /// The trace is closed and every check passed.
     Ok,
     /// The trace has no `turn_ended` marker but no findings.
@@ -478,25 +558,25 @@ impl TraceStatus {
 
 /// One verification finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TraceProblem {
+pub(crate) struct TraceProblem {
     /// Trace sequence number, or `None` for whole-turn findings.
-    seq: Option<u64>,
+    pub(crate) seq: Option<u64>,
     /// Stable machine-readable problem kind.
-    kind: &'static str,
+    pub(crate) kind: &'static str,
     /// Human-readable explanation.
-    message: String,
+    pub(crate) message: String,
 }
 
 impl TraceProblem {
     /// Creates a finding.
-    fn new(seq: Option<u64>, kind: &'static str, message: String) -> Self {
+    pub(crate) fn new(seq: Option<u64>, kind: &'static str, message: String) -> Self {
         Self { seq, kind, message }
     }
 }
 
 /// Counts over one verification report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-struct TraceSummary {
+pub(crate) struct TraceSummary {
     /// Number of turns checked.
     turns: usize,
     /// Number of verified closed traces.
@@ -511,12 +591,43 @@ struct TraceSummary {
 
 impl TraceSummary {
     /// Renders the one-line summary used by text output and errors.
-    fn line(self) -> String {
+    pub(crate) fn line(self) -> String {
         format!(
             "{} turns: {} ok, {} open, {} invalid, {} problems",
             self.turns, self.ok, self.open, self.invalid, self.problems
         )
     }
+}
+
+/// Counts statuses and findings over one turn list.
+pub(crate) fn summarize(turns: &[TurnVerification]) -> TraceSummary {
+    let mut summary = TraceSummary {
+        turns: turns.len(),
+        ok: 0,
+        open: 0,
+        invalid: 0,
+        problems: 0,
+    };
+    for turn in turns {
+        match turn.status {
+            TraceStatus::Ok => summary.ok += 1,
+            TraceStatus::Open => summary.open += 1,
+            TraceStatus::Invalid => {
+                summary.invalid += 1;
+                summary.problems += turn.problems.len();
+            }
+        }
+    }
+    summary
+}
+
+/// Returns whether every turn is acceptable under the open-trace policy.
+pub(crate) fn all_verified(turns: &[TurnVerification], allow_open: bool) -> bool {
+    turns.iter().all(|turn| match turn.status {
+        TraceStatus::Ok => true,
+        TraceStatus::Open => allow_open,
+        TraceStatus::Invalid => false,
+    })
 }
 
 /// Stable JSON shape of one verification run.
@@ -533,23 +644,7 @@ struct TraceVerifyReport {
 impl TraceVerifyReport {
     /// Builds a report and its summary.
     fn new(turns: Vec<TurnVerification>) -> Self {
-        let mut summary = TraceSummary {
-            turns: turns.len(),
-            ok: 0,
-            open: 0,
-            invalid: 0,
-            problems: 0,
-        };
-        for turn in &turns {
-            match turn.status {
-                TraceStatus::Ok => summary.ok += 1,
-                TraceStatus::Open => summary.open += 1,
-                TraceStatus::Invalid => {
-                    summary.invalid += 1;
-                    summary.problems += turn.problems.len();
-                }
-            }
-        }
+        let summary = summarize(&turns);
         Self {
             report_version: REPORT_VERSION,
             turns,
@@ -559,17 +654,18 @@ impl TraceVerifyReport {
 
     /// Returns whether every selected trace is acceptable.
     fn all_verified(&self, allow_open: bool) -> bool {
-        self.turns.iter().all(|turn| match turn.status {
-            TraceStatus::Ok => true,
-            TraceStatus::Open => allow_open,
-            TraceStatus::Invalid => false,
-        })
+        all_verified(&self.turns, allow_open)
     }
 }
 
 /// Renders one report as text, one line per turn plus findings and a summary.
 fn print_text(report: &TraceVerifyReport) {
-    for turn in &report.turns {
+    print_verification_text(&report.turns, report.summary);
+}
+
+/// Renders per-turn verification rows and the summary line.
+pub(crate) fn print_verification_text(turns: &[TurnVerification], summary: TraceSummary) {
+    for turn in turns {
         let schema = turn
             .schema_version
             .map(|version| version.to_string())
@@ -607,11 +703,11 @@ fn print_text(report: &TraceVerifyReport) {
             }
         }
     }
-    println!("summary: {}", report.summary.line());
+    println!("summary: {}", summary.line());
 }
 
 /// Runs the pure verification layers over one trace.
-fn verify_entries(
+pub(crate) fn verify_entries(
     turn_id: &str,
     closed: bool,
     entries: &[Entry],

@@ -80,7 +80,10 @@ pub use skill_log::{
     NewSkill, Skill, SkillId, SkillLog, SkillLogError, SkillSource, SkillStatus, SqliteSkillStore,
     SqliteSkillStoreError,
 };
-pub use trace_store::{StoredTraceEvent, StoredTraceTurn, TraceTurnSummary};
+pub use trace_store::{
+    StoredTraceEvent, StoredTraceTurn, TraceEvidenceEntry, TraceTurnSummary, trace_bundle_digest,
+    verify_exported_trace,
+};
 
 /// SQLite schema and the append-only guards installed on every open.
 const SCHEMA: &str = r#"
