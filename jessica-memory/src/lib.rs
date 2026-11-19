@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::{AgentEvent, Message, SessionId};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
 pub use embedding::{
@@ -234,6 +234,49 @@ impl EventStore {
     pub fn open_in_memory() -> Result<Self, EventStoreError> {
         let connection = Connection::open_in_memory().map_err(EventStoreError::InMemory)?;
         Self::initialize(connection)
+    }
+
+    /// Opens an existing database without creating, migrating, or modifying it.
+    ///
+    /// This is the audit path used by `jessica trace verify`. Unlike
+    /// [`EventStore::open`], a missing file is an error rather than a new
+    /// database, and a database without the trace schema is rejected instead of
+    /// being upgraded. Databases written by a newer build are rejected for the
+    /// same reason as [`EventStore::open`].
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
+        let path = path.as_ref();
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| EventStoreError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(EventStoreError::Schema)?;
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(EventStoreError::Schema)?;
+        if version > SCHEMA_VERSION {
+            return Err(EventStoreError::UnsupportedVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let trace_table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name IN ('trace_events', 'trace_heads')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(EventStoreError::Schema)?;
+        if version < 1 || trace_table_count != 2 {
+            return Err(EventStoreError::TraceSchemaMissing {
+                path: path.to_path_buf(),
+                version,
+            });
+        }
+        Ok(Self { connection })
     }
 
     /// Installs or upgrades the schema and wraps the connection.
@@ -575,6 +618,19 @@ pub enum EventStoreError {
         found: i64,
         /// Highest version this build supports.
         supported: i64,
+    },
+    /// A read-only open found a database without the trace schema.
+    ///
+    /// The caller asked for audit access, so silently creating or migrating the
+    /// database would change the evidence being inspected.
+    #[error(
+        "event store `{path}` has no trace schema (user_version = {version}); open it once with a current read-write build"
+    )]
+    TraceSchemaMissing {
+        /// Database path that was opened.
+        path: PathBuf,
+        /// Version stored in the database's `user_version`.
+        version: i64,
     },
     /// The event could not be serialized to JSON.
     #[error("failed to serialize the agent event: {0}")]

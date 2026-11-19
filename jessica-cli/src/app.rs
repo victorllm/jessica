@@ -1577,6 +1577,48 @@ pub(crate) enum CliError {
     /// Offline replay failed.
     #[error("replay failed: {0}")]
     Replay(#[from] ReplayError),
+    /// `trace` was requested without a configured event store.
+    #[error("`trace` requires an `[events]` path in the configuration")]
+    TraceRequiresEventStore,
+    /// A `trace` argument was missing, unknown, or malformed.
+    #[error("invalid trace command: {message}")]
+    InvalidTraceCommand {
+        /// Human-readable parse failure.
+        message: String,
+    },
+    /// `trace verify --turn` was given without a turn id.
+    #[error("`trace verify --turn` requires a turn id")]
+    MissingTraceTurn,
+    /// `trace verify --turn` was given more than once.
+    #[error("`trace verify --turn` may be given only once")]
+    DuplicateTraceTurn,
+    /// `trace verify` was given neither `--turn` nor `--all`.
+    #[error("`trace verify` requires `--turn <turn_id>` or `--all`")]
+    MissingTraceSelection,
+    /// `trace verify` was given both `--turn` and `--all`.
+    #[error("`trace verify --turn` cannot be combined with `--all`")]
+    TraceSelectionConflict,
+    /// The requested turn trace does not exist.
+    #[error("turn `{turn_id}` was not found in the event store")]
+    UnknownTurn {
+        /// Turn id that could not be found.
+        turn_id: String,
+    },
+    /// The read-only event store could not be opened or read.
+    #[error("trace verification could not access the event store: {0}")]
+    TraceStore(#[from] jessica_memory::EventStoreError),
+    /// The blocking verification task failed.
+    #[error("trace verification task failed: {0}")]
+    TraceTask(#[source] tokio::task::JoinError),
+    /// The verification report could not be serialized.
+    #[error("failed to serialize the trace report: {0}")]
+    TraceReport(#[source] serde_json::Error),
+    /// One or more traces failed verification.
+    #[error("trace verification failed: {summary}")]
+    TraceVerificationFailed {
+        /// One-line summary of the report.
+        summary: String,
+    },
     /// The requested session is absent from the event store.
     #[error("session `{session_id}` was not found in the event store")]
     UnknownSession {

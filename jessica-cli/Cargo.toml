@@ -27,3 +27,8 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 agent-client-protocol = { workspace = true }
+
+[dev-dependencies]
+# Task 7.4: trace-verification E2E tests need to seed a structurally corrupt
+# trace, which the append-only store API intentionally cannot produce.
+rusqlite = { workspace = true }

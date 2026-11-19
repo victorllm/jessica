@@ -18,6 +18,7 @@ mod pump;
 mod replay;
 mod shutdown;
 mod skills;
+mod trace_verify;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ use crate::hot_reload::ConfigWatcher;
 use crate::memory::MemoryAssembly;
 use crate::shutdown::{ShutdownController, ShutdownSignal, SignalListener};
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
+use crate::trace_verify::{TraceCommand, TraceSelection, run_command as run_trace_command};
 
 #[tokio::main]
 async fn main() {
@@ -135,6 +137,20 @@ async fn run() -> RunOutcome {
             // opens the event store.
             let result: Result<Option<SessionEndReason>, CliError> = async {
                 run_skill_command(&config.skills, &root, command).await?;
+                Ok(None)
+            }
+            .await;
+            RunOutcome {
+                result,
+                signal: None,
+            }
+        }
+        Mode::Trace { command } => {
+            // Verification only opens the event store read-only. It never
+            // initializes a provider, wasm tool, memory store, or signal
+            // listener; an audit must not change the evidence.
+            let result: Result<Option<SessionEndReason>, CliError> = async {
+                run_trace_command(&config, &root, command).await?;
                 Ok(None)
             }
             .await;
@@ -368,6 +384,11 @@ enum Mode {
         /// Review command to execute.
         command: SkillCommand,
     },
+    /// Verifies recorded turn traces offline.
+    Trace {
+        /// Parsed trace command.
+        command: TraceCommand,
+    },
     /// Serves stable ACP v1 over stdin/stdout.
     Acp,
 }
@@ -436,6 +457,15 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                 return Ok(Some(Options {
                     config,
                     mode: Mode::Skills { command },
+                }));
+            }
+            "trace" if resume.is_none() && prompt_parts.is_empty() => {
+                let Some(command) = parse_trace_args(args)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(Options {
+                    config,
+                    mode: Mode::Trace { command },
                 }));
             }
             "acp" if resume.is_none() && prompt_parts.is_empty() => {
@@ -642,6 +672,102 @@ fn parse_skill_args(
     }
 }
 
+/// Parses the arguments following the `trace` subcommand.
+fn parse_trace_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<TraceCommand>, CliError> {
+    let Some(subcommand) = args.next() else {
+        print_trace_usage();
+        return Err(CliError::InvalidTraceCommand {
+            message: "missing subcommand".to_owned(),
+        });
+    };
+    if subcommand == "--help" || subcommand == "-h" {
+        print_trace_usage();
+        return Ok(None);
+    }
+
+    match subcommand.as_str() {
+        "verify" => parse_trace_verify_args(args),
+        other => Err(CliError::InvalidTraceCommand {
+            message: format!("unknown subcommand `{other}`; expected verify"),
+        }),
+    }
+}
+
+/// Parses the arguments following `trace verify`.
+///
+/// `--turn` and `--all` are mutually exclusive; exactly one is required.
+/// `--allow-open` is accepted only with `--all`, because a single requested turn
+/// is either complete or not and must not be silently downgraded.
+fn parse_trace_verify_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<TraceCommand>, CliError> {
+    let mut turn = None;
+    let mut all = false;
+    let mut json = false;
+    let mut allow_open = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_trace_usage();
+                return Ok(None);
+            }
+            "--turn" => {
+                let id = args.next().ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id)?;
+            }
+            _ if arg.starts_with("--turn=") => {
+                let id = arg
+                    .strip_prefix("--turn=")
+                    .filter(|id| !id.is_empty())
+                    .ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id.to_owned())?;
+            }
+            "--all" => all = true,
+            "--json" => json = true,
+            "--allow-open" => allow_open = true,
+            _ => {
+                return Err(CliError::InvalidTraceCommand {
+                    message: format!("unexpected `trace verify` argument `{arg}`"),
+                });
+            }
+        }
+    }
+
+    if all && turn.is_some() {
+        return Err(CliError::TraceSelectionConflict);
+    }
+    if allow_open && !all {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--allow-open` requires `--all`".to_owned(),
+        });
+    }
+
+    let selection = match (turn, all) {
+        (Some(turn), false) => TraceSelection::Turn(turn),
+        (None, true) => TraceSelection::All,
+        _ => return Err(CliError::MissingTraceSelection),
+    };
+    Ok(Some(TraceCommand::Verify {
+        selection,
+        json,
+        allow_open,
+    }))
+}
+
+fn set_trace_turn(slot: &mut Option<String>, id: String) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateTraceTurn);
+    }
+    if id.is_empty() {
+        return Err(CliError::MissingTraceTurn);
+    }
+    *slot = Some(id);
+    Ok(())
+}
+
 fn set_skill_status(slot: &mut Option<SkillStatus>, value: &str) -> Result<(), CliError> {
     if slot.is_some() {
         return Err(CliError::InvalidSkillsCommand {
@@ -703,6 +829,26 @@ fn print_skill_usage() {
     );
 }
 
+fn print_trace_usage() {
+    println!(
+        "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json]\n\
+         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \n\
+         Verifies recorded turn traces without creating, migrating, or modifying\n\
+         the [events] database. It checks structural completeness, version-2\n\
+         semantics, and trace-to-legacy mirror consistency. It never calls the\n\
+         model or a tool.\n\
+         \n\
+         --turn <turn_id>  Verify one turn; an unknown turn is an error\n\
+         --all             Verify every stored turn and summarize the results\n\
+         --json            Emit the stable JSON report instead of text\n\
+         --allow-open      Treat traces without `turn_ended` as verified (with --all)\n\
+         \n\
+         Exit code 0 means every selected trace passed; 1 means a trace was\n\
+         invalid, an open trace was not allowed, or verification could not run."
+    );
+}
+
 fn set_resume(slot: &mut Option<SessionId>, id: &str) -> Result<(), CliError> {
     if slot.is_some() {
         return Err(CliError::DuplicateResume);
@@ -756,6 +902,13 @@ fn print_usage() {
          results drive the loop, and the resulting events are written as JSONL. It\n\
          requires an [events] path, never calls the model or a tool, and never reads\n\
          the clock or the network.\n\
+         \n\
+         Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json]\n\
+         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \n\
+         Verifies recorded turn traces offline against an existing [events]\n\
+         database. The store is opened read-only: verification never creates or\n\
+         migrates it. See `jessica trace --help` for problem kinds and exit codes.\n\
          \n\
          Usage: jessica [--config <path>] acp\n\
          \n\
@@ -949,6 +1102,15 @@ mod tests {
         };
         assert_eq!(watched_config_path(&skills, &config), None);
 
+        let trace = Mode::Trace {
+            command: TraceCommand::Verify {
+                selection: TraceSelection::All,
+                json: false,
+                allow_open: false,
+            },
+        };
+        assert_eq!(watched_config_path(&trace, &config), None);
+
         assert_eq!(
             watched_config_path(&Mode::Acp, &config),
             config,
@@ -971,6 +1133,83 @@ mod tests {
             assert_eq!(options.config, Some(config.clone()));
             assert!(matches!(options.mode, Mode::Acp));
         }
+    }
+
+    #[test]
+    fn trace_verify_parses_turn_and_all_selections() {
+        assert_eq!(
+            parse_trace_args(skill_args(&["verify", "--turn", "turn-a", "--json"]))
+                .expect("turn selection must parse"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::Turn("turn-a".to_owned()),
+                json: true,
+                allow_open: false,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&["verify", "--all", "--json", "--allow-open"]))
+                .expect("all selection must parse"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::All,
+                json: true,
+                allow_open: true,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&["verify", "--turn=turn-b"]))
+                .expect("equals-form turn selection must parse"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::Turn("turn-b".to_owned()),
+                json: false,
+                allow_open: false,
+            })
+        );
+    }
+
+    #[test]
+    fn trace_help_is_not_an_error_and_prints_usage() {
+        assert_eq!(
+            parse_trace_args(skill_args(&["--help"])).expect("trace help must parse"),
+            None
+        );
+        assert_eq!(
+            parse_trace_args(skill_args(&["verify", "-h"])).expect("verify help must parse"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_trace_arguments_are_rejected_with_the_offending_value() {
+        for (arguments, expected) in [
+            (vec!["publish"], "publish"),
+            (vec!["verify"], "requires"),
+            (vec!["verify", "--turn"], "requires a turn id"),
+            (vec!["verify", "--turn="], "requires a turn id"),
+            (vec!["verify", "--turn", "a", "--turn", "b"], "only once"),
+            (vec!["verify", "--turn", "a", "--all"], "cannot be combined"),
+            (
+                vec!["verify", "--all", "--allow-open=true"],
+                "--allow-open=true",
+            ),
+            (
+                vec!["verify", "--turn", "a", "--allow-open"],
+                "requires `--all`",
+            ),
+            (vec!["verify", "--unknown"], "--unknown"),
+        ] {
+            let error = parse_trace_args(skill_args(&arguments))
+                .expect_err("malformed trace arguments must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "error `{error}` must mention `{expected}`"
+            );
+        }
+
+        let error =
+            parse_trace_args(skill_args(&[])).expect_err("a missing subcommand must be rejected");
+        assert!(error.to_string().contains("missing subcommand"));
     }
 
     #[test]
