@@ -402,9 +402,12 @@ fn sigterm_during_a_turn_persists_cancelled_and_exits_143() {
     );
 }
 
-#[test]
-fn sigint_on_an_idle_repl_exits_130_without_creating_a_turn() {
-    let temp = TempDir::new("sigint-idle");
+/// Runs the idle-REPL SIGINT scenario once.
+///
+/// Returns the temporary directory (kept alive for later database assertions),
+/// the child pid, and the captured output.
+fn run_idle_sigint(label: &str) -> (TempDir, u32, Output) {
+    let temp = TempDir::new(label);
     let config = temp.path.join("harness.toml");
     write_config(&config, "[events]\npath = \"events.sqlite\"\n");
     // Bind but never accept: the CLI must not connect at all in this test.
@@ -429,6 +432,13 @@ fn sigint_on_an_idle_repl_exits_130_without_creating_a_turn() {
     let status = wait_with_timeout(&mut child);
     let output = collect_output(child, status);
     drop(listener);
+    (temp, pid, output)
+}
+
+#[test]
+fn sigint_on_an_idle_repl_exits_130_without_creating_a_turn() {
+    let (temp, pid, output) = run_idle_sigint("sigint-idle");
+    let database = temp.path.join("events.sqlite");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -463,6 +473,30 @@ fn sigint_on_an_idle_repl_exits_130_without_creating_a_turn() {
             .is_none(),
         "shutdown must not record session metadata without a turn"
     );
+}
+
+#[test]
+fn every_idle_sigint_writes_its_diagnostic_before_exiting() {
+    // The diagnostic used to be written after the controller recorded the
+    // signal. The REPL could wake and exit in that window, producing exit 130
+    // with no stderr line (CI run 44431198725). Repeat the real process
+    // scenario so the ordering is guarded by behaviour, not only by the
+    // controller unit tests.
+    for iteration in 0..20 {
+        let (_temp, _pid, output) = run_idle_sigint("sigint-idle-stress");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "iteration {iteration}: SIGINT must produce exit code 130\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("SIGINT received; stopping new turns and draining"),
+            "iteration {iteration}: the first-signal diagnostic must not race with exit\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_no_panic(&stdout, &stderr);
+    }
 }
 
 #[test]
