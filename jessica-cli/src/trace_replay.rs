@@ -22,7 +22,7 @@ use jessica_runtime::RecordedEvent;
 use serde::Serialize;
 
 use crate::events::StoredSession;
-use crate::replay::{ReplayError, replay_session};
+use crate::replay::{ReplayError, replay_resumed_session, replay_session};
 
 /// Status of one replay parity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,14 +127,20 @@ pub(crate) async fn verify(entries: &[(u64, TraceEvent)]) -> ReplayOutcome {
         replayed += 1;
         compared += attempt.events.len();
         let stored = StoredSession {
-            initial_messages: attempt.initial_messages.clone(),
+            initial_messages: attempt.start.initial_messages().to_vec(),
             events: attempt
                 .events
                 .iter()
                 .map(|(seq, event)| RecordedEvent::new(*seq, event.clone()))
                 .collect(),
         };
-        match replay_session(&attempt.session, &stored).await {
+        let replay = match attempt.start.rounds_completed() {
+            Some(rounds_completed) => {
+                replay_resumed_session(&attempt.session, &stored, rounds_completed).await
+            }
+            None => replay_session(&attempt.session, &stored).await,
+        };
+        match replay {
             Ok(actual) => compare_attempt(attempt, &actual, &mut problems),
             Err(ReplayError::EventLag { skipped }) => {
                 return ReplayOutcome {
@@ -175,14 +181,53 @@ pub(crate) async fn verify(entries: &[(u64, TraceEvent)]) -> ReplayOutcome {
     }
 }
 
+/// Starting state of one attempt's replay.
+#[derive(Debug, Clone, PartialEq)]
+enum AttemptStart {
+    /// A fresh attempt whose bootstrap messages come from `SessionStarted`.
+    Fresh {
+        /// Conversation recorded with the attempt.
+        initial_messages: Vec<Message>,
+    },
+    /// A resumed attempt that starts from an out-of-band checkpoint.
+    Resumed {
+        /// Conversation the resumed loop must see.
+        initial_messages: Vec<Message>,
+        /// Model rounds the original session completed before resuming.
+        rounds_completed: u32,
+    },
+}
+
+impl AttemptStart {
+    /// Returns the conversation the replay loop must start with.
+    fn initial_messages(&self) -> &[Message] {
+        match self {
+            Self::Fresh { initial_messages }
+            | Self::Resumed {
+                initial_messages, ..
+            } => initial_messages,
+        }
+    }
+
+    /// Returns the completed rounds when this attempt resumed a checkpoint.
+    fn rounds_completed(&self) -> Option<u32> {
+        match self {
+            Self::Fresh { .. } => None,
+            Self::Resumed {
+                rounds_completed, ..
+            } => Some(*rounds_completed),
+        }
+    }
+}
+
 /// One attempt reconstructed from the trace.
 struct PreparedAttempt {
     /// One-based attempt number.
     number: u32,
     /// Session that owns the attempt's events.
     session: SessionId,
-    /// Bootstrap conversation recorded on the attempt's `SessionStarted`.
-    initial_messages: Vec<Message>,
+    /// Starting state reconstructed from the trace.
+    start: AttemptStart,
     /// Terminal reason of the attempt's `SessionEnded`.
     reason: SessionEndReason,
     /// Replayable events with their original trace sequences.
@@ -205,10 +250,10 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
         return Err("the trace has no entries".to_owned());
     }
     let version = entries[0].1.schema_version;
-    if version < 2 {
-        return Err(
-            "version-1 traces do not carry bootstrap messages or explicit rounds".to_owned(),
-        );
+    if !(1..=2).contains(&version) {
+        return Err(format!(
+            "trace schema version {version} is not supported by replay"
+        ));
     }
     if entries
         .iter()
@@ -218,6 +263,7 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
     }
 
     let mut mode = None;
+    let mut turn_messages = Vec::new();
     let mut terminal = None;
     let mut attempts: BTreeMap<u32, Vec<(u64, TraceEvent)>> = BTreeMap::new();
     let mut outer = Vec::new();
@@ -227,7 +273,13 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
             TracePayload::Gap { .. } => {
                 return Err("the trace contains a gap; replay would be incomplete".to_owned());
             }
-            TracePayload::TurnStarted { mode: started, .. } => mode = Some(*started),
+            TracePayload::TurnStarted {
+                mode: started,
+                messages,
+            } => {
+                mode = Some(*started);
+                turn_messages = messages.clone();
+            }
             TracePayload::TurnEnded { reason } => terminal = Some(*reason),
             TracePayload::Agent { .. } => match trace.attempt {
                 Some(attempt) => attempts
@@ -239,21 +291,35 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
         }
     }
 
-    match mode {
-        Some(TraceTurnMode::Fresh) => {}
-        Some(TraceTurnMode::Resumed) => {
-            return Err(
-                "resumed turns have no `SessionStarted` and omit checkpoint state from the trace"
-                    .to_owned(),
-            );
-        }
-        None => return Err("the trace has no `turn_started` entry".to_owned()),
-    }
+    let Some(mode) = mode else {
+        return Err("the trace has no `turn_started` entry".to_owned());
+    };
     let Some(terminal) = terminal else {
         return Err("the trace has no `turn_ended` entry".to_owned());
     };
     if attempts.is_empty() {
         return Err("the trace contains no attempt".to_owned());
+    }
+    match mode {
+        TraceTurnMode::Fresh => {
+            if version < 2 && attempts.len() != 1 {
+                return Err(
+                    "version-1 traces with multiple attempts do not record each attempt's bootstrap messages"
+                        .to_owned(),
+                );
+            }
+        }
+        TraceTurnMode::Resumed => {
+            if version < 2 {
+                return Err("resumed turns require trace schema version 2".to_owned());
+            }
+            if attempts.len() != 1 {
+                return Err(
+                    "resumed turns with multiple attempts do not record enough checkpoint state to replay"
+                        .to_owned(),
+                );
+            }
+        }
     }
 
     let numbers: Vec<u32> = attempts.keys().copied().collect();
@@ -268,7 +334,13 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
 
     let mut prepared = Vec::with_capacity(attempts.len());
     for (number, events) in attempts {
-        prepared.push(prepare_attempt(number, events)?);
+        prepared.push(prepare_attempt(
+            number,
+            events,
+            mode,
+            version,
+            &turn_messages,
+        )?);
     }
 
     let outer = outer
@@ -290,6 +362,9 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
 fn prepare_attempt(
     number: u32,
     entries: Vec<(u64, TraceEvent)>,
+    mode: TraceTurnMode,
+    version: u16,
+    turn_messages: &[Message],
 ) -> Result<PreparedAttempt, String> {
     let mut session: Option<SessionId> = None;
     let mut events = Vec::new();
@@ -330,23 +405,6 @@ fn prepare_attempt(
     };
     let Some((
         _,
-        AgentEvent::SessionStarted {
-            session_id: started,
-            messages,
-        },
-    )) = events.first()
-    else {
-        return Err(format!(
-            "attempt {number} does not begin with a `SessionStarted` event"
-        ));
-    };
-    if *started != session {
-        return Err(format!(
-            "attempt {number} starts the wrong session: expected `{session}`, found `{started}`"
-        ));
-    }
-    let Some((
-        _,
         AgentEvent::SessionEnded {
             session_id: ended,
             reason,
@@ -364,16 +422,6 @@ fn prepare_attempt(
     }
     if events
         .iter()
-        .filter(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. }))
-        .count()
-        != 1
-    {
-        return Err(format!(
-            "attempt {number} contains more than one `SessionStarted` event"
-        ));
-    }
-    if events
-        .iter()
         .filter(|(_, event)| matches!(event, AgentEvent::SessionEnded { .. }))
         .count()
         != 1
@@ -382,6 +430,75 @@ fn prepare_attempt(
             "attempt {number} contains more than one `SessionEnded` event"
         ));
     }
+
+    let start = match mode {
+        TraceTurnMode::Fresh => {
+            let Some((
+                _,
+                AgentEvent::SessionStarted {
+                    session_id: started,
+                    messages,
+                },
+            )) = events.first()
+            else {
+                return Err(format!(
+                    "attempt {number} does not begin with a `SessionStarted` event"
+                ));
+            };
+            if *started != session {
+                return Err(format!(
+                    "attempt {number} starts the wrong session: expected `{session}`, found `{started}`"
+                ));
+            }
+            if events
+                .iter()
+                .filter(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. }))
+                .count()
+                != 1
+            {
+                return Err(format!(
+                    "attempt {number} contains more than one `SessionStarted` event"
+                ));
+            }
+            if version < 2 {
+                if !messages.is_empty() {
+                    return Err(format!(
+                        "version-1 attempt {number} carries bootstrap messages on `SessionStarted`"
+                    ));
+                }
+                AttemptStart::Fresh {
+                    initial_messages: turn_messages.to_vec(),
+                }
+            } else {
+                AttemptStart::Fresh {
+                    initial_messages: messages.clone(),
+                }
+            }
+        }
+        TraceTurnMode::Resumed => {
+            if events
+                .iter()
+                .any(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. }))
+            {
+                return Err(format!(
+                    "attempt {number} contains a `SessionStarted` event in a resumed turn"
+                ));
+            }
+            let Some((_, AgentEvent::RoundStarted { round })) = events.first() else {
+                return Err(format!(
+                    "resumed attempt {number} does not begin with a `RoundStarted` event"
+                ));
+            };
+            let rounds_completed = round
+                .checked_sub(1)
+                .ok_or_else(|| format!("resumed attempt {number} starts at invalid round 0"))?;
+            AttemptStart::Resumed {
+                initial_messages: turn_messages.to_vec(),
+                rounds_completed,
+            }
+        }
+    };
+
     match reason {
         SessionEndReason::Completed | SessionEndReason::Error => {}
         SessionEndReason::BudgetExceeded => {
@@ -414,7 +531,7 @@ fn prepare_attempt(
     Ok(PreparedAttempt {
         number,
         session,
-        initial_messages: messages.clone(),
+        start,
         reason: *reason,
         events,
     })
@@ -1140,17 +1257,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_one_traces_are_unsupported() {
+    async fn version_one_traces_replay_from_turn_started_bootstrap() {
         let session = session("session-a");
         let mut entries = vec![
             started(TraceTurnMode::Fresh),
-            session_started(2, 1, &session, "do it"),
-            session_ended(3, 1, &session, SessionEndReason::Completed),
-            ended(4, SessionEndReason::Completed),
+            attempt_agent(
+                2,
+                1,
+                &session,
+                AgentEvent::SessionStarted {
+                    session_id: session.clone(),
+                    messages: Vec::new(),
+                },
+            ),
+            attempt_agent(
+                3,
+                1,
+                &session,
+                AgentEvent::ModelDelta {
+                    text: "legacy".to_owned(),
+                },
+            ),
+            session_ended(4, 1, &session, SessionEndReason::Completed),
+            ended(5, SessionEndReason::Completed),
         ];
         for (_, trace) in &mut entries {
             trace.schema_version = 1;
         }
+
+        let outcome = verify(&entries).await;
+
+        assert_eq!(outcome.verification.status, ReplayStatus::Ok, "{outcome:?}");
+        assert_eq!(outcome.verification.attempts, 1);
+        assert_eq!(outcome.verification.events, 3);
+        assert!(outcome.problems.is_empty(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_trace_replays_from_its_recorded_checkpoint() {
+        let session = session("session-a");
+        let entries = vec![
+            (
+                1,
+                envelope(
+                    None,
+                    None,
+                    TracePayload::TurnStarted {
+                        mode: TraceTurnMode::Resumed,
+                        messages: vec![Message::user("continue")],
+                    },
+                ),
+            ),
+            attempt_agent(2, 1, &session, AgentEvent::RoundStarted { round: 3 }),
+            attempt_agent(
+                3,
+                1,
+                &session,
+                AgentEvent::ModelDelta {
+                    text: "done".to_owned(),
+                },
+            ),
+            attempt_agent(
+                4,
+                1,
+                &session,
+                AgentEvent::RoundFinished {
+                    round: 3,
+                    usage: None,
+                },
+            ),
+            session_ended(5, 1, &session, SessionEndReason::Completed),
+            ended(6, SessionEndReason::Completed),
+        ];
+
+        let outcome = verify(&entries).await;
+
+        assert_eq!(outcome.verification.status, ReplayStatus::Ok, "{outcome:?}");
+        assert_eq!(outcome.verification.attempts, 1);
+        assert_eq!(outcome.verification.events, 4);
+        assert!(outcome.problems.is_empty(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn resumed_traces_without_a_model_round_are_unsupported() {
+        let session = session("session-a");
+        let entries = vec![
+            (
+                1,
+                envelope(
+                    None,
+                    None,
+                    TracePayload::TurnStarted {
+                        mode: TraceTurnMode::Resumed,
+                        messages: vec![Message::user("continue")],
+                    },
+                ),
+            ),
+            session_ended(2, 1, &session, SessionEndReason::Completed),
+            ended(3, SessionEndReason::Completed),
+        ];
 
         let outcome = verify(&entries).await;
 
@@ -1160,24 +1365,13 @@ mod tests {
                 .verification
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("version-1"))
+                .is_some_and(|reason| reason.contains("does not begin with a `RoundStarted`"))
         );
     }
 
     #[tokio::test]
-    async fn resumed_cancelled_and_governance_budget_traces_are_unsupported() {
+    async fn cancelled_and_governance_budget_traces_are_unsupported() {
         let session = session("session-a");
-
-        let resumed = vec![
-            started(TraceTurnMode::Resumed),
-            session_started(2, 1, &session, "do it"),
-            session_ended(3, 1, &session, SessionEndReason::Completed),
-            ended(4, SessionEndReason::Completed),
-        ];
-        assert_eq!(
-            verify(&resumed).await.verification.status,
-            ReplayStatus::Unsupported
-        );
 
         let cancelled = vec![
             started(TraceTurnMode::Fresh),

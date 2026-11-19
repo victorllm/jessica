@@ -202,6 +202,34 @@ fn resume_continues_from_the_recorded_checkpoint_without_replaying_tools() {
             reason: SessionEndReason::Completed
         }
     ));
+    let turn_id = summaries[0].turn_id().to_string();
+    drop(store);
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_jessica"))
+        .current_dir(workspace_root())
+        .arg("--config")
+        .arg(&config)
+        .arg("trace")
+        .arg("verify")
+        .arg("--turn")
+        .arg(&turn_id)
+        .arg("--replay")
+        .output()
+        .expect("trace verification should run");
+    let stdout = String::from_utf8_lossy(&verified.stdout);
+    let stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(
+        verified.status.success(),
+        "the real resumed trace must replay\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("replay: ok attempts=1 events=4"),
+        "the resumed trace must replay all four recorded events:\n{stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "successful replay must not write to stderr:\n{stderr}"
+    );
 }
 
 /// Writes a session that stopped after its first complete tool batch.

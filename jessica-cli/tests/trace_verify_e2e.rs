@@ -309,49 +309,166 @@ fn replay_mismatches_make_the_turn_invalid() {
 }
 
 #[test]
-fn replay_unsupported_traces_fail_explicitly() {
-    let temp = TempDir::new("replay-unsupported");
+fn replay_supports_version_one_fresh_traces() {
+    let temp = TempDir::new("replay-v1");
     let database = temp.path.join("events.sqlite");
     let mut store = EventStore::open(&database).expect("event store should open");
     seed_v1_turn(&mut store, "turn-v1", "session-v1", 1_000);
     drop(store);
     let config = write_config(&temp, &database);
 
-    let output = run_verify(&config, &["--turn", "turn-v1", "--replay", "--json"]);
+    let text = run_verify(&config, &["--turn", "turn-v1", "--replay"]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        text.status.success(),
+        "a version-1 trace must replay from its turn bootstrap\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("replay: ok attempts=1 events=2"),
+        "the version-1 session start and end must match:\n{stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "success must not write to stderr:\n{stderr}"
+    );
+
+    let json = run_verify(&config, &["--turn", "turn-v1", "--replay", "--json"]);
+    assert!(json.status.success());
+    let report = json_report(&json);
+    let turn = report_turn(&report, "turn-v1");
+    assert_eq!(turn["status"], "ok");
+    assert_eq!(turn["replay"]["status"], "ok");
+    assert_eq!(turn["replay"]["events"], 2);
+    assert!(turn["replay"]["reason"].is_null());
+}
+
+#[test]
+fn batch_replay_covers_fresh_version_one_and_resumed_traces() {
+    let temp = TempDir::new("replay-batch-ok");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_replayable_turn(&mut store, "turn-fresh", "session-fresh", 1_000);
+    seed_v1_turn(&mut store, "turn-v1", "session-v1", 2_000);
+    seed_resumed_turn(&mut store, "turn-resumed", "session-resumed", 3_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--all", "--replay", "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "every replayable trace must pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "success must not write to stderr:\n{stderr}"
+    );
+
+    let report = json_report(&output);
+    assert_eq!(report["summary"]["turns"], 3);
+    assert_eq!(report["summary"]["ok"], 3);
+    assert_eq!(report["summary"]["invalid"], 0);
+    for (turn_id, events) in [("turn-fresh", 5), ("turn-v1", 2), ("turn-resumed", 4)] {
+        let turn = report_turn(&report, turn_id);
+        assert_eq!(turn["status"], "ok", "{turn}");
+        assert_eq!(turn["replay"]["status"], "ok", "{turn}");
+        assert_eq!(turn["replay"]["attempts"], 1, "{turn}");
+        assert_eq!(turn["replay"]["events"], events, "{turn}");
+    }
+}
+
+#[test]
+fn batch_replay_continues_after_a_mismatch() {
+    let temp = TempDir::new("replay-batch-mismatch");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_replayable_turn(&mut store, "turn-ok-a", "session-ok-a", 1_000);
+    seed_valid_turn(&mut store, "turn-mismatch", "session-mismatch", 2_000);
+    seed_v1_turn(&mut store, "turn-ok-b", "session-ok-b", 3_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--all", "--replay", "--json"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "an unreplayable trace must not pass silently\nstdout:\n{}\nstderr:\n{stderr}",
+        "a batch with a parity mismatch must fail\nstdout:\n{}\nstderr:\n{stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
 
     let report = json_report(&output);
-    let turn = report_turn(&report, "turn-v1");
+    assert_eq!(report["summary"]["turns"], 3);
+    assert_eq!(report["summary"]["ok"], 2);
+    assert_eq!(report["summary"]["invalid"], 1);
+    assert_eq!(report_turn(&report, "turn-ok-a")["replay"]["status"], "ok");
+    let mismatch = report_turn(&report, "turn-mismatch");
+    assert_eq!(mismatch["status"], "invalid");
+    assert_eq!(mismatch["replay"]["status"], "mismatch");
+    assert!(problem_kinds(mismatch).contains(&"replay_mismatch"));
     assert_eq!(
-        turn["status"], "ok",
-        "the trace itself passes structural verification"
-    );
-    assert_eq!(turn["replay"]["status"], "unsupported");
-    assert!(
-        turn["replay"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("version-1")),
-        "the report must explain the unsupported subset: {turn}"
+        report_turn(&report, "turn-ok-b")["replay"]["status"],
+        "ok",
+        "the batch must keep replaying after a mismatch"
     );
     assert!(
-        stderr.contains("cannot be replay-verified") && stderr.contains("version-1"),
-        "the CLI must fail with an explicit unsupported error:\n{stderr}"
+        stderr.contains("trace verification failed"),
+        "the CLI must report verification failure:\n{stderr}"
     );
 }
 
 #[test]
-fn replay_rejects_batch_selection() {
-    let temp = TempDir::new("replay-batch");
+fn batch_replay_reports_unsupported_turns_without_invalidating_them() {
+    let temp = TempDir::new("replay-batch-unsupported");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_replayable_turn(&mut store, "turn-ok", "session-ok", 1_000);
+    seed_unreplayable_resumed_turn(&mut store, "turn-resumed", "session-resumed", 2_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--all", "--replay", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an unsupported valid trace must make batch replay exit non-zero\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let report = json_report(&output);
+    assert_eq!(report["summary"]["turns"], 2);
+    assert_eq!(report["summary"]["ok"], 2);
+    assert_eq!(report["summary"]["invalid"], 0);
+    assert_eq!(report_turn(&report, "turn-ok")["replay"]["status"], "ok");
+    let unsupported = report_turn(&report, "turn-resumed");
+    assert_eq!(
+        unsupported["status"], "ok",
+        "unsupported replay must not invalidate valid evidence"
+    );
+    assert_eq!(unsupported["replay"]["status"], "unsupported");
+    assert!(
+        unsupported["replay"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("RoundStarted")),
+        "the report must explain the unsupported subset: {unsupported}"
+    );
+    assert!(
+        stderr.contains("cannot be replay-verified")
+            && stderr.contains("turn-resumed")
+            && !stderr.contains("trace verification failed"),
+        "the CLI must report only the replay limitation:\n{stderr}"
+    );
+}
+
+#[test]
+fn batch_replay_rejects_allow_open() {
+    let temp = TempDir::new("replay-batch-open");
     let database = temp.path.join("events.sqlite");
     drop(EventStore::open(&database).expect("event store should open"));
     let config = write_config(&temp, &database);
 
-    let output = run_verify(&config, &["--all", "--replay"]);
+    let output = run_verify(&config, &["--all", "--replay", "--allow-open"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
@@ -359,8 +476,8 @@ fn replay_rejects_batch_selection() {
         "a rejected command must not produce a report"
     );
     assert!(
-        stderr.contains("requires `--turn`"),
-        "the error must explain the required selection:\n{stderr}"
+        stderr.contains("cannot be combined"),
+        "the error must explain the incompatible flags:\n{stderr}"
     );
 }
 
@@ -383,6 +500,19 @@ fn an_empty_store_is_a_successful_zero_turn_report() {
     assert_eq!(report["summary"]["open"], 0);
     assert_eq!(report["summary"]["invalid"], 0);
     assert_eq!(report["summary"]["problems"], 0);
+    assert_eq!(
+        report["turns"].as_array().expect("turns must be an array"),
+        &Vec::<Value>::new()
+    );
+
+    let replay = run_verify(&config, &["--all", "--replay", "--json"]);
+    assert!(
+        replay.status.success(),
+        "batch replay over an empty store has nothing to reject:\n{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let report = json_report(&replay);
+    assert_eq!(report["summary"]["turns"], 0);
     assert_eq!(
         report["turns"].as_array().expect("turns must be an array"),
         &Vec::<Value>::new()
@@ -1028,8 +1158,8 @@ fn seed_replayable_turn(store: &mut EventStore, turn: &str, session_name: &str, 
     );
 }
 
-/// Writes a structurally valid version-1 trace. It carries no bootstrap
-/// messages, rounds, or usage, so execution replay cannot reconstruct it.
+/// Writes a structurally valid version-1 trace. It has no explicit rounds or
+/// usage; replay reconstructs its single model turn from the turn bootstrap.
 fn seed_v1_turn(store: &mut EventStore, turn: &str, session_name: &str, base: i64) {
     let turn_id = TurnId::new(turn);
     let session = SessionId::new(session_name);
@@ -1082,6 +1212,136 @@ fn seed_v1_turn(store: &mut EventStore, turn: &str, session_name: &str, base: i6
         )),
         None,
         base + 3,
+    );
+}
+
+/// Writes a closed resumed trace that continues at model round two.
+fn seed_resumed_turn(store: &mut EventStore, turn: &str, session_name: &str, base: i64) {
+    let turn_id = TurnId::new(turn);
+    let session = SessionId::new(session_name);
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id.clone(),
+            None,
+            Some(session.clone()),
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Resumed,
+                messages: vec![
+                    Message::system("resume test"),
+                    Message::user("continue"),
+                    Message::assistant("working"),
+                    Message::tool("call-1", "recorded output"),
+                ],
+            },
+        ),
+        None,
+        base,
+    );
+
+    let round_started = AgentEvent::RoundStarted { round: 2 };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, round_started.clone()),
+        Some((&session, &round_started)),
+        base + 1,
+    );
+
+    let delta = AgentEvent::ModelDelta {
+        text: "resumed done".to_owned(),
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, delta.clone()),
+        Some((&session, &delta)),
+        base + 2,
+    );
+
+    let round_finished = AgentEvent::RoundFinished {
+        round: 2,
+        usage: Some(TokenUsage::new(7, 3)),
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, round_finished.clone()),
+        Some((&session, &round_finished)),
+        base + 3,
+    );
+
+    let session_ended = AgentEvent::SessionEnded {
+        session_id: session.clone(),
+        reason: SessionEndReason::Completed,
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, session_ended.clone()),
+        Some((&session, &session_ended)),
+        base + 4,
+    );
+
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id,
+            None,
+            None,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed,
+            },
+        ),
+        None,
+        base + 5,
+    );
+}
+
+/// Writes a valid resumed trace with no model round. Replay cannot infer the
+/// checkpoint's completed-round count from such a stream, so it is unsupported.
+fn seed_unreplayable_resumed_turn(
+    store: &mut EventStore,
+    turn: &str,
+    session_name: &str,
+    base: i64,
+) {
+    let turn_id = TurnId::new(turn);
+    let session = SessionId::new(session_name);
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id.clone(),
+            None,
+            Some(session.clone()),
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Resumed,
+                messages: vec![Message::user("continue")],
+            },
+        ),
+        None,
+        base,
+    );
+
+    let session_ended = AgentEvent::SessionEnded {
+        session_id: session.clone(),
+        reason: SessionEndReason::Completed,
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, session_ended.clone()),
+        Some((&session, &session_ended)),
+        base + 1,
+    );
+
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id,
+            None,
+            None,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed,
+            },
+        ),
+        None,
+        base + 2,
     );
 }
 

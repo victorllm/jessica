@@ -707,8 +707,8 @@ fn parse_trace_args(
 ///
 /// `--turn` and `--all` are mutually exclusive; exactly one is required.
 /// `--allow-open` is accepted only with `--all`, because a single requested turn
-/// is either complete or not and must not be silently downgraded. `--replay`
-/// needs one specific turn, so it is accepted only with `--turn`.
+/// is either complete or not and must not be silently downgraded. Replay accepts
+/// either selection, but not `--allow-open`: replay requires a closed trace.
 fn parse_trace_verify_args(
     mut args: impl Iterator<Item = String>,
 ) -> Result<Option<TraceCommand>, CliError> {
@@ -776,9 +776,9 @@ fn parse_trace_verify_args(
         (None, true) => TraceSelection::All,
         _ => return Err(CliError::MissingTraceSelection),
     };
-    if replay && !matches!(selection, TraceSelection::Turn(_)) {
+    if replay && allow_open {
         return Err(CliError::InvalidTraceCommand {
-            message: "`--replay` requires `--turn`".to_owned(),
+            message: "`--allow-open` cannot be combined with `--replay`".to_owned(),
         });
     }
     if expect.is_some() && !matches!(selection, TraceSelection::Turn(_)) {
@@ -1089,7 +1089,7 @@ fn print_skill_usage() {
 fn print_trace_usage() {
     println!(
         "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay] [--expect <digest>]\n\
-         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open] [--replay]\n\
          \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
          \x20      jessica [--config <path>] trace digest --all [--json]\n\
          \x20      jessica [--config <path>] trace export --turn <turn_id> --out <path>\n\
@@ -1105,9 +1105,10 @@ fn print_trace_usage() {
          --turn <turn_id>  Verify, digest, or export one turn; unknown is an error\n\
          --all             Select every stored turn\n\
          --json            Emit the stable JSON report instead of text\n\
-         --allow-open      Treat traces without `turn_ended` as verified (with --all)\n\
-         --replay          Re-run each fresh attempt with recorded inputs and require\n\
-         \x20                 the event sequence to match (with verify --turn)\n\
+         --allow-open      Treat traces without `turn_ended` as verified (with --all;\n\
+         \x20                 not with --replay)\n\
+         --replay          Re-run each fresh or resumed attempt with recorded inputs\n\
+         \x20                 and require the event sequence to match (verify only)\n\
          --expect <digest> Require a turn chain digest (verify) or the bundle\n\
          \x20                 aggregate digest (verify-bundle) to match 64 hex chars\n\
          --out <path>      Write the evidence bundle; an existing file is replaced\n\
@@ -1181,7 +1182,7 @@ fn print_usage() {
          the clock or the network.\n\
          \n\
          Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay] [--expect <digest>]\n\
-         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open] [--replay]\n\
          \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
          \x20      jessica [--config <path>] trace digest --all [--json]\n\
          \x20      jessica [--config <path>] trace export --turn <turn_id> --out <path>\n\
@@ -1466,6 +1467,18 @@ mod tests {
             .expect("replay with one turn must parse"),
             Some(TraceCommand::Verify {
                 selection: TraceSelection::Turn("turn-c".to_owned()),
+                json: true,
+                allow_open: false,
+                replay: true,
+                expect: None,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&["verify", "--all", "--replay", "--json"]))
+                .expect("batch replay must parse"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::All,
                 json: true,
                 allow_open: false,
                 replay: true,
@@ -1759,7 +1772,10 @@ mod tests {
                 vec!["verify", "--turn", "a", "--allow-open"],
                 "requires `--all`",
             ),
-            (vec!["verify", "--all", "--replay"], "requires `--turn`"),
+            (
+                vec!["verify", "--all", "--replay", "--allow-open"],
+                "cannot be combined",
+            ),
             (vec!["verify", "--unknown"], "--unknown"),
         ] {
             let error = parse_trace_args(skill_args(&arguments))

@@ -143,13 +143,20 @@ async fn run_verify(
     replay: bool,
     expect: Option<String>,
 ) -> Result<(), CliError> {
-    if replay && !matches!(selection, TraceSelection::Turn(_)) {
-        return Err(CliError::InvalidTraceCommand {
-            message: "`--replay` requires `--turn`".to_owned(),
-        });
-    }
-
     let database = event_store_path(config, root)?;
+    if replay && matches!(selection, TraceSelection::All) {
+        if allow_open {
+            return Err(CliError::InvalidTraceCommand {
+                message: "`--allow-open` cannot be combined with `--replay`".to_owned(),
+            });
+        }
+        if expect.is_some() {
+            return Err(CliError::InvalidTraceCommand {
+                message: "`--expect` requires `--turn`".to_owned(),
+            });
+        }
+        return run_all_replay(&database, json).await;
+    }
     let allow_open_hint = matches!(selection, TraceSelection::All);
 
     let BuiltReport {
@@ -197,56 +204,12 @@ async fn run_verify(
                 summary: "the single-turn report is missing its turn".to_owned(),
             });
         };
-        let outcome = if turn.status == TraceStatus::Ok {
-            match replay_entries {
-                Some(entries) => trace_replay::verify(&entries).await,
-                None => {
-                    ReplayOutcome::unsupported("the trace is not structurally valid".to_owned())
-                }
-            }
-        } else {
-            let reason = match turn.status {
-                TraceStatus::Open => "the trace is not closed; `turn_ended` is missing",
-                TraceStatus::Ok | TraceStatus::Invalid => {
-                    "the trace is not valid; fix the reported findings first"
-                }
-            };
-            ReplayOutcome::unsupported(reason.to_owned())
-        };
-
-        match outcome.verification.status {
-            ReplayStatus::Mismatch => {
-                for problem in &outcome.problems {
-                    turn.problems.push(TraceProblem::new(
-                        problem.seq,
-                        problem.kind,
-                        problem.message.clone(),
-                    ));
-                }
-                turn.status = TraceStatus::Invalid;
-            }
-            ReplayStatus::Unsupported => {
-                unsupported = Some((
-                    turn.turn_id.clone(),
-                    outcome
-                        .verification
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "replay is not supported for this trace".to_owned()),
-                ));
-            }
-            ReplayStatus::Ok => {}
-        }
-        turn.replay = Some(outcome.verification);
+        let outcome = replay_outcome(turn, replay_entries).await;
+        unsupported = apply_replay_outcome(turn, outcome);
         report = TraceVerifyReport::new(report.turns);
     }
 
-    if json {
-        let rendered = serde_json::to_string_pretty(&report).map_err(CliError::TraceReport)?;
-        println!("{rendered}");
-    } else {
-        print_text(&report);
-    }
+    render_report(&report, json)?;
 
     if !report.all_verified(allow_open) {
         let mut summary = report.summary.line();
@@ -261,6 +224,157 @@ async fn run_verify(
         return Err(CliError::TraceReplayUnsupported { turn_id, reason });
     }
 
+    Ok(())
+}
+
+/// Replays every stored turn while holding at most one trace's entries.
+///
+/// Each turn is loaded, structurally verified, and replayed in its own
+/// read-only store session. The report is accumulated after every trace's
+/// entries have been dropped, so batch replay remains bounded by the largest
+/// single trace rather than the size of the entire store.
+async fn run_all_replay(database: &Path, json: bool) -> Result<(), CliError> {
+    let listing_database = database.to_path_buf();
+    let turn_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>, EventStoreError> {
+        let store = EventStore::open_read_only(&listing_database)?;
+        Ok(store
+            .trace_turns(usize::MAX)?
+            .into_iter()
+            .map(|summary| summary.turn_id().to_string())
+            .collect())
+    })
+    .await
+    .map_err(CliError::TraceTask)??;
+
+    let mut turns = Vec::with_capacity(turn_ids.len());
+    let mut unsupported = Vec::new();
+    for turn_id in turn_ids {
+        let loaded = load_verified_turn(database.to_path_buf(), turn_id.clone()).await?;
+        let (mut turn, entries) = match loaded {
+            Some(loaded) => loaded,
+            None => (
+                structural_failure(
+                    turn_id,
+                    "the turn head disappeared during verification".to_owned(),
+                ),
+                Vec::new(),
+            ),
+        };
+        let outcome = replay_outcome(&turn, Some(entries)).await;
+        if let Some(item) = apply_replay_outcome(&mut turn, outcome) {
+            unsupported.push(item);
+        }
+        turns.push(turn);
+    }
+
+    let report = TraceVerifyReport::new(turns);
+    render_report(&report, json)?;
+
+    if !report.all_verified(false) {
+        return Err(CliError::TraceVerificationFailed {
+            summary: report.summary.line(),
+        });
+    }
+    if !unsupported.is_empty() {
+        let count = unsupported.len();
+        let names = unsupported
+            .iter()
+            .map(|(turn_id, _)| format!("`{turn_id}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::TraceReplayUnsupportedBatch {
+            count,
+            turns: names,
+        });
+    }
+    Ok(())
+}
+
+/// Verification result plus the raw entries needed for replay.
+type VerifiedTurn = Option<(TurnVerification, Vec<(u64, TraceEvent)>)>;
+
+/// Loads and fully verifies one trace in a blocking store session.
+async fn load_verified_turn(database: PathBuf, turn_id: String) -> Result<VerifiedTurn, CliError> {
+    let loaded = tokio::task::spawn_blocking(move || -> Result<VerifiedTurn, EventStoreError> {
+        let store = EventStore::open_read_only(&database)?;
+        let requested = TurnId::new(turn_id);
+        match load_trace(&store, &requested)? {
+            Some(LoadedTrace::Complete(trace)) => Ok(Some(verify_stored_turn(&store, &trace))),
+            Some(LoadedTrace::Structural { message }) => Ok(Some((
+                structural_failure(requested.to_string(), message),
+                Vec::new(),
+            ))),
+            None => Ok(None),
+        }
+    })
+    .await
+    .map_err(CliError::TraceTask)??;
+    Ok(loaded)
+}
+
+/// Runs the replay layer for one already-verified turn.
+async fn replay_outcome(
+    turn: &TurnVerification,
+    entries: Option<Vec<(u64, TraceEvent)>>,
+) -> ReplayOutcome {
+    if turn.status != TraceStatus::Ok {
+        return ReplayOutcome::unsupported(replay_unsupported_reason(turn.status).to_owned());
+    }
+    match entries {
+        Some(entries) => trace_replay::verify(&entries).await,
+        None => ReplayOutcome::unsupported("the trace is not structurally valid".to_owned()),
+    }
+}
+
+/// Returns the unsupported reason for a trace that cannot be replayed.
+fn replay_unsupported_reason(status: TraceStatus) -> &'static str {
+    match status {
+        TraceStatus::Open => "the trace is not closed; `turn_ended` is missing",
+        TraceStatus::Ok | TraceStatus::Invalid => {
+            "the trace is not valid; fix the reported findings first"
+        }
+    }
+}
+
+/// Applies one replay result to a turn and returns an unsupported finding.
+fn apply_replay_outcome(
+    turn: &mut TurnVerification,
+    outcome: ReplayOutcome,
+) -> Option<(String, String)> {
+    let unsupported = match outcome.verification.status {
+        ReplayStatus::Mismatch => {
+            for problem in &outcome.problems {
+                turn.problems.push(TraceProblem::new(
+                    problem.seq,
+                    problem.kind,
+                    problem.message.clone(),
+                ));
+            }
+            turn.status = TraceStatus::Invalid;
+            None
+        }
+        ReplayStatus::Unsupported => Some((
+            turn.turn_id.clone(),
+            outcome
+                .verification
+                .reason
+                .clone()
+                .unwrap_or_else(|| "replay is not supported for this trace".to_owned()),
+        )),
+        ReplayStatus::Ok => None,
+    };
+    turn.replay = Some(outcome.verification);
+    unsupported
+}
+
+/// Renders one report as JSON or text.
+fn render_report(report: &TraceVerifyReport, json: bool) -> Result<(), CliError> {
+    if json {
+        let rendered = serde_json::to_string_pretty(report).map_err(CliError::TraceReport)?;
+        println!("{rendered}");
+    } else {
+        print_text(report);
+    }
     Ok(())
 }
 

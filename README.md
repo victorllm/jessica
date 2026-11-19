@@ -136,6 +136,7 @@ jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id>
 jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --replay
 jessica --config ~/.jessica/harness.toml trace verify --all --json
 jessica --config ~/.jessica/harness.toml trace verify --all --allow-open
+jessica --config ~/.jessica/harness.toml trace verify --all --replay
 jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --expect <digest>
 ```
 
@@ -145,20 +146,31 @@ the same session, timestamp, and payload. It also recomputes each turn's
 SHA-256 hash chain from the stored column bytes, so an edited, deleted, or
 inserted trace row is reported as a structural failure instead of being
 verified. `--turn` and `--all` are mutually exclusive; `--allow-open` accepts
-traces without a `turn_ended` marker but never accepts an invalid trace.
-`--replay` requires `--turn`: it rebuilds each fresh attempt from the trace's
-own bootstrap messages and recorded runtime events, drives the deterministic
-replay engine, and requires the produced event sequence to match. It covers
-closed v2 fresh traces ending `completed`, `error`, or on the max-rounds
-budget; traces outside that subset report `unsupported` and exit `1` instead of
-being silently skipped. `--expect` requires `--turn` and a 64-character
-hexadecimal digest (case-insensitive); a matching digest leaves the report
-unchanged, while a mismatch adds a `digest_mismatch` problem. Exit code `0`
-means every selected trace passed; `1` means an invalid trace, an unallowed
-open trace, an unknown turn, a replay mismatch, an unreplayable trace, or a
-storage/configuration error. `--json` emits a stable report with
-`report_version: 3`, per-turn statuses, per-turn `digest`, optional replay
-results, and machine-readable problem kinds.
+traces without a `turn_ended` marker but never accepts an invalid trace and is
+rejected with `--replay`.
+`--replay` accepts `--turn` or `--all` but cannot be combined with
+`--allow-open`. It rebuilds each fresh attempt from the trace's own bootstrap
+messages and recorded runtime events, drives the deterministic replay engine,
+and requires the produced event sequence to match. Version-1 fresh traces use
+`turn_started.messages` as the bootstrap. Resumed traces start the real
+`AgentLoop` from the recorded checkpoint conversation; the first
+`round_started` supplies the checkpoint's completed-round offset, and replay
+uses the same total round budget so budget-exhaustion messages match. It covers
+closed fresh v1/v2 traces ending `completed`, `error`, or on the max-rounds
+budget, plus closed single-attempt resumed v2 traces with at least one model
+round; broader subsets report `unsupported` and exit `1` instead of being
+silently skipped. `--all --replay` loads, verifies, and replays one turn at a
+time so memory stays bounded by the largest single trace. A mismatch invalidates
+that turn and the batch continues; an unsupported but otherwise valid trace
+stays `ok` with `replay.status: "unsupported"`, and the run exits `1` naming the
+affected turns. `--expect` requires `--turn` and a 64-character hexadecimal
+digest (case-insensitive); a matching digest leaves the report unchanged, while
+a mismatch adds a `digest_mismatch` problem. Exit code `0` means every selected
+trace passed; `1` means an invalid trace, an unallowed open trace, an unknown
+turn, a replay mismatch, an unreplayable trace, or a storage/configuration
+error. `--json` emits a stable report with `report_version: 3`, per-turn
+statuses, per-turn `digest`, optional replay results, and machine-readable
+problem kinds.
 
 Auditing requires event-store schema version 2, which adds the hash chain and
 backfills it for existing traces during migration. A version-1 database must be
