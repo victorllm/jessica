@@ -1907,9 +1907,9 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
-Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1 已确认，8.2–8.5 待逐项确认）
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b 已完成，8.3–8.7 待逐项确认）
 
-背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，其余按依赖顺序逐 Task 确认。
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），其余按依赖顺序逐 Task 确认。
 
 Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
@@ -1928,9 +1928,30 @@ Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
 禁止：不改变 SIGINT=130/SIGTERM=143/第二次信号强制退出语义；不新增信号；不修改 `jessica-core`、`jessica-memory` 或 SQLite schema；不新增第三方 crate；不在本 Task 顺手实现 8.2–8.5。
 
+Task 8.2a：EventStore WAL 与事务化迁移（2026-11-19 确认，8.2 拆分）
+
+目标：为 EventStore 启用 WAL 与 `synchronous=FULL`，并把 schema 安装改为事务化迁移；只读审计契约留给 8.2b，不改变 CLI 命令面或冻结 API。
+
+操作：
+
+1. `EventStore::initialize` 先读 `user_version`，未来版本直接拒绝且不写库；随后设置 `PRAGMA journal_mode=WAL`（文件库必须返回 `wal`，内存库接受 `memory`，否则返回结构化错误）与 `PRAGMA synchronous=FULL`。
+2. 用 `migrate` 取代 `install_schema` 的非事务安装：`user_version < SCHEMA_VERSION` 时在单个 SQLite transaction 内执行迁移 DDL 并写 `PRAGMA user_version`，失败整体回滚。`SCHEMA_VERSION` 仍为 1；迁移 1 = 现有 legacy `SCHEMA` + `trace_store::TRACE_SCHEMA`；v1 库保持现有幂等 `IF NOT EXISTS` 安装行为，避免回退。
+3. 文档说明 WAL sidecar、clean close checkpoint、单写者模型和 `synchronous=FULL` 的耐久性含义。
+4. 不修改 `open_read_only` 的 immutable/只读目录行为（8.2b），但确保现有 read-only 测试在 clean WAL 库上仍通过。
+
+测试：WAL 模式（文件库 `wal`、内存库 `memory`）、`synchronous=FULL`、clean close 无 `-wal`/`-shm`、v0→v1 保留事件、v1 幂等、未来版本不写库即拒绝、失败迁移回滚 DDL 与 `user_version`；现有 workspace 测试全绿。
+
+验收：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 全绿；PR CI 全绿。
+
+禁止：不实现 8.2b 的 immutable 只读 URI、pending WAL 拒绝、SIGKILL/磁盘满测试；不 bump schema 版本、不加表/索引；不改 `jessica-core`/CLI/trace 语义；不新增第三方 crate；不把 EventStore 改成异步。
+
+Task 8.2b（2026-11-19 确认并完成）：只读审计契约与崩溃/磁盘满测试
+
+- `open_read_only` 对非空 `-wal` 返回结构化错误；对 clean 库用 `immutable=1` URI 打开，支持只读目录且不产生 sidecar。
+- SIGKILL 提交恢复、磁盘满回滚、chmod 0555 只读目录与 URI 分隔符路径测试。
+
 后续候选（未确认，不执行）：
 
-- 8.2 EventStore WAL、只读审计契约、事务化迁移框架、SIGKILL/磁盘满/迁移回滚测试。
 - 8.3 trace 哈希链、`trace digest`、`verify --expect`。
 - 8.4 可移植证据包 export 与离线 verify。
 - 8.5 `--all --replay` 与 Resumed/v1 覆盖扩展。
@@ -2019,7 +2040,11 @@ Task 7.4 ☑ 耗时未精确计时（跨上下文执行；含方案确认） —
 
 Task 7.5 ☑ 耗时未精确计时（跨上下文执行；含方案确认） — 按用户批准的单 turn 执行一致性方案交付 `trace verify --replay`。`jessica-cli`：新增 `trace_replay` 模块（可重放子集判定、attempt 分组、事件过滤、调用既有 `replay_session`、按原 trace seq 逐事件比较、mismatch 定位 seq、外层 session 静态校验）；`trace_verify` 集成 `--replay`（仅 `--turn`）、`report_version` 1→2、per-turn `replay` 字段（`null` 或 `{status, attempts, events, reason?}`）、文本 replay 摘要、unsupported/mismatch 的退出语义；`main.rs` 参数解析与 usage；`CliError::TraceReplayUnsupported`。可重放范围仅 closed v2 fresh turn、无 Gap、attempt 1..n 连续、每 attempt 一个 session 且 `SessionStarted` 首/`SessionEnded` 末、终态 Completed/Error 或仅 MaxRounds 的 BudgetExceeded；v1、Resumed、Cancelled、AcceptanceFailed、缺失 start/end、非连续 attempt、非 MaxRounds budget 均显式 unsupported、exit 1。每次 attempt 以 `SessionStarted.messages` + 录制事件驱动真实 `AgentLoop`，排除 trace-only（PermissionDecided、ChildSession*、AcceptanceFailed）与 CLI governance（PolicyDenied、非 MaxRounds budget）；mismatch 生成 `replay_mismatch` problem、turn invalid、exit 1。未改 SQLite schema、`jessica-memory`、既有 `replay --session` 行为或冻结 `jessica-core` API，未新增第三方 crate。测试新增 15 个：`trace_replay` 11、CLI 参数接受/拒绝（并入既有参数测试）、E2E 4（文本/JSON 成功、非 parity invalid、v1 unsupported、batch 拒绝），既有 `report_version` 断言更新为 2。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 854 passed, 0 failed, 2 ignored（53 suites）。偏离/说明：1) 对 open/invalid trace，`--replay` 不运行 parity，只在报告中写 unsupported，并让既有验证失败优先，仍非静默跳过；2) 外层 session 只做静态校验，不重放；3) E2E 使用真实 SQLite/真实 CLI 与手工构造的 trace，不启动 provider 或真实 turn；4) 按方案拒绝 `--all --replay`，批量 parity 留在 Deferred。未提交、未推送，`DESIGN.md` 保持未跟踪。
 
-Task 8.1 ☑ 约 30 分钟（含只读核对、实现与全量验收；未精确计时） — 修复 main CI run 44431198725 暴露的 shutdown 诊断竞态。根因：`ShutdownController::on_signal` 先记录 signal 并取消 root token，`handle_signal` 之后才写 `eprintln!`；REPL 被取消唤醒后 `main` 读取已记录的 signal 并以 130 退出，可能抢在诊断行到达 stderr 之前。`jessica-cli/src/shutdown.rs`：移除有副作用的 `on_signal`，新增只读 `classify_next() -> SignalAction`（第一条 Cancel、第二条 Force、之后 Ignore）；`handle_signal` 先分类、写诊断并 flush stderr，再 `request_shutdown`（第一条）或 `force` + `process::exit`（第二条）；模块文档明确“先写诊断、后提交状态”及原因。测试：shutdown 单测改为两阶段断言（分类阶段不记录 signal、不取消 child token、不置 forced；提交后才可见）；新增 E2E 压力测试 `every_idle_sigint_writes_its_diagnostic_before_exiting`，用真实 CLI 重复 20 次 idle REPL + SIGINT，每次断言 exit 130、stderr 含 `SIGINT received; stopping new turns and draining`、无 panic；原 idle SIGINT 测试抽取 `run_idle_sigint` helper 复用。未改 SIGINT=130/SIGTERM=143/第二次信号强制退出语义，未新增信号，未改 `jessica-core`、`jessica-memory` 或 SQLite schema，未新增第三方 crate。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 855 passed, 0 failed, 2 ignored（53 suites）；shutdown E2E 5 passed（含 20 轮压力），shutdown 单测 5 passed。偏离/说明：1) 修复前本地连续 20 次串行 + 4 路并发共 40 次未能复现该竞态，故以 CI 失败日志定位根因；修复用结构性顺序保证并新增压力测试防回归，未通过人为延迟制造失败；2) GitHub Actions 全绿需在提交/PR 后确认；3) 未提交、未推送，`DESIGN.md` 保持未跟踪。
+Task 8.1 ☑ 约 30 分钟（含只读核对、实现与全量验收；未精确计时） — 修复 main CI run 44431198725 暴露的 shutdown 诊断竞态。根因：`ShutdownController::on_signal` 先记录 signal 并取消 root token，`handle_signal` 之后才写 `eprintln!`；REPL 被取消唤醒后 `main` 读取已记录的 signal 并以 130 退出，可能抢在诊断行到达 stderr 之前。`jessica-cli/src/shutdown.rs`：移除有副作用的 `on_signal`，新增只读 `classify_next() -> SignalAction`（第一条 Cancel、第二条 Force、之后 Ignore）；`handle_signal` 先分类、写诊断并 flush stderr，再 `request_shutdown`（第一条）或 `force` + `process::exit`（第二条）；模块文档明确“先写诊断、后提交状态”及原因。测试：shutdown 单测改为两阶段断言（分类阶段不记录 signal、不取消 child token、不置 forced；提交后才可见）；新增 E2E 压力测试 `every_idle_sigint_writes_its_diagnostic_before_exiting`，用真实 CLI 重复 20 次 idle REPL + SIGINT，每次断言 exit 130、stderr 含 `SIGINT received; stopping new turns and draining`、无 panic；原 idle SIGINT 测试抽取 `run_idle_sigint` helper 复用。未改 SIGINT=130/SIGTERM=143/第二次信号强制退出语义，未新增信号，未改 `jessica-core`、`jessica-memory` 或 SQLite schema，未新增第三方 crate。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 855 passed, 0 failed, 2 ignored（53 suites）；shutdown E2E 5 passed（含 20 轮压力），shutdown 单测 5 passed。偏离/说明：1) 修复前本地连续 20 次串行 + 4 路并发共 40 次未能复现该竞态，故以 CI 失败日志定位根因；修复用结构性顺序保证并新增压力测试防回归，未通过人为延迟制造失败；2) 已提交并合并为 PR #37（merge `321e0ba`），PR CI 与合并后 main CI run 44470072803 全绿；3) 本地 `DESIGN.md` 保持未跟踪。
+
+Task 8.2a ☑ 约 60 分钟（含方案确认、实现、格式化与全量验收；未精确计时） — EventStore 启用 WAL 与 `synchronous=FULL`，并把 schema 安装改为事务化迁移。`jessica-memory/src/lib.rs`：`initialize` 先读 `user_version`，未来版本直接拒绝且不写库；随后设置 `PRAGMA journal_mode=WAL`（文件库必须返回 `wal`，内存库接受 `memory`，否则 `EventStoreError::JournalMode`）与 `PRAGMA synchronous=FULL`；新增 `read_user_version`。`install_schema` 改为按版本循环迁移：每个版本在独立 SQLite transaction 内执行 DDL 并写 `user_version`，失败整体回滚；迁移 1 = 现有 legacy `SCHEMA` + `trace_store::TRACE_SCHEMA`；v1 库仍执行幂等 `IF NOT EXISTS` 安装以保留 schema 修复行为。新增 `apply_migration`、`configure_wal` 与 `EventStoreError::{JournalMode,MigrationUnavailable}`；模块、`open`、`EventStore`、`SCHEMA_VERSION` 文档同步更新。测试：`jessica-memory/tests/durability.rs` 4 个（文件库 WAL 与 clean close 无 sidecar、未来版本不写库即拒绝、失败迁移回滚 DDL 与 `user_version`、v1 缺失 trigger 自动修复）；`lib.rs` 单测 1 个（内存库 `memory` 与 `synchronous=FULL`）；既有 v0→v1 升级测试继续通过。未改 `open_read_only` 的 immutable/pending-WAL 契约、CLI、`jessica-core`、trace 语义、schema 版本或第三方依赖。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 860 passed, 0 failed, 2 ignored（54 suites）。偏离/说明：1) 原计划用不匹配的 `trace_heads` 表触发迁移失败，但 SQLite 允许触发器引用不存在的列；改为预置名为 `sessions` 的 index 使 `CREATE TABLE sessions` 失败，真实触发事务回滚；2) WAL 在迁移事务之前设置，迁移失败时 journal_mode 保持 `wal`，测试已断言；3) 8.2b 的只读 immutable/pending-WAL、SIGKILL/磁盘满测试未实现。未提交、未推送，`DESIGN.md` 保持未跟踪。
+
+Task 8.2b ☑ 约 45 分钟（含方案确认、实现、格式化与全量验收；未精确计时） — 完成只读审计契约与崩溃/磁盘满测试。`jessica-memory/src/lib.rs`：`open_read_only` 在打开前检查 `-wal` sidecar，非空返回新增 `EventStoreError::PendingWal { path, bytes }`，元数据读取失败返回 `WalInspect`；改用 `file:<percent-encoded path>?mode=ro&immutable=1` 并以 `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI` 打开，`immutable=1` 不建 `-shm`/不加锁，支持 0555 只读目录且不产生任何 sidecar；新增 `immutable_uri` 仅保留 `A-Za-z0-9-._~/` 与 `:`，其余字节（`?`/`#`/`%`/空格/非 ASCII）按 UTF-8 percent-encode，非 UTF-8 路径返回 `NonUtf8Path`；空 `-wal` 允许，未来版本、缺 trace schema、缺文件语义保持不变。测试：新增 `tests/read_only_audit.rs` 5 个（活写者非空 WAL 拒绝并报告真实字节数、clean close 后可审计且不建 sidecar、空 WAL 接受、0555 目录 + 0444 文件可读且目录无 sidecar、含 `?`/`#`/`%`/空格/中文路径可读）；`tests/durability.rs` 新增 SIGKILL 提交恢复测试（`current_exe --exact` 重入 helper 进程，提交 3 个事件并 flush 哨兵后休眠；父进程确认 `-wal` 非空、`Child::kill()` 后重开，断言 3 个事件、seq 1..3 与 payload 顺序，并在 clean close 后只读审计成功；helper 无环境变量时为空操作）；`lib.rs` 单测新增磁盘满回滚（`PRAGMA max_page_count = page_count + 1` 触发真实 `SQLiteFailure(DiskFull)`，断言 `Append` 错误、事件数与 `last_seq` 不变，提高上限后同一 store 可继续追加）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 868 passed, 0 failed, 2 ignored（55 suites）。偏离/说明：1) 磁盘满用 SQLite `max_page_count` 在页分配层制造真实 `SQLITE_FULL`，未挂载实际满盘文件系统（无需 root/loop 设备）；2) SIGKILL 用同一 integration test 二进制的 helper 重入实现，因此套件多一个无环境变量时立即返回的 helper 测试；3) `immutable=1` 连接上 SQLite 报告 `journal_mode=delete`（实测行为），审计测试不断言 `wal`；4) 未改 CLI/`jessica-core`/schema 版本/trace 语义，未新增第三方 crate，未实现 8.3+。未提交、未推送，`DESIGN.md` 保持未跟踪。
 
 ---
 
