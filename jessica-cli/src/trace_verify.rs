@@ -18,7 +18,7 @@
 //! the legacy log with identical timestamps and payloads.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode, TurnId};
 use jessica_core::types::{AgentEvent, PermissionDecision, SessionEndReason, SessionId};
@@ -30,7 +30,7 @@ use crate::config::HarnessConfig;
 use crate::trace_replay::{self, ReplayOutcome, ReplayStatus, ReplayVerification};
 
 /// Version of the JSON report structure.
-const REPORT_VERSION: u32 = 2;
+const REPORT_VERSION: u32 = 3;
 
 /// A parsed `trace` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,15 @@ pub(crate) enum TraceCommand {
         allow_open: bool,
         /// Whether to check execution parity with the replay engine.
         replay: bool,
+        /// Optional externally recorded chain digest to require.
+        expect: Option<String>,
+    },
+    /// Prints verified chain digests.
+    Digest {
+        /// Turn selection.
+        selection: TraceSelection,
+        /// Whether to render the report as JSON.
+        json: bool,
     },
 }
 
@@ -67,27 +76,49 @@ pub(crate) async fn run_command(
     root: &Path,
     command: TraceCommand,
 ) -> Result<(), CliError> {
-    let TraceCommand::Verify {
-        selection,
-        json,
-        allow_open,
-        replay,
-    } = command;
+    match command {
+        TraceCommand::Verify {
+            selection,
+            json,
+            allow_open,
+            replay,
+            expect,
+        } => run_verify(config, root, selection, json, allow_open, replay, expect).await,
+        TraceCommand::Digest { selection, json } => {
+            crate::trace_digest::run_command(config, root, selection, json).await
+        }
+    }
+}
 
+/// Resolves the configured event store path against the workspace root.
+pub(crate) fn event_store_path(config: &HarnessConfig, root: &Path) -> Result<PathBuf, CliError> {
+    let Some(configured_path) = config.events.path.as_ref() else {
+        return Err(CliError::TraceRequiresEventStore);
+    };
+    Ok(if configured_path.is_absolute() {
+        configured_path.clone()
+    } else {
+        root.join(configured_path)
+    })
+}
+
+/// Runs one `trace verify` invocation.
+async fn run_verify(
+    config: &HarnessConfig,
+    root: &Path,
+    selection: TraceSelection,
+    json: bool,
+    allow_open: bool,
+    replay: bool,
+    expect: Option<String>,
+) -> Result<(), CliError> {
     if replay && !matches!(selection, TraceSelection::Turn(_)) {
         return Err(CliError::InvalidTraceCommand {
             message: "`--replay` requires `--turn`".to_owned(),
         });
     }
 
-    let Some(configured_path) = config.events.path.as_ref() else {
-        return Err(CliError::TraceRequiresEventStore);
-    };
-    let database = if configured_path.is_absolute() {
-        configured_path.clone()
-    } else {
-        root.join(configured_path)
-    };
+    let database = event_store_path(config, root)?;
     let allow_open_hint = matches!(selection, TraceSelection::All);
 
     let BuiltReport {
@@ -96,6 +127,37 @@ pub(crate) async fn run_command(
     } = tokio::task::spawn_blocking(move || build_report(&database, &selection))
         .await
         .map_err(CliError::TraceTask)??;
+
+    if let Some(expected) = expect.as_deref() {
+        {
+            let Some(turn) = report.turns.first_mut() else {
+                return Err(CliError::TraceVerificationFailed {
+                    summary: "the single-turn report is missing its turn".to_owned(),
+                });
+            };
+            match turn.digest.as_deref() {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    turn.problems.push(TraceProblem::new(
+                        None,
+                        "digest_mismatch",
+                        format!("chain digest mismatch: expected {expected}, found {actual}"),
+                    ));
+                    turn.status = TraceStatus::Invalid;
+                }
+                None => {
+                    turn.problems.push(TraceProblem::new(
+                        None,
+                        "digest_unavailable",
+                        "cannot check --expect because the trace chain is invalid or unavailable"
+                            .to_owned(),
+                    ));
+                    turn.status = TraceStatus::Invalid;
+                }
+            }
+        }
+        report = TraceVerifyReport::new(report.turns);
+    }
 
     let mut unsupported = None;
     if replay {
@@ -259,7 +321,7 @@ fn load_trace(
 }
 
 /// Returns whether an error reports corrupt trace evidence rather than storage.
-fn is_structural_trace_error(error: &EventStoreError) -> bool {
+pub(crate) fn is_structural_trace_error(error: &EventStoreError) -> bool {
     matches!(
         error,
         EventStoreError::TraceSequence { .. }
@@ -275,6 +337,7 @@ fn structural_failure(turn_id: String, message: String) -> TurnVerification {
         turn_id,
         schema_version: None,
         entries: None,
+        digest: None,
         status: TraceStatus::Invalid,
         problems: vec![TraceProblem::new(None, "trace_structure", message)],
         replay: None,
@@ -313,7 +376,9 @@ fn verify_stored_turn(
         }
     };
 
-    let verification = verify_entries(&turn_id, trace.closed(), &entries, legacy, initial_problems);
+    let mut verification =
+        verify_entries(&turn_id, trace.closed(), &entries, legacy, initial_problems);
+    verification.digest = Some(trace.digest().to_owned());
     let replay_entries = entries
         .into_iter()
         .map(|entry| (entry.seq, entry.event))
@@ -378,6 +443,8 @@ struct TurnVerification {
     schema_version: Option<u16>,
     /// Number of trace entries, or `None` when stored rows are corrupt.
     entries: Option<u64>,
+    /// Lowercase hex chain digest, or `None` when the chain is unavailable.
+    digest: Option<String>,
     /// Verification status.
     status: TraceStatus,
     /// Findings that make an invalid trace invalid.
@@ -517,6 +584,9 @@ fn print_text(report: &TraceVerifyReport) {
             turn.turn_id,
             turn.problems.len()
         );
+        if let Some(digest) = &turn.digest {
+            println!("  digest {digest}");
+        }
         for problem in &turn.problems {
             match problem.seq {
                 Some(seq) => println!("  seq {seq} [{}] {}", problem.kind, problem.message),
@@ -572,6 +642,7 @@ fn verify_entries(
         turn_id: turn_id.to_owned(),
         schema_version,
         entries: Some(entry_count),
+        digest: None,
         status,
         problems: verifier.problems,
         replay: None,
@@ -1941,6 +2012,7 @@ mod tests {
             turn_id: "turn".to_owned(),
             schema_version: Some(2),
             entries: Some(1),
+            digest: Some("0".repeat(64)),
             status,
             problems: Vec::new(),
             replay: None,
@@ -1958,6 +2030,7 @@ mod tests {
             turn_id: "bad".to_owned(),
             schema_version: Some(2),
             entries: Some(1),
+            digest: Some("0".repeat(64)),
             status: TraceStatus::Invalid,
             problems: vec![TraceProblem::new(
                 Some(1),

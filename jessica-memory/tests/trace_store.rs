@@ -653,16 +653,16 @@ fn a_legacy_database_is_upgraded_without_rewriting_its_events() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version should read");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let table_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'table' AND name IN ('trace_events', 'trace_heads')",
+             WHERE type = 'table' AND name IN ('trace_events', 'trace_heads', 'trace_chain')",
             [],
             |row| row.get(0),
         )
         .expect("trace tables should be visible");
-    assert_eq!(table_count, 2);
+    assert_eq!(table_count, 3);
 
     let reopened = EventStore::open(database.path()).expect("upgraded store should reopen");
     let trace = reopened
@@ -678,15 +678,15 @@ fn a_database_from_a_newer_schema_is_rejected() {
     let database = TempDatabase::new("future");
     let connection = Connection::open(database.path()).expect("raw connection should open");
     connection
-        .execute_batch("PRAGMA user_version = 2;")
+        .execute_batch("PRAGMA user_version = 3;")
         .expect("future version should set");
     drop(connection);
 
     let error = EventStore::open(database.path()).expect_err("a future schema must be rejected");
     match error {
         EventStoreError::UnsupportedVersion { found, supported } => {
-            assert_eq!(found, 2);
-            assert_eq!(supported, 1);
+            assert_eq!(found, 3);
+            assert_eq!(supported, 2);
         }
         other => panic!("expected UnsupportedVersion, found {other:?}"),
     }
@@ -1314,7 +1314,7 @@ fn a_read_only_open_rejects_a_newer_schema_without_touching_it() {
     let database = TempDatabase::new("future-open");
     let connection = Connection::open(database.path()).expect("raw connection should open");
     connection
-        .execute_batch("PRAGMA user_version = 2")
+        .execute_batch("PRAGMA user_version = 3")
         .expect("a future version should be recorded");
     drop(connection);
 
@@ -1324,8 +1324,8 @@ fn a_read_only_open_rejects_a_newer_schema_without_touching_it() {
         matches!(
             error,
             EventStoreError::UnsupportedVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ),
         "unexpected error: {error:?}"

@@ -19,6 +19,9 @@ use jessica_core::trace::{
 use jessica_core::types::{AgentEvent, SessionId};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::trace_chain::{
+    ChainEntry, GENESIS_HASH, decode_hex_32, encode_hex, entry_hash, turn_digest,
+};
 use crate::{EventStore, EventStoreError, Timestamp, append_in_transaction, event_type_tag};
 
 /// Trace tables and their append-only guards.
@@ -134,6 +137,8 @@ pub struct StoredTraceTurn {
     turn_id: TurnId,
     /// Whether the trace ended with `turn_ended` at the time of the read.
     closed: bool,
+    /// Lowercase hex digest of the validated hash chain.
+    digest: String,
     /// Entries in ascending sequence order.
     events: Vec<StoredTraceEvent>,
 }
@@ -150,6 +155,18 @@ impl StoredTraceTurn {
     /// stopped or a persistence failure prevented the closing marker.
     pub fn closed(&self) -> bool {
         self.closed
+    }
+
+    /// Returns the lowercase hex SHA-256 digest of the validated entry chain.
+    ///
+    /// The digest covers the exact stored trace-entry columns and changes if an
+    /// entry is modified, inserted, or removed. It does not cover `trace_heads`
+    /// metadata or the legacy event log, and it is not a signature: a writer
+    /// able to rewrite the whole database can recompute it. Compare it with an
+    /// externally recorded value, for example through
+    /// `jessica trace verify --expect`, to detect that case.
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 
     /// Returns the entries in ascending sequence order.
@@ -318,6 +335,57 @@ impl EventStore {
 
         let seq_value = i64::try_from(seq)
             .map_err(|_| lifecycle_error(&turn_id, "the trace sequence is out of range"))?;
+        let attempt_value = trace.attempt.map(i64::from);
+        let session_value = trace.session_id.as_ref().map(SessionId::as_str);
+        let timestamp_value = timestamp.as_millis();
+        let previous_hash = match head {
+            None => GENESIS_HASH,
+            Some((last_seq, _)) => {
+                let chain: Option<(i64, String)> = transaction
+                    .query_row(
+                        "SELECT seq, entry_hash FROM trace_chain \
+                         WHERE turn_id = ?1 ORDER BY seq DESC LIMIT 1",
+                        [turn_id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|source| store_error(&turn_id, source))?;
+                match chain {
+                    Some((chain_seq, hash)) if chain_seq == last_seq => decode_hex_32(&hash)
+                        .ok_or_else(|| {
+                            invalid_error(&turn_id, seq, "the stored trace chain hash is malformed")
+                        })?,
+                    Some(_) => {
+                        return Err(invalid_error(
+                            &turn_id,
+                            seq,
+                            "the trace hash chain disagrees with the stored head",
+                        ));
+                    }
+                    None => {
+                        return Err(invalid_error(
+                            &turn_id,
+                            seq,
+                            "the trace hash chain is missing for an existing turn",
+                        ));
+                    }
+                }
+            }
+        };
+        let entry_hash_value = {
+            let entry = ChainEntry {
+                turn_id: &turn_id,
+                seq: seq_value,
+                schema_version: i64::from(trace.schema_version),
+                payload_kind,
+                event_type,
+                attempt: attempt_value,
+                session_id: session_value,
+                payload_json: &payload_json,
+                timestamp: timestamp_value,
+            };
+            entry_hash(&previous_hash, &entry)
+        };
         transaction
             .execute(
                 "INSERT INTO trace_events (\
@@ -330,10 +398,22 @@ impl EventStore {
                     i64::from(trace.schema_version),
                     payload_kind,
                     event_type,
-                    trace.attempt.map(i64::from),
-                    trace.session_id.as_ref().map(SessionId::as_str),
+                    attempt_value,
+                    session_value,
                     payload_json,
-                    timestamp.as_millis(),
+                    timestamp_value,
+                ],
+            )
+            .map_err(|source| store_error(&turn_id, source))?;
+        transaction
+            .execute(
+                "INSERT INTO trace_chain (turn_id, seq, prev_hash, entry_hash) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    turn_id.as_str(),
+                    seq_value,
+                    encode_hex(&previous_hash),
+                    encode_hex(&entry_hash_value)
                 ],
             )
             .map_err(|source| store_error(&turn_id, source))?;
@@ -347,7 +427,7 @@ impl EventStore {
                     turn_id.as_str(),
                     seq_value,
                     i64::from(closed),
-                    timestamp.as_millis()
+                    timestamp_value
                 ],
             )
             .map_err(|source| store_error(&turn_id, source))?;
@@ -581,9 +661,11 @@ impl EventStore {
             ));
         }
 
+        let digest = verify_chain(&self.connection, turn, &events)?;
         Ok(Some(StoredTraceTurn {
             turn_id: turn_id.clone(),
             closed,
+            digest,
             events,
         }))
     }
@@ -640,6 +722,127 @@ impl EventStore {
         }
         Ok(turns)
     }
+}
+
+/// Recomputes and validates the hash chain for one structurally valid turn.
+///
+/// Every chain row must exist, align with an entry's sequence number, point at
+/// the previous entry hash, and match the hash recomputed from the stored
+/// columns. Anything else is evidence corruption, not a storage failure.
+fn verify_chain(
+    connection: &Connection,
+    turn: &str,
+    events: &[StoredTraceEvent],
+) -> Result<String, EventStoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT seq, prev_hash, entry_hash FROM trace_chain \
+             WHERE turn_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(|source| store_error(turn, source))?;
+    let mut rows = statement
+        .query([turn])
+        .map_err(|source| store_error(turn, source))?;
+    let mut chain = Vec::new();
+    while let Some(row) = rows.next().map_err(|source| store_error(turn, source))? {
+        let seq: i64 = row.get(0).map_err(|source| store_error(turn, source))?;
+        let previous: String = row.get(1).map_err(|source| store_error(turn, source))?;
+        let entry: String = row.get(2).map_err(|source| store_error(turn, source))?;
+        chain.push((seq, previous, entry));
+    }
+
+    if chain.len() != events.len() {
+        return Err(invalid_error(
+            turn,
+            0,
+            "the trace hash chain does not match the stored entries",
+        ));
+    }
+
+    let mut previous_hash = GENESIS_HASH;
+    for (index, event) in events.iter().enumerate() {
+        let (chain_seq, stored_previous, stored_entry) = &chain[index];
+        let expected_seq = i64::try_from(event.seq()).map_err(|_| {
+            invalid_error(
+                turn,
+                event.seq(),
+                "the trace sequence is out of the hash chain range",
+            )
+        })?;
+        if *chain_seq != expected_seq {
+            return Err(invalid_error(
+                turn,
+                event.seq(),
+                "the trace hash chain sequence disagrees with the stored entries",
+            ));
+        }
+        let stored_previous = decode_hex_32(stored_previous).ok_or_else(|| {
+            invalid_error(
+                turn,
+                event.seq(),
+                "the stored previous chain hash is malformed",
+            )
+        })?;
+        if stored_previous != previous_hash {
+            return Err(invalid_error(
+                turn,
+                event.seq(),
+                "the trace hash chain link is broken",
+            ));
+        }
+        let entry = chain_entry(event)?;
+        let computed = entry_hash(&previous_hash, &entry);
+        let stored_entry = decode_hex_32(stored_entry).ok_or_else(|| {
+            invalid_error(
+                turn,
+                event.seq(),
+                "the stored entry chain hash is malformed",
+            )
+        })?;
+        if stored_entry != computed {
+            return Err(invalid_error(
+                turn,
+                event.seq(),
+                "the stored entry chain hash does not match the trace entry",
+            ));
+        }
+        previous_hash = computed;
+    }
+
+    Ok(turn_digest(turn, &previous_hash))
+}
+
+/// Builds the exact chain input for one already-validated stored entry.
+///
+/// The stored-row validation has already proved that every mirrored column
+/// agrees with the decoded envelope, so rebuilding the input from the envelope
+/// hashes the same bytes that were inserted or backfilled.
+fn chain_entry(event: &StoredTraceEvent) -> Result<ChainEntry<'_>, EventStoreError> {
+    let trace = event.event();
+    let seq = i64::try_from(event.seq()).map_err(|_| {
+        invalid_error(
+            trace.turn_id.as_str(),
+            event.seq(),
+            "the trace sequence is out of the hash chain range",
+        )
+    })?;
+    let event_type = match &trace.payload {
+        TracePayload::Agent { event } => Some(event_type_tag(event)),
+        TracePayload::Gap { .. }
+        | TracePayload::TurnStarted { .. }
+        | TracePayload::TurnEnded { .. } => None,
+    };
+    Ok(ChainEntry {
+        turn_id: trace.turn_id.as_str(),
+        seq,
+        schema_version: i64::from(trace.schema_version),
+        payload_kind: trace.payload.kind(),
+        event_type,
+        attempt: trace.attempt.map(i64::from),
+        session_id: trace.session_id.as_ref().map(SessionId::as_str),
+        payload_json: event.payload_json(),
+        timestamp: event.timestamp().as_millis(),
+    })
 }
 
 /// Validates the context rules an envelope must satisfy before storage.

@@ -1586,17 +1586,17 @@ pub(crate) enum CliError {
         /// Human-readable parse failure.
         message: String,
     },
-    /// `trace verify --turn` was given without a turn id.
-    #[error("`trace verify --turn` requires a turn id")]
+    /// `trace --turn` was given without a turn id.
+    #[error("`trace --turn` requires a turn id")]
     MissingTraceTurn,
-    /// `trace verify --turn` was given more than once.
-    #[error("`trace verify --turn` may be given only once")]
+    /// `trace --turn` was given more than once.
+    #[error("`trace --turn` may be given only once")]
     DuplicateTraceTurn,
-    /// `trace verify` was given neither `--turn` nor `--all`.
-    #[error("`trace verify` requires `--turn <turn_id>` or `--all`")]
+    /// `trace verify`/`trace digest` was given neither `--turn` nor `--all`.
+    #[error("`trace` requires `--turn <turn_id>` or `--all`")]
     MissingTraceSelection,
-    /// `trace verify` was given both `--turn` and `--all`.
-    #[error("`trace verify --turn` cannot be combined with `--all`")]
+    /// `trace verify`/`trace digest` was given both `--turn` and `--all`.
+    #[error("`trace --turn` cannot be combined with `--all`")]
     TraceSelectionConflict,
     /// The requested turn trace does not exist.
     #[error("turn `{turn_id}` was not found in the event store")]
@@ -1605,14 +1605,22 @@ pub(crate) enum CliError {
         turn_id: String,
     },
     /// The read-only event store could not be opened or read.
-    #[error("trace verification could not access the event store: {0}")]
+    #[error("trace command could not access the event store: {0}")]
     TraceStore(#[from] jessica_memory::EventStoreError),
-    /// The blocking verification task failed.
-    #[error("trace verification task failed: {0}")]
+    /// The blocking trace task failed.
+    #[error("trace task failed: {0}")]
     TraceTask(#[source] tokio::task::JoinError),
-    /// The verification report could not be serialized.
+    /// The trace report could not be serialized.
     #[error("failed to serialize the trace report: {0}")]
     TraceReport(#[source] serde_json::Error),
+    /// A turn's digest could not be computed from trustworthy evidence.
+    #[error("cannot compute a trace digest for turn `{turn_id}`: {message}")]
+    TraceDigestFailed {
+        /// Turn whose chain could not be validated.
+        turn_id: String,
+        /// Description of the evidence failure.
+        message: String,
+    },
     /// One or more traces failed verification.
     #[error("trace verification failed: {summary}")]
     TraceVerificationFailed {
