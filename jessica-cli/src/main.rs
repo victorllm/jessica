@@ -18,6 +18,7 @@ mod pump;
 mod replay;
 mod shutdown;
 mod skills;
+mod trace_replay;
 mod trace_verify;
 
 use std::io::{self, IsTerminal, Write};
@@ -699,7 +700,8 @@ fn parse_trace_args(
 ///
 /// `--turn` and `--all` are mutually exclusive; exactly one is required.
 /// `--allow-open` is accepted only with `--all`, because a single requested turn
-/// is either complete or not and must not be silently downgraded.
+/// is either complete or not and must not be silently downgraded. `--replay`
+/// needs one specific turn, so it is accepted only with `--turn`.
 fn parse_trace_verify_args(
     mut args: impl Iterator<Item = String>,
 ) -> Result<Option<TraceCommand>, CliError> {
@@ -707,6 +709,7 @@ fn parse_trace_verify_args(
     let mut all = false;
     let mut json = false;
     let mut allow_open = false;
+    let mut replay = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -728,6 +731,7 @@ fn parse_trace_verify_args(
             "--all" => all = true,
             "--json" => json = true,
             "--allow-open" => allow_open = true,
+            "--replay" => replay = true,
             _ => {
                 return Err(CliError::InvalidTraceCommand {
                     message: format!("unexpected `trace verify` argument `{arg}`"),
@@ -750,10 +754,16 @@ fn parse_trace_verify_args(
         (None, true) => TraceSelection::All,
         _ => return Err(CliError::MissingTraceSelection),
     };
+    if replay && !matches!(selection, TraceSelection::Turn(_)) {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--replay` requires `--turn`".to_owned(),
+        });
+    }
     Ok(Some(TraceCommand::Verify {
         selection,
         json,
         allow_open,
+        replay,
     }))
 }
 
@@ -831,7 +841,7 @@ fn print_skill_usage() {
 
 fn print_trace_usage() {
     println!(
-        "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json]\n\
+        "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay]\n\
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
          \n\
          Verifies recorded turn traces without creating, migrating, or modifying\n\
@@ -843,9 +853,12 @@ fn print_trace_usage() {
          --all             Verify every stored turn and summarize the results\n\
          --json            Emit the stable JSON report instead of text\n\
          --allow-open      Treat traces without `turn_ended` as verified (with --all)\n\
+         --replay          Re-run each fresh attempt with recorded inputs and require\n\
+         \x20                 the event sequence to match (with --turn)\n\
          \n\
          Exit code 0 means every selected trace passed; 1 means a trace was\n\
-         invalid, an open trace was not allowed, or verification could not run."
+         invalid, an open trace was not allowed, replay found a mismatch, the\n\
+         trace is not replayable, or verification could not run."
     );
 }
 
@@ -1107,6 +1120,7 @@ mod tests {
                 selection: TraceSelection::All,
                 json: false,
                 allow_open: false,
+                replay: false,
             },
         };
         assert_eq!(watched_config_path(&trace, &config), None);
@@ -1144,6 +1158,7 @@ mod tests {
                 selection: TraceSelection::Turn("turn-a".to_owned()),
                 json: true,
                 allow_open: false,
+                replay: false,
             })
         );
 
@@ -1154,6 +1169,7 @@ mod tests {
                 selection: TraceSelection::All,
                 json: true,
                 allow_open: true,
+                replay: false,
             })
         );
 
@@ -1164,6 +1180,20 @@ mod tests {
                 selection: TraceSelection::Turn("turn-b".to_owned()),
                 json: false,
                 allow_open: false,
+                replay: false,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "verify", "--turn", "turn-c", "--replay", "--json"
+            ]))
+            .expect("replay with one turn must parse"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::Turn("turn-c".to_owned()),
+                json: true,
+                allow_open: false,
+                replay: true,
             })
         );
     }
@@ -1197,6 +1227,7 @@ mod tests {
                 vec!["verify", "--turn", "a", "--allow-open"],
                 "requires `--all`",
             ),
+            (vec!["verify", "--all", "--replay"], "requires `--turn`"),
             (vec!["verify", "--unknown"], "--unknown"),
         ] {
             let error = parse_trace_args(skill_args(&arguments))

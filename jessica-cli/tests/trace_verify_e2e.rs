@@ -74,7 +74,7 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
     );
 
     let report = json_report(&output);
-    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["report_version"], 2);
     assert_eq!(report["summary"]["turns"], 4);
     assert_eq!(report["summary"]["ok"], 1);
     assert_eq!(report["summary"]["open"], 1);
@@ -90,6 +90,10 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
             .as_array()
             .expect("problems must be an array"),
         &Vec::<Value>::new()
+    );
+    assert!(
+        ok["replay"].is_null(),
+        "replay must stay absent unless --replay is requested"
     );
 
     let open = report_turn(&report, "turn-open");
@@ -207,6 +211,133 @@ fn turn_selection_verifies_one_trace_and_unknown_turns_are_errors() {
     assert!(
         stderr.contains("turn-missing") && stderr.contains("not found"),
         "unknown turn error must name the turn:\n{stderr}"
+    );
+}
+
+#[test]
+fn replay_reproduces_a_closed_fresh_trace_and_reports_it() {
+    let temp = TempDir::new("replay-ok");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_replayable_turn(&mut store, "turn-replay", "session-replay", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let text = run_verify(&config, &["--turn", "turn-replay", "--replay"]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        text.status.success(),
+        "a replayable trace must pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("replay: ok attempts=1 events=5"),
+        "text output must summarize execution parity:\n{stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "success must not write to stderr:\n{stderr}"
+    );
+
+    let json = run_verify(&config, &["--turn", "turn-replay", "--replay", "--json"]);
+    assert!(json.status.success());
+    let report = json_report(&json);
+    assert_eq!(report["report_version"], 2);
+    let turn = report_turn(&report, "turn-replay");
+    assert_eq!(turn["status"], "ok");
+    assert_eq!(turn["replay"]["status"], "ok");
+    assert_eq!(turn["replay"]["attempts"], 1);
+    assert_eq!(turn["replay"]["events"], 5);
+    assert!(turn["replay"]["reason"].is_null());
+}
+
+#[test]
+fn replay_mismatches_make_the_turn_invalid() {
+    let temp = TempDir::new("replay-mismatch");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    // Structurally valid, but its one tool round is followed directly by a
+    // `Completed` end. A real `AgentLoop` with max_rounds = 1 ends on the round
+    // budget instead, so execution parity must reject the claim.
+    seed_valid_turn(&mut store, "turn-mismatch", "session-mismatch", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--turn", "turn-mismatch", "--replay", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a parity mismatch must fail\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let report = json_report(&output);
+    let turn = report_turn(&report, "turn-mismatch");
+    assert_eq!(turn["status"], "invalid");
+    assert_eq!(turn["replay"]["status"], "mismatch");
+    assert!(
+        problem_kinds(turn).contains(&"replay_mismatch"),
+        "the mismatch must be reported as a problem: {turn}"
+    );
+    assert!(
+        stderr.contains("trace verification failed"),
+        "the CLI must report verification failure:\n{stderr}"
+    );
+}
+
+#[test]
+fn replay_unsupported_traces_fail_explicitly() {
+    let temp = TempDir::new("replay-unsupported");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_v1_turn(&mut store, "turn-v1", "session-v1", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--turn", "turn-v1", "--replay", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an unreplayable trace must not pass silently\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let report = json_report(&output);
+    let turn = report_turn(&report, "turn-v1");
+    assert_eq!(
+        turn["status"], "ok",
+        "the trace itself passes structural verification"
+    );
+    assert_eq!(turn["replay"]["status"], "unsupported");
+    assert!(
+        turn["replay"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("version-1")),
+        "the report must explain the unsupported subset: {turn}"
+    );
+    assert!(
+        stderr.contains("cannot be replay-verified") && stderr.contains("version-1"),
+        "the CLI must fail with an explicit unsupported error:\n{stderr}"
+    );
+}
+
+#[test]
+fn replay_rejects_batch_selection() {
+    let temp = TempDir::new("replay-batch");
+    let database = temp.path.join("events.sqlite");
+    drop(EventStore::open(&database).expect("event store should open"));
+    let config = write_config(&temp, &database);
+
+    let output = run_verify(&config, &["--all", "--replay"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        empty_stdout(&output),
+        "a rejected command must not produce a report"
+    );
+    assert!(
+        stderr.contains("requires `--turn`"),
+        "the error must explain the required selection:\n{stderr}"
     );
 }
 
@@ -493,6 +624,154 @@ fn seed_valid_turn(store: &mut EventStore, turn: &str, session_name: &str, base:
         None,
         base + 9,
     );
+}
+
+/// Writes a closed fresh trace that the deterministic replay engine can
+/// reproduce: one model round with text and no tool calls, ending `Completed`.
+fn seed_replayable_turn(store: &mut EventStore, turn: &str, session_name: &str, base: i64) {
+    let turn_id = TurnId::new(turn);
+    let session = SessionId::new(session_name);
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id.clone(),
+            None,
+            Some(session.clone()),
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Fresh,
+                messages: vec![Message::user("replay")],
+            },
+        ),
+        None,
+        base,
+    );
+
+    let session_started = AgentEvent::SessionStarted {
+        session_id: session.clone(),
+        messages: vec![Message::user("do it")],
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, session_started.clone()),
+        Some((&session, &session_started)),
+        base + 1,
+    );
+
+    let round_started = AgentEvent::RoundStarted { round: 1 };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, round_started.clone()),
+        Some((&session, &round_started)),
+        base + 2,
+    );
+
+    let delta = AgentEvent::ModelDelta {
+        text: "done".to_owned(),
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, delta.clone()),
+        Some((&session, &delta)),
+        base + 3,
+    );
+
+    let round_finished = AgentEvent::RoundFinished {
+        round: 1,
+        usage: Some(TokenUsage::new(5, 2)),
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, round_finished.clone()),
+        Some((&session, &round_finished)),
+        base + 4,
+    );
+
+    let session_ended = AgentEvent::SessionEnded {
+        session_id: session.clone(),
+        reason: SessionEndReason::Completed,
+    };
+    append(
+        store,
+        &traced_agent(&turn_id, &session, 1, session_ended.clone()),
+        Some((&session, &session_ended)),
+        base + 5,
+    );
+
+    append(
+        store,
+        &TraceEvent::new(
+            turn_id,
+            None,
+            None,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed,
+            },
+        ),
+        None,
+        base + 6,
+    );
+}
+
+/// Writes a structurally valid version-1 trace. It carries no bootstrap
+/// messages, rounds, or usage, so execution replay cannot reconstruct it.
+fn seed_v1_turn(store: &mut EventStore, turn: &str, session_name: &str, base: i64) {
+    let turn_id = TurnId::new(turn);
+    let session = SessionId::new(session_name);
+    append(
+        store,
+        &v1(TraceEvent::new(
+            turn_id.clone(),
+            None,
+            Some(session.clone()),
+            TracePayload::TurnStarted {
+                mode: TraceTurnMode::Fresh,
+                messages: vec![Message::user("legacy")],
+            },
+        )),
+        None,
+        base,
+    );
+
+    let session_started = AgentEvent::SessionStarted {
+        session_id: session.clone(),
+        messages: Vec::new(),
+    };
+    append(
+        store,
+        &v1(traced_agent(&turn_id, &session, 1, session_started.clone())),
+        Some((&session, &session_started)),
+        base + 1,
+    );
+
+    let session_ended = AgentEvent::SessionEnded {
+        session_id: session.clone(),
+        reason: SessionEndReason::Completed,
+    };
+    append(
+        store,
+        &v1(traced_agent(&turn_id, &session, 1, session_ended.clone())),
+        Some((&session, &session_ended)),
+        base + 2,
+    );
+
+    append(
+        store,
+        &v1(TraceEvent::new(
+            turn_id,
+            None,
+            None,
+            TracePayload::TurnEnded {
+                reason: SessionEndReason::Completed,
+            },
+        )),
+        None,
+        base + 3,
+    );
+}
+
+fn v1(mut trace: TraceEvent) -> TraceEvent {
+    trace.schema_version = 1;
+    trace
 }
 
 /// Writes a trace that stops after `session_started` and therefore has no

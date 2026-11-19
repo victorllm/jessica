@@ -11,9 +11,11 @@
 //! 3. trace-to-legacy mirror consistency, by matching every mirrored agent event
 //!    against the legacy event stream as a multiset.
 //!
-//! The verifier never executes a replay. Full execution parity remains a
-//! separate concern; this module only proves that the events a trace claims to
-//! have recorded exist in the legacy log with identical timestamps and payloads.
+//! Verification never executes a replay unless `--replay` is requested. That
+//! opt-in layer drives the deterministic replay engine over the trace's own
+//! bootstrap and runtime events; see [`crate::trace_replay`]. Without it, this
+//! module only proves that the events a trace claims to have recorded exist in
+//! the legacy log with identical timestamps and payloads.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -25,9 +27,10 @@ use serde::Serialize;
 
 use crate::app::CliError;
 use crate::config::HarnessConfig;
+use crate::trace_replay::{self, ReplayOutcome, ReplayStatus, ReplayVerification};
 
 /// Version of the JSON report structure.
-const REPORT_VERSION: u32 = 1;
+const REPORT_VERSION: u32 = 2;
 
 /// A parsed `trace` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,8 @@ pub(crate) enum TraceCommand {
         json: bool,
         /// Whether open traces are accepted as verified.
         allow_open: bool,
+        /// Whether to check execution parity with the replay engine.
+        replay: bool,
     },
 }
 
@@ -66,7 +71,14 @@ pub(crate) async fn run_command(
         selection,
         json,
         allow_open,
+        replay,
     } = command;
+
+    if replay && !matches!(selection, TraceSelection::Turn(_)) {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--replay` requires `--turn`".to_owned(),
+        });
+    }
 
     let Some(configured_path) = config.events.path.as_ref() else {
         return Err(CliError::TraceRequiresEventStore);
@@ -78,9 +90,63 @@ pub(crate) async fn run_command(
     };
     let allow_open_hint = matches!(selection, TraceSelection::All);
 
-    let report = tokio::task::spawn_blocking(move || build_report(&database, &selection))
+    let BuiltReport {
+        mut report,
+        replay_entries,
+    } = tokio::task::spawn_blocking(move || build_report(&database, &selection))
         .await
         .map_err(CliError::TraceTask)??;
+
+    let mut unsupported = None;
+    if replay {
+        let Some(turn) = report.turns.first_mut() else {
+            return Err(CliError::TraceVerificationFailed {
+                summary: "the single-turn report is missing its turn".to_owned(),
+            });
+        };
+        let outcome = if turn.status == TraceStatus::Ok {
+            match replay_entries {
+                Some(entries) => trace_replay::verify(&entries).await,
+                None => {
+                    ReplayOutcome::unsupported("the trace is not structurally valid".to_owned())
+                }
+            }
+        } else {
+            let reason = match turn.status {
+                TraceStatus::Open => "the trace is not closed; `turn_ended` is missing",
+                TraceStatus::Ok | TraceStatus::Invalid => {
+                    "the trace is not valid; fix the reported findings first"
+                }
+            };
+            ReplayOutcome::unsupported(reason.to_owned())
+        };
+
+        match outcome.verification.status {
+            ReplayStatus::Mismatch => {
+                for problem in &outcome.problems {
+                    turn.problems.push(TraceProblem::new(
+                        problem.seq,
+                        problem.kind,
+                        problem.message.clone(),
+                    ));
+                }
+                turn.status = TraceStatus::Invalid;
+            }
+            ReplayStatus::Unsupported => {
+                unsupported = Some((
+                    turn.turn_id.clone(),
+                    outcome
+                        .verification
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "replay is not supported for this trace".to_owned()),
+                ));
+            }
+            ReplayStatus::Ok => {}
+        }
+        turn.replay = Some(outcome.verification);
+        report = TraceVerifyReport::new(report.turns);
+    }
 
     if json {
         let rendered = serde_json::to_string_pretty(&report).map_err(CliError::TraceReport)?;
@@ -89,15 +155,20 @@ pub(crate) async fn run_command(
         print_text(&report);
     }
 
-    if report.all_verified(allow_open) {
-        return Ok(());
+    if !report.all_verified(allow_open) {
+        let mut summary = report.summary.line();
+        if allow_open_hint && !allow_open && report.summary.open > 0 && report.summary.invalid == 0
+        {
+            summary.push_str("; rerun with --allow-open to accept open traces");
+        }
+        return Err(CliError::TraceVerificationFailed { summary });
     }
 
-    let mut summary = report.summary.line();
-    if allow_open_hint && !allow_open && report.summary.open > 0 && report.summary.invalid == 0 {
-        summary.push_str("; rerun with --allow-open to accept open traces");
+    if let Some((turn_id, reason)) = unsupported {
+        return Err(CliError::TraceReplayUnsupported { turn_id, reason });
     }
-    Err(CliError::TraceVerificationFailed { summary })
+
+    Ok(())
 }
 
 /// A stored trace as loaded for verification.
@@ -111,29 +182,36 @@ enum LoadedTrace {
     },
 }
 
+/// Verification report plus the entries a single-turn replay might need.
+struct BuiltReport {
+    /// Completed verification report.
+    report: TraceVerifyReport,
+    /// Raw entries for `--replay`; present only for a single loaded turn.
+    replay_entries: Option<Vec<(u64, TraceEvent)>>,
+}
+
 /// Opens the store read-only and verifies the selected turns.
-fn build_report(
-    database: &Path,
-    selection: &TraceSelection,
-) -> Result<TraceVerifyReport, CliError> {
+fn build_report(database: &Path, selection: &TraceSelection) -> Result<BuiltReport, CliError> {
     let store = EventStore::open_read_only(database)?;
 
-    let turns = match selection {
+    match selection {
         TraceSelection::Turn(turn_id) => {
             let requested = TurnId::new(turn_id.clone());
-            match load_trace(&store, &requested)? {
+            let (verification, replay_entries) = match load_trace(&store, &requested)? {
                 None => {
                     return Err(CliError::UnknownTurn {
                         turn_id: turn_id.clone(),
                     });
                 }
-                Some(LoadedTrace::Complete(trace)) => {
-                    vec![verify_stored_turn(&store, &trace)]
-                }
+                Some(LoadedTrace::Complete(trace)) => verify_stored_turn(&store, &trace),
                 Some(LoadedTrace::Structural { message }) => {
-                    vec![structural_failure(turn_id.clone(), message)]
+                    (structural_failure(turn_id.clone(), message), Vec::new())
                 }
-            }
+            };
+            Ok(BuiltReport {
+                report: TraceVerifyReport::new(vec![verification]),
+                replay_entries: Some(replay_entries),
+            })
         }
         TraceSelection::All => {
             let summaries = store.trace_turns(usize::MAX)?;
@@ -142,7 +220,7 @@ fn build_report(
                 let turn_id = summary.turn_id().to_string();
                 match load_trace(&store, summary.turn_id())? {
                     Some(LoadedTrace::Complete(trace)) => {
-                        turns.push(verify_stored_turn(&store, &trace));
+                        turns.push(verify_stored_turn(&store, &trace).0);
                     }
                     Some(LoadedTrace::Structural { message }) => {
                         turns.push(structural_failure(turn_id, message));
@@ -153,11 +231,12 @@ fn build_report(
                     )),
                 }
             }
-            turns
+            Ok(BuiltReport {
+                report: TraceVerifyReport::new(turns),
+                replay_entries: None,
+            })
         }
-    };
-
-    Ok(TraceVerifyReport::new(turns))
+    }
 }
 
 /// Loads one turn, separating structural corruption from storage failure.
@@ -198,11 +277,18 @@ fn structural_failure(turn_id: String, message: String) -> TurnVerification {
         entries: None,
         status: TraceStatus::Invalid,
         problems: vec![TraceProblem::new(None, "trace_structure", message)],
+        replay: None,
     }
 }
 
 /// Verifies one structurally valid stored trace.
-fn verify_stored_turn(store: &EventStore, trace: &StoredTraceTurn) -> TurnVerification {
+///
+/// Returns the verification and the raw entries so an opt-in replay can use
+/// the trace as its own source of truth.
+fn verify_stored_turn(
+    store: &EventStore,
+    trace: &StoredTraceTurn,
+) -> (TurnVerification, Vec<(u64, TraceEvent)>) {
     let entries: Vec<Entry> = trace
         .events()
         .iter()
@@ -227,7 +313,12 @@ fn verify_stored_turn(store: &EventStore, trace: &StoredTraceTurn) -> TurnVerifi
         }
     };
 
-    verify_entries(&turn_id, trace.closed(), &entries, legacy, initial_problems)
+    let verification = verify_entries(&turn_id, trace.closed(), &entries, legacy, initial_problems);
+    let replay_entries = entries
+        .into_iter()
+        .map(|entry| (entry.seq, entry.event))
+        .collect();
+    (verification, replay_entries)
 }
 
 /// Loads the legacy rows needed by the trace-to-legacy mirror check.
@@ -291,6 +382,8 @@ struct TurnVerification {
     status: TraceStatus,
     /// Findings that make an invalid trace invalid.
     problems: Vec<TraceProblem>,
+    /// Execution-parity result, present only when `--replay` was requested.
+    replay: Option<ReplayVerification>,
 }
 
 /// Status of one turn trace.
@@ -430,6 +523,19 @@ fn print_text(report: &TraceVerifyReport) {
                 None => println!("  [{}] {}", problem.kind, problem.message),
             }
         }
+        if let Some(replay) = &turn.replay {
+            match (&replay.status, &replay.reason) {
+                (ReplayStatus::Unsupported, Some(reason)) => {
+                    println!("  replay: unsupported ({reason})");
+                }
+                _ => println!(
+                    "  replay: {} attempts={} events={}",
+                    replay.status.as_str(),
+                    replay.attempts,
+                    replay.events
+                ),
+            }
+        }
     }
     println!("summary: {}", report.summary.line());
 }
@@ -468,6 +574,7 @@ fn verify_entries(
         entries: Some(entry_count),
         status,
         problems: verifier.problems,
+        replay: None,
     }
 }
 
@@ -1836,6 +1943,7 @@ mod tests {
             entries: Some(1),
             status,
             problems: Vec::new(),
+            replay: None,
         };
 
         let ok = TraceVerifyReport::new(vec![turn(TraceStatus::Ok)]);
@@ -1856,6 +1964,7 @@ mod tests {
                 "trace_structure",
                 "broken".to_owned(),
             )],
+            replay: None,
         }]);
         assert!(!invalid.all_verified(false));
         assert!(!invalid.all_verified(true));

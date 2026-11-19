@@ -1619,6 +1619,14 @@ pub(crate) enum CliError {
         /// One-line summary of the report.
         summary: String,
     },
+    /// The trace is valid evidence but the replay engine cannot exercise it.
+    #[error("turn `{turn_id}` cannot be replay-verified: {reason}")]
+    TraceReplayUnsupported {
+        /// Turn whose parity check could not run.
+        turn_id: String,
+        /// Why the trace is outside the replayable subset.
+        reason: String,
+    },
     /// The requested session is absent from the event store.
     #[error("session `{session_id}` was not found in the event store")]
     UnknownSession {
