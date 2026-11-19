@@ -52,6 +52,7 @@ mod memory_log;
 mod memory_store;
 mod skill_jobs;
 mod skill_log;
+mod trace_chain;
 mod trace_store;
 mod workspace;
 
@@ -129,10 +130,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in the event database's `user_version` pragma.
 ///
 /// Version 1 adds the versioned trace tables without changing or rewriting the
-/// legacy `events` and `sessions` tables. Migrations are applied one version at
-/// a time inside a transaction; a schema change bumps this constant and adds
-/// the matching arm in `apply_migration`.
-const SCHEMA_VERSION: i64 = 1;
+/// legacy `events` and `sessions` tables. Version 2 adds the append-only
+/// `trace_chain` table and backfills one SHA-256 link per existing trace entry.
+/// Migrations are applied one version at a time inside a transaction; a schema
+/// change bumps this constant and adds the matching arm in `apply_migration`.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
 ///
@@ -247,11 +249,14 @@ impl EventStore {
 
     /// Opens an existing database without creating, migrating, or modifying it.
     ///
-    /// This is the audit path used by `jessica trace verify`. Unlike
-    /// [`EventStore::open`], a missing file is an error rather than a new
-    /// database, and a database without the trace schema is rejected instead of
-    /// being upgraded. Databases written by a newer build are rejected for the
-    /// same reason as [`EventStore::open`].
+    /// This is the audit path used by `jessica trace verify` and
+    /// `jessica trace digest`. Unlike [`EventStore::open`], a missing file is an
+    /// error rather than a new database, and a database without the current
+    /// trace schema is rejected instead of being upgraded. A database written by
+    /// the previous schema version must be opened once by a current read-write
+    /// build to run the trace-chain migration; auditing never migrates evidence
+    /// itself. Databases written by a newer build are rejected for the same
+    /// reason as [`EventStore::open`].
     ///
     /// The database is opened through a `file:...?mode=ro&immutable=1` URI, so
     /// SQLite takes no locks and never creates `-shm` or `-wal` sidecars. This
@@ -281,15 +286,28 @@ impl EventStore {
                 supported: SCHEMA_VERSION,
             });
         }
+        if version == 0 {
+            return Err(EventStoreError::TraceSchemaMissing {
+                path: path.to_path_buf(),
+                version,
+            });
+        }
+        if version < SCHEMA_VERSION {
+            return Err(EventStoreError::TraceSchemaOutdated {
+                path: path.to_path_buf(),
+                found: version,
+                required: SCHEMA_VERSION,
+            });
+        }
         let trace_table_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('trace_events', 'trace_heads')",
+                 WHERE type = 'table' AND name IN ('trace_events', 'trace_heads', 'trace_chain')",
                 [],
                 |row| row.get(0),
             )
             .map_err(EventStoreError::Schema)?;
-        if version < 1 || trace_table_count != 2 {
+        if trace_table_count != 3 {
             return Err(EventStoreError::TraceSchemaMissing {
                 path: path.to_path_buf(),
                 version,
@@ -504,9 +522,10 @@ impl EventStore {
 ///
 /// Each migration runs inside its own transaction together with the
 /// `user_version` update, so an interrupted or failing upgrade leaves the
-/// previous version intact. A database already at [`SCHEMA_VERSION`] keeps the
-/// previous `IF NOT EXISTS` installation so a partially removed schema is
-/// repaired on the next open.
+/// previous version intact. A database already at [`SCHEMA_VERSION`] only gets
+/// `IF NOT EXISTS` structural repair; data repair, including chain backfill, is
+/// confined to migrations and never rewrites or recomputes evidence on an
+/// ordinary open.
 fn install_schema(connection: &mut Connection, version: i64) -> Result<(), EventStoreError> {
     let mut current = version;
     while current < SCHEMA_VERSION {
@@ -522,7 +541,7 @@ fn install_schema(connection: &mut Connection, version: i64) -> Result<(), Event
 
     if version == SCHEMA_VERSION {
         let transaction = connection.transaction().map_err(EventStoreError::Schema)?;
-        apply_migration(&transaction, SCHEMA_VERSION)?;
+        repair_schema(&transaction)?;
         transaction.commit().map_err(EventStoreError::Schema)?;
     }
     Ok(())
@@ -540,8 +559,25 @@ fn apply_migration(
                 .map_err(EventStoreError::Schema)?;
             trace_store::install(transaction)
         }
+        2 => {
+            trace_chain::install(transaction)?;
+            trace_chain::backfill(transaction)
+        }
         _ => Err(EventStoreError::MigrationUnavailable { version }),
     }
+}
+
+/// Reinstalls the current schema's tables and triggers without touching data.
+///
+/// The repair is intentionally limited to `IF NOT EXISTS` DDL. It never
+/// backfills, recomputes, or repairs chain rows, so a missing or edited chain
+/// link remains a detectable audit failure.
+fn repair_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), EventStoreError> {
+    transaction
+        .execute_batch(SCHEMA)
+        .map_err(EventStoreError::Schema)?;
+    trace_store::install(transaction)?;
+    trace_chain::install(transaction)
 }
 
 /// Configures WAL journaling and full write durability on a writable connection.
@@ -771,6 +807,22 @@ pub enum EventStoreError {
         path: PathBuf,
         /// Version stored in the database's `user_version`.
         version: i64,
+    },
+    /// A read-only open found a database from the previous trace schema.
+    ///
+    /// Auditing requires the hash chain added in the current version, so the
+    /// database must be opened once with a current read-write build to migrate.
+    /// The read-only path never changes the evidence it is inspecting.
+    #[error(
+        "event store `{path}` uses schema version {found}, but auditing requires version {required}; open it once with a current read-write build to migrate"
+    )]
+    TraceSchemaOutdated {
+        /// Database path that was opened.
+        path: PathBuf,
+        /// Version stored in the database's `user_version`.
+        found: i64,
+        /// Schema version required by the audit path.
+        required: i64,
     },
     /// A read-only open found uncheckpointed WAL frames.
     ///

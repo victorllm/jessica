@@ -1907,9 +1907,9 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
-Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b 已完成，8.3–8.7 待逐项确认）
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3 已完成，8.4–8.7 待逐项确认）
 
-背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），其余按依赖顺序逐 Task 确认。
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`），其余按依赖顺序逐 Task 确认。
 
 Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
@@ -1950,9 +1950,27 @@ Task 8.2b（2026-11-19 确认并完成）：只读审计契约与崩溃/磁盘�
 - `open_read_only` 对非空 `-wal` 返回结构化错误；对 clean 库用 `immutable=1` URI 打开，支持只读目录且不产生 sidecar。
 - SIGKILL 提交恢复、磁盘满回滚、chmod 0555 只读目录与 URI 分隔符路径测试。
 
+Task 8.3（2026-11-19 确认并完成）：trace 哈希链、`trace digest` 与 `verify --expect`
+
+目标：为每个 turn 的已存 trace 建立可重算的 SHA-256 哈希链，提供只读 digest 输出与外部摘要锚定，使 trace 字节级篡改可被发现；不改变追加速度、不引入签名或新依赖。
+
+操作：
+
+1. `jessica-memory`：新增 `trace_chain(turn_id, seq, prev_hash, entry_hash)` 表（`WITHOUT ROWID`、长度 `CHECK`）及 UPDATE/DELETE 拒绝触发器；`SCHEMA_VERSION` 1→2。迁移 2 在单个事务内建表并按 `(turn_id, seq)` 顺序回填全部既有 `trace_events`，每条 turn 从 32 零字节 genesis 起链；失败整体回滚，`user_version` 不前进。普通 reopen 的 `repair_schema` 只补建缺失结构（`IF NOT EXISTS`），绝不重算或回填链数据，缺失链保持可检测。
+2. 哈希格式：领域分离 + u64 big-endian 长度前缀；`entry_hash = SHA-256(entry domain || prev_hash || turn_id || seq || schema_version || payload_kind || optional(event_type) || optional(attempt) || optional(session_id) || timestamp || payload_json)`，`optional(None)` 与 `optional(Some)` 使用不同存在标记；genesis 为 32 零字节；`digest = SHA-256(digest domain || turn_id || last_entry_hash)`，输出小写 hex。追加在同一事务写 `trace_events` + `trace_chain` + `trace_heads`；既有 turn 追加前读取最后链节并要求 `seq == head.last_seq`。
+3. `trace_turn` 在既有结构/生命周期校验全部通过后验证链：链节数等于事件数、seq 对齐、prev 链接一致、从已校验 envelope 重算 entry hash 一致；任一不符返回 `TraceInvalid`。`StoredTraceTurn::digest()` 暴露该 turn 的 digest。
+4. `open_read_only` 要求 schema v2：v1 返回可操作的 `TraceSchemaOutdated { path, found, required }`，提示先用当前读写构建迁移一次；只读路径仍不迁移、不建 sidecar。
+5. CLI：新增 `trace digest --turn <id> | --all [--json]`；单 turn 文本只输出 digest，`--all` 按 turn_id 升序输出 `turn_id<TAB>digest`；digest JSON 为 `report_version: 1`、`digest_format: "jessica.trace.digest.v1"`、per-turn `digest/closed/entries`。`trace verify` 新增 `--expect <64-hex>`（仅 `--turn`，大小写不敏感并规范化为小写）；不匹配新增 `digest_mismatch` problem，结构失败导致无 digest 时新增 `digest_unavailable`；verify `report_version` 2→3，per-turn 增加 `digest`，文本模式打印 digest。解析器与 usage 同步。
+6. README 记录命令、schema v2 审计要求与威胁模型：链只在期望 digest 存于库外时可作为防篡改证据；能重写整库者可重算链，因此不是签名。
+
+测试：`trace_chain` 单测 6（golden vector、长度前缀边界碰撞、optional 有无、逐字段敏感性、prev 敏感性、hex 往返/拒绝）；`tests/trace_chain.rs` 6（链接与 reopen 稳定、迁移回填 digest 一致且 v1 只读被拒、payload 编辑/删链节/插链节被检出、失败回填整体回滚并可重试）；CLI 解析 4（digest turn/all/equals、expect 大写规范化、非法 digest、非法 expect）；E2E 18 个（新增 7 个：digest 单 turn 与 verify digest 一致、all 排序/JSON、空库、未知 turn、链被删、expect 匹配/大写/不匹配、结构损坏时 `digest_unavailable`；既有 `report_version` 断言更新为 3 并断言 per-turn digest）；`durability`/`trace_store` 的未来版本夹具改为 3、表清单加入 `trace_chain`、legacy 升级断言 `user_version=2`。未改 `jessica-core`，未新增第三方 crate（复用已有 sha2），未实现跨 turn 聚合 digest 或 8.4+。
+
+验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 891 passed, 0 failed, 2 ignored（56 suites）。
+
+偏离/说明：1) digest 覆盖精确存储列（`payload_json` 文本与 mirrored i64），不重新序列化，保证迁移回填与在线追加一致；2) `--all` 仍通过 `trace_heads` 枚举 turn，未被 head 索引的孤儿 `trace_events` 行不会出现在 digest/verify 中，已记入 Deferred；3) 未提供跨 turn 聚合摘要或外部时间戳，留待 8.4；4) 本地 `DESIGN.md` 保持未跟踪。
+
 后续候选（未确认，不执行）：
 
-- 8.3 trace 哈希链、`trace digest`、`verify --expect`。
 - 8.4 可移植证据包 export 与离线 verify。
 - 8.5 `--all --replay` 与 Resumed/v1 覆盖扩展。
 - 8.6 子 Agent 轨迹证据（需先设计，可能需 core 批准）。
@@ -2046,6 +2064,8 @@ Task 8.2a ☑ 约 60 分钟（含方案确认、实现、格式化与全量验�
 
 Task 8.2b ☑ 约 45 分钟（含方案确认、实现、格式化与全量验收；未精确计时） — 完成只读审计契约与崩溃/磁盘满测试。`jessica-memory/src/lib.rs`：`open_read_only` 在打开前检查 `-wal` sidecar，非空返回新增 `EventStoreError::PendingWal { path, bytes }`，元数据读取失败返回 `WalInspect`；改用 `file:<percent-encoded path>?mode=ro&immutable=1` 并以 `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI` 打开，`immutable=1` 不建 `-shm`/不加锁，支持 0555 只读目录且不产生任何 sidecar；新增 `immutable_uri` 仅保留 `A-Za-z0-9-._~/` 与 `:`，其余字节（`?`/`#`/`%`/空格/非 ASCII）按 UTF-8 percent-encode，非 UTF-8 路径返回 `NonUtf8Path`；空 `-wal` 允许，未来版本、缺 trace schema、缺文件语义保持不变。测试：新增 `tests/read_only_audit.rs` 5 个（活写者非空 WAL 拒绝并报告真实字节数、clean close 后可审计且不建 sidecar、空 WAL 接受、0555 目录 + 0444 文件可读且目录无 sidecar、含 `?`/`#`/`%`/空格/中文路径可读）；`tests/durability.rs` 新增 SIGKILL 提交恢复测试（`current_exe --exact` 重入 helper 进程，提交 3 个事件并 flush 哨兵后休眠；父进程确认 `-wal` 非空、`Child::kill()` 后重开，断言 3 个事件、seq 1..3 与 payload 顺序，并在 clean close 后只读审计成功；helper 无环境变量时为空操作）；`lib.rs` 单测新增磁盘满回滚（`PRAGMA max_page_count = page_count + 1` 触发真实 `SQLiteFailure(DiskFull)`，断言 `Append` 错误、事件数与 `last_seq` 不变，提高上限后同一 store 可继续追加）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 868 passed, 0 failed, 2 ignored（55 suites）。偏离/说明：1) 磁盘满用 SQLite `max_page_count` 在页分配层制造真实 `SQLITE_FULL`，未挂载实际满盘文件系统（无需 root/loop 设备）；2) SIGKILL 用同一 integration test 二进制的 helper 重入实现，因此套件多一个无环境变量时立即返回的 helper 测试；3) `immutable=1` 连接上 SQLite 报告 `journal_mode=delete`（实测行为），审计测试不断言 `wal`；4) 未改 CLI/`jessica-core`/schema 版本/trace 语义，未新增第三方 crate，未实现 8.3+。未提交、未推送，`DESIGN.md` 保持未跟踪。
 
+Task 8.3 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付 trace 哈希链、`trace digest` 与 `verify --expect`。`jessica-memory`：新增 `trace_chain(turn_id, seq, prev_hash, entry_hash)`（`WITHOUT ROWID`、长度 CHECK、append-only UPDATE/DELETE 触发器）与 `trace_chain.rs`（领域分离 + u64 big-endian 长度前缀的 entry/digest 哈希、genesis、hex 编解码、回填与 golden vector 单测）；`SCHEMA_VERSION` 1→2，迁移 2 在单事务内建表并按 `(turn_id, seq)` 回填既有 `trace_events`，失败整体回滚；`repair_schema` 只补建缺失结构、绝不重算或回填；`append_traced` 在同一事务写 trace_events + trace_chain + trace_heads，并对既有 turn 校验最后链节与 head seq 对齐；`trace_turn` 在既有结构/生命周期校验后验证链条数、seq、prev 链接与重算 hash，`StoredTraceTurn::digest()` 暴露 digest；`open_read_only` 要求 v2，v1 返回新增 `TraceSchemaOutdated { found, required }` 且不迁移。`jessica-cli`：新增 `trace_digest` 模块与 `trace digest --turn|--all [--json]`（单 turn 仅输出 digest，all 按 turn_id 升序输出 tab 分隔行，JSON `report_version: 1`/`digest_format`/per-turn `digest/closed/entries`）；`trace verify` 新增 `--expect <64-hex>`（仅 `--turn`、大小写归一），不匹配产生 `digest_mismatch`、无 digest 产生 `digest_unavailable`，`report_version` 2→3 且 per-turn 增加 `digest`，文本打印 digest；参数解析、usage 与 README（命令、schema v2 审计要求、威胁模型）同步。测试新增 23 个：memory 链集成 6、链单测 6、CLI 解析 4、E2E 7（digest 单 turn 与 verify 一致、all 排序/JSON、空库、未知 turn、删链节、expect 匹配/大写/不匹配、结构损坏时 digest_unavailable），既有 E2E `report_version` 更新为 3；`durability`/`trace_store` 未来版本夹具与表清单更新到 v2/trace_chain。未改 `jessica-core`，未新增第三方 crate（复用 sha2），未实现跨 turn 聚合 digest 或 8.4+。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 891 passed, 0 failed, 2 ignored（56 suites）。偏离/说明：1) 哈希覆盖精确存储列而非重新序列化，保证迁移回填与在线追加一致；2) `--all` 仍按 `trace_heads` 枚举，孤儿 `trace_events` 行不可见，已记入 Deferred；3) 未提供跨 turn 聚合摘要/签名，留待 8.4；4) 未提交、未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
@@ -2131,6 +2151,7 @@ Deferred（待办，由用户决定是否单开 Task）
 · Phase 6 的 ACP ConfigWatcher 随首次 prompt 的惰性 runtime 装配启动（`assemble_runtime` 成功后才 spawn）；进程启动到首次 prompt 之间的配置文件修改不会触发通知，首次 prompt 使用启动快照，之后需再次修改文件才会被观察。若要求从 `initialize` 起就监听，需把 watcher 与 runtime 装配解耦并定义首次 prompt 取哪一份快照，单开 Task。
 · Paseo 0.15.x 的全局 provider catalog 探测会用 `cwd = $HOME` 调用 `session/new`；Jessica 的 cwd 又被限制在 ACP 进程启动 root 内，因此当 Paseo daemon 从项目目录启动且 workspace 在 `$HOME` 之外时，provider 目录刷新会报 `cwd must be inside the startup workspace root`。当前通过从 `$HOME` 启动 daemon（workspace 位于 `$HOME` 下）或 wrapper `cd` 到共同祖先规避，并已记录到 README；若要在任意 daemon cwd 下支持，需要单开 Task 定义可配置的额外允许根或 Paseo 专用 catalog 处理，不能在 ACP-4 放宽 cwd containment。
 · 可执行文件名仍为 `jessica-cli`（需要 `cargo run -p jessica-cli -- acp`，安装后命令名为 `jessica-cli`），而 Phase 6 Task 文案写的是 `jessica acp`。改名（如设置 `[[bin]] name = "jessica"`）会影响现有脚本、文档与发布产物，需单开 Task 统一命名并更新全部调用点，不得在 ACP Task 中顺手改动。
+· Task 8.3 的 `trace digest --all` 与 `trace verify --all` 仍按 `trace_heads` 枚举 turn；`trace_events` 中可能存在但未被任何 head 索引的孤儿行不会进入审计或 digest，其链缺失也不可见。若要覆盖全库一致性，须单开 Task 定义孤儿行扫描、归属与修复语义（只读审计不得自动修复），并明确迁移/损坏边界；不得在 8.4+ 顺手改变 `--all` 的枚举来源。
 
 ---
 

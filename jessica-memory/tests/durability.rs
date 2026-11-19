@@ -112,7 +112,7 @@ fn a_future_schema_is_rejected_before_wal_or_schema_changes() {
     {
         let connection = Connection::open(database.path()).expect("raw connection should open");
         connection
-            .execute_batch("PRAGMA user_version = 2;")
+            .execute_batch("PRAGMA user_version = 3;")
             .expect("future version should set");
     }
 
@@ -121,8 +121,8 @@ fn a_future_schema_is_rejected_before_wal_or_schema_changes() {
         matches!(
             error,
             EventStoreError::UnsupportedVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ),
         "unexpected error: {error:?}"
@@ -132,7 +132,7 @@ fn a_future_schema_is_rejected_before_wal_or_schema_changes() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version should read");
-    assert_eq!(version, 2, "the rejected database must keep its version");
+    assert_eq!(version, 3, "the rejected database must keep its version");
     let journal_mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("journal mode should read");
@@ -144,7 +144,7 @@ fn a_future_schema_is_rejected_before_wal_or_schema_changes() {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' \
-               AND name IN ('events', 'sessions', 'trace_events', 'trace_heads')",
+               AND name IN ('events', 'sessions', 'trace_events', 'trace_heads', 'trace_chain')",
             [],
             |row| row.get(0),
         )
@@ -187,7 +187,7 @@ fn a_failed_migration_rolls_back_ddl_and_user_version() {
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' \
-               AND name IN ('events', 'sessions', 'trace_events', 'trace_heads')",
+               AND name IN ('events', 'sessions', 'trace_events', 'trace_heads', 'trace_chain')",
             [],
             |row| row.get(0),
         )

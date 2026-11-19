@@ -18,6 +18,7 @@ mod pump;
 mod replay;
 mod shutdown;
 mod skills;
+mod trace_digest;
 mod trace_replay;
 mod trace_verify;
 
@@ -690,8 +691,9 @@ fn parse_trace_args(
 
     match subcommand.as_str() {
         "verify" => parse_trace_verify_args(args),
+        "digest" => parse_trace_digest_args(args),
         other => Err(CliError::InvalidTraceCommand {
-            message: format!("unknown subcommand `{other}`; expected verify"),
+            message: format!("unknown subcommand `{other}`; expected verify or digest"),
         }),
     }
 }
@@ -710,6 +712,7 @@ fn parse_trace_verify_args(
     let mut json = false;
     let mut allow_open = false;
     let mut replay = false;
+    let mut expect = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -727,6 +730,20 @@ fn parse_trace_verify_args(
                     .filter(|id| !id.is_empty())
                     .ok_or(CliError::MissingTraceTurn)?;
                 set_trace_turn(&mut turn, id.to_owned())?;
+            }
+            "--expect" => {
+                let digest = args.next().ok_or_else(|| CliError::InvalidTraceCommand {
+                    message: "`--expect` requires a digest".to_owned(),
+                })?;
+                set_trace_expect(&mut expect, &digest)?;
+            }
+            _ if arg.starts_with("--expect=") => {
+                let digest =
+                    arg.strip_prefix("--expect=")
+                        .ok_or_else(|| CliError::InvalidTraceCommand {
+                            message: "`--expect` requires a digest".to_owned(),
+                        })?;
+                set_trace_expect(&mut expect, digest)?;
             }
             "--all" => all = true,
             "--json" => json = true,
@@ -759,12 +776,82 @@ fn parse_trace_verify_args(
             message: "`--replay` requires `--turn`".to_owned(),
         });
     }
+    if expect.is_some() && !matches!(selection, TraceSelection::Turn(_)) {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--expect` requires `--turn`".to_owned(),
+        });
+    }
     Ok(Some(TraceCommand::Verify {
         selection,
         json,
         allow_open,
         replay,
+        expect,
     }))
+}
+
+/// Parses the arguments following `trace digest`.
+///
+/// `--turn` and `--all` are mutually exclusive; exactly one is required.
+fn parse_trace_digest_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<TraceCommand>, CliError> {
+    let mut turn = None;
+    let mut all = false;
+    let mut json = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_trace_usage();
+                return Ok(None);
+            }
+            "--turn" => {
+                let id = args.next().ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id)?;
+            }
+            _ if arg.starts_with("--turn=") => {
+                let id = arg
+                    .strip_prefix("--turn=")
+                    .filter(|id| !id.is_empty())
+                    .ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id.to_owned())?;
+            }
+            "--all" => all = true,
+            "--json" => json = true,
+            _ => {
+                return Err(CliError::InvalidTraceCommand {
+                    message: format!("unexpected `trace digest` argument `{arg}`"),
+                });
+            }
+        }
+    }
+
+    if all && turn.is_some() {
+        return Err(CliError::TraceSelectionConflict);
+    }
+    let selection = match (turn, all) {
+        (Some(turn), false) => TraceSelection::Turn(turn),
+        (None, true) => TraceSelection::All,
+        _ => return Err(CliError::MissingTraceSelection),
+    };
+    Ok(Some(TraceCommand::Digest { selection, json }))
+}
+
+/// Validates and normalizes an expected digest.
+fn set_trace_expect(slot: &mut Option<String>, digest: &str) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--expect` may be given only once".to_owned(),
+        });
+    }
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--expect` requires exactly 64 hexadecimal characters".to_owned(),
+        });
+    }
+    *slot = Some(digest.to_ascii_lowercase());
+    Ok(())
 }
 
 fn set_trace_turn(slot: &mut Option<String>, id: String) -> Result<(), CliError> {
@@ -841,24 +928,32 @@ fn print_skill_usage() {
 
 fn print_trace_usage() {
     println!(
-        "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay]\n\
+        "Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay] [--expect <digest>]\n\
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
+         \x20      jessica [--config <path>] trace digest --all [--json]\n\
          \n\
-         Verifies recorded turn traces without creating, migrating, or modifying\n\
-         the [events] database. It checks structural completeness, version-2\n\
-         semantics, and trace-to-legacy mirror consistency. It never calls the\n\
-         model or a tool.\n\
+         Verifies or digests recorded turn traces without creating, migrating, or\n\
+         modifying the [events] database. Verification checks structural\n\
+         completeness, version-2 semantics, trace-to-legacy mirror consistency,\n\
+         and the SHA-256 hash chain. It never calls the model or a tool.\n\
          \n\
-         --turn <turn_id>  Verify one turn; an unknown turn is an error\n\
-         --all             Verify every stored turn and summarize the results\n\
+         --turn <turn_id>  Verify or digest one turn; an unknown turn is an error\n\
+         --all             Select every stored turn\n\
          --json            Emit the stable JSON report instead of text\n\
          --allow-open      Treat traces without `turn_ended` as verified (with --all)\n\
          --replay          Re-run each fresh attempt with recorded inputs and require\n\
          \x20                 the event sequence to match (with --turn)\n\
+         --expect <digest> Require the turn chain digest to equal 64 hexadecimal\n\
+         \x20                 characters (with --turn)\n\
+         \n\
+         `trace digest --turn` prints only the lowercase hex digest; --all prints\n\
+         one `turn_id<TAB>digest` line per turn in ascending turn-id order.\n\
          \n\
          Exit code 0 means every selected trace passed; 1 means a trace was\n\
          invalid, an open trace was not allowed, replay found a mismatch, the\n\
-         trace is not replayable, or verification could not run."
+         trace is not replayable, a digest was unavailable, or the command could\n\
+         not run."
     );
 }
 
@@ -916,12 +1011,15 @@ fn print_usage() {
          requires an [events] path, never calls the model or a tool, and never reads\n\
          the clock or the network.\n\
          \n\
-         Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json]\n\
+         Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay] [--expect <digest>]\n\
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
+         \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
+         \x20      jessica [--config <path>] trace digest --all [--json]\n\
          \n\
-         Verifies recorded turn traces offline against an existing [events]\n\
-         database. The store is opened read-only: verification never creates or\n\
-         migrates it. See `jessica trace --help` for problem kinds and exit codes.\n\
+         Verifies or digests recorded turn traces offline against an existing\n\
+         [events] database. The store is opened read-only: the command never\n\
+         creates or migrates it. See `jessica trace --help` for problem kinds and\n\
+         exit codes.\n\
          \n\
          Usage: jessica [--config <path>] acp\n\
          \n\
@@ -1121,6 +1219,7 @@ mod tests {
                 json: false,
                 allow_open: false,
                 replay: false,
+                expect: None,
             },
         };
         assert_eq!(watched_config_path(&trace, &config), None);
@@ -1159,6 +1258,7 @@ mod tests {
                 json: true,
                 allow_open: false,
                 replay: false,
+                expect: None,
             })
         );
 
@@ -1170,6 +1270,7 @@ mod tests {
                 json: true,
                 allow_open: true,
                 replay: false,
+                expect: None,
             })
         );
 
@@ -1181,6 +1282,7 @@ mod tests {
                 json: false,
                 allow_open: false,
                 replay: false,
+                expect: None,
             })
         );
 
@@ -1194,8 +1296,147 @@ mod tests {
                 json: true,
                 allow_open: false,
                 replay: true,
+                expect: None,
             })
         );
+    }
+
+    #[test]
+    fn trace_digest_parses_turn_and_all_selections() {
+        assert_eq!(
+            parse_trace_args(skill_args(&["digest", "--turn", "turn-a", "--json"]))
+                .expect("turn digest must parse"),
+            Some(TraceCommand::Digest {
+                selection: TraceSelection::Turn("turn-a".to_owned()),
+                json: true,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&["digest", "--all"]))
+                .expect("all-turns digest must parse"),
+            Some(TraceCommand::Digest {
+                selection: TraceSelection::All,
+                json: false,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&["digest", "--turn=turn-b"]))
+                .expect("equals-form turn digest must parse"),
+            Some(TraceCommand::Digest {
+                selection: TraceSelection::Turn("turn-b".to_owned()),
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn trace_expect_is_validated_and_normalized() {
+        let uppercase = "AB".repeat(32);
+        let lowercase = "ab".repeat(32);
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "verify",
+                "--turn",
+                "turn-a",
+                "--expect",
+                uppercase.as_str(),
+            ]))
+            .expect("an uppercase digest must be accepted"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::Turn("turn-a".to_owned()),
+                json: false,
+                allow_open: false,
+                replay: false,
+                expect: Some(lowercase.clone()),
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "verify",
+                "--turn=turn-b",
+                format!("--expect={uppercase}").as_str(),
+            ]))
+            .expect("the equals form must be accepted"),
+            Some(TraceCommand::Verify {
+                selection: TraceSelection::Turn("turn-b".to_owned()),
+                json: false,
+                allow_open: false,
+                replay: false,
+                expect: Some(lowercase),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_digest_arguments_are_rejected() {
+        for (arguments, expected) in [
+            (vec!["digest"], "requires"),
+            (vec!["digest", "--turn"], "requires a turn id"),
+            (vec!["digest", "--turn="], "requires a turn id"),
+            (vec!["digest", "--turn", "a", "--turn", "b"], "only once"),
+            (vec!["digest", "--turn", "a", "--all"], "cannot be combined"),
+            (vec!["digest", "--expect", "00"], "--expect"),
+            (vec!["digest", "--unknown"], "--unknown"),
+        ] {
+            let error = parse_trace_args(skill_args(&arguments))
+                .expect_err("malformed digest arguments must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "error `{error}` must mention `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_expect_arguments_are_rejected() {
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        let non_hex = "g".repeat(64);
+        let valid = "a".repeat(64);
+        for (arguments, expected) in [
+            (
+                vec!["verify", "--turn", "a", "--expect"],
+                "requires a digest",
+            ),
+            (
+                vec!["verify", "--turn", "a", "--expect", short.as_str()],
+                "64 hexadecimal",
+            ),
+            (
+                vec!["verify", "--turn", "a", "--expect", long.as_str()],
+                "64 hexadecimal",
+            ),
+            (
+                vec!["verify", "--turn", "a", "--expect", non_hex.as_str()],
+                "64 hexadecimal",
+            ),
+            (
+                vec![
+                    "verify",
+                    "--turn",
+                    "a",
+                    "--expect",
+                    valid.as_str(),
+                    "--expect",
+                    valid.as_str(),
+                ],
+                "only once",
+            ),
+            (
+                vec!["verify", "--all", "--expect", valid.as_str()],
+                "requires `--turn`",
+            ),
+        ] {
+            let error = parse_trace_args(skill_args(&arguments))
+                .expect_err("malformed expect arguments must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "error `{error}` must mention `{expected}`"
+            );
+        }
     }
 
     #[test]

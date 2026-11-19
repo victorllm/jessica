@@ -125,7 +125,7 @@ cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml "修改
 `OPENAI_API_KEY` is required. `OPENAI_BASE_URL` and `OPENAI_MODEL` select an
 OpenAI-compatible endpoint and model.
 
-## Trace verification
+## Trace verification and digests
 
 `jessica trace verify` audits recorded turn traces without creating or
 migrating the `[events]` database. It does not execute a replay unless
@@ -136,23 +136,54 @@ jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id>
 jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --replay
 jessica --config ~/.jessica/harness.toml trace verify --all --json
 jessica --config ~/.jessica/harness.toml trace verify --all --allow-open
+jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --expect <digest>
 ```
 
 It checks structural completeness, v2 round/permission/child-session semantics,
 and that every mirrored agent event still exists in the legacy event stream with
-the same session, timestamp, and payload. `--turn` and `--all` are mutually
-exclusive; `--allow-open` accepts traces without a `turn_ended` marker but never
-accepts an invalid trace. `--replay` requires `--turn`: it rebuilds each fresh
-attempt from the trace's own bootstrap messages and recorded runtime events,
-drives the deterministic replay engine, and requires the produced event
-sequence to match. It covers closed v2 fresh traces ending `completed`, `error`,
-or on the max-rounds budget; traces outside that subset report `unsupported`
-and exit `1` instead of being silently skipped. Exit code `0` means every
-selected trace passed; `1` means an invalid trace, an unallowed open trace, an
-unknown turn, a replay mismatch, an unreplayable trace, or a
+the same session, timestamp, and payload. It also recomputes each turn's
+SHA-256 hash chain from the stored column bytes, so an edited, deleted, or
+inserted trace row is reported as a structural failure instead of being
+verified. `--turn` and `--all` are mutually exclusive; `--allow-open` accepts
+traces without a `turn_ended` marker but never accepts an invalid trace.
+`--replay` requires `--turn`: it rebuilds each fresh attempt from the trace's
+own bootstrap messages and recorded runtime events, drives the deterministic
+replay engine, and requires the produced event sequence to match. It covers
+closed v2 fresh traces ending `completed`, `error`, or on the max-rounds
+budget; traces outside that subset report `unsupported` and exit `1` instead of
+being silently skipped. `--expect` requires `--turn` and a 64-character
+hexadecimal digest (case-insensitive); a matching digest leaves the report
+unchanged, while a mismatch adds a `digest_mismatch` problem. Exit code `0`
+means every selected trace passed; `1` means an invalid trace, an unallowed
+open trace, an unknown turn, a replay mismatch, an unreplayable trace, or a
 storage/configuration error. `--json` emits a stable report with
-`report_version`, per-turn statuses, optional replay results, and
-machine-readable problem kinds.
+`report_version: 3`, per-turn statuses, per-turn `digest`, optional replay
+results, and machine-readable problem kinds.
+
+Auditing requires event-store schema version 2, which adds the hash chain and
+backfills it for existing traces during migration. A version-1 database must be
+opened once by a current read-write build before it can be audited; read-only
+audit never migrates and reports the required schema version instead.
+
+`jessica trace digest` prints the verified digest for one turn or all turns
+without a full verification report:
+
+```bash
+jessica --config ~/.jessica/harness.toml trace digest --turn <turn_id>
+jessica --config ~/.jessica/harness.toml trace digest --all
+jessica --config ~/.jessica/harness.toml trace digest --all --json
+```
+
+A single-turn run prints only the digest, so it can be captured directly. An
+`--all` run prints one `turn_id<TAB>digest` line per turn in ascending turn-id
+order. `--json` emits `report_version: 1`, `digest_format:
+"jessica.trace.digest.v1"`, and per-turn `digest`, `closed`, and `entries`.
+
+The hash chain is tamper-evident only relative to an externally kept digest:
+an attacker able to rewrite the whole database can recompute the chain. It is
+not a signature. Record the digest outside the database, for example in CI
+output or a release manifest, and pass it back with `--expect` to anchor the
+audit.
 
 ## ACP (Agent Client Protocol)
 

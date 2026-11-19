@@ -74,7 +74,7 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
     );
 
     let report = json_report(&output);
-    assert_eq!(report["report_version"], 2);
+    assert_eq!(report["report_version"], 3);
     assert_eq!(report["summary"]["turns"], 4);
     assert_eq!(report["summary"]["ok"], 1);
     assert_eq!(report["summary"]["open"], 1);
@@ -95,20 +95,43 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
         ok["replay"].is_null(),
         "replay must stay absent unless --replay is requested"
     );
+    let ok_digest = ok["digest"]
+        .as_str()
+        .expect("a verified turn must carry its chain digest");
+    assert!(
+        is_lower_hex_64(ok_digest),
+        "the digest must be canonical lowercase hex: {ok_digest}"
+    );
 
     let open = report_turn(&report, "turn-open");
     assert_eq!(open["status"], "open");
     assert_eq!(open["schema_version"], 2);
     assert_eq!(open["entries"], 2);
+    let open_digest = open["digest"]
+        .as_str()
+        .expect("an open turn's chain is still digestible");
+    assert!(is_lower_hex_64(open_digest));
+    assert_ne!(
+        ok_digest, open_digest,
+        "different turns must not share one digest"
+    );
 
     let gap = report_turn(&report, "turn-gap");
     assert_eq!(gap["status"], "invalid");
     assert_eq!(problem_kinds(gap), vec!["trace_gap"]);
+    assert!(
+        is_lower_hex_64(gap["digest"].as_str().expect("digest must survive a gap")),
+        "a semantic gap does not break the chain"
+    );
 
     let corrupt = report_turn(&report, "turn-corrupt");
     assert_eq!(corrupt["status"], "invalid");
     assert!(corrupt["schema_version"].is_null());
     assert!(corrupt["entries"].is_null());
+    assert!(
+        corrupt["digest"].is_null(),
+        "a structurally invalid trace has no digest"
+    );
     assert_eq!(problem_kinds(corrupt), vec!["trace_structure"]);
 
     // --allow-open relaxes only the open status. The gap and the corrupt head
@@ -242,7 +265,7 @@ fn replay_reproduces_a_closed_fresh_trace_and_reports_it() {
     let json = run_verify(&config, &["--turn", "turn-replay", "--replay", "--json"]);
     assert!(json.status.success());
     let report = json_report(&json);
-    assert_eq!(report["report_version"], 2);
+    assert_eq!(report["report_version"], 3);
     let turn = report_turn(&report, "turn-replay");
     assert_eq!(turn["status"], "ok");
     assert_eq!(turn["replay"]["status"], "ok");
@@ -367,6 +390,286 @@ fn an_empty_store_is_a_successful_zero_turn_report() {
 }
 
 #[test]
+fn digest_prints_the_same_digest_that_verify_reports() {
+    let temp = TempDir::new("digest-single");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_valid_turn(&mut store, "turn-ok", "session-ok", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let text = run_trace(&config, "digest", &["--turn", "turn-ok"]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        text.status.success(),
+        "a valid chain must digest\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "success must not write to stderr:\n{stderr}"
+    );
+    let digest = stdout.trim();
+    assert!(
+        is_lower_hex_64(digest),
+        "single-turn output must be just the digest: {stdout:?}"
+    );
+
+    let verify = run_verify(&config, &["--turn", "turn-ok", "--json"]);
+    let report = json_report(&verify);
+    assert_eq!(
+        report_turn(&report, "turn-ok")["digest"].as_str(),
+        Some(digest),
+        "verify and digest must report one digest for one stored chain"
+    );
+
+    let json = run_trace(&config, "digest", &["--turn", "turn-ok", "--json"]);
+    assert!(json.status.success());
+    let report = json_report(&json);
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["digest_format"], "jessica.trace.digest.v1");
+    let turns = report["turns"].as_array().expect("turns must be an array");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["turn_id"], "turn-ok");
+    assert_eq!(turns[0]["digest"], digest);
+    assert_eq!(turns[0]["closed"], true);
+    assert_eq!(turns[0]["entries"], 10);
+}
+
+#[test]
+fn digest_all_reports_every_turn_in_ascending_order() {
+    let temp = TempDir::new("digest-all");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_valid_turn(&mut store, "turn-alpha", "session-alpha", 1_000);
+    seed_open_turn(&mut store, "turn-beta", "session-beta", 2_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let text = run_trace(&config, "digest", &["--all"]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.status.success(),
+        "an open turn still has a digestible chain:\n{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "unexpected text output:\n{stdout}");
+    let mut split = lines[0].split('\t');
+    assert_eq!(split.next(), Some("turn-alpha"));
+    assert!(
+        split.next().is_some_and(is_lower_hex_64),
+        "the first line must carry the alpha digest: {stdout}"
+    );
+    let mut split = lines[1].split('\t');
+    assert_eq!(split.next(), Some("turn-beta"));
+    assert!(
+        split.next().is_some_and(is_lower_hex_64),
+        "the second line must carry the beta digest: {stdout}"
+    );
+
+    let json = run_trace(&config, "digest", &["--all", "--json"]);
+    assert!(json.status.success());
+    let report = json_report(&json);
+    let turns = report["turns"].as_array().expect("turns must be an array");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["turn_id"], "turn-alpha");
+    assert_eq!(turns[0]["closed"], true);
+    assert_eq!(turns[1]["turn_id"], "turn-beta");
+    assert_eq!(turns[1]["closed"], false);
+    assert_eq!(turns[1]["entries"], 2);
+}
+
+#[test]
+fn digest_of_an_empty_store_is_a_successful_empty_report() {
+    let temp = TempDir::new("digest-empty");
+    let database = temp.path.join("events.sqlite");
+    drop(EventStore::open(&database).expect("event store should open"));
+    let config = write_config(&temp, &database);
+
+    let text = run_trace(&config, "digest", &["--all"]);
+    assert!(
+        text.status.success(),
+        "an empty store has no failing chain:\n{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(
+        text.stdout.is_empty(),
+        "an empty all-turns digest prints nothing"
+    );
+
+    let json = run_trace(&config, "digest", &["--all", "--json"]);
+    assert!(json.status.success());
+    let report = json_report(&json);
+    assert_eq!(
+        report["turns"].as_array().expect("turns must be an array"),
+        &Vec::<Value>::new()
+    );
+}
+
+#[test]
+fn digest_rejects_an_unknown_turn() {
+    let temp = TempDir::new("digest-missing");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_valid_turn(&mut store, "turn-ok", "session-ok", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let output = run_trace(&config, "digest", &["--turn", "turn-missing"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        empty_stdout(&output),
+        "an unknown turn must not produce a digest"
+    );
+    assert!(
+        stderr.contains("turn-missing") && stderr.contains("not found"),
+        "the error must name the missing turn:\n{stderr}"
+    );
+}
+
+#[test]
+fn digest_detects_a_tampered_chain() {
+    let temp = TempDir::new("digest-tamper");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_valid_turn(&mut store, "turn-ok", "session-ok", 1_000);
+    drop(store);
+
+    {
+        let connection =
+            rusqlite::Connection::open(&database).expect("raw database connection should open");
+        connection
+            .execute_batch("DROP TRIGGER trace_chain_append_only_delete;")
+            .expect("the delete guard should drop for the fixture");
+        let deleted = connection
+            .execute(
+                "DELETE FROM trace_chain WHERE turn_id = 'turn-ok' AND seq = 3",
+                [],
+            )
+            .expect("the fixture deletion should apply");
+        assert_eq!(deleted, 1, "the fixture must delete exactly one link");
+    }
+
+    let config = write_config(&temp, &database);
+    let output = run_trace(&config, "digest", &["--turn", "turn-ok"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a missing chain link must not produce a digest\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        empty_stdout(&output),
+        "a broken chain must not print an unverified digest"
+    );
+    assert!(
+        stderr.contains("turn-ok") && stderr.contains("chain"),
+        "the error must name the turn and the broken chain:\n{stderr}"
+    );
+}
+
+#[test]
+fn verify_expect_accepts_only_the_anchored_digest() {
+    let temp = TempDir::new("expect");
+    let database = temp.path.join("events.sqlite");
+    let mut store = EventStore::open(&database).expect("event store should open");
+    seed_valid_turn(&mut store, "turn-ok", "session-ok", 1_000);
+    drop(store);
+    let config = write_config(&temp, &database);
+
+    let baseline = run_trace(&config, "digest", &["--turn", "turn-ok"]);
+    assert!(baseline.status.success());
+    let digest = String::from_utf8_lossy(&baseline.stdout).trim().to_owned();
+    assert!(is_lower_hex_64(&digest));
+
+    let matching = run_verify(
+        &config,
+        &["--turn", "turn-ok", "--json", "--expect", &digest],
+    );
+    let stderr = String::from_utf8_lossy(&matching.stderr);
+    assert!(
+        matching.status.success(),
+        "the recorded digest must pass verification\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        report_turn(&json_report(&matching), "turn-ok")["status"],
+        "ok"
+    );
+
+    let uppercase = digest.to_ascii_uppercase();
+    let normalized = run_verify(
+        &config,
+        &["--turn", "turn-ok", "--json", "--expect", &uppercase],
+    );
+    assert!(
+        normalized.status.success(),
+        "an uppercase expected digest must be normalized:\n{}",
+        String::from_utf8_lossy(&normalized.stderr)
+    );
+
+    let wrong = if digest == "0".repeat(64) {
+        "1".repeat(64)
+    } else {
+        "0".repeat(64)
+    };
+    let mismatch = run_verify(
+        &config,
+        &["--turn", "turn-ok", "--json", "--expect", &wrong],
+    );
+    let stderr = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(
+        !mismatch.status.success(),
+        "an unanchored digest must fail\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&mismatch.stdout)
+    );
+    let report = json_report(&mismatch);
+    let turn = report_turn(&report, "turn-ok");
+    assert_eq!(turn["status"], "invalid");
+    assert_eq!(turn["digest"], digest);
+    assert_eq!(problem_kinds(turn), vec!["digest_mismatch"]);
+    assert!(
+        stderr.contains("trace verification failed"),
+        "the CLI must report verification failure:\n{stderr}"
+    );
+}
+
+#[test]
+fn verify_expect_cannot_anchor_a_structurally_invalid_trace() {
+    let temp = TempDir::new("expect-unavailable");
+    let database = temp.path.join("events.sqlite");
+    drop(EventStore::open(&database).expect("event store should open"));
+    seed_corrupt_head(&database, "turn-corrupt", 2_000);
+    let config = write_config(&temp, &database);
+
+    let expected = "0".repeat(64);
+    let output = run_verify(
+        &config,
+        &["--turn", "turn-corrupt", "--json", "--expect", &expected],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an unverifiable trace cannot be anchored\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report = json_report(&output);
+    let turn = report_turn(&report, "turn-corrupt");
+    assert_eq!(turn["status"], "invalid");
+    assert!(turn["digest"].is_null());
+    let kinds = problem_kinds(turn);
+    assert!(
+        kinds.contains(&"trace_structure"),
+        "the structural failure must remain visible: {turn}"
+    );
+    assert!(
+        kinds.contains(&"digest_unavailable"),
+        "the missing digest must be reported, not assumed to match: {turn}"
+    );
+}
+
+#[test]
 fn verification_never_creates_the_event_store() {
     let temp = TempDir::new("missing");
     let database = temp.path.join("missing.sqlite");
@@ -422,6 +725,11 @@ fn trace_requires_an_event_store_path() {
 
 /// Runs the real CLI in trace-verification mode without provider configuration.
 fn run_verify(config: &Path, arguments: &[&str]) -> Output {
+    run_trace(config, "verify", arguments)
+}
+
+/// Runs the real CLI in one trace subcommand without provider configuration.
+fn run_trace(config: &Path, subcommand: &str, arguments: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace_root())
         .env_remove("JESSICA_PROVIDER")
@@ -434,7 +742,7 @@ fn run_verify(config: &Path, arguments: &[&str]) -> Output {
         .arg("--config")
         .arg(config)
         .arg("trace")
-        .arg("verify")
+        .arg(subcommand)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -509,6 +817,14 @@ fn problem_kinds(turn: &Value) -> Vec<&str> {
 
 fn empty_stdout(output: &Output) -> bool {
     output.stdout.is_empty()
+}
+
+/// Returns whether `value` is 64 lowercase hexadecimal characters.
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Writes a complete trace that satisfies every verification layer.
