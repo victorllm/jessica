@@ -21,8 +21,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode, TurnId};
-use jessica_core::types::{AgentEvent, PermissionDecision, SessionEndReason, SessionId};
+use jessica_core::types::{
+    AgentEvent, Message, PermissionDecision, Role, SessionEndReason, SessionId, ToolCall,
+};
 use jessica_memory::{EventStore, EventStoreError, StoredTraceTurn, Timestamp};
+use jessica_runtime::{
+    CHILD_AGENT_SYSTEM_PROMPT, DELEGATE_TASK_TOOL_NAME, parse_delegate_task_args,
+};
 use serde::Serialize;
 
 use crate::app::CliError;
@@ -877,6 +882,10 @@ struct Verifier {
     children: BTreeMap<(SessionId, String), ChildRecord>,
     /// Parents whose open children were already checked at session end.
     children_checked_sessions: BTreeSet<Attribution>,
+    /// Parent `delegate_task` calls keyed by `((attempt, session), call_id)`.
+    delegate_calls: BTreeMap<(Attribution, String), DelegateCallRecord>,
+    /// Whether the turn contains any nested child evidence.
+    has_child_evidence: bool,
 }
 
 impl Verifier {
@@ -895,6 +904,8 @@ impl Verifier {
             finished_calls: BTreeMap::new(),
             children: BTreeMap::new(),
             children_checked_sessions: BTreeSet::new(),
+            delegate_calls: BTreeMap::new(),
+            has_child_evidence: false,
         }
     }
 
@@ -918,6 +929,9 @@ impl Verifier {
                     self.check_children_at_turn_end(entry.seq, *reason);
                 }
                 TracePayload::Agent { event } => self.on_agent_event(entry, event),
+                TracePayload::ChildAgent { call_id, event } => {
+                    self.on_child_event(entry, call_id, event);
+                }
             }
         }
 
@@ -926,6 +940,9 @@ impl Verifier {
             for key in remaining {
                 self.check_permission_resolution(&key);
             }
+        }
+        if self.has_child_evidence {
+            self.check_child_linkage();
         }
     }
 
@@ -957,15 +974,24 @@ impl Verifier {
             AgentEvent::ModelDelta { .. } => {
                 self.on_model_delta(entry.seq, entry);
             }
-            AgentEvent::ToolCallStarted { .. } => {
+            AgentEvent::ToolCallStarted { call } => {
                 self.on_tool_call_started(entry.seq, entry);
+                if call.name == DELEGATE_TASK_TOOL_NAME {
+                    self.on_delegate_call_started(entry, call);
+                }
             }
             AgentEvent::ToolCallFinished { result } => {
                 if let Some(key) = attribution(&entry.event) {
                     self.finished_calls
-                        .entry(key)
+                        .entry(key.clone())
                         .or_default()
                         .insert(result.tool_call_id.clone());
+                    if let Some(call) = self
+                        .delegate_calls
+                        .get_mut(&(key, result.tool_call_id.clone()))
+                    {
+                        call.finished_seq = Some(entry.seq);
+                    }
                 }
             }
             AgentEvent::SessionEnded { reason, .. } => {
@@ -983,17 +1009,22 @@ impl Verifier {
             AgentEvent::ChildSessionEnded {
                 child_session_id,
                 call_id,
+                reason,
+                rounds,
                 tool_calls,
                 tool_errors,
-                ..
             } => {
                 self.on_child_ended(
                     entry.seq,
                     entry,
                     child_session_id,
                     call_id,
-                    *tool_calls,
-                    *tool_errors,
+                    *reason,
+                    ChildEndCounts {
+                        rounds: *rounds,
+                        tool_calls: *tool_calls,
+                        tool_errors: *tool_errors,
+                    },
                 );
             }
             AgentEvent::SessionStarted { .. }
@@ -1268,6 +1299,427 @@ impl Verifier {
         }
     }
 
+    /// Records one parent `delegate_task` call for later evidence linkage.
+    fn on_delegate_call_started(&mut self, entry: &Entry, call: &ToolCall) {
+        let Some(parent) = attribution(&entry.event) else {
+            return;
+        };
+        if call.id.is_empty() {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "delegate_empty_call_id",
+                "a `delegate_task` call has an empty tool call id".to_owned(),
+            ));
+            return;
+        }
+        let task = parse_delegate_task_args(&call.arguments, usize::MAX)
+            .ok()
+            .map(|args| args.task().to_owned());
+        let key = (parent, call.id.clone());
+        if self.delegate_calls.contains_key(&key) {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "delegate_duplicate_call",
+                format!("`delegate_task` call `{}` started more than once", call.id),
+            ));
+            return;
+        }
+        self.delegate_calls.insert(
+            key,
+            DelegateCallRecord {
+                task,
+                finished_seq: None,
+            },
+        );
+    }
+
+    /// Validates one nested child event against its parent call bracket.
+    fn on_child_event(&mut self, entry: &Entry, call_id: &str, event: &AgentEvent) {
+        let Some(attempt) = entry.event.attempt else {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "missing_attribution",
+                "a child-agent payload requires the parent attempt".to_owned(),
+            ));
+            return;
+        };
+        let Some(child_session_id) = entry.event.session_id.clone() else {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "missing_attribution",
+                "a child-agent payload requires the child session id".to_owned(),
+            ));
+            return;
+        };
+        if call_id.is_empty() {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "child_empty_call_id",
+                "a child-agent payload has an empty parent tool call id".to_owned(),
+            ));
+            return;
+        }
+        let pair = (child_session_id.clone(), call_id.to_owned());
+        let Some(record) = self.children.get_mut(&pair) else {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "child_event_without_start",
+                format!(
+                    "child session `{child_session_id}` for call `{call_id}` emitted an event \
+                     without a parent `child_session_started`"
+                ),
+            ));
+            return;
+        };
+        if !record.open {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "child_event_after_end",
+                format!(
+                    "child session `{child_session_id}` for call `{call_id}` emitted an event \
+                     after its parent reported the child ended"
+                ),
+            ));
+            return;
+        }
+        if record.parent.0 != attempt {
+            self.problems.push(TraceProblem::new(
+                Some(entry.seq),
+                "child_event_attribution",
+                format!(
+                    "child session `{child_session_id}` emitted an event under attempt {attempt} \
+                     instead of its parent attempt {}",
+                    record.parent.0
+                ),
+            ));
+            return;
+        }
+
+        self.has_child_evidence = true;
+        record.trajectory.has_entries = true;
+        let task = record.delegate_task.clone();
+        let trajectory = &mut record.trajectory;
+
+        match event {
+            AgentEvent::SessionStarted {
+                session_id,
+                messages,
+            } => {
+                if session_id != &child_session_id {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_session_identity",
+                        format!("child session `{child_session_id}` started as `{session_id}`"),
+                    ));
+                    return;
+                }
+                if trajectory.started {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_duplicate_trajectory_start",
+                        format!(
+                            "child session `{child_session_id}` for call `{call_id}` started twice"
+                        ),
+                    ));
+                    return;
+                }
+                if trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_after_end",
+                        format!(
+                            "child session `{child_session_id}` for call `{call_id}` started \
+                             after it already ended"
+                        ),
+                    ));
+                    return;
+                }
+                check_child_bootstrap(&mut self.problems, entry.seq, messages, task.as_deref());
+                trajectory.started = true;
+            }
+            AgentEvent::SessionEnded { session_id, reason } => {
+                if session_id != &child_session_id {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_session_identity",
+                        format!("child session `{child_session_id}` ended as `{session_id}`"),
+                    ));
+                    return;
+                }
+                if !trajectory.started {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_before_start",
+                        format!(
+                            "child session `{child_session_id}` for call `{call_id}` ended \
+                             before its own session started"
+                        ),
+                    ));
+                    return;
+                }
+                if trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_duplicate_terminal",
+                        format!(
+                            "child session `{child_session_id}` for call `{call_id}` ended twice"
+                        ),
+                    ));
+                    return;
+                }
+                if let Some(open) = trajectory.round.open {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "open_round_at_child_end",
+                        format!(
+                            "child session `{child_session_id}` ended while round {open} is still open"
+                        ),
+                    ));
+                }
+                if *reason == SessionEndReason::Completed && !trajectory.open_calls.is_empty() {
+                    let missing = trajectory
+                        .open_calls
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("`, `");
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "open_tool_call_at_child_end",
+                        format!(
+                            "child session `{child_session_id}` completed with unfinished tool \
+                             calls: `{missing}`"
+                        ),
+                    ));
+                }
+                trajectory.ended = Some(*reason);
+            }
+            AgentEvent::RoundStarted { round } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` started round {round} outside \
+                             its session bracket"
+                        ),
+                    ));
+                } else if *round == 0 {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "invalid_child_round",
+                        "child rounds are one-based; round zero cannot start".to_owned(),
+                    ));
+                } else if let Some(open) = trajectory.round.open {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "nested_child_round",
+                        format!("child round {round} started while round {open} is still open"),
+                    ));
+                } else {
+                    let expected = trajectory
+                        .round
+                        .last_started
+                        .and_then(|previous| previous.checked_add(1))
+                        .unwrap_or(1);
+                    if *round != expected {
+                        self.problems.push(TraceProblem::new(
+                            Some(entry.seq),
+                            "child_round_sequence",
+                            format!(
+                                "child round {round} started but round {expected} was expected"
+                            ),
+                        ));
+                    }
+                    trajectory.round.open = Some(*round);
+                    trajectory.round.last_started = Some(*round);
+                }
+            }
+            AgentEvent::RoundFinished { round, .. } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` finished round {round} outside \
+                             its session bracket"
+                        ),
+                    ));
+                } else if trajectory.round.open == Some(*round) {
+                    trajectory.round.open = None;
+                    trajectory.rounds += 1;
+                } else {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "unexpected_child_round_finish",
+                        format!("child round {round} finished without an open round"),
+                    ));
+                }
+            }
+            AgentEvent::ModelDelta { .. } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` emitted model output outside \
+                             its session bracket"
+                        ),
+                    ));
+                } else if trajectory.round.open.is_none() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_model_delta_outside_round",
+                        format!(
+                            "child session `{child_session_id}` emitted model output outside \
+                             an open round"
+                        ),
+                    ));
+                }
+            }
+            AgentEvent::ToolCallStarted { call } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` started tool call `{}` outside \
+                             its session bracket",
+                            call.id
+                        ),
+                    ));
+                } else if trajectory.round.open.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_tool_call_before_round_finished",
+                        format!(
+                            "child session `{child_session_id}` started tool call `{}` before \
+                             its round finished",
+                            call.id
+                        ),
+                    ));
+                } else if trajectory.round.last_started.is_none() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_tool_call_without_round",
+                        format!(
+                            "child session `{child_session_id}` started tool call `{}` without \
+                             a preceding model round",
+                            call.id
+                        ),
+                    ));
+                } else if call.id.is_empty() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_empty_tool_call_id",
+                        "a child tool call has an empty id".to_owned(),
+                    ));
+                } else if trajectory.open_calls.contains(&call.id)
+                    || trajectory.finished_calls.contains(&call.id)
+                {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_duplicate_tool_call",
+                        format!(
+                            "child session `{child_session_id}` started tool call `{}` more \
+                             than once",
+                            call.id
+                        ),
+                    ));
+                } else {
+                    trajectory.open_calls.insert(call.id.clone());
+                    trajectory.tool_calls += 1;
+                }
+            }
+            AgentEvent::ToolCallFinished { result } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` finished tool call `{}` outside \
+                             its session bracket",
+                            result.tool_call_id
+                        ),
+                    ));
+                } else if trajectory.open_calls.remove(&result.tool_call_id) {
+                    trajectory
+                        .finished_calls
+                        .insert(result.tool_call_id.clone());
+                    if result.is_error {
+                        trajectory.tool_errors += 1;
+                    }
+                } else {
+                    let kind = if trajectory.finished_calls.contains(&result.tool_call_id) {
+                        "child_duplicate_tool_finish"
+                    } else {
+                        "child_tool_finish_without_start"
+                    };
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        kind,
+                        format!(
+                            "child session `{child_session_id}` finished tool call `{}` without \
+                             a matching start",
+                            result.tool_call_id
+                        ),
+                    ));
+                }
+            }
+            AgentEvent::Error { message } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` reported an error outside its \
+                             session bracket"
+                        ),
+                    ));
+                } else if message.starts_with("maximum tool calls (")
+                    && message.ends_with(") exceeded")
+                {
+                    trajectory.tool_call_limit_hit = true;
+                }
+            }
+            AgentEvent::BudgetExceeded { .. } => {
+                if !trajectory.started || trajectory.ended.is_some() {
+                    self.problems.push(TraceProblem::new(
+                        Some(entry.seq),
+                        "child_event_outside_trajectory",
+                        format!(
+                            "child session `{child_session_id}` reported a budget event outside \
+                             its session bracket"
+                        ),
+                    ));
+                }
+            }
+            AgentEvent::PolicyDenied { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::AcceptanceFailed { .. } => {
+                self.problems.push(TraceProblem::new(
+                    Some(entry.seq),
+                    "child_parent_only_event",
+                    format!(
+                        "child session `{child_session_id}` must not emit parent-only event \
+                         `{}`",
+                        agent_event_kind(event)
+                    ),
+                ));
+            }
+            AgentEvent::ChildSessionStarted { .. } | AgentEvent::ChildSessionEnded { .. } => {
+                self.problems.push(TraceProblem::new(
+                    Some(entry.seq),
+                    "child_nested_session",
+                    format!(
+                        "child session `{child_session_id}` must not nest another child \
+                         session event"
+                    ),
+                ));
+            }
+        }
+    }
+
     /// Records a child-session start and rejects duplicates.
     fn on_child_started(
         &mut self,
@@ -1290,8 +1742,24 @@ impl Verifier {
             ));
             return;
         }
-        self.children
-            .insert(pair, ChildRecord { parent, open: true });
+        let delegate = self
+            .delegate_calls
+            .get(&(parent.clone(), call_id.to_owned()));
+        let delegate_call_found = delegate.is_some();
+        let delegate_task = delegate.and_then(|call| call.task.clone());
+        let delegate_finished_seq = delegate.and_then(|call| call.finished_seq);
+        self.children.insert(
+            pair,
+            ChildRecord {
+                seq,
+                parent,
+                open: true,
+                delegate_call_found,
+                delegate_task,
+                delegate_finished_seq,
+                trajectory: ChildTrajectory::default(),
+            },
+        );
     }
 
     /// Pairs a child-session end with its start.
@@ -1301,8 +1769,8 @@ impl Verifier {
         entry: &Entry,
         child_session_id: &SessionId,
         call_id: &str,
-        tool_calls: u32,
-        tool_errors: u32,
+        reason: SessionEndReason,
+        counts: ChildEndCounts,
     ) {
         if self
             .require_attribution(seq, entry, "child_session_ended")
@@ -1311,37 +1779,101 @@ impl Verifier {
             return;
         }
         let pair = (child_session_id.clone(), call_id.to_owned());
-        let problem = match self.children.get_mut(&pair) {
-            None => Some((
+        let findings = match self.children.get_mut(&pair) {
+            None => vec![TraceProblem::new(
+                Some(seq),
                 "child_end_without_start",
                 format!(
                     "child session `{child_session_id}` for call `{call_id}` ended without a start"
                 ),
-            )),
-            Some(record) if !record.open => Some((
+            )],
+            Some(record) if !record.open => vec![TraceProblem::new(
+                Some(seq),
                 "child_end_without_start",
                 format!(
                     "child session `{child_session_id}` for call `{call_id}` ended more than once"
                 ),
-            )),
+            )],
             Some(record) => {
                 record.open = false;
-                if tool_errors > tool_calls {
-                    Some((
+                let mut findings = Vec::new();
+                if counts.tool_errors > counts.tool_calls {
+                    findings.push(TraceProblem::new(
+                        Some(seq),
                         "child_tool_counts",
                         format!(
-                            "child session `{child_session_id}` reports {tool_errors} tool errors out of {tool_calls} tool calls"
+                            "child session `{child_session_id}` reports {} tool errors out of {} tool calls",
+                            counts.tool_errors, counts.tool_calls
                         ),
-                    ))
-                } else {
-                    None
+                    ));
                 }
+                if record.trajectory.has_entries {
+                    findings.extend(child_terminal_findings(
+                        seq,
+                        child_session_id,
+                        call_id,
+                        record,
+                        reason,
+                        counts,
+                    ));
+                }
+                findings
             }
         };
-        if let Some((kind, message)) = problem {
-            self.problems
-                .push(TraceProblem::new(Some(seq), kind, message));
+        self.problems.extend(findings);
+    }
+
+    /// Links child evidence back to the parent `delegate_task` call.
+    fn check_child_linkage(&mut self) {
+        let mut findings = Vec::new();
+        let mut linked_calls: BTreeSet<(Attribution, String)> = BTreeSet::new();
+        for ((child_session_id, call_id), record) in &self.children {
+            if !record.trajectory.has_entries {
+                continue;
+            }
+            if !record.delegate_call_found {
+                findings.push(TraceProblem::new(
+                    Some(record.seq),
+                    "child_without_delegate_call",
+                    format!(
+                        "child session `{child_session_id}` for call `{call_id}` has no \
+                         preceding parent `delegate_task` tool call"
+                    ),
+                ));
+                continue;
+            }
+            if let Some(finished) = record.delegate_finished_seq {
+                findings.push(TraceProblem::new(
+                    Some(record.seq),
+                    "child_started_after_delegate_finish",
+                    format!(
+                        "child session `{child_session_id}` for call `{call_id}` started after \
+                         the parent tool call finished at sequence {finished}"
+                    ),
+                ));
+            }
+            if record.delegate_task.is_none() {
+                findings.push(TraceProblem::new(
+                    Some(record.seq),
+                    "delegate_arguments_invalid",
+                    format!(
+                        "child session `{child_session_id}` for call `{call_id}` has parent \
+                         arguments that are not a valid delegation request"
+                    ),
+                ));
+            }
+            if !linked_calls.insert((record.parent.clone(), call_id.clone())) {
+                findings.push(TraceProblem::new(
+                    Some(record.seq),
+                    "delegate_call_reused",
+                    format!(
+                        "parent `delegate_task` call `{call_id}` is linked to more than one \
+                         child session"
+                    ),
+                ));
+            }
         }
+        self.problems.extend(findings);
     }
 
     /// Requires children to be closed when their parent session completes.
@@ -1433,13 +1965,188 @@ struct PermissionRecord {
     decision: PermissionDecision,
 }
 
-/// Child-session lifecycle state.
+/// Parent `delegate_task` call recorded for child-evidence linkage.
+#[derive(Debug, Clone)]
+struct DelegateCallRecord {
+    /// Parsed task, or `None` when the arguments were invalid.
+    task: Option<String>,
+    /// Sequence of the parent `tool_call_finished`, when observed.
+    finished_seq: Option<u64>,
+}
+
+/// Child-session lifecycle and trajectory state.
 #[derive(Debug, Clone)]
 struct ChildRecord {
+    /// Sequence of the parent `child_session_started`.
+    seq: u64,
     /// Parent attempt/session that observed the child.
     parent: Attribution,
     /// Whether `child_session_ended` has not been observed.
     open: bool,
+    /// Whether the parent `delegate_task` call preceded the child start.
+    delegate_call_found: bool,
+    /// Task parsed from that call, when available.
+    delegate_task: Option<String>,
+    /// Sequence of the parent tool finish, when it preceded the child start.
+    delegate_finished_seq: Option<u64>,
+    /// Nested child events and their derived state.
+    trajectory: ChildTrajectory,
+}
+
+/// Counters reported by the parent's `child_session_ended` event.
+#[derive(Debug, Clone, Copy)]
+struct ChildEndCounts {
+    /// Model rounds the child completed.
+    rounds: u32,
+    /// Tool calls the child requested, including refused calls.
+    tool_calls: u32,
+    /// Child tool calls whose result was an error.
+    tool_errors: u32,
+}
+
+/// State derived from one child's nested evidence.
+#[derive(Debug, Clone, Default)]
+struct ChildTrajectory {
+    /// Whether any nested child event was observed.
+    has_entries: bool,
+    /// Whether the child's own `session_started` was observed.
+    started: bool,
+    /// Child terminal reason, when observed.
+    ended: Option<SessionEndReason>,
+    /// Child round lifecycle.
+    round: RoundState,
+    /// Number of finished rounds.
+    rounds: u32,
+    /// Number of started tool calls.
+    tool_calls: u32,
+    /// Number of error tool results.
+    tool_errors: u32,
+    /// Tool calls started but not finished.
+    open_calls: BTreeSet<String>,
+    /// Tool calls already finished.
+    finished_calls: BTreeSet<String>,
+    /// Whether the child stopped on the tool-call limit refusal.
+    tool_call_limit_hit: bool,
+}
+
+/// Validates a child bootstrap against the isolation contract.
+fn check_child_bootstrap(
+    problems: &mut Vec<TraceProblem>,
+    seq: u64,
+    messages: &[Message],
+    task: Option<&str>,
+) {
+    let expected_shape = messages.len() == 2
+        && messages[0].role == Role::System
+        && messages[0].content == CHILD_AGENT_SYSTEM_PROMPT
+        && messages[1].role == Role::User;
+    if !expected_shape {
+        problems.push(TraceProblem::new(
+            Some(seq),
+            "child_bootstrap",
+            "child `session_started` must carry exactly the isolation system prompt and one \
+             user task"
+                .to_owned(),
+        ));
+        return;
+    }
+    if let Some(task) = task
+        && messages[1].content != task
+    {
+        problems.push(TraceProblem::new(
+            Some(seq),
+            "child_bootstrap_task",
+            "the child bootstrap task does not match the parent `delegate_task` arguments"
+                .to_owned(),
+        ));
+    }
+}
+
+/// Compares a child's observed trajectory with the parent lifecycle counters.
+fn child_terminal_findings(
+    seq: u64,
+    child_session_id: &SessionId,
+    call_id: &str,
+    record: &ChildRecord,
+    reason: SessionEndReason,
+    counts: ChildEndCounts,
+) -> Vec<TraceProblem> {
+    let trajectory = &record.trajectory;
+    let mut findings = Vec::new();
+    if !trajectory.started {
+        findings.push(TraceProblem::new(
+            Some(seq),
+            "child_trajectory_missing_start",
+            format!(
+                "child session `{child_session_id}` for call `{call_id}` ended without its own \
+                 `session_started` evidence"
+            ),
+        ));
+    }
+    match trajectory.ended {
+        Some(child_reason) if child_reason == reason => {}
+        Some(child_reason) => findings.push(TraceProblem::new(
+            Some(seq),
+            "child_terminal_mismatch",
+            format!(
+                "child session `{child_session_id}` ended as `{child_reason:?}` but its parent \
+                 reports `{reason:?}`"
+            ),
+        )),
+        None if reason == SessionEndReason::Cancelled => {
+            // A timed-out child is dropped before its terminal event; the
+            // observed prefix remains valid evidence.
+        }
+        None => findings.push(TraceProblem::new(
+            Some(seq),
+            "child_missing_terminal",
+            format!(
+                "child session `{child_session_id}` for call `{call_id}` has no terminal event \
+                 but its parent reports `{reason:?}`"
+            ),
+        )),
+    }
+    let limit_extra =
+        if trajectory.tool_call_limit_hit && trajectory.ended == Some(SessionEndReason::Error) {
+            1
+        } else {
+            0
+        };
+    let expected_tool_calls = trajectory.tool_calls.saturating_add(limit_extra);
+    if trajectory.rounds != counts.rounds {
+        findings.push(TraceProblem::new(
+            Some(seq),
+            "child_round_count",
+            format!(
+                "child session `{child_session_id}` reports {} rounds but its evidence \
+                 contains {} finished rounds",
+                counts.rounds, trajectory.rounds
+            ),
+        ));
+    }
+    if expected_tool_calls != counts.tool_calls {
+        findings.push(TraceProblem::new(
+            Some(seq),
+            "child_tool_count",
+            format!(
+                "child session `{child_session_id}` reports {} tool calls but its \
+                 evidence contains {expected_tool_calls}",
+                counts.tool_calls
+            ),
+        ));
+    }
+    if trajectory.tool_errors != counts.tool_errors {
+        findings.push(TraceProblem::new(
+            Some(seq),
+            "child_tool_error_count",
+            format!(
+                "child session `{child_session_id}` reports {} tool errors but its \
+                 evidence contains {}",
+                counts.tool_errors, trajectory.tool_errors
+            ),
+        ));
+    }
+    findings
 }
 
 /// Returns the attempt/session attribution of an envelope.
@@ -1647,17 +2354,205 @@ mod tests {
         tool_calls: u32,
         tool_errors: u32,
     ) -> Entry {
+        child_ended_counts(seq, child, call, reason, 1, tool_calls, tool_errors)
+    }
+
+    fn child_ended_counts(
+        seq: u64,
+        child: &str,
+        call: &str,
+        reason: SessionEndReason,
+        rounds: u32,
+        tool_calls: u32,
+        tool_errors: u32,
+    ) -> Entry {
         attributed(
             seq,
             AgentEvent::ChildSessionEnded {
                 child_session_id: SessionId::new(child),
                 call_id: call.to_owned(),
                 reason,
-                rounds: 1,
+                rounds,
                 tool_calls,
                 tool_errors,
             },
         )
+    }
+
+    /// Builds one child-agent entry for the standard `child`/`call-1` pair.
+    fn child_evidence(seq: u64, attempt: u32, event: AgentEvent) -> Entry {
+        Entry {
+            seq,
+            timestamp: at(seq),
+            event: TraceEvent::new(
+                TurnId::new("turn"),
+                Some(attempt),
+                Some(SessionId::new("child")),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event,
+                },
+            ),
+        }
+    }
+
+    fn child_evidence_started(seq: u64) -> Entry {
+        child_evidence(
+            seq,
+            1,
+            AgentEvent::SessionStarted {
+                session_id: SessionId::new("child"),
+                messages: vec![
+                    Message::system(CHILD_AGENT_SYSTEM_PROMPT),
+                    Message::user("do it"),
+                ],
+            },
+        )
+    }
+
+    fn child_evidence_round_started(seq: u64, round: u32) -> Entry {
+        child_evidence(seq, 1, AgentEvent::RoundStarted { round })
+    }
+
+    fn child_evidence_round_finished(seq: u64, round: u32) -> Entry {
+        child_evidence(seq, 1, AgentEvent::RoundFinished { round, usage: None })
+    }
+
+    fn child_evidence_tool_started(seq: u64, id: &str) -> Entry {
+        child_evidence(
+            seq,
+            1,
+            AgentEvent::ToolCallStarted {
+                call: ToolCall::new(id, "read_file", json!({"path": "child.md"})),
+            },
+        )
+    }
+
+    fn child_evidence_tool_finished(seq: u64, result: ToolResult) -> Entry {
+        child_evidence(seq, 1, AgentEvent::ToolCallFinished { result })
+    }
+
+    fn child_evidence_model_delta(seq: u64) -> Entry {
+        child_evidence(
+            seq,
+            1,
+            AgentEvent::ModelDelta {
+                text: "child thinking".to_owned(),
+            },
+        )
+    }
+
+    fn child_evidence_ended(seq: u64, reason: SessionEndReason) -> Entry {
+        child_evidence(
+            seq,
+            1,
+            AgentEvent::SessionEnded {
+                session_id: SessionId::new("child"),
+                reason,
+            },
+        )
+    }
+
+    fn delegate_started(seq: u64, id: &str) -> Entry {
+        delegate_started_with_args(seq, id, json!({"task": "do it", "tools": []}))
+    }
+
+    fn delegate_started_with_args(seq: u64, id: &str, arguments: serde_json::Value) -> Entry {
+        attributed(
+            seq,
+            AgentEvent::ToolCallStarted {
+                call: ToolCall::new(id, DELEGATE_TASK_TOOL_NAME, arguments),
+            },
+        )
+    }
+
+    fn delegate_finished(seq: u64, id: &str) -> Entry {
+        attributed(
+            seq,
+            AgentEvent::ToolCallFinished {
+                result: ToolResult::success(id, "done"),
+            },
+        )
+    }
+
+    /// Returns the eight child entries for a complete two-round, one-tool child.
+    fn child_evidence_body(start: u64) -> Vec<Entry> {
+        vec![
+            child_evidence_started(start),
+            child_evidence_round_started(start + 1, 1),
+            child_evidence_round_finished(start + 2, 1),
+            child_evidence_tool_started(start + 3, "child-tool"),
+            child_evidence_tool_finished(
+                start + 4,
+                ToolResult::success("child-tool", "tool output"),
+            ),
+            child_evidence_round_started(start + 5, 2),
+            child_evidence_round_finished(start + 6, 2),
+            child_evidence_ended(start + 7, SessionEndReason::Completed),
+        ]
+    }
+
+    /// Returns a fully valid turn whose child has observable evidence.
+    fn valid_child_turn() -> Vec<Entry> {
+        let mut entries = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_started(5, "child", "call-1"),
+        ];
+        entries.extend(child_evidence_body(6));
+        entries.push(child_ended_counts(
+            14,
+            "child",
+            "call-1",
+            SessionEndReason::Completed,
+            2,
+            1,
+            0,
+        ));
+        entries.push(delegate_finished(15, "call-1"));
+        entries.push(session_ended(16, SessionEndReason::Completed));
+        entries.push(ended(17, SessionEndReason::Completed));
+        entries
+    }
+
+    /// Replaces the parent `child_session_ended` counters in a valid turn.
+    fn set_parent_child_end(
+        entries: &mut [Entry],
+        reason: SessionEndReason,
+        rounds: u32,
+        tool_calls: u32,
+        tool_errors: u32,
+    ) {
+        let entry = entries
+            .iter_mut()
+            .find(|entry| {
+                matches!(
+                    &entry.event.payload,
+                    TracePayload::Agent {
+                        event: AgentEvent::ChildSessionEnded { .. }
+                    }
+                )
+            })
+            .expect("the turn must contain a parent child terminal");
+        let TracePayload::Agent { event } = &mut entry.event.payload else {
+            unreachable!("the find predicate selected an agent payload");
+        };
+        let AgentEvent::ChildSessionEnded {
+            reason: stored_reason,
+            rounds: stored_rounds,
+            tool_calls: stored_tool_calls,
+            tool_errors: stored_tool_errors,
+            ..
+        } = event
+        else {
+            unreachable!("the find predicate selected a child terminal");
+        };
+        *stored_reason = reason;
+        *stored_rounds = rounds;
+        *stored_tool_calls = tool_calls;
+        *stored_tool_errors = tool_errors;
     }
 
     fn verify(entries: Vec<Entry>, closed: bool) -> TurnVerification {
@@ -1700,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_v2_turn_passes_every_semantic_check() {
+    fn a_complete_turn_passes_every_semantic_check() {
         let result = verify(
             vec![
                 started(1, TraceTurnMode::Fresh),
@@ -1719,7 +2614,7 @@ mod tests {
 
         assert_eq!(result.status, TraceStatus::Ok);
         assert_eq!(result.problems, Vec::new());
-        assert_eq!(result.schema_version, Some(2));
+        assert_eq!(result.schema_version, Some(3));
         assert_eq!(result.entries, Some(10));
     }
 
@@ -2053,6 +2948,365 @@ mod tests {
             true,
         );
         assert_eq!(kinds(&bad_counts), vec!["child_tool_counts"]);
+    }
+
+    #[test]
+    fn child_evidence_is_verified_end_to_end() {
+        let result = verify(valid_child_turn(), true);
+        assert_eq!(result.status, TraceStatus::Ok, "{:?}", result.problems);
+        assert_eq!(result.schema_version, Some(3));
+    }
+
+    #[test]
+    fn child_bootstrap_must_match_the_delegate_request() {
+        let mut wrong_prompt = valid_child_turn();
+        wrong_prompt[5] = child_evidence(
+            6,
+            1,
+            AgentEvent::SessionStarted {
+                session_id: SessionId::new("child"),
+                messages: vec![
+                    Message::system("not the isolation prompt"),
+                    Message::user("do it"),
+                ],
+            },
+        );
+        let result = verify(wrong_prompt, true);
+        assert!(
+            has_kind(&result, "child_bootstrap"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut wrong_task = valid_child_turn();
+        wrong_task[5] = child_evidence(
+            6,
+            1,
+            AgentEvent::SessionStarted {
+                session_id: SessionId::new("child"),
+                messages: vec![
+                    Message::system(CHILD_AGENT_SYSTEM_PROMPT),
+                    Message::user("something else"),
+                ],
+            },
+        );
+        let result = verify(wrong_task, true);
+        assert!(
+            has_kind(&result, "child_bootstrap_task"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn child_round_and_tool_order_is_enforced() {
+        let mut out_of_sequence = valid_child_turn();
+        out_of_sequence[6] = child_evidence_round_started(7, 2);
+        out_of_sequence[7] = child_evidence_round_finished(8, 2);
+        out_of_sequence[10] = child_evidence_round_started(11, 3);
+        out_of_sequence[11] = child_evidence_round_finished(12, 3);
+        let result = verify(out_of_sequence, true);
+        assert!(
+            has_kind(&result, "child_round_sequence"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut tool_inside_round = valid_child_turn();
+        tool_inside_round.swap(7, 8);
+        let result = verify(tool_inside_round, true);
+        assert!(
+            has_kind(&result, "child_tool_call_before_round_finished"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut delta_outside_round = valid_child_turn();
+        delta_outside_round.insert(6, child_evidence_model_delta(100));
+        let result = verify(delta_outside_round, true);
+        assert!(
+            has_kind(&result, "child_model_delta_outside_round"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn child_terminal_must_agree_with_observed_evidence_and_parent_counters() {
+        let mut missing_terminal = valid_child_turn();
+        missing_terminal.remove(12);
+        let result = verify(missing_terminal, true);
+        assert!(
+            has_kind(&result, "child_missing_terminal"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut mismatched_terminal = valid_child_turn();
+        mismatched_terminal[12] = child_evidence_ended(13, SessionEndReason::Cancelled);
+        let result = verify(mismatched_terminal, true);
+        assert!(
+            has_kind(&result, "child_terminal_mismatch"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut wrong_rounds = valid_child_turn();
+        set_parent_child_end(&mut wrong_rounds, SessionEndReason::Completed, 3, 1, 0);
+        let result = verify(wrong_rounds, true);
+        assert!(
+            has_kind(&result, "child_round_count"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut wrong_tools = valid_child_turn();
+        set_parent_child_end(&mut wrong_tools, SessionEndReason::Completed, 2, 2, 0);
+        let result = verify(wrong_tools, true);
+        assert!(
+            has_kind(&result, "child_tool_count"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut wrong_errors = valid_child_turn();
+        wrong_errors[9] =
+            child_evidence_tool_finished(10, ToolResult::error("child-tool", "tool exploded"));
+        let result = verify(wrong_errors, true);
+        assert!(
+            has_kind(&result, "child_tool_error_count"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn timed_out_child_evidence_is_judged_as_a_partial_prefix() {
+        let entries = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_started(5, "child", "call-1"),
+            child_evidence_started(6),
+            child_evidence_round_started(7, 1),
+            child_evidence_round_finished(8, 1),
+            child_ended_counts(9, "child", "call-1", SessionEndReason::Cancelled, 1, 0, 0),
+            session_ended(10, SessionEndReason::Cancelled),
+            ended(11, SessionEndReason::Cancelled),
+        ];
+        let result = verify(entries.clone(), true);
+        assert_eq!(result.status, TraceStatus::Ok, "{:?}", result.problems);
+
+        let mut wrong_prefix = entries;
+        set_parent_child_end(&mut wrong_prefix, SessionEndReason::Cancelled, 2, 0, 0);
+        let result = verify(wrong_prefix, true);
+        assert!(
+            has_kind(&result, "child_round_count"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn the_tool_call_limit_accounts_for_the_refused_call() {
+        let entries = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_started(5, "child", "call-1"),
+            child_evidence_started(6),
+            child_evidence_round_started(7, 1),
+            child_evidence_round_finished(8, 1),
+            child_evidence(
+                9,
+                1,
+                AgentEvent::Error {
+                    message: "maximum tool calls (1) exceeded".to_owned(),
+                },
+            ),
+            child_evidence_ended(10, SessionEndReason::Error),
+            child_ended_counts(11, "child", "call-1", SessionEndReason::Error, 1, 1, 0),
+            delegate_finished(12, "call-1"),
+            session_ended(13, SessionEndReason::Error),
+            ended(14, SessionEndReason::Error),
+        ];
+        let result = verify(entries.clone(), true);
+        assert_eq!(result.status, TraceStatus::Ok, "{:?}", result.problems);
+
+        let mut double_counted = entries;
+        set_parent_child_end(&mut double_counted, SessionEndReason::Error, 1, 2, 0);
+        let result = verify(double_counted, true);
+        assert!(
+            has_kind(&result, "child_tool_count"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn child_evidence_is_linked_to_a_preceding_delegate_call() {
+        let no_delegate = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            child_started(4, "child", "call-1"),
+            child_evidence_started(5),
+            child_evidence_round_started(6, 1),
+            child_evidence_round_finished(7, 1),
+            child_evidence_ended(8, SessionEndReason::Completed),
+            child_ended_counts(9, "child", "call-1", SessionEndReason::Completed, 1, 0, 0),
+            session_ended(10, SessionEndReason::Completed),
+            ended(11, SessionEndReason::Completed),
+        ];
+        let result = verify(no_delegate, true);
+        assert!(
+            has_kind(&result, "child_without_delegate_call"),
+            "{:?}",
+            result.problems
+        );
+
+        let finished_first = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            delegate_finished(5, "call-1"),
+            child_started(6, "child", "call-1"),
+            child_evidence_started(7),
+            child_evidence_round_started(8, 1),
+            child_evidence_round_finished(9, 1),
+            child_evidence_ended(10, SessionEndReason::Completed),
+            child_ended_counts(11, "child", "call-1", SessionEndReason::Completed, 1, 0, 0),
+            session_ended(12, SessionEndReason::Completed),
+            ended(13, SessionEndReason::Completed),
+        ];
+        let result = verify(finished_first, true);
+        assert!(
+            has_kind(&result, "child_started_after_delegate_finish"),
+            "{:?}",
+            result.problems
+        );
+
+        let invalid_arguments = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started_with_args(4, "call-1", json!({"task": "do it"})),
+            child_started(5, "child", "call-1"),
+            child_evidence_started(6),
+            child_evidence_round_started(7, 1),
+            child_evidence_round_finished(8, 1),
+            child_evidence_ended(9, SessionEndReason::Completed),
+            child_ended_counts(10, "child", "call-1", SessionEndReason::Completed, 1, 0, 0),
+            delegate_finished(11, "call-1"),
+            session_ended(12, SessionEndReason::Completed),
+            ended(13, SessionEndReason::Completed),
+        ];
+        let result = verify(invalid_arguments, true);
+        assert!(
+            has_kind(&result, "delegate_arguments_invalid"),
+            "{:?}",
+            result.problems
+        );
+    }
+
+    #[test]
+    fn child_evidence_rejects_parent_only_nested_and_out_of_bracket_events() {
+        let parent_only = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_started(5, "child", "call-1"),
+            child_evidence_started(6),
+            child_evidence(
+                7,
+                1,
+                AgentEvent::PermissionDecided {
+                    call: tool_call("child-call"),
+                    decision: PermissionDecision::Deny,
+                },
+            ),
+            child_evidence_ended(8, SessionEndReason::Completed),
+            child_ended_counts(9, "child", "call-1", SessionEndReason::Completed, 0, 0, 0),
+            delegate_finished(10, "call-1"),
+            session_ended(11, SessionEndReason::Completed),
+            ended(12, SessionEndReason::Completed),
+        ];
+        let result = verify(parent_only, true);
+        assert!(
+            has_kind(&result, "child_parent_only_event"),
+            "{:?}",
+            result.problems
+        );
+
+        let nested = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_started(5, "child", "call-1"),
+            child_evidence_started(6),
+            child_evidence(
+                7,
+                1,
+                AgentEvent::ChildSessionStarted {
+                    child_session_id: SessionId::new("grandchild"),
+                    call_id: "nested".to_owned(),
+                },
+            ),
+            child_evidence_ended(8, SessionEndReason::Completed),
+            child_ended_counts(9, "child", "call-1", SessionEndReason::Completed, 0, 0, 0),
+            delegate_finished(10, "call-1"),
+            session_ended(11, SessionEndReason::Completed),
+            ended(12, SessionEndReason::Completed),
+        ];
+        let result = verify(nested, true);
+        assert!(
+            has_kind(&result, "child_nested_session"),
+            "{:?}",
+            result.problems
+        );
+
+        let without_bracket = vec![
+            started(1, TraceTurnMode::Fresh),
+            round_started(2, 1),
+            round_finished(3, 1),
+            delegate_started(4, "call-1"),
+            child_evidence_started(5),
+            child_evidence_ended(6, SessionEndReason::Completed),
+            session_ended(7, SessionEndReason::Completed),
+            ended(8, SessionEndReason::Completed),
+        ];
+        let result = verify(without_bracket, true);
+        assert!(
+            has_kind(&result, "child_event_without_start"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut after_end = valid_child_turn();
+        after_end.insert(14, child_evidence_round_started(100, 3));
+        let result = verify(after_end, true);
+        assert!(
+            has_kind(&result, "child_event_after_end"),
+            "{:?}",
+            result.problems
+        );
+
+        let mut misattributed = valid_child_turn();
+        misattributed.insert(
+            6,
+            child_evidence(100, 2, AgentEvent::RoundStarted { round: 1 }),
+        );
+        let result = verify(misattributed, true);
+        assert!(
+            has_kind(&result, "child_event_attribution"),
+            "{:?}",
+            result.problems
+        );
     }
 
     #[test]

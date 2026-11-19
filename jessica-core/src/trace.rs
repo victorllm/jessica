@@ -14,7 +14,13 @@
 //! it marks the expanded [`AgentEvent`] vocabulary (session input, rounds,
 //! usage, permissions, and child-session lifecycle). Version-1 traces remain
 //! readable, but a version-1 trace must not contain a version-2-only event.
-//! Readers reject versions newer than [`TRACE_SCHEMA_VERSION`].
+//!
+//! Schema version 3 adds [`TracePayload::ChildAgent`], which nests one event
+//! emitted inside a delegated child session under the parent turn's trace. The
+//! envelope's `attempt` and `session_id` carry the parent attempt and the child
+//! session respectively, while the payload's `call_id` links the child to the
+//! parent `delegate_task` tool call. Readers reject versions newer than
+//! [`TRACE_SCHEMA_VERSION`].
 
 use serde::{Deserialize, Serialize};
 
@@ -25,13 +31,14 @@ use crate::types::{AgentEvent, Message, SessionEndReason, SessionId};
 /// A reader must reject envelopes whose version it does not understand rather
 /// than guessing at their semantics. See
 /// [`MIN_SUPPORTED_TRACE_SCHEMA_VERSION`] for the oldest readable version.
-pub const TRACE_SCHEMA_VERSION: u16 = 2;
+pub const TRACE_SCHEMA_VERSION: u16 = 3;
 
 /// Oldest trace schema version this build can read.
 ///
 /// Version-1 traces predate the explicit round, usage, permission, and
 /// child-session events. Their smaller event vocabulary is still valid; absent
-/// facts are not synthesized during decoding.
+/// facts are not synthesized during decoding. Version-2 traces may contain the
+/// expanded event vocabulary but never [`TracePayload::ChildAgent`].
 pub const MIN_SUPPORTED_TRACE_SCHEMA_VERSION: u16 = 1;
 
 /// Returns whether `version` is readable by this build.
@@ -92,12 +99,16 @@ pub struct TraceEvent {
     /// Turn this entry belongs to.
     pub turn_id: TurnId,
     /// One-based acceptance attempt, when the entry belongs to one.
+    ///
+    /// A [`TracePayload::ChildAgent`] entry names the *parent* attempt that
+    /// owns the delegated child; the child itself has no acceptance attempt.
     pub attempt: Option<u32>,
     /// Session attributed to the entry, when one exists.
     ///
     /// Agent events emitted between attempts, such as an acceptance failure,
-    /// point at the attempt whose output was judged. Turn-level markers leave
-    /// this unset.
+    /// point at the attempt whose output was judged. A
+    /// [`TracePayload::ChildAgent`] entry names the child session. Turn-level
+    /// markers leave this unset.
     pub session_id: Option<SessionId>,
     /// Entry payload.
     pub payload: TracePayload,
@@ -128,6 +139,17 @@ pub enum TracePayload {
     /// An event broadcast by the runtime, harness, or CLI governance.
     Agent {
         /// The observed event.
+        event: AgentEvent,
+    },
+    /// One event emitted inside a delegated child session.
+    ///
+    /// The envelope carries the parent attempt and the child session. The
+    /// payload is trace-only: child events are never mirrored into the legacy
+    /// event log, and replay does not execute the child again.
+    ChildAgent {
+        /// Parent provider tool-call id that triggered the delegation.
+        call_id: String,
+        /// Event observed inside the child session.
         event: AgentEvent,
     },
     /// The recorder observed a broadcast gap and could not persist the lost
@@ -163,6 +185,7 @@ impl TracePayload {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Agent { .. } => "agent",
+            Self::ChildAgent { .. } => "child_agent",
             Self::Gap { .. } => "gap",
             Self::TurnStarted { .. } => "turn_started",
             Self::TurnEnded { .. } => "turn_ended",
@@ -171,11 +194,12 @@ impl TracePayload {
 
     /// Returns the minimum trace schema version that can carry this payload.
     ///
-    /// Only agent payloads can require version 2; the trace envelope itself is
-    /// unchanged from version 1.
+    /// Agent payloads follow the wrapped event vocabulary. Child-agent payloads
+    /// require version 3 because version-2 readers do not know the variant.
     pub fn required_trace_schema_version(&self) -> u16 {
         match self {
             Self::Agent { event } => event.required_trace_schema_version(),
+            Self::ChildAgent { .. } => 3,
             Self::Gap { .. } | Self::TurnStarted { .. } | Self::TurnEnded { .. } => 1,
         }
     }
@@ -221,11 +245,12 @@ mod tests {
         );
 
         assert_eq!(event.schema_version, TRACE_SCHEMA_VERSION);
-        assert_eq!(event.schema_version, 2);
+        assert_eq!(event.schema_version, 3);
         assert!(is_supported_trace_schema_version(1));
         assert!(is_supported_trace_schema_version(2));
+        assert!(is_supported_trace_schema_version(3));
         assert!(!is_supported_trace_schema_version(0));
-        assert!(!is_supported_trace_schema_version(3));
+        assert!(!is_supported_trace_schema_version(4));
     }
 
     #[test]
@@ -239,6 +264,18 @@ mod tests {
                 TracePayload::Agent {
                     event: AgentEvent::ModelDelta {
                         text: "hello".to_owned(),
+                    },
+                },
+            ),
+            TraceEvent::new(
+                turn(),
+                Some(2),
+                Some(SessionId::new("child-7")),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event: AgentEvent::SessionStarted {
+                        session_id: SessionId::new("child-7"),
+                        messages: vec![Message::system("child"), Message::user("task")],
                     },
                 },
             ),
@@ -293,7 +330,7 @@ mod tests {
         );
 
         let json = serde_json::to_value(&event).expect("trace event must serialize");
-        assert_eq!(json["schema_version"], json!(2));
+        assert_eq!(json["schema_version"], json!(3));
         assert_eq!(json["turn_id"], json!("turn-9"));
         assert_eq!(json["attempt"], json!(1));
         assert_eq!(json["session_id"], json!("cli-9"));
@@ -302,6 +339,28 @@ mod tests {
             json["payload"]["event"]["type"],
             json!("tool_call_finished")
         );
+    }
+
+    #[test]
+    fn child_agent_payloads_keep_the_parent_call_and_child_event_separate() {
+        let event = TraceEvent::new(
+            TurnId::new("turn-child"),
+            Some(2),
+            Some(SessionId::new("child-1")),
+            TracePayload::ChildAgent {
+                call_id: "call-42".to_owned(),
+                event: AgentEvent::RoundStarted { round: 1 },
+            },
+        );
+
+        let json = serde_json::to_value(&event).expect("trace event must serialize");
+        assert_eq!(json["schema_version"], json!(3));
+        assert_eq!(json["attempt"], json!(2));
+        assert_eq!(json["session_id"], json!("child-1"));
+        assert_eq!(json["payload"]["kind"], json!("child_agent"));
+        assert_eq!(json["payload"]["call_id"], json!("call-42"));
+        assert_eq!(json["payload"]["event"]["type"], json!("round_started"));
+        assert_eq!(json["payload"]["event"]["round"], json!(1));
     }
 
     #[test]
@@ -353,6 +412,16 @@ mod tests {
         ];
         for payload in v2_payloads {
             assert_eq!(payload.required_trace_schema_version(), 2);
+        }
+
+        let v3_payloads = [TracePayload::ChildAgent {
+            call_id: "call-1".to_owned(),
+            event: AgentEvent::ModelDelta {
+                text: "child output".to_owned(),
+            },
+        }];
+        for payload in v3_payloads {
+            assert_eq!(payload.required_trace_schema_version(), 3);
         }
     }
 

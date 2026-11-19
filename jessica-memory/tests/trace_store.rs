@@ -68,6 +68,25 @@ fn agent(turn: &TurnId, attempt: u32, session: &SessionId, event: AgentEvent) ->
     )
 }
 
+/// Builds a child-agent entry nested under `attempt` and the child session.
+fn child_agent(
+    turn: &TurnId,
+    attempt: u32,
+    session: &SessionId,
+    call_id: &str,
+    event: AgentEvent,
+) -> TraceEvent {
+    TraceEvent::new(
+        turn.clone(),
+        Some(attempt),
+        Some(session.clone()),
+        TracePayload::ChildAgent {
+            call_id: call_id.to_owned(),
+            event,
+        },
+    )
+}
+
 /// Builds a `turn_ended` entry for `turn`.
 fn ended(turn: &TurnId, reason: SessionEndReason) -> TraceEvent {
     TraceEvent::new(turn.clone(), None, None, TracePayload::TurnEnded { reason })
@@ -204,11 +223,379 @@ fn a_complete_turn_is_written_losslessly_and_reads_back_closed() {
 
     let raw: String = appended[3].payload_json().to_owned();
     let raw: serde_json::Value = serde_json::from_str(&raw).expect("payload must be JSON");
-    assert_eq!(raw["schema_version"], json!(2));
+    assert_eq!(raw["schema_version"], json!(3));
     assert_eq!(raw["attempt"], json!(1));
     assert_eq!(raw["session_id"], json!("cli-complete"));
     assert_eq!(raw["payload"]["kind"], json!("agent"));
     assert_eq!(raw["payload"]["event"]["type"], json!("acceptance_failed"));
+}
+
+#[test]
+fn child_agent_evidence_round_trips_as_trace_only_entries() {
+    let database = TempDatabase::new("child-agent");
+    let mut store = EventStore::open(database.path()).expect("store should open");
+    let turn = TurnId::new("turn-child");
+    let parent = SessionId::new("parent");
+    let child = SessionId::new("child-session");
+    let call_id = "parent-call";
+
+    let parent_started = AgentEvent::SessionStarted {
+        session_id: parent.clone(),
+        messages: Vec::new(),
+    };
+    let parent_ended = AgentEvent::SessionEnded {
+        session_id: parent.clone(),
+        reason: SessionEndReason::Completed,
+    };
+    let child_started = AgentEvent::SessionStarted {
+        session_id: child.clone(),
+        messages: vec![Message::system("child prompt"), Message::user("do it")],
+    };
+    let round_started = AgentEvent::RoundStarted { round: 1 };
+    let round_finished = AgentEvent::RoundFinished {
+        round: 1,
+        usage: None,
+    };
+    let call = jessica_core::types::ToolCall::new("child-call", "echo", json!({}));
+    let tool_started = AgentEvent::ToolCallStarted { call: call.clone() };
+    let tool_finished = AgentEvent::ToolCallFinished {
+        result: jessica_core::types::ToolResult::success("child-call", "done"),
+    };
+    let child_ended = AgentEvent::SessionEnded {
+        session_id: child.clone(),
+        reason: SessionEndReason::Completed,
+    };
+
+    let appended = vec![
+        store
+            .append_traced(&started(&turn, &parent), None, Timestamp::from_millis(1))
+            .expect("turn start"),
+        store
+            .append_traced(
+                &agent(&turn, 1, &parent, parent_started.clone()),
+                Some((&parent, &parent_started)),
+                Timestamp::from_millis(2),
+            )
+            .expect("parent start"),
+        store
+            .append_traced(
+                &agent(
+                    &turn,
+                    1,
+                    &parent,
+                    AgentEvent::ChildSessionStarted {
+                        child_session_id: child.clone(),
+                        call_id: call_id.to_owned(),
+                    },
+                ),
+                None,
+                Timestamp::from_millis(3),
+            )
+            .expect("parent child start"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, child_started),
+                None,
+                Timestamp::from_millis(4),
+            )
+            .expect("child session start"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, round_started),
+                None,
+                Timestamp::from_millis(5),
+            )
+            .expect("child round start"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, round_finished),
+                None,
+                Timestamp::from_millis(6),
+            )
+            .expect("child round finish"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, tool_started),
+                None,
+                Timestamp::from_millis(7),
+            )
+            .expect("child tool start"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, tool_finished),
+                None,
+                Timestamp::from_millis(8),
+            )
+            .expect("child tool finish"),
+        store
+            .append_traced(
+                &child_agent(&turn, 1, &child, call_id, child_ended),
+                None,
+                Timestamp::from_millis(9),
+            )
+            .expect("child session end"),
+        store
+            .append_traced(
+                &agent(
+                    &turn,
+                    1,
+                    &parent,
+                    AgentEvent::ChildSessionEnded {
+                        child_session_id: child.clone(),
+                        call_id: call_id.to_owned(),
+                        reason: SessionEndReason::Completed,
+                        rounds: 1,
+                        tool_calls: 1,
+                        tool_errors: 0,
+                    },
+                ),
+                None,
+                Timestamp::from_millis(10),
+            )
+            .expect("parent child end"),
+        store
+            .append_traced(
+                &agent(&turn, 1, &parent, parent_ended.clone()),
+                Some((&parent, &parent_ended)),
+                Timestamp::from_millis(11),
+            )
+            .expect("parent end"),
+        store
+            .append_traced(
+                &ended(&turn, SessionEndReason::Completed),
+                None,
+                Timestamp::from_millis(12),
+            )
+            .expect("turn end"),
+    ];
+    assert_eq!(
+        appended.iter().map(|entry| entry.seq()).collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<_>>()
+    );
+
+    let raw = Connection::open(database.path()).expect("raw connection should open");
+    let mut statement = raw
+        .prepare(
+            "SELECT payload_kind, event_type FROM trace_events \
+             WHERE turn_id = ?1 ORDER BY seq ASC",
+        )
+        .expect("query should prepare");
+    let rows: Vec<(String, Option<String>)> = statement
+        .query_map([turn.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows should query")
+        .collect::<Result<_, _>>()
+        .expect("rows should decode");
+    let child_types = [
+        "session_started",
+        "round_started",
+        "round_finished",
+        "tool_call_started",
+        "tool_call_finished",
+        "session_ended",
+    ];
+    for (index, expected) in child_types.iter().enumerate() {
+        let (kind, event_type) = &rows[index + 3];
+        assert_eq!(kind, "child_agent");
+        assert_eq!(event_type.as_deref(), Some(*expected));
+    }
+    assert_eq!(rows[2].0, "agent");
+    assert_eq!(rows[2].1.as_deref(), Some("child_session_started"));
+    assert_eq!(rows[9].0, "agent");
+    assert_eq!(rows[9].1.as_deref(), Some("child_session_ended"));
+
+    let raw_payload: String = raw
+        .query_row(
+            "SELECT payload_json FROM trace_events WHERE turn_id = ?1 AND seq = 5",
+            [turn.as_str()],
+            |row| row.get(0),
+        )
+        .expect("child payload should exist");
+    let raw_payload: serde_json::Value =
+        serde_json::from_str(&raw_payload).expect("payload must be JSON");
+    assert_eq!(raw_payload["schema_version"], json!(3));
+    assert_eq!(raw_payload["attempt"], json!(1));
+    assert_eq!(raw_payload["session_id"], json!("child-session"));
+    assert_eq!(raw_payload["payload"]["kind"], json!("child_agent"));
+    assert_eq!(raw_payload["payload"]["call_id"], json!(call_id));
+    assert_eq!(
+        raw_payload["payload"]["event"]["type"],
+        json!("round_started")
+    );
+
+    let trace = store
+        .trace_turn(&turn)
+        .expect("trace should read")
+        .expect("trace should exist");
+    assert!(trace.closed());
+    assert_eq!(trace.events().len(), 12);
+    assert_eq!(
+        trace
+            .events()
+            .iter()
+            .map(|entry| entry.event().payload.kind())
+            .collect::<Vec<_>>(),
+        vec![
+            "turn_started",
+            "agent",
+            "agent",
+            "child_agent",
+            "child_agent",
+            "child_agent",
+            "child_agent",
+            "child_agent",
+            "child_agent",
+            "agent",
+            "agent",
+            "turn_ended"
+        ]
+    );
+    for entry in &trace.events()[3..9] {
+        assert_eq!(entry.event().attempt, Some(1));
+        assert_eq!(entry.event().session_id.as_ref(), Some(&child));
+        match &entry.event().payload {
+            TracePayload::ChildAgent {
+                call_id: stored_call,
+                event,
+            } => {
+                assert_eq!(stored_call, call_id);
+                assert!(!matches!(
+                    event,
+                    AgentEvent::ChildSessionStarted { .. } | AgentEvent::ChildSessionEnded { .. }
+                ));
+            }
+            other => panic!("expected child evidence, found {other:?}"),
+        }
+    }
+
+    assert!(
+        store.events(&child).expect("child legacy read").is_empty(),
+        "child evidence must never enter the legacy event log"
+    );
+    assert_eq!(
+        store
+            .events(&parent)
+            .expect("parent legacy read")
+            .iter()
+            .map(|event| event.event().clone())
+            .collect::<Vec<_>>(),
+        vec![parent_started, parent_ended]
+    );
+}
+
+#[test]
+fn child_agent_envelopes_are_validated_before_storage() {
+    let mut store = EventStore::open_in_memory().expect("store should open");
+    let turn = TurnId::new("turn-child-invalid");
+    let parent = SessionId::new("parent");
+    let child = SessionId::new("child");
+    store
+        .append_traced(&started(&turn, &parent), None, Timestamp::from_millis(1))
+        .expect("turn start");
+
+    let round = AgentEvent::RoundStarted { round: 1 };
+    let missing_attempt = TraceEvent::new(
+        turn.clone(),
+        None,
+        Some(child.clone()),
+        TracePayload::ChildAgent {
+            call_id: "parent-call".to_owned(),
+            event: round.clone(),
+        },
+    );
+    let error = store
+        .append_traced(&missing_attempt, None, Timestamp::from_millis(2))
+        .expect_err("child evidence needs the parent attempt");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("parent attempt")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let missing_session = TraceEvent::new(
+        turn.clone(),
+        Some(1),
+        None,
+        TracePayload::ChildAgent {
+            call_id: "parent-call".to_owned(),
+            event: round.clone(),
+        },
+    );
+    let error = store
+        .append_traced(&missing_session, None, Timestamp::from_millis(3))
+        .expect_err("child evidence needs the child session");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("child session")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let empty_call = child_agent(&turn, 1, &child, "", round.clone());
+    let error = store
+        .append_traced(&empty_call, None, Timestamp::from_millis(4))
+        .expect_err("child evidence needs the parent call id");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("parent tool call")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let nested = child_agent(
+        &turn,
+        1,
+        &child,
+        "parent-call",
+        AgentEvent::ChildSessionStarted {
+            child_session_id: child.clone(),
+            call_id: "nested".to_owned(),
+        },
+    );
+    let error = store
+        .append_traced(&nested, None, Timestamp::from_millis(5))
+        .expect_err("child evidence must not nest a child lifecycle");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("must not nest")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let mirrored = child_agent(&turn, 1, &child, "parent-call", round.clone());
+    let error = store
+        .append_traced(&mirrored, Some((&child, &round)), Timestamp::from_millis(6))
+        .expect_err("child evidence is always trace-only");
+    assert!(
+        matches!(
+            &error,
+            EventStoreError::TraceInvalid { message, .. }
+                if message.contains("trace-only")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let trace = store
+        .trace_turn(&turn)
+        .expect("trace should read")
+        .expect("trace should exist");
+    assert_eq!(
+        trace.events().len(),
+        1,
+        "no invalid child evidence may be stored"
+    );
+    assert!(
+        store.events(&child).expect("legacy read").is_empty(),
+        "no invalid child evidence may mirror into the legacy log"
+    );
 }
 
 #[test]
@@ -343,7 +730,7 @@ fn envelope_context_is_validated_before_storage() {
     ));
 
     let mut future = started(&turn, &session);
-    future.schema_version = 3;
+    future.schema_version = 4;
     let error = store
         .append_traced(&future, None, Timestamp::from_millis(2))
         .expect_err("an unknown schema version must be rejected");
@@ -514,7 +901,7 @@ fn a_trace_append_and_its_legacy_mirror_roll_back_together() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, payload_json, timestamp) \
-             VALUES (?1, 3, 2, 'gap', '{}', 0)",
+             VALUES (?1, 3, 3, 'gap', '{}', 0)",
             [turn.as_str()],
         )
         .expect("the competing row should insert");
@@ -846,7 +1233,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, payload_json, timestamp) \
-             VALUES (?1, 1, 2, 'agent', 'model_delta', ?2, 0)",
+             VALUES (?1, 1, 3, 'agent', 'model_delta', ?2, 0)",
             params![missing_start.as_str(), agent_payload],
         )
         .expect("row should insert");
@@ -867,7 +1254,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
                 "INSERT INTO trace_events \
                  (turn_id, seq, schema_version, payload_kind, event_type, attempt, session_id, \
                   payload_json, timestamp) \
-                 VALUES (?1, ?2, 2, ?3, ?4, NULL, ?5, ?6, 0)",
+                 VALUES (?1, ?2, 3, ?3, ?4, NULL, ?5, ?6, 0)",
                 params![
                     gap_turn.as_str(),
                     seq,
@@ -900,7 +1287,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
         .execute(
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, payload_json, timestamp) \
-             VALUES (?1, 1, 2, 'gap', NULL, ?2, 0)",
+             VALUES (?1, 1, 3, 'gap', NULL, ?2, 0)",
             params![wrong_kind_turn.as_str(), wrong_kind_payload],
         )
         .expect("row should insert");
@@ -918,7 +1305,7 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, session_id, payload_json, \
               timestamp) \
-             VALUES (?1, 1, 2, 'turn_started', NULL, ?2, ?3, 0)",
+             VALUES (?1, 1, 3, 'turn_started', NULL, ?2, ?3, 0)",
             params![
                 wrong_closed_turn.as_str(),
                 session.as_str(),
@@ -932,7 +1319,10 @@ fn structurally_corrupt_traces_are_rejected_instead_of_partially_returned() {
     let error = store
         .trace_turn(&missing_start)
         .expect_err("a trace without turn_started is corrupt");
-    assert!(matches!(error, EventStoreError::TraceLifecycle { .. }));
+    assert!(
+        matches!(error, EventStoreError::TraceLifecycle { .. }),
+        "unexpected error: {error:?}"
+    );
 
     let error = store
         .trace_turn(&gap_turn)
@@ -1173,7 +1563,7 @@ fn traces_from_a_future_schema_version_are_rejected_on_read() {
     let turn = TurnId::new("turn-future-read");
     let session = SessionId::new("cli-future-read");
     let mut start = started(&turn, &session);
-    start.schema_version = 3;
+    start.schema_version = 4;
     connection
         .execute(
             "INSERT INTO trace_heads (turn_id, last_seq, closed, created_at) VALUES (?1, 1, 0, 0)",
@@ -1185,7 +1575,7 @@ fn traces_from_a_future_schema_version_are_rejected_on_read() {
             "INSERT INTO trace_events \
              (turn_id, seq, schema_version, payload_kind, event_type, session_id, payload_json, \
               timestamp) \
-             VALUES (?1, 1, 3, 'turn_started', NULL, ?2, ?3, 0)",
+             VALUES (?1, 1, 4, 'turn_started', NULL, ?2, ?3, 0)",
             params![
                 turn.as_str(),
                 session.as_str(),
@@ -1203,7 +1593,7 @@ fn traces_from_a_future_schema_version_are_rejected_on_read() {
         matches!(
             &error,
             EventStoreError::TraceInvalid { message, .. }
-                if message.contains("unsupported trace schema version 3")
+                if message.contains("unsupported trace schema version 4")
         ),
         "unexpected error: {error:?}"
     );

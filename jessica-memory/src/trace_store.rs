@@ -263,8 +263,10 @@ impl EventStore {
     /// place an event after that attempt's `session_ended` and break recovery;
     /// [`AgentEvent::PermissionDecided`], [`AgentEvent::ChildSessionStarted`],
     /// and [`AgentEvent::ChildSessionEnded`] are trace-only because replay does
-    /// not re-run permission gates or child sessions. When a legacy event is
-    /// supplied, both writes commit in one transaction or neither does.
+    /// not re-run permission gates or child sessions.
+    /// [`TracePayload::ChildAgent`] entries are always trace-only. When a
+    /// legacy event is supplied, both writes commit in one transaction or
+    /// neither does.
     ///
     /// The returned entry carries the allocated sequence number and the exact
     /// JSON text persisted.
@@ -283,7 +285,9 @@ impl EventStore {
             })?;
         let payload_kind = trace.payload.kind();
         let event_type = match &trace.payload {
-            TracePayload::Agent { event } => Some(event_type_tag(event)),
+            TracePayload::Agent { event } | TracePayload::ChildAgent { event, .. } => {
+                Some(event_type_tag(event))
+            }
             TracePayload::Gap { .. }
             | TracePayload::TurnStarted { .. }
             | TracePayload::TurnEnded { .. } => None,
@@ -627,7 +631,11 @@ impl EventStore {
                 ));
             }
             match (&event.payload, &event_type) {
-                (TracePayload::Agent { event: agent }, Some(stored)) => {
+                (
+                    TracePayload::Agent { event: agent }
+                    | TracePayload::ChildAgent { event: agent, .. },
+                    Some(stored),
+                ) => {
                     if event_type_tag(agent) != stored.as_str() {
                         return Err(invalid_error(
                             turn,
@@ -636,7 +644,7 @@ impl EventStore {
                         ));
                     }
                 }
-                (TracePayload::Agent { .. }, None) => {
+                (TracePayload::Agent { .. } | TracePayload::ChildAgent { .. }, None) => {
                     return Err(invalid_error(
                         turn,
                         seq,
@@ -665,7 +673,9 @@ impl EventStore {
                 TracePayload::TurnEnded { .. } => {
                     ended_at = Some(seq);
                 }
-                TracePayload::Agent { .. } | TracePayload::Gap { .. } => {}
+                TracePayload::Agent { .. }
+                | TracePayload::ChildAgent { .. }
+                | TracePayload::Gap { .. } => {}
             }
 
             events.push(StoredTraceEvent {
@@ -867,7 +877,9 @@ pub fn verify_exported_trace(
         }
         let payload_kind = event.payload.kind();
         let event_type = match &event.payload {
-            TracePayload::Agent { event } => Some(event_type_tag(event)),
+            TracePayload::Agent { event } | TracePayload::ChildAgent { event, .. } => {
+                Some(event_type_tag(event))
+            }
             TracePayload::Gap { .. }
             | TracePayload::TurnStarted { .. }
             | TracePayload::TurnEnded { .. } => None,
@@ -1049,7 +1061,9 @@ fn chain_entry(event: &StoredTraceEvent) -> Result<ChainEntry<'_>, EventStoreErr
         )
     })?;
     let event_type = match &trace.payload {
-        TracePayload::Agent { event } => Some(event_type_tag(event)),
+        TracePayload::Agent { event } | TracePayload::ChildAgent { event, .. } => {
+            Some(event_type_tag(event))
+        }
         TracePayload::Gap { .. }
         | TracePayload::TurnStarted { .. }
         | TracePayload::TurnEnded { .. } => None,
@@ -1128,6 +1142,39 @@ fn validate_envelope(trace: &TraceEvent) -> Result<(), EventStoreError> {
             }
         }
         TracePayload::Agent { .. } => {}
+        TracePayload::ChildAgent { call_id, event } => {
+            if call_id.is_empty() {
+                return Err(invalid_error(
+                    &turn_id,
+                    0,
+                    "a child-agent payload must name the parent tool call",
+                ));
+            }
+            if trace.attempt.is_none() {
+                return Err(invalid_error(
+                    &turn_id,
+                    0,
+                    "a child-agent payload must be attributed to its parent attempt",
+                ));
+            }
+            if trace.session_id.is_none() {
+                return Err(invalid_error(
+                    &turn_id,
+                    0,
+                    "a child-agent payload must name the child session",
+                ));
+            }
+            if matches!(
+                event,
+                AgentEvent::ChildSessionStarted { .. } | AgentEvent::ChildSessionEnded { .. }
+            ) {
+                return Err(invalid_error(
+                    &turn_id,
+                    0,
+                    "a child-agent payload must not nest another child lifecycle event",
+                ));
+            }
+        }
         TracePayload::Gap { skipped, .. } => {
             if *skipped == 0 {
                 return Err(invalid_error(
@@ -1194,6 +1241,11 @@ fn validate_legacy_mirror(
             }
             Ok(())
         }
+        (TracePayload::ChildAgent { .. }, Some(_)) => Err(invalid_error(
+            &turn_id,
+            0,
+            "a child-agent payload must be trace-only",
+        )),
         (_, Some(_)) => Err(invalid_error(
             &turn_id,
             0,

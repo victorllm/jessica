@@ -83,7 +83,7 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
 
     let ok = report_turn(&report, "turn-ok");
     assert_eq!(ok["status"], "ok");
-    assert_eq!(ok["schema_version"], 2);
+    assert_eq!(ok["schema_version"], 3);
     assert_eq!(ok["entries"], 10);
     assert_eq!(
         ok["problems"]
@@ -105,7 +105,7 @@ fn json_report_distinguishes_ok_open_gap_and_corrupt_turns() {
 
     let open = report_turn(&report, "turn-open");
     assert_eq!(open["status"], "open");
-    assert_eq!(open["schema_version"], 2);
+    assert_eq!(open["schema_version"], 3);
     assert_eq!(open["entries"], 2);
     let open_digest = open["digest"]
         .as_str()

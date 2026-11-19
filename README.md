@@ -141,13 +141,33 @@ jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id> --expect 
 ```
 
 It checks structural completeness, v2 round/permission/child-session semantics,
-and that every mirrored agent event still exists in the legacy event stream with
-the same session, timestamp, and payload. It also recomputes each turn's
+v3 nested child-agent evidence, and that every mirrored agent event still exists
+in the legacy event stream with the same session, timestamp, and payload. It also recomputes each turn's
 SHA-256 hash chain from the stored column bytes, so an edited, deleted, or
 inserted trace row is reported as a structural failure instead of being
-verified. `--turn` and `--all` are mutually exclusive; `--allow-open` accepts
-traces without a `turn_ended` marker but never accepts an invalid trace and is
+verified. Trace schema version 3 is the current producer version; versions 1
+through 3 remain readable, while a version newer than the build is rejected.
+`--turn` and `--all` are mutually exclusive; `--allow-open` accepts traces
+without a `turn_ended` marker but never accepts an invalid trace and is
 rejected with `--replay`.
+
+Schema version 3 adds `child_agent` entries. Each entry nests one event emitted
+inside a delegated child session under the parent turn's trace chain; the
+envelope keeps the parent attempt and the child session, and `call_id` links the
+event to the parent `delegate_task` call. Child entries are trace-only and have
+no legacy mirror row. When a trace contains child-agent evidence, `verify`
+requires the child's `session_started.messages` to equal exactly the fixed
+child system prompt plus the task from the preceding, not-yet-finished
+`delegate_task` call in the same parent attempt and session. It then enforces
+one-based child rounds, model deltas only inside an open round, paired tool
+start/finish events, and the absence of parent-only or nested child lifecycle
+events. The child `session_ended` reason, rounds, tool calls, and tool errors
+must agree with the parent's `child_session_ended`; a missing child terminal is
+accepted only for a cancelled (timed-out) child, and only when the reported
+counters match the observed prefix. Traces with lifecycle-only child evidence
+(for example version-2 traces or older version-3 producers) keep the earlier
+relaxed checks.
+
 `--replay` accepts `--turn` or `--all` but cannot be combined with
 `--allow-open`. It rebuilds each fresh attempt from the trace's own bootstrap
 messages and recorded runtime events, drives the deterministic replay engine,
@@ -156,10 +176,13 @@ and requires the produced event sequence to match. Version-1 fresh traces use
 `AgentLoop` from the recorded checkpoint conversation; the first
 `round_started` supplies the checkpoint's completed-round offset, and replay
 uses the same total round budget so budget-exhaustion messages match. It covers
-closed fresh v1/v2 traces ending `completed`, `error`, or on the max-rounds
-budget, plus closed single-attempt resumed v2 traces with at least one model
+closed fresh v1/v2/v3 traces ending `completed`, `error`, or on the max-rounds
+budget, plus closed single-attempt resumed v2/v3 traces with at least one model
 round; broader subsets report `unsupported` and exit `1` instead of being
-silently skipped. `--all --replay` loads, verifies, and replays one turn at a
+silently skipped. Nested child-agent entries are validated first and then
+ignored by replay: it never executes a delegated child or issues a child
+provider call, because the parent's recorded `delegate_task` tool result already
+reproduces the delegation boundary. `--all --replay` loads, verifies, and replays one turn at a
 time so memory stays bounded by the largest single trace. A mismatch invalidates
 that turn and the batch continues; an unsupported but otherwise valid trace
 stays `ok` with `replay.status: "unsupported"`, and the run exits `1` naming the
@@ -171,6 +194,14 @@ turn, a replay mismatch, an unreplayable trace, or a storage/configuration
 error. `--json` emits a stable report with `report_version: 3`, per-turn
 statuses, per-turn `digest`, optional replay results, and machine-readable
 problem kinds.
+
+Child evidence is as sensitive as parent evidence: the child bootstrap contains
+the delegated task, and the trajectory records child model output, tool
+arguments, and tool results. These entries live in the same append-only trace
+database as the parent and appear in exported bundles, under the same access
+controls and retention. Trace retention and privacy deletion are not
+implemented yet, so treat the event database and every exported bundle as
+carrying the full child conversation.
 
 Auditing requires event-store schema version 2, which adds the hash chain and
 backfills it for existing traces during migration. A version-1 database must be
@@ -218,7 +249,11 @@ The bundle is `bundle_version: 1`, `bundle_format:
 "jessica.trace.bundle.v1"`. Each turn carries its id, `closed` flag, declared
 turn digest, trace entries (`seq`, `timestamp`, exact `payload_json`), and the
 legacy mirror rows (`session_id`, `timestamp`, `payload_json`) that the mirror
-check consumes. `aggregate_digest` is the SHA-256 of the
+check consumes. Entries are exported verbatim, so nested child-agent evidence is
+covered by the per-turn hash chain, `trace digest`, `trace export`, and
+`verify-bundle` without a separate bundle format: editing, inserting, or
+deleting a child event changes the chain and is detected like any other trace
+edit. `aggregate_digest` is the SHA-256 of the
 `jessica.trace.bundle.v1` domain, the big-endian turn count, and each turn's id
 and raw 32-byte digest in ascending turn-id order, with every field length
 prefixed.
