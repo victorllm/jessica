@@ -1907,9 +1907,9 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
-Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3 已完成，8.4–8.7 待逐项确认）
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3、8.4 已完成，8.5–8.7 待逐项确认）
 
-背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`），其余按依赖顺序逐 Task 确认。
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`）与 8.4（可移植证据包 export 与离线 verify），其余按依赖顺序逐 Task 确认。
 
 Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
@@ -1969,9 +1969,26 @@ Task 8.3（2026-11-19 确认并完成）：trace 哈希链、`trace digest` 与 
 
 偏离/说明：1) digest 覆盖精确存储列（`payload_json` 文本与 mirrored i64），不重新序列化，保证迁移回填与在线追加一致；2) `--all` 仍通过 `trace_heads` 枚举 turn，未被 head 索引的孤儿 `trace_events` 行不会出现在 digest/verify 中，已记入 Deferred；3) 未提供跨 turn 聚合摘要或外部时间戳，留待 8.4；4) 本地 `DESIGN.md` 保持未跟踪。
 
+Task 8.4（2026-11-19 确认并完成）：可移植证据包 export 与离线 verify
+
+目标：把已验证的 turn trace、哈希链和 mirror 所需的 legacy 证据导出为单个 JSON 文件，并能在没有 `[events]` 配置、没有事件库的机器上离线复算链、重跑结构/语义/mirror 校验与聚合摘要；不引入签名、TSA 或新依赖。
+
+操作：
+
+1. `jessica-memory/src/trace_chain.rs`：新增 `jessica.trace.bundle.v1` 聚合领域与 `bundle_digest(&[(&str, [u8; 32])])`。编码为 `SHA-256(field(domain) || field(u64_be(turn_count)) || 按 turn_id 升序逐 turn: field(turn_id) || field(raw_digest))`，`field(x) = u64_be(len(x)) || x`；golden vector 锁定 `19c7f90e4a9178e211e37be8c7a1405acce610a4f0587ab83071e31e3e993205`，空聚合锁定 `caa75444df5a644018913defe9dbc552d8ff3fc759eec5c72f95007a73e5c647`。
+2. `jessica-memory/src/trace_store.rs`：新增公共 `TraceEvidenceEntry`（私有字段 + `new/seq/timestamp/payload_json` 访问器）、`trace_bundle_digest(&[&StoredTraceTurn])`（按 turn_id 排序、拒绝重复 turn、只接受规范小写 64-hex digest）与 `verify_exported_trace(turn_id, closed, entries)`。离线重建打开私有内存 `EventStore`，要求 entry 非空、`seq` 从 1 连续、逐条解码 `TraceEvent` 并校验 envelope 与 payload turn_id 一致，写入 `trace_events`/`trace_chain`/`trace_heads`，最后调用既有 `EventStore::trace_turn` 复用 8.3 的结构、生命周期、链完整性校验并返回重算 digest 的 `StoredTraceTurn`；不复制验证逻辑，不改 schema。
+3. `jessica-cli/src/trace_bundle.rs`：新增 bundle DTO（`bundle_version: 1`、`bundle_format: "jessica.trace.bundle.v1"`、`aggregate_digest`、按 turn_id 升序的 turns，每 turn 含 `turn_id/closed/digest/entries/legacy`）。`trace export --turn <id> | --all --out <file> [--allow-open]` 通过 `open_read_only` 读取，逐个重跑 `verify_stored_turn`；invalid 一律拒绝，open 仅在 `--all --allow-open` 下允许；校验通过后才写文件，拒绝路径不产生输出。legacy 证据只包含 mirror 校验实际消费的 `(session_id, timestamp, payload_json)` 多重集行，顺序与 trace entry 一致。`--all` 空库导出 0 turn；同一库重复导出字节一致。
+4. `trace verify-bundle --bundle <file> [--json] [--allow-open] [--expect <64-hex>]` 不读取配置的 `[events]`、不打开/创建/迁移事件库。读取前以 metadata 强制 64 MiB 上限；校验 version、format、聚合/逐 turn digest 的规范小写 64-hex 与重复 turn_id；随后在内存中重建每条链，重跑 mirror 校验，比较声明的逐 turn digest 与重算值，并只在全部 turn 结构有效时重算聚合。`--expect` 与聚合不匹配、声明聚合不匹配、结构失败（`digest_unavailable`）、turn digest 不匹配、mirror 失败、open 且未 `--allow-open` 均使命令退出 1；JSON 报告 `report_version: 1`，文本共享既有逐 turn 摘要。`--replay` 显式拒绝。
+5. `trace_verify` 暴露可复用内部项，并新增 `exported_legacy_rows`（按 verifier 的精确序列化与多重集消费规则返回证据行）；参数解析、usage、`app.rs` 结构化错误与 README（命令、bundle 格式、聚合编码、离线语义、64 MiB 上限、退出码、威胁模型）同步。
+
+测试新增 19 个：`trace_chain` 单测 +1（聚合 golden vector 与空/单 turn 区分）；`jessica-memory/tests/trace_evidence.rs` 6（导出 entry 复算在线 digest、时间戳编辑改变 digest、seq gap/重复拒绝、畸形 JSON 与跨 turn payload 拒绝、生命周期不符/空证据/ended 后 entry 拒绝、聚合与顺序无关且对集合敏感并拒绝重复 turn）；CLI 解析 3（export turn/all/out/allow-open、verify-bundle 离线参数、畸形 bundle 参数拒绝）；`jessica-cli/tests/trace_bundle_e2e.rs` 9（真实 SQLite + 真实 CLI：export→无 `[events]` 配置离线验证往返、确定性字节与排序、open 导出/离线 `--allow-open`、invalid trace 导出失败且不写文件、trace/legacy/aggregate 三类篡改检出、turn digest 与 `--expect` 锚定、缺失/版本/格式/重复/非法 digest/超限 bundle 拒绝、空库空 bundle、缺失事件库不创建）。
+
+验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 910 passed, 0 failed, 2 ignored（58 suites）。
+
+偏离/说明：1) 离线校验复用私有内存 `EventStore` + `trace_turn`，而不是另写一套结构校验，保证与在线 verify 逐项同源；该内存库不接触用户数据库；2) 聚合只覆盖 turn digest，legacy 证据通过 mirror 校验绑定到 digest 覆盖的 trace payload，不单独纳入聚合；3) 导出只接受可验证的正面证据，invalid trace 不能作为“失败证据”导出，遗漏某 turn 本身不可证伪，除非外部锚定 turn 集合/聚合；4) `verify-bundle` 不支持 `--replay`，离线重放语义未定义，已在解析层拒绝；5) bundle 不是签名，能重写整个 bundle 者可重算全部摘要，必须用 `--expect` 与库外记录锚定；6) 既有 `trace digest --all` 输出契约不变，未加入聚合；7) 导出用 `std::fs::write` 一次性写文件，未做临时文件 + fsync 的原子替换；8) 本地 `DESIGN.md` 保持未跟踪；未改 `jessica-core`，未新增第三方 crate。
+
 后续候选（未确认，不执行）：
 
-- 8.4 可移植证据包 export 与离线 verify。
 - 8.5 `--all --replay` 与 Resumed/v1 覆盖扩展。
 - 8.6 子 Agent 轨迹证据（需先设计，可能需 core 批准）。
 - 8.7 保留期/隐私删除（需先确认 append-only 契约变更）。
@@ -2066,6 +2083,8 @@ Task 8.2b ☑ 约 45 分钟（含方案确认、实现、格式化与全量验�
 
 Task 8.3 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付 trace 哈希链、`trace digest` 与 `verify --expect`。`jessica-memory`：新增 `trace_chain(turn_id, seq, prev_hash, entry_hash)`（`WITHOUT ROWID`、长度 CHECK、append-only UPDATE/DELETE 触发器）与 `trace_chain.rs`（领域分离 + u64 big-endian 长度前缀的 entry/digest 哈希、genesis、hex 编解码、回填与 golden vector 单测）；`SCHEMA_VERSION` 1→2，迁移 2 在单事务内建表并按 `(turn_id, seq)` 回填既有 `trace_events`，失败整体回滚；`repair_schema` 只补建缺失结构、绝不重算或回填；`append_traced` 在同一事务写 trace_events + trace_chain + trace_heads，并对既有 turn 校验最后链节与 head seq 对齐；`trace_turn` 在既有结构/生命周期校验后验证链条数、seq、prev 链接与重算 hash，`StoredTraceTurn::digest()` 暴露 digest；`open_read_only` 要求 v2，v1 返回新增 `TraceSchemaOutdated { found, required }` 且不迁移。`jessica-cli`：新增 `trace_digest` 模块与 `trace digest --turn|--all [--json]`（单 turn 仅输出 digest，all 按 turn_id 升序输出 tab 分隔行，JSON `report_version: 1`/`digest_format`/per-turn `digest/closed/entries`）；`trace verify` 新增 `--expect <64-hex>`（仅 `--turn`、大小写归一），不匹配产生 `digest_mismatch`、无 digest 产生 `digest_unavailable`，`report_version` 2→3 且 per-turn 增加 `digest`，文本打印 digest；参数解析、usage 与 README（命令、schema v2 审计要求、威胁模型）同步。测试新增 23 个：memory 链集成 6、链单测 6、CLI 解析 4、E2E 7（digest 单 turn 与 verify 一致、all 排序/JSON、空库、未知 turn、删链节、expect 匹配/大写/不匹配、结构损坏时 digest_unavailable），既有 E2E `report_version` 更新为 3；`durability`/`trace_store` 未来版本夹具与表清单更新到 v2/trace_chain。未改 `jessica-core`，未新增第三方 crate（复用 sha2），未实现跨 turn 聚合 digest 或 8.4+。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 891 passed, 0 failed, 2 ignored（56 suites）。偏离/说明：1) 哈希覆盖精确存储列而非重新序列化，保证迁移回填与在线追加一致；2) `--all` 仍按 `trace_heads` 枚举，孤儿 `trace_events` 行不可见，已记入 Deferred；3) 未提供跨 turn 聚合摘要/签名，留待 8.4；4) 未提交、未推送，`DESIGN.md` 保持未跟踪。
 
+Task 8.4 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付可移植证据包 export 与离线 verify。`jessica-memory`：`trace_chain.rs` 新增 `jessica.trace.bundle.v1` 领域与 `bundle_digest`（长度前缀、turn 计数、turn_id 升序、raw 32-byte digest），golden vector 锁定聚合/空聚合；新增 `TraceEvidenceEntry`（私有字段 + 访问器）、`trace_bundle_digest`（排序、拒绝重复 turn、规范 hex 解码）与 `verify_exported_trace`（要求非空/seq 连续/包络有效/payload turn 一致，写入私有内存 EventStore 的 trace_events/chain/heads，再调用 `trace_turn` 复用 8.3 结构、生命周期与链校验，返回重算 digest）；未改 schema、既有 API 或 `jessica-core`。`jessica-cli`：新增 `trace_bundle` 模块与 `trace export --turn|--all --out [--allow-open]`、`trace verify-bundle --bundle [--json] [--allow-open] [--expect]`；export 只读打开并逐 turn 重验，invalid 拒绝、open 仅 `--all --allow-open` 允许、拒绝不写文件，evidence 含精确 trace entry 与 mirror 消费的 legacy 行，同库重复导出字节一致；verify-bundle 不读 `[events]`、不打开/创建/迁移事件库，读前强制 64 MiB 上限，校验 version/format/规范 digest/重复 turn，离线重建并比较逐 turn digest、aggregate 与 `--expect`，`--replay` 显式拒绝；`trace_verify` 暴露复用内部项并新增 `exported_legacy_rows`，参数解析/usage/结构化错误/README 同步。测试新增 19 个：trace_chain 聚合 golden 单测 1、`tests/trace_evidence.rs` 6、CLI 解析 3、`tests/trace_bundle_e2e.rs` 9（无 `[events]` 离线往返、确定性/排序、open 两种路径、invalid 不落盘、trace/legacy/aggregate 篡改、turn digest 与 expect、畸形/超限 bundle、空库、缺失库不创建）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 910 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) 离线校验复用内存 EventStore + `trace_turn`，与在线 verify 同源；2) 聚合只覆盖 turn digest，legacy 通过 mirror 校验绑定；3) 只导出正面证据，invalid trace 与遗漏 turn 不可作为失败/省略证据，除非外部锚定；4) 不支持 `verify-bundle --replay`；5) 不是签名，必须用 `--expect` 锚定库外记录；6) 既有 `trace digest --all` 输出不变；7) 导出使用 `std::fs::write`，未做临时文件 + fsync 原子替换；8) 未提交、未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
@@ -2151,7 +2170,13 @@ Deferred（待办，由用户决定是否单开 Task）
 · Phase 6 的 ACP ConfigWatcher 随首次 prompt 的惰性 runtime 装配启动（`assemble_runtime` 成功后才 spawn）；进程启动到首次 prompt 之间的配置文件修改不会触发通知，首次 prompt 使用启动快照，之后需再次修改文件才会被观察。若要求从 `initialize` 起就监听，需把 watcher 与 runtime 装配解耦并定义首次 prompt 取哪一份快照，单开 Task。
 · Paseo 0.15.x 的全局 provider catalog 探测会用 `cwd = $HOME` 调用 `session/new`；Jessica 的 cwd 又被限制在 ACP 进程启动 root 内，因此当 Paseo daemon 从项目目录启动且 workspace 在 `$HOME` 之外时，provider 目录刷新会报 `cwd must be inside the startup workspace root`。当前通过从 `$HOME` 启动 daemon（workspace 位于 `$HOME` 下）或 wrapper `cd` 到共同祖先规避，并已记录到 README；若要在任意 daemon cwd 下支持，需要单开 Task 定义可配置的额外允许根或 Paseo 专用 catalog 处理，不能在 ACP-4 放宽 cwd containment。
 · 可执行文件名仍为 `jessica-cli`（需要 `cargo run -p jessica-cli -- acp`，安装后命令名为 `jessica-cli`），而 Phase 6 Task 文案写的是 `jessica acp`。改名（如设置 `[[bin]] name = "jessica"`）会影响现有脚本、文档与发布产物，需单开 Task 统一命名并更新全部调用点，不得在 ACP Task 中顺手改动。
-· Task 8.3 的 `trace digest --all` 与 `trace verify --all` 仍按 `trace_heads` 枚举 turn；`trace_events` 中可能存在但未被任何 head 索引的孤儿行不会进入审计或 digest，其链缺失也不可见。若要覆盖全库一致性，须单开 Task 定义孤儿行扫描、归属与修复语义（只读审计不得自动修复），并明确迁移/损坏边界；不得在 8.4+ 顺手改变 `--all` 的枚举来源。
+· Task 8.3 的 `trace digest --all` 与 `trace verify --all` 仍按 `trace_heads` 枚举 turn；`trace_events` 中可能存在但未被任何 head 索引的孤儿行不会进入审计或 digest，其链缺失也不可见。Task 8.4 的 `trace export --all` 复用同一枚举来源，因此也不会导出孤儿行。若要覆盖全库一致性，须单开 Task 定义孤儿行扫描、归属与修复语义（只读审计不得自动修复），并明确迁移/损坏边界；不得在 8.4+ 顺手改变 `--all` 的枚举来源。
+· Task 8.4 的 `trace verify-bundle` 明确拒绝 `--replay`，bundle 本身不携带 provider/工具环境与回放所需的完整外部状态。若要离线重放，须先定义可重放的 bundle 子集、环境声明、结果 schema 与 mismatch 报告，并证明不会执行未受信内容；单开 Task。
+· Task 8.4 的 bundle 不是签名或时间戳凭证；能重写整个 bundle 者可重算逐 turn 与聚合 digest。若需证明“由某方在某时生成”，须单开 Task 引入签名（密钥管理、算法与依赖审批）或 RFC 3161 TSA，不得在现有格式中静默扩展。
+· Task 8.4 只导出正面证据：invalid trace 不能导出，遗漏的 turn 本身不可证伪，`--expect` 只能锚定聚合而不能证明预期 turn 集合完整。若要支持负证据/省略证明，须先定义预期 turn 清单、服务端日志对照或累计 Merkle 根等语义，单开 Task。
+· Task 8.4 的 bundle 含完整 trace payload 与 legacy 行，可能包含提示、模型输出、工具参数和路径等敏感数据；当前没有脱敏、字段裁剪或过期删除机制。隐私删除/保留期须与 append-only 契约一并通过单开 Task 设计，不能静默改写已导出 bundle。
+· Task 8.4 的 export 使用一次性 `std::fs::write`，进程在写入中途崩溃或被强杀时可能留下截断文件（不会留下部分验证通过的 bundle，但需要重新导出）。若要求原子发布，须单开 Task 改为同目录临时文件 + fsync + rename，并定义跨文件系统行为。
+· Task 8.4 未把 bundle 聚合暴露到数据库侧 `trace digest --all`；若需要 CI 直接对在线库输出聚合而不导出文件，须单开 Task 定义命令面与兼容性（不得改变既有 digest 文本/JSON 契约）。
 
 ---
 

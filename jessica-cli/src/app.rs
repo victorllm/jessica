@@ -1598,6 +1598,18 @@ pub(crate) enum CliError {
     /// `trace verify`/`trace digest` was given both `--turn` and `--all`.
     #[error("`trace --turn` cannot be combined with `--all`")]
     TraceSelectionConflict,
+    /// `trace export --out` was given without a path.
+    #[error("`trace export --out` requires a path")]
+    MissingTraceExportOut,
+    /// `trace export --out` was given more than once.
+    #[error("`trace export --out` may be given only once")]
+    DuplicateTraceExportOut,
+    /// `trace verify-bundle --bundle` was given without a path.
+    #[error("`trace verify-bundle --bundle` requires a path")]
+    MissingTraceBundle,
+    /// `trace verify-bundle --bundle` was given more than once.
+    #[error("`trace verify-bundle --bundle` may be given only once")]
+    DuplicateTraceBundle,
     /// The requested turn trace does not exist.
     #[error("turn `{turn_id}` was not found in the event store")]
     UnknownTurn {
@@ -1634,6 +1646,77 @@ pub(crate) enum CliError {
         turn_id: String,
         /// Why the trace is outside the replayable subset.
         reason: String,
+    },
+    /// A trace could not be exported as portable evidence.
+    #[error("trace export failed: {summary}")]
+    TraceExportFailed {
+        /// One-line reason for the refusal.
+        summary: String,
+    },
+    /// A bundle file could not be inspected or read.
+    #[error("failed to read trace bundle `{path}`: {source}")]
+    TraceBundleRead {
+        /// Bundle path that could not be read.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A bundle exceeded the offline verifier's size limit.
+    #[error("trace bundle `{path}` is {bytes} bytes, exceeding the {limit}-byte limit")]
+    TraceBundleTooLarge {
+        /// Bundle path that was rejected.
+        path: PathBuf,
+        /// Observed file size.
+        bytes: u64,
+        /// Maximum accepted size.
+        limit: u64,
+    },
+    /// A bundle file was not valid JSON for the bundle schema.
+    #[error("failed to decode trace bundle `{path}`: {source}")]
+    TraceBundleDecode {
+        /// Bundle path that could not be decoded.
+        path: PathBuf,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A bundle used an unsupported structure version.
+    #[error("trace bundle version {found} is unsupported; this build supports version {supported}")]
+    TraceBundleVersion {
+        /// Version declared by the bundle.
+        found: u32,
+        /// Version supported by this build.
+        supported: u32,
+    },
+    /// A bundle used an unrecognized format identifier.
+    #[error("trace bundle format `{found}` is unsupported")]
+    TraceBundleFormat {
+        /// Format identifier declared by the bundle.
+        found: String,
+    },
+    /// A bundle listed the same turn more than once.
+    #[error("trace bundle contains turn `{turn_id}` more than once")]
+    TraceBundleDuplicateTurn {
+        /// Turn that was repeated.
+        turn_id: String,
+    },
+    /// A bundle digest field was not canonical lowercase SHA-256 hex.
+    #[error("trace bundle {field} is not 64 lowercase hexadecimal characters: `{value}`")]
+    TraceBundleDigest {
+        /// Field that failed validation.
+        field: &'static str,
+        /// Rejected value.
+        value: String,
+    },
+    /// A bundle could not be written.
+    #[error("failed to write trace bundle `{path}`: {source}")]
+    TraceBundleWrite {
+        /// Destination path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
     },
     /// The requested session is absent from the event store.
     #[error("session `{session_id}` was not found in the event store")]

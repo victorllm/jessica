@@ -60,6 +60,9 @@ const ENTRY_DOMAIN: &[u8] = b"jessica.trace.entry.v1";
 /// Domain tag for a turn digest.
 const DIGEST_DOMAIN: &[u8] = b"jessica.trace.digest.v1";
 
+/// Domain tag for a portable bundle aggregate digest.
+const BUNDLE_DOMAIN: &[u8] = b"jessica.trace.bundle.v1";
+
 /// Exact stored columns covered by one chain link.
 #[derive(Debug)]
 pub(crate) struct ChainEntry<'a> {
@@ -185,6 +188,22 @@ pub(crate) fn turn_digest(turn_id: &str, last: &[u8; HASH_BYTES]) -> String {
     encode_hex(&finish(hasher))
 }
 
+/// Computes the aggregate digest of an ordered, unique set of turn chains.
+///
+/// The caller supplies turn digests decoded from their canonical lowercase
+/// hexadecimal form and sorted by turn id. The turn count is part of the hash so
+/// an empty bundle and a bundle with no matching turns cannot collide.
+pub(crate) fn bundle_digest(turns: &[(&str, [u8; HASH_BYTES])]) -> String {
+    let mut hasher = Sha256::new();
+    field(&mut hasher, BUNDLE_DOMAIN);
+    field(&mut hasher, &(turns.len() as u64).to_be_bytes());
+    for (turn_id, digest) in turns {
+        field(&mut hasher, turn_id.as_bytes());
+        field(&mut hasher, digest);
+    }
+    encode_hex(&finish(hasher))
+}
+
 /// Encodes bytes as lowercase hexadecimal.
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -292,6 +311,27 @@ mod tests {
             turn_digest("turn-golden", &hash),
             "3c58a61e766e7a919ad0eaf6518e511751b810e2761f1382eeb9eefcab0635b0",
             "changing the turn digest encoding invalidates every recorded digest"
+        );
+    }
+
+    #[test]
+    fn the_bundle_digest_format_is_locked_by_a_golden_vector() {
+        let first = [
+            0x3c, 0x58, 0xa6, 0x1e, 0x76, 0x6e, 0x7a, 0x91, 0x9a, 0xd0, 0xea, 0xf6, 0x51, 0x8e,
+            0x51, 0x17, 0x51, 0xb8, 0x10, 0xe2, 0x76, 0x1f, 0x13, 0x82, 0xee, 0xb9, 0xee, 0xfc,
+            0xab, 0x06, 0x35, 0xb0,
+        ];
+        let mut second = [0_u8; HASH_BYTES];
+        second[31] = 1;
+        assert_eq!(
+            bundle_digest(&[("turn-golden", first), ("turn-zeta", second)]),
+            "19c7f90e4a9178e211e37be8c7a1405acce610a4f0587ab83071e31e3e993205",
+            "changing the bundle encoding invalidates every recorded aggregate"
+        );
+        assert_ne!(
+            bundle_digest(&[]),
+            bundle_digest(&[("turn-golden", first)]),
+            "the turn count must be part of the digest"
         );
     }
 

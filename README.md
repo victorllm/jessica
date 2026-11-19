@@ -179,6 +179,60 @@ A single-turn run prints only the digest, so it can be captured directly. An
 order. `--json` emits `report_version: 1`, `digest_format:
 "jessica.trace.digest.v1"`, and per-turn `digest`, `closed`, and `entries`.
 
+## Portable evidence bundles
+
+`jessica trace export` writes a self-contained JSON evidence bundle. The
+bundle can be verified on a machine that has no event database and no
+`[events]` configuration:
+
+```bash
+jessica --config ~/.jessica/harness.toml trace export --turn <turn_id> --out evidence.json
+jessica --config ~/.jessica/harness.toml trace export --all --out evidence.json
+jessica --config ~/.jessica/harness.toml trace export --all --allow-open --out evidence.json
+jessica trace verify-bundle --bundle evidence.json
+jessica trace verify-bundle --bundle evidence.json --json
+jessica trace verify-bundle --bundle evidence.json --allow-open
+jessica trace verify-bundle --bundle evidence.json --expect <digest>
+```
+
+Export runs against the event store read-only and refuses to write a bundle
+for an invalid trace (for example one with a `Gap`, a broken lifecycle, or a
+broken hash chain); no partial file is written. Open traces without a
+`turn_ended` marker are rejected unless `--all --allow-open` is used;
+`--allow-open` is not accepted with `--turn`. The same store exports
+byte-identically every time, with turns in ascending turn-id order.
+
+The bundle is `bundle_version: 1`, `bundle_format:
+"jessica.trace.bundle.v1"`. Each turn carries its id, `closed` flag, declared
+turn digest, trace entries (`seq`, `timestamp`, exact `payload_json`), and the
+legacy mirror rows (`session_id`, `timestamp`, `payload_json`) that the mirror
+check consumes. `aggregate_digest` is the SHA-256 of the
+`jessica.trace.bundle.v1` domain, the big-endian turn count, and each turn's id
+and raw 32-byte digest in ascending turn-id order, with every field length
+prefixed.
+
+`verify-bundle` never reads `[events]`, opens a database, migrates a schema, or
+creates sidecars. It reconstructs every chain in a private in-memory store,
+re-runs the same structural, semantic, hash-chain, and trace-to-legacy mirror
+checks, compares each declared turn digest with the recomputed value, and
+compares the declared aggregate with the aggregate recomputed from the
+verified chains. `--expect` additionally requires the recomputed aggregate to
+equal an externally recorded 64-character hexadecimal digest
+(case-insensitive). `--json` emits a stable report with `report_version: 1`,
+the declared/computed/expected aggregate, bundle-level problems, and per-turn
+statuses. Exit code `0` means the bundle has no problems and every turn is
+acceptable; open turns require `--allow-open`. Exit code `1` means a bundle
+problem, an invalid or unallowed open turn, a malformed or oversized bundle,
+or a digest mismatch. Bundles larger than 64 MiB are rejected before parsing.
+Replay is not run from a bundle, so `--replay` is rejected.
+
+A bundle is evidence, not a signature. An attacker able to rewrite the whole
+bundle can recompute every chain and the aggregate; compare the aggregate with
+a value recorded outside the bundle, for example through `--expect`, to detect
+that case. The bundle also records only positive evidence: an exporter that
+omits a turn is not proven inconsistent unless the expected aggregate or turn
+set is anchored externally.
+
 The hash chain is tamper-evident only relative to an externally kept digest:
 an attacker able to rewrite the whole database can recompute the chain. It is
 not a signature. Record the digest outside the database, for example in CI

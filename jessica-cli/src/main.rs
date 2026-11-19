@@ -18,6 +18,7 @@ mod pump;
 mod replay;
 mod shutdown;
 mod skills;
+mod trace_bundle;
 mod trace_digest;
 mod trace_replay;
 mod trace_verify;
@@ -692,8 +693,12 @@ fn parse_trace_args(
     match subcommand.as_str() {
         "verify" => parse_trace_verify_args(args),
         "digest" => parse_trace_digest_args(args),
+        "export" => parse_trace_export_args(args),
+        "verify-bundle" => parse_trace_verify_bundle_args(args),
         other => Err(CliError::InvalidTraceCommand {
-            message: format!("unknown subcommand `{other}`; expected verify or digest"),
+            message: format!(
+                "unknown subcommand `{other}`; expected verify, digest, export, or verify-bundle"
+            ),
         }),
     }
 }
@@ -838,6 +843,161 @@ fn parse_trace_digest_args(
     Ok(Some(TraceCommand::Digest { selection, json }))
 }
 
+/// Parses the arguments following `trace export`.
+///
+/// `--turn` and `--all` are mutually exclusive; `--out` is required. As with
+/// verification, `--allow-open` is accepted only with `--all`.
+fn parse_trace_export_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<TraceCommand>, CliError> {
+    let mut turn = None;
+    let mut all = false;
+    let mut out = None;
+    let mut allow_open = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_trace_usage();
+                return Ok(None);
+            }
+            "--turn" => {
+                let id = args.next().ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id)?;
+            }
+            _ if arg.starts_with("--turn=") => {
+                let id = arg
+                    .strip_prefix("--turn=")
+                    .filter(|id| !id.is_empty())
+                    .ok_or(CliError::MissingTraceTurn)?;
+                set_trace_turn(&mut turn, id.to_owned())?;
+            }
+            "--out" => {
+                let path = args.next().ok_or(CliError::MissingTraceExportOut)?;
+                set_trace_export_out(&mut out, PathBuf::from(path))?;
+            }
+            _ if arg.starts_with("--out=") => {
+                let path = arg
+                    .strip_prefix("--out=")
+                    .filter(|path| !path.is_empty())
+                    .ok_or(CliError::MissingTraceExportOut)?;
+                set_trace_export_out(&mut out, PathBuf::from(path))?;
+            }
+            "--all" => all = true,
+            "--allow-open" => allow_open = true,
+            _ => {
+                return Err(CliError::InvalidTraceCommand {
+                    message: format!("unexpected `trace export` argument `{arg}`"),
+                });
+            }
+        }
+    }
+
+    if all && turn.is_some() {
+        return Err(CliError::TraceSelectionConflict);
+    }
+    if allow_open && !all {
+        return Err(CliError::InvalidTraceCommand {
+            message: "`--allow-open` requires `--all`".to_owned(),
+        });
+    }
+    let selection = match (turn, all) {
+        (Some(turn), false) => TraceSelection::Turn(turn),
+        (None, true) => TraceSelection::All,
+        _ => return Err(CliError::MissingTraceSelection),
+    };
+    let out = out.ok_or(CliError::MissingTraceExportOut)?;
+    Ok(Some(TraceCommand::Export {
+        selection,
+        out,
+        allow_open,
+    }))
+}
+
+/// Parses the arguments following `trace verify-bundle`.
+///
+/// The command is offline: `--bundle` names the portable evidence package and
+/// no `[events]` path is consulted. `--replay` is deliberately rejected until
+/// bundle replay is implemented.
+fn parse_trace_verify_bundle_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<TraceCommand>, CliError> {
+    let mut bundle = None;
+    let mut json = false;
+    let mut allow_open = false;
+    let mut expect = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_trace_usage();
+                return Ok(None);
+            }
+            "--bundle" => {
+                let path = args.next().ok_or(CliError::MissingTraceBundle)?;
+                set_trace_bundle(&mut bundle, PathBuf::from(path))?;
+            }
+            _ if arg.starts_with("--bundle=") => {
+                let path = arg
+                    .strip_prefix("--bundle=")
+                    .filter(|path| !path.is_empty())
+                    .ok_or(CliError::MissingTraceBundle)?;
+                set_trace_bundle(&mut bundle, PathBuf::from(path))?;
+            }
+            "--json" => json = true,
+            "--allow-open" => allow_open = true,
+            "--expect" => {
+                let digest = args.next().ok_or_else(|| CliError::InvalidTraceCommand {
+                    message: "`--expect` requires a digest".to_owned(),
+                })?;
+                set_trace_expect(&mut expect, &digest)?;
+            }
+            _ if arg.starts_with("--expect=") => {
+                let digest =
+                    arg.strip_prefix("--expect=")
+                        .ok_or_else(|| CliError::InvalidTraceCommand {
+                            message: "`--expect` requires a digest".to_owned(),
+                        })?;
+                set_trace_expect(&mut expect, digest)?;
+            }
+            "--replay" => {
+                return Err(CliError::InvalidTraceCommand {
+                    message: "`--replay` is not supported with `trace verify-bundle`".to_owned(),
+                });
+            }
+            _ => {
+                return Err(CliError::InvalidTraceCommand {
+                    message: format!("unexpected `trace verify-bundle` argument `{arg}`"),
+                });
+            }
+        }
+    }
+
+    let bundle = bundle.ok_or(CliError::MissingTraceBundle)?;
+    Ok(Some(TraceCommand::VerifyBundle {
+        bundle,
+        json,
+        allow_open,
+        expect,
+    }))
+}
+
+fn set_trace_export_out(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateTraceExportOut);
+    }
+    *slot = Some(path);
+    Ok(())
+}
+
+fn set_trace_bundle(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::DuplicateTraceBundle);
+    }
+    *slot = Some(path);
+    Ok(())
+}
+
 /// Validates and normalizes an expected digest.
 fn set_trace_expect(slot: &mut Option<String>, digest: &str) -> Result<(), CliError> {
     if slot.is_some() {
@@ -932,23 +1092,32 @@ fn print_trace_usage() {
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
          \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
          \x20      jessica [--config <path>] trace digest --all [--json]\n\
+         \x20      jessica [--config <path>] trace export --turn <turn_id> --out <path>\n\
+         \x20      jessica [--config <path>] trace export --all --out <path> [--allow-open]\n\
+         \x20      jessica trace verify-bundle --bundle <path> [--json] [--allow-open] [--expect <digest>]\n\
          \n\
-         Verifies or digests recorded turn traces without creating, migrating, or\n\
-         modifying the [events] database. Verification checks structural\n\
-         completeness, version-2 semantics, trace-to-legacy mirror consistency,\n\
-         and the SHA-256 hash chain. It never calls the model or a tool.\n\
+         Verifies, digests, or exports recorded turn traces without creating,\n\
+         migrating, or modifying the [events] database. Verification checks\n\
+         structural completeness, version-2 semantics, trace-to-legacy mirror\n\
+         consistency, and the SHA-256 hash chain. It never calls the model or a\n\
+         tool. `verify-bundle` is fully offline and does not read [events].\n\
          \n\
-         --turn <turn_id>  Verify or digest one turn; an unknown turn is an error\n\
+         --turn <turn_id>  Verify, digest, or export one turn; unknown is an error\n\
          --all             Select every stored turn\n\
          --json            Emit the stable JSON report instead of text\n\
          --allow-open      Treat traces without `turn_ended` as verified (with --all)\n\
          --replay          Re-run each fresh attempt with recorded inputs and require\n\
-         \x20                 the event sequence to match (with --turn)\n\
-         --expect <digest> Require the turn chain digest to equal 64 hexadecimal\n\
-         \x20                 characters (with --turn)\n\
+         \x20                 the event sequence to match (with verify --turn)\n\
+         --expect <digest> Require a turn chain digest (verify) or the bundle\n\
+         \x20                 aggregate digest (verify-bundle) to match 64 hex chars\n\
+         --out <path>      Write the evidence bundle; an existing file is replaced\n\
+         --bundle <path>   Read a portable evidence bundle for offline verification\n\
          \n\
          `trace digest --turn` prints only the lowercase hex digest; --all prints\n\
          one `turn_id<TAB>digest` line per turn in ascending turn-id order.\n\
+         `trace export` accepts only traces that pass structural, semantic, and\n\
+         mirror verification. Invalid traces and unallowed open traces abort the\n\
+         export without writing a bundle.\n\
          \n\
          Exit code 0 means every selected trace passed; 1 means a trace was\n\
          invalid, an open trace was not allowed, replay found a mismatch, the\n\
@@ -1015,11 +1184,15 @@ fn print_usage() {
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open]\n\
          \x20      jessica [--config <path>] trace digest --turn <turn_id> [--json]\n\
          \x20      jessica [--config <path>] trace digest --all [--json]\n\
+         \x20      jessica [--config <path>] trace export --turn <turn_id> --out <path>\n\
+         \x20      jessica [--config <path>] trace export --all --out <path> [--allow-open]\n\
+         \x20      jessica trace verify-bundle --bundle <path> [--json] [--allow-open] [--expect <digest>]\n\
          \n\
-         Verifies or digests recorded turn traces offline against an existing\n\
+         Verifies, digests, or exports recorded turn traces against an existing\n\
          [events] database. The store is opened read-only: the command never\n\
-         creates or migrates it. See `jessica trace --help` for problem kinds and\n\
-         exit codes.\n\
+         creates or migrates it. `trace verify-bundle` audits a portable bundle\n\
+         entirely offline. See `jessica trace --help` for problem kinds and exit\n\
+         codes.\n\
          \n\
          Usage: jessica [--config <path>] acp\n\
          \n\
@@ -1432,6 +1605,124 @@ mod tests {
         ] {
             let error = parse_trace_args(skill_args(&arguments))
                 .expect_err("malformed expect arguments must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "error `{error}` must mention `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_export_parses_turn_all_out_and_allow_open() {
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "export",
+                "--turn",
+                "turn-a",
+                "--out",
+                "evidence.json",
+            ]))
+            .expect("single-turn export must parse"),
+            Some(TraceCommand::Export {
+                selection: TraceSelection::Turn("turn-a".to_owned()),
+                out: PathBuf::from("evidence.json"),
+                allow_open: false,
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "export",
+                "--all",
+                "--allow-open",
+                "--out=all.json",
+            ]))
+            .expect("all-turns export must parse"),
+            Some(TraceCommand::Export {
+                selection: TraceSelection::All,
+                out: PathBuf::from("all.json"),
+                allow_open: true,
+            })
+        );
+    }
+
+    #[test]
+    fn trace_verify_bundle_parses_offline_flags() {
+        let uppercase = "AB".repeat(32);
+        let lowercase = "ab".repeat(32);
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "verify-bundle",
+                "--bundle",
+                "evidence.json",
+                "--json",
+                "--allow-open",
+                "--expect",
+                uppercase.as_str(),
+            ]))
+            .expect("bundle verification must parse without an event store"),
+            Some(TraceCommand::VerifyBundle {
+                bundle: PathBuf::from("evidence.json"),
+                json: true,
+                allow_open: true,
+                expect: Some(lowercase.clone()),
+            })
+        );
+
+        assert_eq!(
+            parse_trace_args(skill_args(&[
+                "verify-bundle",
+                "--bundle=evidence.json",
+                format!("--expect={uppercase}").as_str(),
+            ]))
+            .expect("equals forms must parse"),
+            Some(TraceCommand::VerifyBundle {
+                bundle: PathBuf::from("evidence.json"),
+                json: false,
+                allow_open: false,
+                expect: Some(lowercase),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_bundle_arguments_are_rejected() {
+        for (arguments, expected) in [
+            (vec!["export", "--turn", "a"], "requires a path"),
+            (
+                vec!["export", "--turn", "a", "--out", "a", "--out", "b"],
+                "only once",
+            ),
+            (
+                vec!["export", "--turn", "a", "--all", "--out", "a"],
+                "cannot be combined",
+            ),
+            (
+                vec!["export", "--turn", "a", "--allow-open", "--out", "a"],
+                "requires `--all`",
+            ),
+            (vec!["export", "--all", "--out"], "requires a path"),
+            (vec!["verify-bundle"], "requires a path"),
+            (
+                vec!["verify-bundle", "--bundle", "a", "--bundle", "b"],
+                "only once",
+            ),
+            (vec!["verify-bundle", "--bundle="], "requires a path"),
+            (
+                vec!["verify-bundle", "--bundle", "a", "--replay"],
+                "not supported",
+            ),
+            (
+                vec!["verify-bundle", "--bundle", "a", "--turn", "t"],
+                "--turn",
+            ),
+            (
+                vec!["verify-bundle", "--bundle", "a", "--expect", "00"],
+                "64 hexadecimal",
+            ),
+        ] {
+            let error = parse_trace_args(skill_args(&arguments))
+                .expect_err("malformed bundle arguments must be rejected");
             assert!(
                 error.to_string().contains(expected),
                 "error `{error}` must mention `{expected}`"
