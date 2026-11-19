@@ -7,8 +7,10 @@
 //!
 //! # Shutdown sequence
 //!
-//! 1. The first signal records its kind, cancels the root token (and therefore
-//!    the active turn's child token), and wakes the REPL's `read_line`.
+//! 1. The first signal writes its diagnostic line, then records its kind,
+//!    cancels the root token (and therefore the active turn's child token), and
+//!    wakes the REPL's `read_line`. Writing the line first prevents `main` from
+//!    exiting with the signal code before the diagnostic reaches stderr.
 //! 2. The REPL creates no further turns. The active turn observes its token and
 //!    ends with [`SessionEndReason::Cancelled`](jessica_core::types::SessionEndReason::Cancelled).
 //!    The existing turn path waits up to its pump timeout (30 seconds) for the
@@ -144,15 +146,21 @@ impl ShutdownController {
         first
     }
 
-    /// Applies one delivered signal.
+    /// Classifies the next signal without changing any shutdown state.
     ///
     /// The first signal cancels the active turn, the second forces an immediate
-    /// exit, and later signals are ignored. Repeated calls are idempotent: the
-    /// recorded signal and the forced flag never regress.
-    pub(crate) fn on_signal(&self, signal: ShutdownSignal) -> SignalAction {
-        if self.request_shutdown(signal) {
+    /// exit, and later signals are ignored. Callers must serialize signal
+    /// delivery; the listener processes one signal at a time.
+    ///
+    /// The caller must write its diagnostic line before committing the action
+    /// with [`request_shutdown`](Self::request_shutdown) or [`force`](Self::force).
+    /// Committing the first signal cancels the root token, which can wake the
+    /// REPL and let `main` exit with the signal code; a message written after
+    /// that point has no guarantee of reaching stderr.
+    pub(crate) fn classify_next(&self) -> SignalAction {
+        if self.lock_signal().is_none() {
             SignalAction::Cancel
-        } else if self.force() {
+        } else if !self.forced.load(Ordering::SeqCst) {
             SignalAction::Force
         } else {
             SignalAction::Ignore
@@ -248,17 +256,28 @@ impl Drop for SignalListener {
 }
 
 /// Applies one OS signal; a forced exit terminates the process from here.
+///
+/// The diagnostic line is written before committing the state change. The first
+/// signal cancels the root token, which can wake the REPL and let `main` exit
+/// with the signal code before a later write would run; writing first keeps the
+/// message from being lost to that race.
 fn handle_signal(controller: &ShutdownController, signal: ShutdownSignal) {
-    match controller.on_signal(signal) {
-        SignalAction::Cancel => eprintln!(
-            "[shutdown] {} received; stopping new turns and draining",
-            signal.as_str()
-        ),
+    match controller.classify_next() {
+        SignalAction::Cancel => {
+            eprintln!(
+                "[shutdown] {} received; stopping new turns and draining",
+                signal.as_str()
+            );
+            let _ = std::io::stderr().flush();
+            let _ = controller.request_shutdown(signal);
+        }
         SignalAction::Force => {
             eprintln!(
                 "[shutdown] second {} received; exiting immediately",
                 signal.as_str()
             );
+            let _ = std::io::stderr().flush();
+            let _ = controller.force();
             let _ = std::io::stdout().flush();
             std::process::exit(i32::from(signal.exit_code()));
         }
@@ -275,10 +294,12 @@ mod tests {
         let controller = ShutdownController::new();
         let turn = controller.child_token();
 
-        assert_eq!(
-            controller.on_signal(ShutdownSignal::SigInt),
-            SignalAction::Cancel
+        assert_eq!(controller.classify_next(), SignalAction::Cancel);
+        assert!(
+            !controller.is_shutting_down() && !turn.is_cancelled(),
+            "classification alone must not make shutdown observable"
         );
+        assert!(controller.request_shutdown(ShutdownSignal::SigInt));
 
         assert!(turn.is_cancelled());
         assert!(controller.is_shutting_down());
@@ -289,26 +310,16 @@ mod tests {
     #[test]
     fn the_second_signal_forces_and_later_signals_are_ignored() {
         let controller = ShutdownController::new();
-        assert_eq!(
-            controller.on_signal(ShutdownSignal::SigTerm),
-            SignalAction::Cancel
-        );
+        assert!(controller.request_shutdown(ShutdownSignal::SigTerm));
 
-        assert_eq!(
-            controller.on_signal(ShutdownSignal::SigInt),
-            SignalAction::Force
+        assert_eq!(controller.classify_next(), SignalAction::Force);
+        assert!(
+            !controller.is_forced(),
+            "classification alone must not force an exit"
         );
-        assert!(controller.is_forced());
-        assert_eq!(
-            controller.signal(),
-            Some(ShutdownSignal::SigTerm),
-            "the first signal determines the recorded kind"
-        );
+        assert!(controller.force());
 
-        assert_eq!(
-            controller.on_signal(ShutdownSignal::SigTerm),
-            SignalAction::Ignore
-        );
+        assert_eq!(controller.classify_next(), SignalAction::Ignore);
         assert!(controller.is_forced());
         assert_eq!(controller.signal(), Some(ShutdownSignal::SigTerm));
     }

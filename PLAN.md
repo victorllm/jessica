@@ -1907,6 +1907,38 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1 已确认，8.2–8.5 待逐项确认）
+
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，其余按依赖顺序逐 Task 确认。
+
+Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
+
+目标：保证第一条 SIGINT/SIGTERM 诊断行在 shutdown 状态对主流程可见之前写入 stderr；不改变退出码和关闭语义。
+
+操作：
+
+1. `ShutdownController` 移除有副作用的 `on_signal`，新增只读 `classify_next() -> SignalAction`；调用方先分类、写诊断并 flush stderr，再调用 `request_shutdown`（第一条）或 `force`（第二条）。
+2. `handle_signal` 按上述顺序执行；强制退出仍先打印再 `process::exit`；`Ignore` 不写日志。
+3. 模块文档明确“先写诊断、后提交状态”的顺序；更新 shutdown 单元测试，断言分类阶段不记录 signal、不取消 token、不置 forced。
+4. 新增真实进程压力测试 `every_idle_sigint_writes_its_diagnostic_before_exiting`：重复 20 次 idle REPL + SIGINT，每次断言 exit 130、stderr 含诊断行、无 panic；原 idle 测试抽取 `run_idle_sigint` helper 复用。
+
+测试：shutdown 单测 5 个；shutdown E2E 5 个（原 4 + 压力 20 轮）。
+
+验收：`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`；main/PR 的 GitHub Actions 全绿。
+
+禁止：不改变 SIGINT=130/SIGTERM=143/第二次信号强制退出语义；不新增信号；不修改 `jessica-core`、`jessica-memory` 或 SQLite schema；不新增第三方 crate；不在本 Task 顺手实现 8.2–8.5。
+
+后续候选（未确认，不执行）：
+
+- 8.2 EventStore WAL、只读审计契约、事务化迁移框架、SIGKILL/磁盘满/迁移回滚测试。
+- 8.3 trace 哈希链、`trace digest`、`verify --expect`。
+- 8.4 可移植证据包 export 与离线 verify。
+- 8.5 `--all --replay` 与 Resumed/v1 覆盖扩展。
+- 8.6 子 Agent 轨迹证据（需先设计，可能需 core 批准）。
+- 8.7 保留期/隐私删除（需先确认 append-only 契约变更）。
+
+---
+
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
 
 1. 一次会话只做一个 Task，完成后主动运行该 Task 的所有验收命令，把结果贴出来。
@@ -1987,6 +2019,8 @@ Task 7.4 ☑ 耗时未精确计时（跨上下文执行；含方案确认） —
 
 Task 7.5 ☑ 耗时未精确计时（跨上下文执行；含方案确认） — 按用户批准的单 turn 执行一致性方案交付 `trace verify --replay`。`jessica-cli`：新增 `trace_replay` 模块（可重放子集判定、attempt 分组、事件过滤、调用既有 `replay_session`、按原 trace seq 逐事件比较、mismatch 定位 seq、外层 session 静态校验）；`trace_verify` 集成 `--replay`（仅 `--turn`）、`report_version` 1→2、per-turn `replay` 字段（`null` 或 `{status, attempts, events, reason?}`）、文本 replay 摘要、unsupported/mismatch 的退出语义；`main.rs` 参数解析与 usage；`CliError::TraceReplayUnsupported`。可重放范围仅 closed v2 fresh turn、无 Gap、attempt 1..n 连续、每 attempt 一个 session 且 `SessionStarted` 首/`SessionEnded` 末、终态 Completed/Error 或仅 MaxRounds 的 BudgetExceeded；v1、Resumed、Cancelled、AcceptanceFailed、缺失 start/end、非连续 attempt、非 MaxRounds budget 均显式 unsupported、exit 1。每次 attempt 以 `SessionStarted.messages` + 录制事件驱动真实 `AgentLoop`，排除 trace-only（PermissionDecided、ChildSession*、AcceptanceFailed）与 CLI governance（PolicyDenied、非 MaxRounds budget）；mismatch 生成 `replay_mismatch` problem、turn invalid、exit 1。未改 SQLite schema、`jessica-memory`、既有 `replay --session` 行为或冻结 `jessica-core` API，未新增第三方 crate。测试新增 15 个：`trace_replay` 11、CLI 参数接受/拒绝（并入既有参数测试）、E2E 4（文本/JSON 成功、非 parity invalid、v1 unsupported、batch 拒绝），既有 `report_version` 断言更新为 2。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 854 passed, 0 failed, 2 ignored（53 suites）。偏离/说明：1) 对 open/invalid trace，`--replay` 不运行 parity，只在报告中写 unsupported，并让既有验证失败优先，仍非静默跳过；2) 外层 session 只做静态校验，不重放；3) E2E 使用真实 SQLite/真实 CLI 与手工构造的 trace，不启动 provider 或真实 turn；4) 按方案拒绝 `--all --replay`，批量 parity 留在 Deferred。未提交、未推送，`DESIGN.md` 保持未跟踪。
 
+Task 8.1 ☑ 约 30 分钟（含只读核对、实现与全量验收；未精确计时） — 修复 main CI run 44431198725 暴露的 shutdown 诊断竞态。根因：`ShutdownController::on_signal` 先记录 signal 并取消 root token，`handle_signal` 之后才写 `eprintln!`；REPL 被取消唤醒后 `main` 读取已记录的 signal 并以 130 退出，可能抢在诊断行到达 stderr 之前。`jessica-cli/src/shutdown.rs`：移除有副作用的 `on_signal`，新增只读 `classify_next() -> SignalAction`（第一条 Cancel、第二条 Force、之后 Ignore）；`handle_signal` 先分类、写诊断并 flush stderr，再 `request_shutdown`（第一条）或 `force` + `process::exit`（第二条）；模块文档明确“先写诊断、后提交状态”及原因。测试：shutdown 单测改为两阶段断言（分类阶段不记录 signal、不取消 child token、不置 forced；提交后才可见）；新增 E2E 压力测试 `every_idle_sigint_writes_its_diagnostic_before_exiting`，用真实 CLI 重复 20 次 idle REPL + SIGINT，每次断言 exit 130、stderr 含 `SIGINT received; stopping new turns and draining`、无 panic；原 idle SIGINT 测试抽取 `run_idle_sigint` helper 复用。未改 SIGINT=130/SIGTERM=143/第二次信号强制退出语义，未新增信号，未改 `jessica-core`、`jessica-memory` 或 SQLite schema，未新增第三方 crate。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 855 passed, 0 failed, 2 ignored（53 suites）；shutdown E2E 5 passed（含 20 轮压力），shutdown 单测 5 passed。偏离/说明：1) 修复前本地连续 20 次串行 + 4 路并发共 40 次未能复现该竞态，故以 CI 失败日志定位根因；修复用结构性顺序保证并新增压力测试防回归，未通过人为延迟制造失败；2) GitHub Actions 全绿需在提交/PR 后确认；3) 未提交、未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
@@ -1997,7 +2031,7 @@ Deferred（待办，由用户决定是否单开 Task）
 · 可观测性仍按 2026-11-14 的决定暂缓，不因本次 Phase 7 规划重启。
 · 说明：以上三块只做优先级归组；与下方既有 Deferred 条目重复之处，以既有条目为准，且各项仍须单开 Task。
 
-· Task 7.0a CI 观察到既有测试 `jessica-cli/tests/shutdown_e2e.rs::sigint_on_an_idle_repl_exits_130_without_creating_a_turn` 间歇失败（run 44302009658：退出码 130 正确，但 stderr 未捕获到 `SIGINT received; stopping new turns and draining`；同一工作流 run 44300376015 通过）。疑似信号处理输出与进程退出/管道收集的时序竞态，会随机让 CI 变红；建议单开 Task 重现并修复（例如退出前同步 flush stderr，或让测试先等待该诊断行再断言退出码），不属于 7.0a 的 CI 配置范围。
+· （已由 Task 8.1 于 2026-11-19 修复；main CI 需在提交/PR 后确认全绿）Task 7.0a 记录的 `shutdown_e2e::sigint_on_an_idle_repl_exits_130_without_creating_a_turn` 间歇失败（run 44302009658：退出码 130 正确但 stderr 缺诊断行；run 44431198725 同因）。根因是 `on_signal` 先记录 signal/取消 root、后写 `eprintln!`，`main` 可在诊断写出前退出；现已改为先写并 flush 诊断、后提交状态，并新增 20 轮真实进程压力测试防回归。
 
 · Anthropic Provider 暂不支持 Prompt caching（cache_control）、thinking block 与多模态 image block；未知 content block 目前按 Other 忽略（thinking/image 内容不会进入 LlmEvent），若需要这些能力须单开 Task。
 · TokenBudgetGuard 的计数已由 CLI 的 TokenCountingProvider 接入，但依赖 Provider 在 LlmEvent::Done 报告 usage；Provider 未报告 usage 时无法计费或限额。若需在 runtime 内强制，必须先单开 Task 修改冻结契约或事件模型。
