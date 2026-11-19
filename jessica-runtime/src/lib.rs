@@ -13,9 +13,9 @@ mod recovery;
 
 pub use agent::{AgentLoop, TranscriptRun};
 pub use delegation::{
-    AgentChildExecutor, CHILD_AGENT_SYSTEM_PROMPT, CHILD_TOOL_TIMEOUT, ChildToolFactory,
-    DELEGATE_TASK_TOOL_NAME, DelegateTaskArgs, DelegateTaskTool, DelegationError, DelegationLimits,
-    MIN_RESULT_BYTES, NarrowedTools, ParentCapabilities, child_session_hash, delegate_task_schema,
-    narrow_tools, parse_delegate_task_args,
+    AgentChildExecutor, CHILD_AGENT_SYSTEM_PROMPT, CHILD_TOOL_TIMEOUT, ChildEventSink,
+    ChildToolFactory, DELEGATE_TASK_TOOL_NAME, DelegateTaskArgs, DelegateTaskTool, DelegationError,
+    DelegationLimits, MIN_RESULT_BYTES, NarrowedTools, ParentCapabilities, child_session_hash,
+    delegate_task_schema, narrow_tools, parse_delegate_task_args,
 };
 pub use recovery::{RecordedEvent, RecoveryError, SessionCheckpoint, recover_session};

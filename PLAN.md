@@ -1907,9 +1907,9 @@ Phase 7.5：Trace replay execution parity（2026-11-19 新增；Task 7.5）
 
 ---
 
-Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3、8.4、8.5 已完成，8.6–8.7 待逐项确认）
+Phase 8：可靠性与可验证性（2026-11-19 新增；Task 8.1、8.2a、8.2b、8.3、8.4、8.5、8.6 已完成；8.7 待逐项确认）
 
-背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`）、8.4（可移植证据包 export 与离线 verify）与 8.5（`--all --replay` 及 v1/Resumed 覆盖扩展），其余按依赖顺序逐 Task 确认。
+背景：Task 7.5 已交付单 turn replay parity，但 2026-11-19 的 main CI run 44431198725 暴露 shutdown 诊断行与进程退出的竞态；同时 EventStore 尚未启用 WAL、没有事务化迁移框架、trace 不具备防篡改摘要、验证不能离线携带、replay 不支持批量/Resumed/v1。用户确认先做 8.1，随后确认 8.2 方案并要求拆成 8.2a（WAL 与事务化迁移）和 8.2b（只读审计契约与崩溃/磁盘满测试），再确认 8.3（trace 哈希链、`trace digest`、`verify --expect`）、8.4（可移植证据包 export 与离线 verify）与 8.5（`--all --replay` 及 v1/Resumed 覆盖扩展），其余按依赖顺序逐 Task 确认。用户于 2026-11-19 对 8.6 先选择“先只保留设计，不实现”，随后确认“继续Task 8.6”并批准冻结 API 变更，Task 8.6 已完成。
 
 Task 8.1：修复 shutdown 诊断竞态（2026-11-19）
 
@@ -2005,9 +2005,27 @@ Task 8.5（2026-11-19 确认并完成）：`--all --replay` 与 v1/Resumed 覆�
 
 偏离/说明：1) resumed 的原始 `Budget.max_rounds` 未写入 trace，批量 replay 以 `rounds_completed + 脚本轮数` 作为总预算；这对 `Completed`/`Error` 足以复现，对 `BudgetExceeded` 恰好等于原始总预算，但无法验证未达到预算时的原始上限数值；2) `--all --replay` 顺序执行而非并发，以换取内存有界与明确错误顺序；3) v1 与 resumed 均只支持单 attempt，多 attempt 缺少逐 attempt 的 bootstrap/checkpoint 归属；4) resumed 无 `RoundStarted` 时无法可靠推导 `rounds_completed`，记录为 Deferred；5) 批量执行期间若外部写入新 turn，本次枚举不会包含它（只读快照语义与既有 `--all` 一致）；6) 未改 `jessica-core`、schema、既有 `replay --session` 或 bundle replay 语义；7) 本地 `DESIGN.md` 保持未跟踪；未提交、未推送。
 
+Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
+
+目标：把委托子 Agent 的内部事件（模型轮次、工具调用、终止原因与计数）作为嵌套证据写入父 turn 的同一条哈希链，使 `trace verify`、`trace digest`、`trace export` / `verify-bundle` 自动覆盖；父 replay 仍不执行子 Agent。
+
+操作：
+
+1. `jessica-core`（经用户批准）：`TRACE_SCHEMA_VERSION` 2→3，`MIN_SUPPORTED_TRACE_SCHEMA_VERSION` 保持 1，支持范围 1..=3；新增 `TracePayload::ChildAgent { call_id, event }`，`kind() == "child_agent"`、`required_trace_schema_version() == 3`。envelope 语义：`attempt` = 父 attempt，`session_id` = 子 session，`call_id` 链接父侧 `delegate_task` 调用；该 payload 永远 trace-only，不写 legacy mirror；v1/v2 继续可读，v2 读者因版本不识别拒绝 v3。
+2. `jessica-runtime`：新增公共 `ChildEventSink` trait（`emit(child_session_id, call_id, event) -> Result<(), EventSinkError>`）与 `AgentChildExecutor::with_child_event_sink`；子 `AgentLoop` 的每个事件先交给 child sink，再走原有私有 broadcast。始终包装内部 `CountingChildSink`，统计已接受的 `RoundFinished`、`ToolCallStarted` 与错误 `ToolCallFinished`；timeout 时父 `ChildSessionEnded` 报告已观测计数而非固定 0/0/0，正常路径继续使用 transcript 计数。child sink 失败会中止子执行并按 `Cancelled` 报告；父侧 lifecycle sink 行为与“子事件不进入父 broadcast”不变。
+3. `jessica-cli` journal：`TurnJournal` 实现 `ChildEventSink` 并提供 `child_sink()`；CLI 同时挂父 sink 与 child sink。强制括号顺序：父 `ChildSessionStarted` → 子 `SessionStarted` → 子轨迹 → 子 `SessionEnded`（timeout 可缺失）→ 父 `ChildSessionEnded`。子事件记录为 `TracePayload::ChildAgent`，父 attempt + 子 session + parent `call_id`，无 legacy；拒绝无括号、重复 start、end 后事件、括号外事件、parent-only 事件、缺失终态（Cancelled 除外）、父 session 提前结束、未闭合时 `finish_turn` 与过期 attempt。
+4. `jessica-memory`：接受并校验 `ChildAgent`：必须同时有 attempt 与 session、`call_id` 非空、禁止嵌套 child lifecycle、禁止 legacy mirror；`payload_kind = "child_agent"`，`event_type` 存内部事件 tag；读取校验、链哈希与 `verify_exported_trace` 同步支持；SQLite schema 不变。
+5. verifier：严格子轨迹校验以“该 turn 是否含至少一个 `ChildAgent`”为开关。子 `SessionStarted` 必须是该 `(child_session_id, call_id)` 的首个证据，bootstrap 精确等于 `[system(CHILD_AGENT_SYSTEM_PROMPT), user(task)]`；task 来自同一父 attempt/session 中尚未 finished 的 `delegate_task` 参数，且同一父调用不得链接多个子 session。校验子轮次从 1 连续、`ModelDelta` 在开放轮内、tool start 在 round finish 后并成对，禁止 parent-only 与嵌套 lifecycle 事件。子终态 reason 与父一致，rounds/tool_calls/tool_errors 与观测前缀一致；timeout 无子终态仅允许父 `Cancelled`；工具限额被拒调用允许父计数比观测多 1。生命周期-only v2/v3 trace 继续按 v2 规则通过。
+6. replay / digest / bundle：`trace replay` 接受 v1–v3，`ChildAgent` 在校验后被忽略，父 replay 不执行子 Agent、不产生子 provider 调用；哈希链、`trace digest`、`trace export`、`verify-bundle` 自动覆盖子轨迹原始 JSON，bundle 格式、`report_version` 与既有 digest 文本/JSON 契约不变。
+7. 文档与测试：README 记录 v3 子轨迹语义、严格校验、replay 忽略子轨迹、digest/bundle 自动覆盖，以及子 prompt/模型输出/工具参数现在会持久化的隐私与留存提示（保留期删除仍留给 8.7）。新增/更新 27 个测试：core 1、runtime 3、journal 11、memory 2、verifier 8、replay 1、真实 delegation E2E 1（含 export/verify-bundle 与子轨迹篡改），并更新既有版本/报告断言。
+
+验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 945 passed, 0 failed, 2 ignored（58 suites）。
+
+偏离/说明：1) child sink 拒绝会中止子执行，此时 transcript 计数可能大于已接受证据；CLI journal 自身失败，正常路径不会产生可完成 turn，未为该异常路径定义“部分证据”验证；2) 严格子轨迹校验以含 `ChildAgent` 为开关，纯生命周期 v3 trace 仍可验证，CLI 生产者总会写 `ChildAgent`；3) replay 只忽略子证据，不重放子 Agent，也不核对子 provider 请求/工具结果的可复现性，子执行一致性留待后续 Task；4) 不支持递归嵌套委派，子工具集仍由 `delegate_task` 参数收紧；5) 子对话与父 trace 同库持久化并进入 bundle，保留/删除策略未实现，留给 8.7；6) 未改 SQLite schema、`delegate_task` 结果契约或 bundle 格式，未新增第三方 crate，未提交/推送，`DESIGN.md` 保持未跟踪。
+
 后续候选（未确认，不执行）：
 
-- 8.6 子 Agent 轨迹证据（需先设计，可能需 core 批准）。
+- 8.6 子 Agent 轨迹证据已完成（见上）。
 - 8.7 保留期/隐私删除（需先确认 append-only 契约变更）。
 
 ---
@@ -2104,11 +2122,16 @@ Task 8.4 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实�
 
 Task 8.5 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付 `--all --replay` 与 v1/Resumed 覆盖扩展。`jessica-runtime`：新增 additive `SessionCheckpoint::from_recorded_state(session_id, messages, rounds_completed)`（`last_seq=0`、无终态），供 trace 只记录 checkpoint 状态时重建 resume 起点。`jessica-cli`：`replay` 抽出 fresh/resumed 共用路径，新增 `replay_resumed_session`（真实 `AgentLoop::resume`、总预算 `rounds_completed + 脚本轮数`）与 no-`SessionStarted` 的 resumed script 模式；`trace_replay` 接受 v1/v2，fresh v1 用 `turn_started.messages` bootstrap、resumed 用首 `RoundStarted.round - 1` 推导已完成轮数并禁止 `SessionStarted`，无轮 resumed 与 v1/resumed 多 attempt 显式 unsupported；`trace_verify` 新增逐 turn 加载/验证/重放的批量路径（单 trace 内存有界）、`TraceReplayUnsupportedBatch`、拒绝 `--allow-open --replay`，`report_version` 保持 3；解析器/usage/README 同步。测试新增/更新 18 个：runtime checkpoint 1、replay 2、trace_replay 3、CLI 解析 2、trace_verify E2E 8、真实 resume E2E 1，以及既有 v1/batch 期望更新。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 918 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) resumed 原始 `Budget.max_rounds` 未入 trace，以 `rounds_completed + 脚本轮数` 复现；2) `--all --replay` 顺序执行并逐 turn 重开只读库；3) v1/resumed 均仅单 attempt；4) 无模型轮 resumed 与批量外部新增 turn 等已记入 Deferred；5) 未改 `jessica-core`、schema、既有 `replay --session` 或 bundle replay；6) 未提交、未推送，`DESIGN.md` 保持未跟踪。
 
+Task 8.6 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付子 Agent 轨迹证据。`jessica-core`（经批准）：`TRACE_SCHEMA_VERSION` 2→3，新增 `TracePayload::ChildAgent { call_id, event }`，支持 1..=3，v2 reader 拒绝 v3，payload 永远 trace-only。`jessica-runtime`：新增 `ChildEventSink` 与 `with_child_event_sink`，子事件先入 child sink，始终包装 `CountingChildSink`，timeout 父终态使用已观测计数，sink 失败按 Cancelled 中止。`jessica-cli`：journal 实现 child sink，强制父 start → 子 start → 子轨迹 → 子 end（timeout 可缺）→ 父 end，拒绝无括号/重复/越界/parent-only/缺失终态/过期 attempt；verifier 在 turn 含 `ChildAgent` 时严格校验 bootstrap、delegate 链接、轮次与工具状态机、终态和计数（timeout 前缀、工具限额 +1），生命周期-only trace 保持 v2 规则；replay 接受 v1–v3 并忽略子证据；README 记录 v3、replay 不执行子 Agent、digest/bundle 覆盖与隐私留存提示。`jessica-memory`：`payload_kind=child_agent`、`event_type` 存内部 tag，拒绝缺 attempt/session、空 call_id、嵌套 lifecycle 与 legacy mirror，链/离线导出同步。测试新增/更新 27 个（core 1、runtime 3、journal 11、memory 2、verifier 8、replay 1、真实 delegation E2E 1，含 export/verify-bundle 与子轨迹篡改）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 945 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) child sink 拒绝后 transcript 计数可大于已接受证据，journal 失败且不定义部分证据验证；2) 严格校验以含 `ChildAgent` 为开关；3) replay 不执行子 Agent，不验证子 provider/工具可复现性；4) 不支持递归委派；5) 保留/隐私删除留给 8.7；6) 未改 SQLite schema/bundle 格式，未新增第三方 crate，未提交/未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
 
-· Trace Integrity v2（2026-11-17 规划）的包络与存储部分已由 Task 7.1（2026-11-18）交付，生产者侧无损记录由 Task 7.2（2026-11-18）交付：新增 additive `TraceEvent` 包络、`trace_events`/`trace_heads`、事务内 legacy+trace 双写、fail-closed、acceptance 事件归属与 `Resumed` 轨迹，未修改 `AgentEvent`；`EventSink` + `TurnJournal` 保证成功 turn 的全部生产事件与 `TurnEnded` 在返回前提交，pump 不再写 trace，`Gap` 变体保留但 CLI 不再产生。事件模型 v2 已由 Task 7.3（2026-11-19）交付：`SessionStarted.messages`、`RoundStarted`/`RoundFinished`（含 usage）、`PermissionDecided`、`ChildSessionStarted`/`ChildSessionEnded`，`TRACE_SCHEMA_VERSION=2` 且 v1 可读；permission/child 生命周期仅写 trace（不镜像 legacy），子会话内部轨迹仍不持久化。trace verify CLI 已由 Task 7.4（2026-11-19）交付：`jessica trace verify --turn/--all` 以只读方式打开事件库，校验结构、v2 语义和 trace↔legacy 镜像，支持稳定 JSON 报告与 `--allow-open`；默认不执行 replay。单 turn 执行一致性已由 Task 7.5（2026-11-19）交付：`trace verify --turn ... --replay` 用 trace 自身的 `SessionStarted.messages` 与录制事件重建每个 fresh attempt，驱动真实 `AgentLoop` 并逐事件比较；仅覆盖 closed v2 fresh、Completed/Error/MaxRounds，trace-only 与 CLI governance 事件排除，其他轨迹显式 unsupported。仍暂缓/未实现：EventStore v2（WAL/增量历史，消除 O(n²)）、批量 `--all --replay` parity 与 Resumed/Cancelled/Acceptance/非 MaxRounds 等超出 Task 7.5 子集的重放、子 Agent 内部轨迹持久化（当前只有父侧 child 生命周期）、trace 保留/GC、fsync/掉电级持久性、v1→v2 混合 legacy 流 replay（见下方 replay 条目）；replay/resume 仍只读 legacy 事件流，trace 不是 recovery 的唯一来源。上述各项须单开 Task。
+· Trace Integrity v2（2026-11-17 规划）的包络与存储部分已由 Task 7.1（2026-11-18）交付，生产者侧无损记录由 Task 7.2（2026-11-18）交付：新增 additive `TraceEvent` 包络、`trace_events`/`trace_heads`、事务内 legacy+trace 双写、fail-closed、acceptance 事件归属与 `Resumed` 轨迹，未修改 `AgentEvent`；`EventSink` + `TurnJournal` 保证成功 turn 的全部生产事件与 `TurnEnded` 在返回前提交，pump 不再写 trace，`Gap` 变体保留但 CLI 不再产生。事件模型 v2 已由 Task 7.3（2026-11-19）交付：`SessionStarted.messages`、`RoundStarted`/`RoundFinished`（含 usage）、`PermissionDecided`、`ChildSessionStarted`/`ChildSessionEnded`，`TRACE_SCHEMA_VERSION=2` 且 v1 可读；permission/child 生命周期仅写 trace（不镜像 legacy），子会话内部轨迹当时未持久化，后由 Task 8.6 以 v3 嵌套证据补齐。trace verify CLI 已由 Task 7.4（2026-11-19）交付：`jessica trace verify --turn/--all` 以只读方式打开事件库，校验结构、v2 语义和 trace↔legacy 镜像，支持稳定 JSON 报告与 `--allow-open`；默认不执行 replay。单 turn 执行一致性已由 Task 7.5（2026-11-19）交付：`trace verify --turn ... --replay` 用 trace 自身的 `SessionStarted.messages` 与录制事件重建每个 fresh attempt，驱动真实 `AgentLoop` 并逐事件比较；仅覆盖 closed v2 fresh、Completed/Error/MaxRounds，trace-only 与 CLI governance 事件排除，其他轨迹显式 unsupported。子 Agent 内部轨迹已由 Task 8.6（2026-11-19）交付为 v3 嵌套证据。仍暂缓/未实现：trace 保留/GC 与隐私删除（8.7 候选）、fsync/掉电级持久性、v1→v2 混合 legacy 流 replay（见下方 replay 条目）、子 Agent replay 与子 provider 调用/工具结果可复现性（8.6 只记录并验证嵌套证据，不重放子执行）、跨 turn 聚合摘要之外的签名/TSA；replay/resume 仍只读 legacy 事件流，trace 不是 recovery 的唯一来源。上述各项须单开 Task。
+· Task 8.6 的子轨迹严格校验只在 turn 含 `ChildAgent` 时启用；纯生命周期 v3 trace（旧生产者或手工证据）仍按 v2 规则通过。若要强制所有 v3 生产者必须携带子轨迹，需升级版本策略或新增显式模式，不能把缺失证据当作合规。
+· Task 8.6 的 `--replay` 仍忽略 `ChildAgent`，不执行子 Agent，因此只证明父事件流可复现，不证明子 provider 请求、子工具结果或子 timeout 可复现。若要验证子执行一致性，需单开 Task 定义子 replay 的脚本、预算与 timeout 语义。
+· Task 8.6 不记录子 Agent 的独立预算/超时配置，父 `ChildSessionEnded` 只有 reason 与计数；无法从 trace 审计实际限额值。若需要，须扩展 trace schema 并保持 v1–v3 兼容。
 · Phase 7 后续 P2 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：执行安全。bash/CommandSensor/CommandAcceptanceCheck/MCP 子进程的进程组终止与超时；文件工具 TOCTOU（openat2/cap-std 等需依赖审批）；Permission v2（allow_always/reject_always、作用域/撤销/审计）；WASI 确定性时钟/随机；密钥脱敏。
 · Phase 7 后续 P3 候选（2026-11-17 规划，暂缓，不属于当前 Phase 7 范围）：能力扩展。edit_file/apply_patch/grep/glob/list_dir；Anthropic prompt caching/thinking/image；MCP resume/HTTP-SSE、per-session workspace；memory/skills 显式写入与真实 embedder。
 · 可观测性仍按 2026-11-14 的决定暂缓，不因本次 Phase 7 规划重启。

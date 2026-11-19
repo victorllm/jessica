@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode, TurnId};
 use jessica_core::types::{AgentEvent, Message, SessionEndReason, SessionId};
+use jessica_runtime::ChildEventSink;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +84,20 @@ struct JournalState {
     writes_stopped: bool,
     /// Whether `turn_ended` has been committed.
     closed: bool,
+    /// Child lifecycle and trajectory state keyed by `(child_session, call_id)`.
+    children: BTreeMap<(SessionId, String), ChildBracket>,
+}
+
+/// One delegated child's journal bracket.
+struct ChildBracket {
+    /// Parent attempt and session that owns the child.
+    parent: CurrentAttempt,
+    /// Whether the child's own `session_started` was recorded.
+    trajectory_started: bool,
+    /// Whether the child's own `session_ended` was recorded.
+    trajectory_ended: bool,
+    /// Whether the parent's `child_session_ended` was recorded.
+    parent_ended: bool,
 }
 
 /// One attributed agent event ready for the writer.
@@ -198,6 +213,15 @@ impl TurnJournal {
     /// Returns the producer-side sink, when persistence is enabled.
     pub(crate) fn sink(self: &Arc<Self>) -> Option<Arc<dyn EventSink>> {
         self.enabled.then(|| Arc::clone(self) as Arc<dyn EventSink>)
+    }
+
+    /// Returns the child-event sink, when persistence is enabled.
+    ///
+    /// The runtime attaches this to delegated child loops so their internal
+    /// events become evidence under the parent turn's trace.
+    pub(crate) fn child_sink(self: &Arc<Self>) -> Option<Arc<dyn ChildEventSink>> {
+        self.enabled
+            .then(|| Arc::clone(self) as Arc<dyn ChildEventSink>)
     }
 
     /// Returns the first integrity failure, if any.
@@ -397,6 +421,18 @@ impl TurnJournal {
             .turn_id
             .clone()
             .ok_or_else(|| integrity("the turn trace was never started"))?;
+        {
+            let state = self.lock_state();
+            if let Some(((child, call), _)) = state
+                .children
+                .iter()
+                .find(|(_, bracket)| !bracket.parent_ended)
+            {
+                return Err(integrity(format!(
+                    "child session `{child}` for call `{call}` was never ended"
+                )));
+            }
+        }
 
         let (ack, receiver) = oneshot::channel();
         self.send(JournalCommand::Finish {
@@ -477,6 +513,155 @@ impl TurnJournal {
             self.lock_state().current = None;
         }
         Ok(())
+    }
+
+    /// Attributes and enqueues one event emitted inside a delegated child.
+    ///
+    /// Child events are trace-only: they never enter the legacy event log, and
+    /// the child's own session has no attempt attribution. The entry is nested
+    /// under the parent attempt and the child session.
+    async fn record_child_event(
+        &self,
+        child_session_id: SessionId,
+        call_id: String,
+        event: AgentEvent,
+    ) -> Result<(), RecorderError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let trace = match self.prepare_child_event(&child_session_id, &call_id, &event) {
+            Ok(trace) => trace,
+            Err(cause) => {
+                if !self.lock_state().closed {
+                    self.fail_integrity(cause.clone(), true);
+                }
+                return Err(integrity(cause));
+            }
+        };
+
+        self.send_agent_command(JournalCommand::Trace {
+            trace: Box::new(trace),
+            legacy: None,
+            ack: None,
+        })
+        .await
+    }
+
+    /// Builds the trace envelope for one child event.
+    fn prepare_child_event(
+        &self,
+        child_session_id: &SessionId,
+        call_id: &str,
+        event: &AgentEvent,
+    ) -> Result<TraceEvent, String> {
+        let mut state = self.lock_state();
+        if state.closed {
+            return Err("the turn trace is already closed".to_owned());
+        }
+        if state.writes_stopped {
+            return Err(state
+                .failure
+                .clone()
+                .unwrap_or_else(|| "trace writes have stopped".to_owned()));
+        }
+        let turn_id = state
+            .turn_id
+            .clone()
+            .ok_or_else(|| "a child event arrived before the turn trace started".to_owned())?;
+
+        let active_parent = state.current.clone().ok_or_else(|| {
+            format!(
+                "child session `{child_session_id}` emitted an event with no active parent session"
+            )
+        })?;
+        let key = (child_session_id.clone(), call_id.to_owned());
+        let bracket = state.children.get_mut(&key).ok_or_else(|| {
+            format!(
+                "child session `{child_session_id}` for call `{call_id}` emitted an event \
+                 without a matching start"
+            )
+        })?;
+        if bracket.parent_ended {
+            return Err(format!(
+                "child session `{child_session_id}` for call `{call_id}` emitted an event \
+                 after it was ended"
+            ));
+        }
+        if active_parent.attempt != bracket.parent.attempt
+            || active_parent.session_id != bracket.parent.session_id
+        {
+            return Err(format!(
+                "child session `{child_session_id}` emitted an event while attempt {} \
+                 session `{}` was active instead of its parent attempt {} session `{}`",
+                active_parent.attempt,
+                active_parent.session_id,
+                bracket.parent.attempt,
+                bracket.parent.session_id
+            ));
+        }
+
+        match event {
+            AgentEvent::SessionStarted { session_id, .. } => {
+                if session_id != child_session_id {
+                    return Err(format!(
+                        "child session `{child_session_id}` started as `{session_id}`"
+                    ));
+                }
+                if bracket.trajectory_started {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` started twice"
+                    ));
+                }
+                bracket.trajectory_started = true;
+            }
+            AgentEvent::SessionEnded { session_id, .. } => {
+                if session_id != child_session_id {
+                    return Err(format!(
+                        "child session `{child_session_id}` ended as `{session_id}`"
+                    ));
+                }
+                if !bracket.trajectory_started {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` ended before \
+                         it started"
+                    ));
+                }
+                if bracket.trajectory_ended {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` ended twice"
+                    ));
+                }
+                bracket.trajectory_ended = true;
+            }
+            AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::AcceptanceFailed { .. }
+            | AgentEvent::PolicyDenied { .. } => {
+                return Err(format!(
+                    "child session `{child_session_id}` emitted a parent-only event: {event:?}"
+                ));
+            }
+            _ => {
+                if !bracket.trajectory_started || bracket.trajectory_ended {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` emitted an \
+                         event outside its session bracket: {event:?}"
+                    ));
+                }
+            }
+        }
+
+        Ok(TraceEvent::new(
+            turn_id,
+            Some(bracket.parent.attempt),
+            Some(child_session_id.clone()),
+            TracePayload::ChildAgent {
+                call_id: call_id.to_owned(),
+                event: event.clone(),
+            },
+        ))
     }
 
     /// Builds the trace envelope and legacy mirror for one event.
@@ -563,6 +748,16 @@ impl TurnJournal {
                         current.session_id
                     ));
                 }
+                if let Some((key, _)) = state.children.iter().find(|(_, bracket)| {
+                    bracket.parent.attempt == attempt
+                        && bracket.parent.session_id == *session_id
+                        && !bracket.parent_ended
+                }) {
+                    return Err(format!(
+                        "session `{session_id}` ended while child `{}` from call `{}` was still open",
+                        key.0, key.1
+                    ));
+                }
                 Ok(PreparedEvent {
                     trace: TraceEvent::new(
                         turn_id,
@@ -580,9 +775,7 @@ impl TurnJournal {
             // the legacy log through the surrounding tool events. Replay does
             // not re-run permission gates or child sessions, so mirroring these
             // would make the legacy stream impossible to reproduce exactly.
-            AgentEvent::PermissionDecided { .. }
-            | AgentEvent::ChildSessionStarted { .. }
-            | AgentEvent::ChildSessionEnded { .. } => {
+            AgentEvent::PermissionDecided { .. } => {
                 let current = state
                     .current
                     .clone()
@@ -592,6 +785,104 @@ impl TurnJournal {
                         turn_id,
                         Some(current.attempt),
                         Some(current.session_id),
+                        TracePayload::Agent {
+                            event: event.clone(),
+                        },
+                    ),
+                    legacy: None,
+                    clear_current: false,
+                })
+            }
+            AgentEvent::ChildSessionStarted {
+                child_session_id,
+                call_id,
+            } => {
+                let current = state
+                    .current
+                    .clone()
+                    .ok_or_else(|| "an event arrived with no active session".to_owned())?;
+                let key = (child_session_id.clone(), call_id.clone());
+                if state.children.contains_key(&key) {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` started twice"
+                    ));
+                }
+                state.children.insert(
+                    key,
+                    ChildBracket {
+                        parent: current.clone(),
+                        trajectory_started: false,
+                        trajectory_ended: false,
+                        parent_ended: false,
+                    },
+                );
+                Ok(PreparedEvent {
+                    trace: TraceEvent::new(
+                        turn_id,
+                        Some(current.attempt),
+                        Some(current.session_id),
+                        TracePayload::Agent {
+                            event: event.clone(),
+                        },
+                    ),
+                    legacy: None,
+                    clear_current: false,
+                })
+            }
+            AgentEvent::ChildSessionEnded {
+                child_session_id,
+                call_id,
+                reason,
+                ..
+            } => {
+                let current = state
+                    .current
+                    .clone()
+                    .ok_or_else(|| "an event arrived with no active session".to_owned())?;
+                let bracket = state
+                    .children
+                    .get_mut(&(child_session_id.clone(), call_id.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "child session `{child_session_id}` for call `{call_id}` ended \
+                             without a matching start"
+                        )
+                    })?;
+                if bracket.parent_ended {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` ended twice"
+                    ));
+                }
+                if bracket.parent.attempt != current.attempt
+                    || bracket.parent.session_id != current.session_id
+                {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` ended under \
+                         attempt {} session `{}` instead of its parent attempt {} session `{}`",
+                        current.attempt,
+                        current.session_id,
+                        bracket.parent.attempt,
+                        bracket.parent.session_id
+                    ));
+                }
+                // A timed-out child is dropped before its own terminal event,
+                // so only cancellation may close a started trajectory without
+                // a child `session_ended`.
+                if bracket.trajectory_started
+                    && !bracket.trajectory_ended
+                    && *reason != SessionEndReason::Cancelled
+                {
+                    return Err(format!(
+                        "child session `{child_session_id}` for call `{call_id}` ended without \
+                         its own terminal event"
+                    ));
+                }
+                bracket.parent_ended = true;
+                Ok(PreparedEvent {
+                    trace: TraceEvent::new(
+                        turn_id,
+                        Some(bracket.parent.attempt),
+                        Some(bracket.parent.session_id.clone()),
                         TracePayload::Agent {
                             event: event.clone(),
                         },
@@ -730,6 +1021,20 @@ impl EventSink for TurnJournal {
     }
 }
 
+#[async_trait]
+impl ChildEventSink for TurnJournal {
+    async fn emit(
+        &self,
+        child_session_id: SessionId,
+        call_id: String,
+        event: AgentEvent,
+    ) -> Result<(), EventSinkError> {
+        self.record_child_event(child_session_id, call_id, event)
+            .await
+            .map_err(|error| EventSinkError::new(error.to_string()))
+    }
+}
+
 /// Single writer that turns commands into trace/legacy transactions.
 async fn writer_loop(
     journal: Arc<dyn EventJournal>,
@@ -858,7 +1163,7 @@ fn integrity(message: impl Into<String>) -> RecorderError {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use jessica_core::types::{PermissionDecision, ToolCall};
+    use jessica_core::types::{PermissionDecision, ToolCall, ToolResult};
     use jessica_harness::Harness;
     use tokio::sync::Notify;
     use tokio::time::timeout;
@@ -1620,5 +1925,607 @@ mod tests {
             records[5].1.is_some(),
             "session_ended keeps its legacy mirror"
         );
+    }
+
+    /// Opens a journal whose parent session is already started.
+    async fn journal_with_parent_session() -> (
+        Arc<RecordingJournal>,
+        Arc<TurnJournal>,
+        SessionId,
+        SessionId,
+    ) {
+        let recorder = Arc::new(RecordingJournal::default());
+        let (journal, _cancel) = active_journal(&recorder, 16);
+        let parent = SessionId::new("parent");
+        let child = SessionId::new("child");
+        let messages = vec![Message::system("system"), Message::user("go")];
+
+        journal
+            .begin_turn(
+                TurnId::new("turn-child"),
+                TraceTurnMode::Fresh,
+                messages.clone(),
+                parent.clone(),
+            )
+            .await
+            .expect("turn must start");
+        journal.begin_attempt(1, &parent).expect("attempt");
+        journal
+            .record_session_start(&parent, &messages)
+            .await
+            .expect("parent metadata");
+        journal
+            .sink()
+            .expect("sink")
+            .emit(AgentEvent::SessionStarted {
+                session_id: parent.clone(),
+                messages: Vec::new(),
+            })
+            .await
+            .expect("parent start");
+        (recorder, journal, parent, child)
+    }
+
+    /// Opens the parent-side child lifecycle bracket.
+    async fn open_child_bracket(sink: &Arc<dyn EventSink>, child: &SessionId) {
+        sink.emit(AgentEvent::ChildSessionStarted {
+            child_session_id: child.clone(),
+            call_id: "parent-call".to_owned(),
+        })
+        .await
+        .expect("child start");
+    }
+
+    #[tokio::test]
+    async fn child_trajectory_events_are_trace_only_and_nested_under_the_parent_attempt() {
+        let (recorder, journal, parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: vec![Message::system("child prompt"), Message::user("do it")],
+                },
+            )
+            .await
+            .expect("child start evidence");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::RoundStarted { round: 1 },
+            )
+            .await
+            .expect("round start");
+        child_sink
+            .emit(child.clone(), "parent-call".to_owned(), delta("thinking"))
+            .await
+            .expect("model delta");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::RoundFinished {
+                    round: 1,
+                    usage: None,
+                },
+            )
+            .await
+            .expect("round finish");
+        let call = ToolCall::new("child-call", "echo", serde_json::json!({}));
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::ToolCallStarted { call: call.clone() },
+            )
+            .await
+            .expect("tool start");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::ToolCallFinished {
+                    result: ToolResult::success(&call.id, "tool output"),
+                },
+            )
+            .await
+            .expect("tool finish");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionEnded {
+                    session_id: child.clone(),
+                    reason: SessionEndReason::Completed,
+                },
+            )
+            .await
+            .expect("child end evidence");
+
+        sink.emit(AgentEvent::ChildSessionEnded {
+            child_session_id: child.clone(),
+            call_id: "parent-call".to_owned(),
+            reason: SessionEndReason::Completed,
+            rounds: 1,
+            tool_calls: 1,
+            tool_errors: 0,
+        })
+        .await
+        .expect("parent child end");
+        sink.emit(AgentEvent::SessionEnded {
+            session_id: parent.clone(),
+            reason: SessionEndReason::Completed,
+        })
+        .await
+        .expect("parent end");
+        journal
+            .finish_turn(SessionEndReason::Completed)
+            .await
+            .expect("turn must close");
+        journal.shutdown();
+
+        let records = recorder.records();
+        assert_eq!(
+            records.len(),
+            13,
+            "turn, parent lifecycle pairs, seven child facts, turn end: {records:?}"
+        );
+        assert!(matches!(
+            records[1].0.payload,
+            TracePayload::Agent {
+                event: AgentEvent::SessionStarted { .. }
+            }
+        ));
+        assert!(matches!(
+            records[2].0.payload,
+            TracePayload::Agent {
+                event: AgentEvent::ChildSessionStarted { .. }
+            }
+        ));
+        assert!(matches!(
+            records[10].0.payload,
+            TracePayload::Agent {
+                event: AgentEvent::ChildSessionEnded { .. }
+            }
+        ));
+        assert!(
+            records[2].1.is_none() && records[10].1.is_none(),
+            "parent-side child lifecycle stays trace-only"
+        );
+        assert_eq!(records[2].0.session_id.as_ref(), Some(&parent));
+        assert_eq!(records[10].0.session_id.as_ref(), Some(&parent));
+
+        let child_events = [
+            &records[3].0.payload,
+            &records[4].0.payload,
+            &records[5].0.payload,
+            &records[6].0.payload,
+            &records[7].0.payload,
+            &records[8].0.payload,
+            &records[9].0.payload,
+        ];
+        let expected = [
+            "session_started",
+            "round_started",
+            "model_delta",
+            "round_finished",
+            "tool_call_started",
+            "tool_call_finished",
+            "session_ended",
+        ];
+        for (index, (payload, expected)) in child_events.iter().zip(expected).enumerate() {
+            let TracePayload::ChildAgent { call_id, event } = payload else {
+                panic!("record {} must be child evidence: {payload:?}", index + 3);
+            };
+            assert_eq!(call_id, "parent-call");
+            let encoded = serde_json::to_value(event).expect("child evidence serializes");
+            assert_eq!(encoded["type"], serde_json::json!(expected));
+            assert_eq!(records[index + 3].0.attempt, Some(1));
+            assert_eq!(records[index + 3].0.session_id.as_ref(), Some(&child));
+            assert!(
+                records[index + 3].1.is_none(),
+                "child evidence never enters the legacy log"
+            );
+        }
+        assert_eq!(recorder.attempts(), records.len());
+        assert_eq!(journal.integrity_failure(), None);
+        assert!(journal.lock_state().closed);
+    }
+
+    #[tokio::test]
+    async fn a_child_event_without_an_open_bracket_is_rejected() {
+        let (recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let child_sink = journal.child_sink().expect("child sink");
+
+        let error = child_sink
+            .emit(
+                child,
+                "missing-call".to_owned(),
+                AgentEvent::RoundStarted { round: 1 },
+            )
+            .await
+            .expect_err("a child event without a start must be rejected");
+
+        assert!(
+            error.to_string().contains("without a matching start"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            journal
+                .integrity_failure()
+                .expect("the rejection must be observable")
+                .contains("without a matching start")
+        );
+        assert!(
+            !recorder
+                .records()
+                .iter()
+                .any(|(trace, _)| matches!(trace.payload, TracePayload::ChildAgent { .. })),
+            "no evidence may be written for an unknown child"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_child_lifecycle_start_is_rejected() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        open_child_bracket(&sink, &child).await;
+
+        let error = sink
+            .emit(AgentEvent::ChildSessionStarted {
+                child_session_id: child,
+                call_id: "parent-call".to_owned(),
+            })
+            .await
+            .expect_err("a duplicate bracket must be rejected");
+
+        assert!(
+            error.to_string().contains("started twice"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn child_events_after_the_parent_lifecycle_end_are_rejected() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+        sink.emit(AgentEvent::ChildSessionEnded {
+            child_session_id: child.clone(),
+            call_id: "parent-call".to_owned(),
+            reason: SessionEndReason::Cancelled,
+            rounds: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+        })
+        .await
+        .expect("parent child end");
+
+        let error = child_sink
+            .emit(
+                child,
+                "parent-call".to_owned(),
+                AgentEvent::RoundStarted { round: 1 },
+            )
+            .await
+            .expect_err("evidence after the bracket must be rejected");
+
+        assert!(
+            error.to_string().contains("after it was ended"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn child_evidence_must_stay_inside_its_session_bracket() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionEnded {
+                    session_id: child.clone(),
+                    reason: SessionEndReason::Completed,
+                },
+            )
+            .await
+            .expect("child end");
+
+        let error = child_sink
+            .emit(
+                child,
+                "parent-call".to_owned(),
+                AgentEvent::RoundStarted { round: 1 },
+            )
+            .await
+            .expect_err("evidence after the child terminal must be rejected");
+
+        assert!(
+            error.to_string().contains("outside its session bracket"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn child_evidence_rejects_parent_only_events() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+
+        let error = child_sink
+            .emit(
+                child,
+                "parent-call".to_owned(),
+                AgentEvent::PermissionDecided {
+                    call: ToolCall::new("child-call", "echo", serde_json::json!({})),
+                    decision: PermissionDecision::Deny,
+                },
+            )
+            .await
+            .expect_err("a parent-only event inside a child must be rejected");
+
+        assert!(
+            error.to_string().contains("parent-only event"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_completed_child_must_supply_its_own_terminal_event() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+
+        let error = sink
+            .emit(AgentEvent::ChildSessionEnded {
+                child_session_id: child,
+                call_id: "parent-call".to_owned(),
+                reason: SessionEndReason::Completed,
+                rounds: 0,
+                tool_calls: 0,
+                tool_errors: 0,
+            })
+            .await
+            .expect_err("a completed child needs its terminal evidence");
+
+        assert!(
+            error.to_string().contains("without its own terminal event"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_child_may_end_without_its_own_terminal_event() {
+        let (recorder, journal, parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::RoundStarted { round: 1 },
+            )
+            .await
+            .expect("observed prefix");
+
+        sink.emit(AgentEvent::ChildSessionEnded {
+            child_session_id: child.clone(),
+            call_id: "parent-call".to_owned(),
+            reason: SessionEndReason::Cancelled,
+            rounds: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+        })
+        .await
+        .expect("a timed-out child has no terminal evidence");
+        sink.emit(AgentEvent::SessionEnded {
+            session_id: parent,
+            reason: SessionEndReason::Cancelled,
+        })
+        .await
+        .expect("parent end");
+        journal
+            .finish_turn(SessionEndReason::Cancelled)
+            .await
+            .expect("turn must close");
+        journal.shutdown();
+
+        let records = recorder.records();
+        assert!(matches!(
+            records.last().map(|(trace, _)| &trace.payload),
+            Some(TracePayload::TurnEnded {
+                reason: SessionEndReason::Cancelled
+            })
+        ));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(trace, _)| matches!(trace.payload, TracePayload::ChildAgent { .. }))
+                .count(),
+            2,
+            "only the observed child prefix is evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_session_cannot_end_while_its_child_is_open() {
+        let (_recorder, journal, parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+
+        let error = sink
+            .emit(AgentEvent::SessionEnded {
+                session_id: parent,
+                reason: SessionEndReason::Cancelled,
+            })
+            .await
+            .expect_err("the parent must wait for its child");
+
+        assert!(
+            error.to_string().contains("was still open"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn finish_turn_refuses_an_open_child_until_the_bracket_closes() {
+        let (_recorder, journal, parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child.clone(),
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect("child start");
+
+        let error = journal
+            .finish_turn(SessionEndReason::Cancelled)
+            .await
+            .expect_err("an open child must block the close");
+        assert!(
+            error.to_string().contains("was never ended"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            journal.integrity_failure().is_none(),
+            "refusing to close must not poison the journal"
+        );
+
+        sink.emit(AgentEvent::ChildSessionEnded {
+            child_session_id: child.clone(),
+            call_id: "parent-call".to_owned(),
+            reason: SessionEndReason::Cancelled,
+            rounds: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+        })
+        .await
+        .expect("close the child bracket");
+        sink.emit(AgentEvent::SessionEnded {
+            session_id: parent,
+            reason: SessionEndReason::Cancelled,
+        })
+        .await
+        .expect("parent end");
+        journal
+            .finish_turn(SessionEndReason::Cancelled)
+            .await
+            .expect("the bracket is closed now");
+        journal.shutdown();
+    }
+
+    #[tokio::test]
+    async fn child_events_must_belong_to_the_active_parent_attempt() {
+        let (_recorder, journal, _parent, child) = journal_with_parent_session().await;
+        let sink = journal.sink().expect("sink");
+        let child_sink = journal.child_sink().expect("child sink");
+        open_child_bracket(&sink, &child).await;
+        let next_parent = SessionId::new("retry");
+        journal
+            .begin_attempt(2, &next_parent)
+            .expect("a retry becomes the active attempt");
+
+        let error = child_sink
+            .emit(
+                child.clone(),
+                "parent-call".to_owned(),
+                AgentEvent::SessionStarted {
+                    session_id: child,
+                    messages: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("evidence from a stale attempt must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("instead of its parent attempt 1"),
+            "unexpected error: {error}"
+        );
+        journal.shutdown();
     }
 }

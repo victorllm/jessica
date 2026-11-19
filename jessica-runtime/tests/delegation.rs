@@ -13,7 +13,7 @@ use jessica_core::types::{
     AgentEvent, Budget, Message, Role, SessionEndReason, SessionId, ToolCall, ToolResult,
 };
 use jessica_runtime::{
-    AgentChildExecutor, AgentLoop, CHILD_AGENT_SYSTEM_PROMPT, ChildToolFactory,
+    AgentChildExecutor, AgentLoop, CHILD_AGENT_SYSTEM_PROMPT, ChildEventSink, ChildToolFactory,
     DELEGATE_TASK_TOOL_NAME, DelegateTaskTool, DelegationError, DelegationLimits,
     ParentCapabilities, child_session_hash, narrow_tools,
 };
@@ -1444,4 +1444,319 @@ async fn a_rejected_child_end_turns_the_delegation_into_an_error() {
         Err(TryRecvError::Empty),
         "a rejected end must not be broadcast"
     );
+}
+
+/// One event offered to a [`RecordingChildSink`].
+#[derive(Clone, Debug)]
+struct RecordedChildEvent {
+    /// Child session stamped on the event.
+    child_session_id: SessionId,
+    /// Parent call id stamped on the event.
+    call_id: String,
+    /// Event offered to the sink.
+    event: AgentEvent,
+}
+
+/// Child sink that records every attempt and can reject one by index.
+struct RecordingChildSink {
+    /// Offers in call order, including a rejected attempt.
+    events: Mutex<Vec<RecordedChildEvent>>,
+    /// Number of `emit` calls observed.
+    calls: AtomicUsize,
+    /// Zero-based emit call that returns an error.
+    reject_at: Option<usize>,
+}
+
+impl RecordingChildSink {
+    /// Creates a sink that optionally rejects one emit call.
+    fn new(reject_at: Option<usize>) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            reject_at,
+        }
+    }
+
+    /// Returns the events offered so far.
+    fn events(&self) -> Vec<RecordedChildEvent> {
+        self.events
+            .lock()
+            .expect("child sink events mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl ChildEventSink for RecordingChildSink {
+    async fn emit(
+        &self,
+        child_session_id: SessionId,
+        call_id: String,
+        event: AgentEvent,
+    ) -> Result<(), EventSinkError> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.events
+            .lock()
+            .expect("child sink events mutex poisoned")
+            .push(RecordedChildEvent {
+                child_session_id,
+                call_id,
+                event,
+            });
+        if self.reject_at == Some(index) {
+            return Err(EventSinkError::new("child sink rejected the event"));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn child_internal_events_reach_the_child_sink_in_order() {
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_response(vec![ToolCall::new(
+            "child-call-1",
+            "echo",
+            json!({"value": 1}),
+        )]),
+        text_response("child answer"),
+    ]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let parent_sink = Arc::new(RecordingSink::new(None));
+    let child_sink = Arc::new(RecordingChildSink::new(None));
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&parent_sink) as Arc<dyn EventSink>)
+    .with_child_event_sink(Arc::clone(&child_sink) as Arc<dyn ChildEventSink>);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": ["echo"]}), "parent-call-7")
+        .await;
+    assert!(!result.is_error, "the child must succeed: {result:?}");
+
+    let offered = child_sink.events();
+    assert_eq!(
+        offered.len(),
+        9,
+        "the sink must observe the whole child transcript: {offered:?}"
+    );
+    let child_session_id = match &offered[0].event {
+        AgentEvent::SessionStarted {
+            session_id,
+            messages,
+        } => {
+            assert_eq!(messages.len(), 2, "two-message child bootstrap");
+            assert_eq!(messages[0].role, Role::System);
+            assert_eq!(messages[0].content, CHILD_AGENT_SYSTEM_PROMPT);
+            assert_eq!(messages[1].role, Role::User);
+            assert_eq!(messages[1].content, "do it");
+            session_id.clone()
+        }
+        other => panic!("expected the child SessionStarted first, got {other:?}"),
+    };
+    assert!(
+        offered
+            .iter()
+            .all(|recorded| recorded.child_session_id == child_session_id),
+        "every child event must carry the child session: {offered:?}"
+    );
+    assert!(
+        offered
+            .iter()
+            .all(|recorded| recorded.call_id == "parent-call-7"),
+        "every child event must carry the parent call id: {offered:?}"
+    );
+
+    match &offered[1].event {
+        AgentEvent::RoundStarted { round } => assert_eq!(*round, 1),
+        other => panic!("expected the first RoundStarted, got {other:?}"),
+    }
+    match &offered[2].event {
+        AgentEvent::RoundFinished { round, .. } => assert_eq!(*round, 1),
+        other => panic!("expected the first RoundFinished, got {other:?}"),
+    }
+    match &offered[3].event {
+        AgentEvent::ToolCallStarted { call } => assert_eq!(call.id, "child-call-1"),
+        other => panic!("expected the child ToolCallStarted, got {other:?}"),
+    }
+    match &offered[4].event {
+        AgentEvent::ToolCallFinished { result } => {
+            assert_eq!(result.tool_call_id, "child-call-1");
+            assert!(!result.is_error);
+            assert_eq!(result.content, "tool output");
+        }
+        other => panic!("expected the child ToolCallFinished, got {other:?}"),
+    }
+    match &offered[5].event {
+        AgentEvent::RoundStarted { round } => assert_eq!(*round, 2),
+        other => panic!("expected the second RoundStarted, got {other:?}"),
+    }
+    match &offered[6].event {
+        AgentEvent::ModelDelta { text } => assert_eq!(text, "child answer"),
+        other => panic!("expected the child ModelDelta, got {other:?}"),
+    }
+    match &offered[7].event {
+        AgentEvent::RoundFinished { round, .. } => assert_eq!(*round, 2),
+        other => panic!("expected the second RoundFinished, got {other:?}"),
+    }
+    match &offered[8].event {
+        AgentEvent::SessionEnded { session_id, reason } => {
+            assert_eq!(session_id, &child_session_id);
+            assert_eq!(*reason, SessionEndReason::Completed);
+        }
+        other => panic!("expected the child SessionEnded last, got {other:?}"),
+    }
+
+    let lifecycle = parent_sink.events();
+    assert_eq!(
+        lifecycle.len(),
+        2,
+        "child-internal events must stay off the parent sink"
+    );
+    match &lifecycle[1] {
+        AgentEvent::ChildSessionEnded {
+            child_session_id: ended_session,
+            reason,
+            rounds,
+            tool_calls,
+            tool_errors,
+            ..
+        } => {
+            assert_eq!(ended_session, &child_session_id);
+            assert_eq!(*reason, SessionEndReason::Completed);
+            assert_eq!((*rounds, *tool_calls, *tool_errors), (2, 1, 0));
+        }
+        other => panic!("expected the parent ChildSessionEnded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_child_terminal_aborts_the_run_and_reports_observed_counts() {
+    let provider = Arc::new(MockProvider::new(vec![text_response("child answer")]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let parent_sink = Arc::new(RecordingSink::new(None));
+    // SessionStarted, RoundStarted, ModelDelta, RoundFinished, SessionEnded.
+    let child_sink = Arc::new(RecordingChildSink::new(Some(4)));
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&parent_sink) as Arc<dyn EventSink>)
+    .with_child_event_sink(Arc::clone(&child_sink) as Arc<dyn ChildEventSink>);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": []}), "call-1")
+        .await;
+
+    assert!(
+        result.is_error,
+        "a rejected child terminal must fail the delegation: {result:?}"
+    );
+    let offered = child_sink.events();
+    assert_eq!(
+        offered.len(),
+        5,
+        "the rejected terminal is still offered: {offered:?}"
+    );
+    assert!(
+        matches!(
+            offered.last().map(|recorded| &recorded.event),
+            Some(AgentEvent::SessionEnded { .. })
+        ),
+        "the rejected event must be the child terminal: {offered:?}"
+    );
+
+    let lifecycle = parent_sink.events();
+    assert_eq!(
+        lifecycle.len(),
+        2,
+        "the parent still records start and end around the aborted child"
+    );
+    match &lifecycle[1] {
+        AgentEvent::ChildSessionEnded {
+            reason,
+            rounds,
+            tool_calls,
+            tool_errors,
+            ..
+        } => {
+            assert_eq!(*reason, SessionEndReason::Cancelled);
+            assert_eq!(
+                (*rounds, *tool_calls, *tool_errors),
+                (1, 0, 0),
+                "the parent must report the child events accepted before the rejection"
+            );
+        }
+        other => panic!("expected the parent ChildSessionEnded, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_child_reports_observed_counts_without_a_child_terminal() {
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_response(vec![ToolCall::new("child-call-1", "echo", json!({}))]),
+        Response::Pending,
+    ]));
+    let factory = Arc::new(TestFactory::new(FactoryMode::Exact));
+    let parent_sink = Arc::new(RecordingSink::new(None));
+    let child_sink = Arc::new(RecordingChildSink::new(None));
+    let executor = executor(
+        Arc::clone(&provider),
+        Arc::clone(&factory),
+        &["echo"],
+        DelegationLimits::default(),
+    )
+    .with_event_sink(Arc::clone(&parent_sink) as Arc<dyn EventSink>)
+    .with_child_event_sink(Arc::clone(&child_sink) as Arc<dyn ChildEventSink>);
+
+    let result = executor
+        .execute_with_call(json!({"task": "do it", "tools": ["echo"]}), "call-1")
+        .await;
+
+    assert!(result.is_error);
+    let value = result_json(&result);
+    let error = value["error"].as_str().expect("error must be a string");
+    assert!(error.contains("timed out"), "unexpected error: {error}");
+
+    let offered = child_sink.events();
+    assert_eq!(
+        offered.len(),
+        6,
+        "the observed prefix ends after the second RoundStarted: {offered:?}"
+    );
+    assert!(
+        offered
+            .iter()
+            .all(|recorded| !matches!(recorded.event, AgentEvent::SessionEnded { .. })),
+        "a timed-out child is dropped before its terminal: {offered:?}"
+    );
+    assert!(matches!(
+        offered.last().map(|recorded| &recorded.event),
+        Some(AgentEvent::RoundStarted { round: 2 })
+    ));
+
+    let lifecycle = parent_sink.events();
+    assert_eq!(lifecycle.len(), 2);
+    match &lifecycle[1] {
+        AgentEvent::ChildSessionEnded {
+            reason,
+            rounds,
+            tool_calls,
+            tool_errors,
+            ..
+        } => {
+            assert_eq!(*reason, SessionEndReason::Cancelled);
+            assert_eq!(
+                (*rounds, *tool_calls, *tool_errors),
+                (1, 1, 0),
+                "the timeout lifecycle must report the observed child counters"
+            );
+        }
+        other => panic!("expected the parent ChildSessionEnded, got {other:?}"),
+    }
 }

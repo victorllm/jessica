@@ -250,7 +250,7 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
         return Err("the trace has no entries".to_owned());
     }
     let version = entries[0].1.schema_version;
-    if !(1..=2).contains(&version) {
+    if !(1..=3).contains(&version) {
         return Err(format!(
             "trace schema version {version} is not supported by replay"
         ));
@@ -281,6 +281,10 @@ fn prepare(entries: &[(u64, TraceEvent)]) -> Result<Prepared, String> {
                 turn_messages = messages.clone();
             }
             TracePayload::TurnEnded { reason } => terminal = Some(*reason),
+            // Child evidence is validated by the verifier before replay, but
+            // replay never executes a delegated child again. The parent's own
+            // tool events already reproduce the delegation boundary.
+            TracePayload::ChildAgent { .. } => {}
             TracePayload::Agent { .. } => match trace.attempt {
                 Some(attempt) => attempts
                     .entry(attempt)
@@ -881,6 +885,69 @@ mod tests {
         assert_eq!(
             outcome.verification.events, 10,
             "the permission decision is trace-only and must not be compared"
+        );
+        assert!(outcome.problems.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_evidence_is_ignored_and_never_replayed() {
+        let mut entries = vec![started(TraceTurnMode::Fresh)];
+        entries.extend(completed_attempt(2, 1, "session-a"));
+        let child = session("child");
+        let child_entries = vec![
+            envelope(
+                Some(1),
+                Some(&child),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event: AgentEvent::SessionStarted {
+                        session_id: child.clone(),
+                        messages: vec![Message::system("child prompt"), Message::user("do it")],
+                    },
+                },
+            ),
+            envelope(
+                Some(1),
+                Some(&child),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event: AgentEvent::RoundStarted { round: 1 },
+                },
+            ),
+            envelope(
+                Some(1),
+                Some(&child),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event: AgentEvent::RoundFinished {
+                        round: 1,
+                        usage: None,
+                    },
+                },
+            ),
+            envelope(
+                Some(1),
+                Some(&child),
+                TracePayload::ChildAgent {
+                    call_id: "call-1".to_owned(),
+                    event: AgentEvent::SessionEnded {
+                        session_id: child.clone(),
+                        reason: SessionEndReason::Completed,
+                    },
+                },
+            ),
+        ];
+        for (offset, trace) in child_entries.into_iter().enumerate() {
+            entries.insert(4 + offset, (100 + offset as u64, trace));
+        }
+
+        let outcome = verify(&entries).await;
+
+        assert_eq!(outcome.verification.status, ReplayStatus::Ok, "{outcome:?}");
+        assert_eq!(outcome.verification.attempts, 1);
+        assert_eq!(
+            outcome.verification.events, 10,
+            "child evidence is never executed or compared by replay"
         );
         assert!(outcome.problems.is_empty());
     }

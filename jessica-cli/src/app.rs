@@ -21,8 +21,8 @@ use jessica_harness::{
     ToolTimeoutGuard, TurnSignals,
 };
 use jessica_runtime::{
-    AgentChildExecutor, AgentLoop, ChildToolFactory, DELEGATE_TASK_TOOL_NAME, DelegateTaskTool,
-    DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
+    AgentChildExecutor, AgentLoop, ChildEventSink, ChildToolFactory, DELEGATE_TASK_TOOL_NAME,
+    DelegateTaskTool, DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
 };
 use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
 use thiserror::Error;
@@ -915,6 +915,7 @@ impl CliRuntime {
             Arc::clone(&provider),
             config,
             journal.sink(),
+            journal.child_sink(),
             events.clone(),
         )?;
 
@@ -982,8 +983,10 @@ impl CliRuntime {
     /// Returns `None` when delegation is disabled or when `allow_delegation`
     /// is false, and in that case does not construct the factory or executor.
     /// The executor receives the turn's sink and broadcast sender so the
-    /// parent-side child session lifecycle is traced alongside the parent;
-    /// child-internal events stay private.
+    /// parent-side child session lifecycle is traced alongside the parent, and
+    /// a child-event sink so child-internal events become trace evidence.
+    /// Child events never enter the legacy event log or the parent broadcast.
+    #[allow(clippy::too_many_arguments)]
     fn build_child_executor(
         &self,
         scope: &TurnScope,
@@ -991,6 +994,7 @@ impl CliRuntime {
         provider: Arc<dyn LlmProvider>,
         config: &HarnessConfig,
         sink: Option<Arc<dyn EventSink>>,
+        child_sink: Option<Arc<dyn ChildEventSink>>,
         events: broadcast::Sender<AgentEvent>,
     ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
         if !allow_delegation || !config.delegation.enabled {
@@ -1007,6 +1011,9 @@ impl CliRuntime {
             AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
         if let Some(sink) = sink {
             executor = executor.with_event_sink(sink);
+        }
+        if let Some(child_sink) = child_sink {
+            executor = executor.with_child_event_sink(child_sink);
         }
         executor = executor.with_event_sender(events);
         Ok(Some(Arc::new(executor)))

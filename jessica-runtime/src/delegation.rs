@@ -25,19 +25,21 @@
 //!
 //! [`AgentChildExecutor`] builds a fresh tool registry and transcript for every
 //! delegation. It shares only the parent provider (and therefore the parent's
-//! token budget); child model and tool events go to a private bounded broadcast
-//! channel that is never forwarded or persisted. Only the parent-side
+//! token budget). Child model and tool events are offered to an optional
+//! [`ChildEventSink`] before they go to a private bounded broadcast channel;
+//! without a sink they remain private and are not persisted. The parent-side
 //! [`AgentEvent::ChildSessionStarted`] and [`AgentEvent::ChildSessionEnded`]
-//! lifecycle events are offered to the parent sink and broadcast. The child is a
-//! bare [`crate::AgentLoop`], so it has no harness, memory, skills, sensors, or
-//! acceptance checks.
+//! lifecycle events are always offered to the parent sink and broadcast. The
+//! child is a bare [`crate::AgentLoop`], so it has no harness, memory, skills,
+//! sensors, or acceptance checks.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use jessica_core::events::EventSink;
+use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::llm::LlmProvider;
 use jessica_core::tool::{Tool, ToolRegistry, ToolSchema};
 use jessica_core::types::{
@@ -912,6 +914,102 @@ pub trait ChildToolFactory: Send + Sync {
     fn build(&self, names: &[String]) -> Result<Vec<Arc<dyn Tool>>, DelegationError>;
 }
 
+/// Receives every event emitted inside one delegated child session.
+///
+/// The executor offers each child event to this sink before publishing it to
+/// the child's private broadcast. The child session id and the parent provider
+/// tool-call id are supplied separately because [`AgentEvent`] has no parent
+/// linkage. Returning an error stops the child run.
+#[async_trait]
+pub trait ChildEventSink: Send + Sync {
+    /// Accepts one child event for recording.
+    async fn emit(
+        &self,
+        child_session_id: SessionId,
+        call_id: String,
+        event: AgentEvent,
+    ) -> Result<(), EventSinkError>;
+}
+
+/// Counts accepted child events for partial and timeout diagnostics.
+struct CountingChildSink {
+    /// Optional downstream sink.
+    inner: Option<Arc<dyn ChildEventSink>>,
+    /// Completed model rounds (`round_finished`).
+    rounds: AtomicU32,
+    /// Requested tool calls (`tool_call_started`).
+    tool_calls: AtomicU32,
+    /// Finished tool calls whose result was an error.
+    tool_errors: AtomicU32,
+}
+
+impl CountingChildSink {
+    /// Creates a counter, optionally forwarding to `inner`.
+    fn new(inner: Option<Arc<dyn ChildEventSink>>) -> Self {
+        Self {
+            inner,
+            rounds: AtomicU32::new(0),
+            tool_calls: AtomicU32::new(0),
+            tool_errors: AtomicU32::new(0),
+        }
+    }
+
+    /// Returns `(rounds, tool_calls, tool_errors)` accepted so far.
+    fn counts(&self) -> (u32, u32, u32) {
+        (
+            self.rounds.load(Ordering::Relaxed),
+            self.tool_calls.load(Ordering::Relaxed),
+            self.tool_errors.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[async_trait]
+impl ChildEventSink for CountingChildSink {
+    async fn emit(
+        &self,
+        child_session_id: SessionId,
+        call_id: String,
+        event: AgentEvent,
+    ) -> Result<(), EventSinkError> {
+        if let Some(inner) = &self.inner {
+            inner.emit(child_session_id, call_id, event.clone()).await?;
+        }
+        match &event {
+            AgentEvent::RoundFinished { .. } => {
+                self.rounds.fetch_add(1, Ordering::Relaxed);
+            }
+            AgentEvent::ToolCallStarted { .. } => {
+                self.tool_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            AgentEvent::ToolCallFinished { result } if result.is_error => {
+                self.tool_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Adapts [`ChildEventSink`] to the child loop's generic [`EventSink`].
+struct ChildEventAdapter {
+    /// Downstream child sink.
+    sink: Arc<dyn ChildEventSink>,
+    /// Child session attributed to every event.
+    child_session_id: SessionId,
+    /// Parent provider tool-call id that triggered the delegation.
+    call_id: String,
+}
+
+#[async_trait]
+impl EventSink for ChildEventAdapter {
+    async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+        self.sink
+            .emit(self.child_session_id.clone(), self.call_id.clone(), event)
+            .await
+    }
+}
+
 /// Executes one delegated child agent.
 ///
 /// The executor owns the parent provider, the tool factory, the parent
@@ -930,6 +1028,8 @@ pub struct AgentChildExecutor {
     limits: DelegationLimits,
     /// Optional producer-side sink for child lifecycle events.
     sink: Option<Arc<dyn EventSink>>,
+    /// Optional producer-side sink for child-internal events.
+    child_sink: Option<Arc<dyn ChildEventSink>>,
     /// Optional parent broadcast sender for child lifecycle events.
     events: Option<broadcast::Sender<AgentEvent>>,
 }
@@ -953,6 +1053,7 @@ impl AgentChildExecutor {
             parent,
             limits,
             sink: None,
+            child_sink: None,
             events: None,
         })
     }
@@ -967,6 +1068,18 @@ impl AgentChildExecutor {
     /// event).
     pub fn with_event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.sink = Some(sink);
+        self
+    }
+
+    /// Attaches a producer-side sink for every child-internal event.
+    ///
+    /// Each child event is offered to the sink before the child broadcasts it.
+    /// A sink failure aborts the child run; the parent still observes a
+    /// `ChildSessionEnded` lifecycle event with the child's final counters.
+    /// Without this sink, child events stay on the private broadcast and are
+    /// not persisted.
+    pub fn with_child_event_sink(mut self, sink: Arc<dyn ChildEventSink>) -> Self {
+        self.child_sink = Some(sink);
         self
     }
 
@@ -1002,10 +1115,12 @@ impl AgentChildExecutor {
     /// is called and as [`AgentEvent::ChildSessionEnded`] when it finishes or
     /// times out. A sink rejection before the child starts prevents the run; a
     /// rejection when recording the end turns the delegation into an error
-    /// result. Child-internal events are never recorded on the parent stream.
+    /// result. Child-internal events are offered to the optional child sink,
+    /// but are never recorded on the parent stream.
     ///
-    /// A delegation timeout drops the child future. Because no final transcript
-    /// exists, that result reports zero rounds and zero tool calls.
+    /// A delegation timeout drops the child future. The timeout lifecycle event
+    /// and error result report the rounds, tool calls, and tool errors accepted
+    /// by the child sink before cancellation; no final transcript exists.
     pub async fn execute_with_call(&self, args: Value, call_id: &str) -> ToolResult {
         let fallback_hash = best_effort_child_session_hash(&args);
         let parsed = match parse_delegate_task_args(&args, self.limits.max_task_bytes) {
@@ -1049,12 +1164,18 @@ impl AgentChildExecutor {
             Message::user(parsed.task()),
         ];
         let (events, _receiver) = broadcast::channel(CHILD_EVENT_CHANNEL_CAPACITY);
+        let counting = Arc::new(CountingChildSink::new(self.child_sink.clone()));
         let child = AgentLoop::new(
             Arc::clone(&self.provider),
             Arc::new(registry),
             Budget::new(0, CHILD_TOOL_TIMEOUT, self.limits.max_rounds),
             events,
-        );
+        )
+        .with_event_sink(Arc::new(ChildEventAdapter {
+            sink: Arc::clone(&counting) as Arc<dyn ChildEventSink>,
+            child_session_id: child_session_id.clone(),
+            call_id: call_id.to_owned(),
+        }));
         let cancel = CancellationToken::new();
         let run = tokio::time::timeout(
             self.limits.timeout,
@@ -1071,27 +1192,28 @@ impl AgentChildExecutor {
             Ok(transcript) => transcript,
             Err(_) => {
                 cancel.cancel();
+                let (rounds, tool_calls, tool_errors) = counting.counts();
                 if !self
                     .emit_child_event(AgentEvent::ChildSessionEnded {
                         child_session_id,
                         call_id: call_id.to_owned(),
                         reason: SessionEndReason::Cancelled,
-                        rounds: 0,
-                        tool_calls: 0,
-                        tool_errors: 0,
+                        rounds,
+                        tool_calls,
+                        tool_errors,
                     })
                     .await
                 {
                     return self.error_result(
-                        0,
-                        0,
+                        rounds,
+                        tool_calls,
                         "event sink failed while recording child session end".to_owned(),
                         child_session_hash,
                     );
                 }
                 return self.error_result(
-                    0,
-                    0,
+                    rounds,
+                    tool_calls,
                     format!(
                         "child agent timed out after {}ms",
                         self.limits.timeout.as_millis()

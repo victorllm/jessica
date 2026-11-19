@@ -4,8 +4,9 @@
 //! temporary workspace. The tests pin the observable parent/child boundary:
 //! child requests contain only the fixed system prompt and the delegated task,
 //! child tools are narrowed to the requested native subset, child events never
-//! reach the parent event store, child failures do not change the parent exit
-//! code, child token usage does change the parent budget, replay and resume
+//! reach the parent legacy event stream but the full child trajectory is
+//! recorded as nested trace evidence, child failures do not change the parent
+//! exit code, child token usage does change the parent budget, replay and resume
 //! never execute a child agent, and a session interrupted inside `delegate_task`
 //! is rejected rather than replayed.
 
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jessica_core::trace::TracePayload;
 use jessica_core::types::{
     AgentEvent, BudgetKind, Message, SessionEndReason, SessionId, ToolCall, ToolResult,
 };
@@ -374,6 +376,32 @@ fn run_replay(workspace: &Path, config: &Path, session: &SessionId, output_path:
     output
 }
 
+/// Runs one `jessica trace` subcommand without provider configuration.
+fn run_trace_command(workspace: &Path, config: &Path, arguments: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
+        .current_dir(workspace)
+        .env_remove("JESSICA_PROVIDER")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .arg("--config")
+        .arg(config)
+        .arg("trace")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start");
+
+    let status = wait_with_timeout(&mut child);
+    let mut output = child
+        .wait_with_output()
+        .expect("CLI output should be collected");
+    output.status = status;
+    output
+}
+
 /// Waits for the child, killing it when the overall budget expires.
 fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + CHILD_TIMEOUT;
@@ -610,6 +638,285 @@ fn normal_delegation_keeps_child_events_out_of_the_parent_store() {
         "child tool events must not enter the parent stream"
     );
     assert_session_absent(&database, &child_session);
+}
+
+#[test]
+fn delegated_child_trajectory_is_verifiable_trace_evidence() {
+    let temp = TempDir::new("trace-evidence");
+    std::fs::write(temp.path.join("NOTE.txt"), "ORANGE-NOTE").expect("note should be written");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &enabled_config(&Settings::default()));
+
+    let run = run_turn(
+        &temp.path,
+        &config,
+        "Please delegate.",
+        vec![
+            Plan::Sse(tool_calls_response(&[(
+                "call_delegate",
+                DELEGATE_TASK_TOOL_NAME,
+                json!({"task": "read the note", "tools": ["read_file"]}),
+            )])),
+            Plan::Sse(tool_calls_response(&[(
+                "child_call",
+                "read_file",
+                json!({"path": "NOTE.txt"}),
+            )])),
+            Plan::Sse(text_response("child answer: ORANGE-NOTE")),
+            Plan::Sse(text_response("parent done")),
+        ],
+    );
+    assert_success(&run.output);
+
+    let database = temp.path.join("events.sqlite");
+    let store = EventStore::open(&database).expect("event store should open");
+    let summaries = store.trace_turns(10).expect("trace turns should list");
+    assert_eq!(summaries.len(), 1, "the turn must produce one trace");
+    let turn = summaries[0].turn_id().clone();
+    let trace = store
+        .trace_turn(&turn)
+        .expect("trace should read")
+        .expect("trace should exist");
+    assert!(trace.closed(), "the delegation turn must close");
+    let entries = trace.events();
+
+    let (_, child_session) = child_trace("read the note", &["read_file"], ALL_TOOLS);
+    let child_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| matches!(&entry.event().payload, TracePayload::ChildAgent { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        child_indices.len(),
+        9,
+        "the whole child transcript is evidence"
+    );
+    for index in &child_indices {
+        let envelope = entries[*index].event();
+        assert_eq!(envelope.attempt, Some(1));
+        assert_eq!(envelope.session_id.as_ref(), Some(&child_session));
+        match &envelope.payload {
+            TracePayload::ChildAgent { call_id, .. } => {
+                assert_eq!(call_id, "call_delegate");
+            }
+            other => panic!("expected child evidence at entry {index}, found {other:?}"),
+        }
+    }
+
+    let child_events: Vec<&AgentEvent> = child_indices
+        .iter()
+        .map(|index| match &entries[*index].event().payload {
+            TracePayload::ChildAgent { event, .. } => event,
+            other => panic!("expected child evidence at entry {index}, found {other:?}"),
+        })
+        .collect();
+    match &child_events[0] {
+        AgentEvent::SessionStarted { messages, .. } => {
+            assert_eq!(
+                messages,
+                &vec![
+                    Message::system(CHILD_AGENT_SYSTEM_PROMPT),
+                    Message::user("read the note"),
+                ],
+                "child evidence records the isolated bootstrap"
+            );
+        }
+        other => panic!("expected the child session start, found {other:?}"),
+    }
+    assert!(
+        child_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallStarted { call } if call.id == "child_call" && call.name == "read_file"
+        )),
+        "the child read_file call must be visible in evidence: {child_events:?}"
+    );
+    assert!(matches!(
+        child_events.last(),
+        Some(AgentEvent::SessionEnded {
+            reason: SessionEndReason::Completed,
+            ..
+        })
+    ));
+
+    let child_start = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event().payload,
+                TracePayload::Agent {
+                    event: AgentEvent::ChildSessionStarted { child_session_id, call_id }
+                } if child_session_id == &child_session && call_id == "call_delegate"
+            )
+        })
+        .expect("the parent must bracket the child start");
+    let child_end = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event().payload,
+                TracePayload::Agent {
+                    event: AgentEvent::ChildSessionEnded { child_session_id, call_id, .. }
+                } if child_session_id == &child_session && call_id == "call_delegate"
+            )
+        })
+        .expect("the parent must bracket the child end");
+    assert!(
+        child_start < child_indices[0],
+        "child evidence must follow the parent start"
+    );
+    assert!(
+        *child_indices.last().unwrap() < child_end,
+        "child evidence must precede the parent end"
+    );
+    match &entries[child_end].event().payload {
+        TracePayload::Agent {
+            event:
+                AgentEvent::ChildSessionEnded {
+                    reason,
+                    rounds,
+                    tool_calls,
+                    tool_errors,
+                    ..
+                },
+        } => {
+            assert_eq!(*reason, SessionEndReason::Completed);
+            assert_eq!((*rounds, *tool_calls, *tool_errors), (2, 1, 0));
+        }
+        other => panic!("expected the parent child end, found {other:?}"),
+    }
+    drop(store);
+
+    assert_session_absent(&database, &child_session);
+    let turn = turn.to_string();
+    let verified = run_trace_command(&temp.path, &config, &["verify", "--turn", turn.as_str()]);
+    assert!(
+        verified.status.success(),
+        "child evidence must pass verification\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let replayed = run_trace_command(
+        &temp.path,
+        &config,
+        &["verify", "--turn", turn.as_str(), "--replay"],
+    );
+    assert!(
+        replayed.status.success(),
+        "replay must ignore child evidence without diverging\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replayed.stdout),
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+
+    let bundle = temp.path.join("child-evidence.json");
+    let bundle_path = bundle.to_str().expect("bundle path must be UTF-8");
+    let exported = run_trace_command(
+        &temp.path,
+        &config,
+        &["export", "--turn", turn.as_str(), "--out", bundle_path],
+    );
+    assert!(
+        exported.status.success(),
+        "child evidence must export\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&exported.stdout),
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let verified_bundle = run_trace_command(
+        &temp.path,
+        &config,
+        &["verify-bundle", "--bundle", bundle_path, "--json"],
+    );
+    assert!(
+        verified_bundle.status.success(),
+        "the exported bundle must verify\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified_bundle.stdout),
+        String::from_utf8_lossy(&verified_bundle.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&verified_bundle.stdout).expect("bundle report must be JSON");
+    assert_eq!(report["summary"]["turns"], 1);
+    assert_eq!(report["summary"]["ok"], 1);
+
+    let bundle_json: Value =
+        serde_json::from_slice(&std::fs::read(&bundle).expect("bundle should be readable"))
+            .expect("bundle must be JSON");
+    let bundle_entries = bundle_json["turns"][0]["entries"]
+        .as_array()
+        .expect("bundle entries");
+    let child_payloads: Vec<Value> = bundle_entries
+        .iter()
+        .filter_map(|entry| {
+            let encoded: Value = serde_json::from_str(entry["payload_json"].as_str()?).ok()?;
+            (encoded["payload"]["kind"] == "child_agent").then_some(encoded)
+        })
+        .collect();
+    assert_eq!(
+        child_payloads.len(),
+        9,
+        "the bundle carries every child event"
+    );
+    for payload in child_payloads {
+        assert_eq!(payload["payload"]["call_id"], "call_delegate");
+        assert_eq!(payload["session_id"], json!(child_session.as_str()));
+        assert_eq!(payload["attempt"], 1);
+    }
+
+    let mut tampered = bundle_json.clone();
+    let entries = tampered["turns"][0]["entries"]
+        .as_array_mut()
+        .expect("bundle entries");
+    let child_entry = entries
+        .iter_mut()
+        .find(|entry| {
+            entry["payload_json"].as_str().is_some_and(|raw| {
+                raw.contains("child answer")
+                    && serde_json::from_str::<Value>(raw)
+                        .is_ok_and(|encoded| encoded["payload"]["kind"] == "child_agent")
+            })
+        })
+        .expect("the bundle must carry the child model output as evidence");
+    let original = child_entry["payload_json"]
+        .as_str()
+        .expect("payload must be a string")
+        .to_owned();
+    child_entry["payload_json"] =
+        Value::String(original.replace("child answer", "tampered child answer"));
+    let tampered_bundle = temp.path.join("tampered-child-evidence.json");
+    std::fs::write(
+        &tampered_bundle,
+        serde_json::to_vec_pretty(&tampered).expect("bundle must serialize"),
+    )
+    .expect("tampered bundle should be written");
+    let rejected = run_trace_command(
+        &temp.path,
+        &config,
+        &[
+            "verify-bundle",
+            "--bundle",
+            tampered_bundle
+                .to_str()
+                .expect("tampered bundle path must be UTF-8"),
+            "--json",
+        ],
+    );
+    assert!(
+        !rejected.status.success(),
+        "editing a child event must invalidate the evidence\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&rejected.stdout).expect("failure report must be JSON");
+    let kinds: Vec<&str> = report["turns"][0]["problems"]
+        .as_array()
+        .expect("turn problems")
+        .iter()
+        .filter_map(|problem| problem["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"digest_mismatch"),
+        "tampered child evidence must break the hash chain: {kinds:?}"
+    );
 }
 
 #[test]
