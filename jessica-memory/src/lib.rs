@@ -25,6 +25,12 @@
 //! runtime must invoke it through `tokio::task::spawn_blocking`, and the store
 //! never reads the host clock itself so callers control event timestamps.
 //!
+//! File databases use WAL journaling with `synchronous = FULL`. WAL lets
+//! readers proceed while the single writer commits, and every commit is
+//! fsynced; the `-wal` and `-shm` sidecars exist while the store is open and a
+//! clean close checkpoints and removes them. In-memory databases keep the
+//! `memory` journal mode.
+//!
 //! [`MemoryLog`] is the append-only storage foundation for layered memory. It
 //! stores raw entries scoped by session and workspace, indexes them with FTS5,
 //! and permits only one-way soft deletion.
@@ -123,7 +129,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Schema version stored in the event database's `user_version` pragma.
 ///
 /// Version 1 adds the versioned trace tables without changing or rewriting the
-/// legacy `events` and `sessions` tables.
+/// legacy `events` and `sessions` tables. Migrations are applied one version at
+/// a time inside a transaction; a schema change bumps this constant and adds
+/// the matching arm in `apply_migration`.
 const SCHEMA_VERSION: i64 = 1;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
@@ -206,9 +214,9 @@ impl StoredEvent {
 
 /// Append-only event log backed by SQLite.
 ///
-/// Opening a database installs the `events` table and its append-only triggers
-/// if they are absent. Appends allocate the next sequence number in a
-/// transaction; reads never modify the log.
+/// Opening a database installs or migrates the schema and enables WAL
+/// journaling with `synchronous = FULL` for file databases. Appends allocate
+/// the next sequence number in a transaction; reads never modify the log.
 #[derive(Debug)]
 pub struct EventStore {
     /// SQLite connection used for every operation on this store.
@@ -219,7 +227,8 @@ impl EventStore {
     /// Opens or creates a database at `path`.
     ///
     /// Missing parent directories are not created. The schema and append-only
-    /// triggers are installed if absent.
+    /// triggers are installed or migrated if needed, and file databases use WAL
+    /// journaling with `synchronous = FULL`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
         let path = path.as_ref();
         let connection = Connection::open(path).map_err(|source| EventStoreError::Open {
@@ -253,9 +262,7 @@ impl EventStore {
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(EventStoreError::Schema)?;
-        let version: i64 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(EventStoreError::Schema)?;
+        let version = read_user_version(&connection)?;
         if version > SCHEMA_VERSION {
             return Err(EventStoreError::UnsupportedVersion {
                 found: version,
@@ -279,16 +286,26 @@ impl EventStore {
         Ok(Self { connection })
     }
 
-    /// Installs or upgrades the schema and wraps the connection.
+    /// Installs or upgrades the schema, enables WAL, and wraps the connection.
     ///
-    /// Databases written before trace support report `user_version = 0`; they
-    /// gain the trace tables without any event rewrite. A database from a
-    /// newer build is rejected instead of being opened with unknown semantics.
-    fn initialize(connection: Connection) -> Result<Self, EventStoreError> {
+    /// The schema version is read before any write, so a database from a newer
+    /// build is rejected without changing its journal mode. Databases written
+    /// before trace support report `user_version = 0`; they gain the trace
+    /// tables without any event rewrite. Migrations and their `user_version`
+    /// updates commit in one transaction.
+    fn initialize(mut connection: Connection) -> Result<Self, EventStoreError> {
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(EventStoreError::Schema)?;
-        install_schema(&connection)?;
+        let version = read_user_version(&connection)?;
+        if version > SCHEMA_VERSION {
+            return Err(EventStoreError::UnsupportedVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        configure_wal(&connection)?;
+        install_schema(&mut connection, version)?;
         Ok(Self { connection })
     }
 
@@ -471,32 +488,78 @@ impl EventStore {
     }
 }
 
-/// Installs the legacy schema, then the trace schema, and finally records the
-/// schema version.
+/// Applies pending migrations, then repairs the current schema idempotently.
 ///
-/// The version is written last so an interrupted upgrade is retried on the
-/// next open instead of being mistaken for a completed one. A database from a
-/// newer build is rejected before any statement runs.
-fn install_schema(connection: &Connection) -> Result<(), EventStoreError> {
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
+/// Each migration runs inside its own transaction together with the
+/// `user_version` update, so an interrupted or failing upgrade leaves the
+/// previous version intact. A database already at [`SCHEMA_VERSION`] keeps the
+/// previous `IF NOT EXISTS` installation so a partially removed schema is
+/// repaired on the next open.
+fn install_schema(connection: &mut Connection, version: i64) -> Result<(), EventStoreError> {
+    let mut current = version;
+    while current < SCHEMA_VERSION {
+        let next = current + 1;
+        let transaction = connection.transaction().map_err(EventStoreError::Schema)?;
+        apply_migration(&transaction, next)?;
+        transaction
+            .pragma_update(None, "user_version", next)
+            .map_err(EventStoreError::Schema)?;
+        transaction.commit().map_err(EventStoreError::Schema)?;
+        current = next;
+    }
+
+    if version == SCHEMA_VERSION {
+        let transaction = connection.transaction().map_err(EventStoreError::Schema)?;
+        apply_migration(&transaction, SCHEMA_VERSION)?;
+        transaction.commit().map_err(EventStoreError::Schema)?;
+    }
+    Ok(())
+}
+
+/// Applies the schema changes for one target version inside `transaction`.
+fn apply_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    version: i64,
+) -> Result<(), EventStoreError> {
+    match version {
+        1 => {
+            transaction
+                .execute_batch(SCHEMA)
+                .map_err(EventStoreError::Schema)?;
+            trace_store::install(transaction)
+        }
+        _ => Err(EventStoreError::MigrationUnavailable { version }),
+    }
+}
+
+/// Configures WAL journaling and full write durability on a writable connection.
+///
+/// File databases must report `wal`; in-memory databases report `memory`.
+/// `synchronous = FULL` makes every commit fsync the WAL, trading throughput for
+/// durability.
+fn configure_wal(connection: &Connection) -> Result<(), EventStoreError> {
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
         .map_err(EventStoreError::Schema)?;
-    if version > SCHEMA_VERSION {
-        return Err(EventStoreError::UnsupportedVersion {
-            found: version,
-            supported: SCHEMA_VERSION,
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(EventStoreError::Schema)?;
+    if journal_mode != "wal" && journal_mode != "memory" {
+        return Err(EventStoreError::JournalMode {
+            found: journal_mode,
         });
     }
     connection
-        .execute_batch(SCHEMA)
+        .pragma_update(None, "synchronous", "FULL")
         .map_err(EventStoreError::Schema)?;
-    trace_store::install(connection)?;
-    if version < SCHEMA_VERSION {
-        connection
-            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .map_err(EventStoreError::Schema)?;
-    }
     Ok(())
+}
+
+/// Reads the database's `user_version` pragma.
+fn read_user_version(connection: &Connection) -> Result<i64, EventStoreError> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(EventStoreError::Schema)
 }
 
 /// Appends one legacy event through an already-open transaction.
@@ -608,6 +671,18 @@ pub enum EventStoreError {
     /// The schema or append-only triggers could not be installed.
     #[error("failed to initialize the event store schema: {0}")]
     Schema(#[source] rusqlite::Error),
+    /// SQLite did not enable WAL journaling for a file database.
+    #[error("event store journal mode is `{found}`, expected `wal` or `memory`")]
+    JournalMode {
+        /// Journal mode reported by SQLite.
+        found: String,
+    },
+    /// No migration is registered for a version the store needs to apply.
+    #[error("no migration is registered for event store schema version {version}")]
+    MigrationUnavailable {
+        /// Target version without a registered migration.
+        version: i64,
+    },
     /// The database was written by a build with a newer schema.
     ///
     /// The store refuses to open it rather than guessing at semantics it does
@@ -778,4 +853,26 @@ pub enum EventStoreError {
         /// Description of the violated invariant.
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_databases_use_the_memory_journal_and_full_synchronous() {
+        let store = EventStore::open_in_memory().expect("in-memory store should open");
+
+        let journal_mode: String = store
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode should read");
+        assert_eq!(journal_mode, "memory");
+
+        let synchronous: i64 = store
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous level should read");
+        assert_eq!(synchronous, 2, "SQLite encodes synchronous=FULL as 2");
+    }
 }
