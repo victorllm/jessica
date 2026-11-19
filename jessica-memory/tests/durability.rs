@@ -1,11 +1,21 @@
 //! Behavioral tests for EventStore WAL mode and transactional migrations.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use jessica_core::types::{AgentEvent, SessionId};
 use jessica_memory::{EventStore, EventStoreError, Timestamp};
 use rusqlite::Connection;
+
+/// Environment variable that turns the child helper test into a live writer.
+const CHILD_DATABASE_ENV: &str = "JESSICA_WAL_CRASH_DATABASE";
+
+/// Line the child prints after all appends have committed.
+const CHILD_READY: &str = "JESSICA_WAL_CHILD_READY";
 
 /// Unique database file removed when the test finishes.
 struct TempDatabase {
@@ -246,4 +256,134 @@ fn reopening_a_current_database_repairs_a_missing_trigger() {
         )
         .expect("trigger should be visible");
     assert_eq!(triggers, 1, "the current schema must be reinstalled");
+}
+
+/// Child half of [`a_sigkill_after_commit_recovers_all_events_from_the_wal`].
+///
+/// Without [`CHILD_DATABASE_ENV`] this test does nothing; the parent re-executes
+/// the test binary with the variable set to obtain a process it can SIGKILL
+/// while it holds committed WAL frames.
+#[test]
+fn wal_commit_child_helper() {
+    let Ok(database) = std::env::var(CHILD_DATABASE_ENV) else {
+        return;
+    };
+    let session = SessionId::new("sigkill-session");
+    let mut store = EventStore::open(database).expect("the child store should open");
+    for (index, text) in ["first", "second", "third"].into_iter().enumerate() {
+        store
+            .append(
+                &session,
+                &model_delta(text),
+                Timestamp::from_millis(index as i64 + 1),
+            )
+            .expect("the child append should commit");
+    }
+    println!("{CHILD_READY}");
+    std::io::stdout()
+        .flush()
+        .expect("the child sentinel should flush");
+
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+/// Kills the child explicitly and reaps it even when an assertion panics.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_sigkill_after_commit_recovers_all_events_from_the_wal() {
+    let database = TempDatabase::new("sigkill");
+    let session = SessionId::new("sigkill-session");
+    let mut child =
+        Command::new(std::env::current_exe().expect("the test executable should resolve"))
+            .args(["--exact", "wal_commit_child_helper", "--nocapture"])
+            .env(CHILD_DATABASE_ENV, database.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("the child writer should start");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("the child stdout should be piped");
+    let child = ChildGuard(child);
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if line.trim() == CHILD_READY => {
+                    let _ = sender.send(());
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the child must report its committed appends before the timeout");
+
+    let pending = std::fs::metadata(sidecar(database.path(), "-wal"))
+        .expect("the live child must keep a WAL sidecar")
+        .len();
+    assert!(
+        pending > 0,
+        "the child must leave committed frames in the WAL before the kill"
+    );
+
+    let mut child = child;
+    child.0.kill().expect("the helper should receive SIGKILL");
+    let status = child.0.wait().expect("the helper should be reaped");
+    assert!(
+        !status.success(),
+        "the helper must die from the signal rather than exit cleanly"
+    );
+
+    let store = EventStore::open(database.path()).expect("WAL recovery should succeed");
+    let events = store
+        .events(&session)
+        .expect("recovered events should read");
+    assert_eq!(
+        events.len(),
+        3,
+        "every committed event must survive SIGKILL"
+    );
+    assert_eq!(
+        events.iter().map(|event| event.seq()).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "recovered events must preserve their sequence order"
+    );
+    let texts: Vec<_> = events
+        .iter()
+        .map(|stored| match stored.event() {
+            AgentEvent::ModelDelta { text } => text.as_str(),
+            other => panic!("unexpected recovered event: {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts, vec!["first", "second", "third"]);
+
+    drop(store);
+    let read_only = EventStore::open_read_only(database.path())
+        .expect("a recovered and cleanly closed database should be auditable");
+    assert_eq!(
+        read_only
+            .events(&session)
+            .expect("events should read")
+            .len(),
+        3
+    );
 }

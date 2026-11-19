@@ -252,13 +252,25 @@ impl EventStore {
     /// database, and a database without the trace schema is rejected instead of
     /// being upgraded. Databases written by a newer build are rejected for the
     /// same reason as [`EventStore::open`].
+    ///
+    /// The database is opened through a `file:...?mode=ro&immutable=1` URI, so
+    /// SQLite takes no locks and never creates `-shm` or `-wal` sidecars. This
+    /// makes the audit usable on a read-only directory. `immutable=1` also
+    /// ignores uncheckpointed WAL frames, so a non-empty `-wal` sidecar is
+    /// rejected with [`EventStoreError::PendingWal`] instead of silently
+    /// omitting committed events. The path must be valid UTF-8.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
         let path = path.as_ref();
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|source| EventStoreError::Open {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        reject_pending_wal(path)?;
+        let uri = immutable_uri(path)?;
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|source| EventStoreError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(EventStoreError::Schema)?;
@@ -562,6 +574,59 @@ fn read_user_version(connection: &Connection) -> Result<i64, EventStoreError> {
         .map_err(EventStoreError::Schema)
 }
 
+/// Rejects a database with uncheckpointed WAL frames before an audit open.
+///
+/// `immutable=1` ignores the WAL entirely, so opening while frames are pending
+/// would return a silently stale snapshot. A missing or zero-length sidecar is
+/// safe: it contains no frames.
+fn reject_pending_wal(path: &Path) -> Result<(), EventStoreError> {
+    let wal = sidecar_path(path, "-wal");
+    match std::fs::metadata(&wal) {
+        Ok(metadata) if metadata.len() > 0 => Err(EventStoreError::PendingWal {
+            path: path.to_path_buf(),
+            bytes: metadata.len(),
+        }),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(EventStoreError::WalInspect { path: wal, source }),
+    }
+}
+
+/// Builds the read-only `immutable` URI used by the audit path.
+///
+/// The path is percent-encoded so URI separators such as `?`, `#`, and `%`
+/// remain part of the file name, and a UTF-8 path is required so the encoding is
+/// lossless.
+fn immutable_uri(path: &Path) -> Result<String, EventStoreError> {
+    let raw = path.to_str().ok_or_else(|| EventStoreError::NonUtf8Path {
+        path: path.to_path_buf(),
+    })?;
+    let mut uri = String::with_capacity(raw.len() + 24);
+    uri.push_str("file:");
+    for &byte in raw.as_bytes() {
+        if matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':'
+        ) {
+            uri.push(char::from(byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
+}
+
+/// Returns the path of a SQLite sidecar file such as `-wal`.
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 /// Appends one legacy event through an already-open transaction.
 ///
 /// Both [`EventStore::append`] and the trace dual-write path use this helper so
@@ -706,6 +771,34 @@ pub enum EventStoreError {
         path: PathBuf,
         /// Version stored in the database's `user_version`.
         version: i64,
+    },
+    /// A read-only open found uncheckpointed WAL frames.
+    ///
+    /// The immutable audit URI ignores the WAL, so opening anyway could omit
+    /// committed events from the snapshot.
+    #[error(
+        "event store `{path}` has a non-empty WAL sidecar ({bytes} bytes); open it once with a read-write build to checkpoint it before auditing"
+    )]
+    PendingWal {
+        /// Database path whose sidecar is pending.
+        path: PathBuf,
+        /// Size in bytes of the `-wal` sidecar.
+        bytes: u64,
+    },
+    /// The WAL sidecar could not be inspected before a read-only open.
+    #[error("failed to inspect event store WAL sidecar `{path}`: {source}")]
+    WalInspect {
+        /// Path of the sidecar that could not be inspected.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A read-only open received a path that cannot be represented in a URI.
+    #[error("event store path `{path}` is not valid UTF-8 and cannot be opened read-only")]
+    NonUtf8Path {
+        /// Path that could not be encoded.
+        path: PathBuf,
     },
     /// The event could not be serialized to JSON.
     #[error("failed to serialize the agent event: {0}")]
@@ -857,7 +950,43 @@ pub enum EventStoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    /// Unique database file removed when the test finishes.
+    struct TempDatabase {
+        /// Path passed to [`EventStore::open`].
+        path: PathBuf,
+    }
+
+    impl TempDatabase {
+        /// Creates an unused path in the system temporary directory.
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "jessica-memory-unit-{label}-{}-{unique}.sqlite",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self { path }
+        }
+
+        /// Returns the database path.
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(sidecar_path(&self.path, suffix));
+            }
+        }
+    }
 
     #[test]
     fn in_memory_databases_use_the_memory_journal_and_full_synchronous() {
@@ -874,5 +1003,79 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .expect("synchronous level should read");
         assert_eq!(synchronous, 2, "SQLite encodes synchronous=FULL as 2");
+    }
+
+    #[test]
+    fn a_full_database_rolls_back_the_append_and_stays_usable() {
+        let database = TempDatabase::new("disk-full");
+        let session = SessionId::new("disk-full-session");
+        let mut store = EventStore::open(database.path()).expect("store should open");
+        store
+            .append(
+                &session,
+                &AgentEvent::ModelDelta {
+                    text: "baseline".to_owned(),
+                },
+                Timestamp::from_millis(1),
+            )
+            .expect("the baseline append should succeed");
+
+        let pages: i64 = store
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("page count should read");
+        store
+            .connection
+            .pragma_update(None, "max_page_count", pages + 1)
+            .expect("the page limit should apply");
+
+        let error = store
+            .append(
+                &session,
+                &AgentEvent::ModelDelta {
+                    text: "x".repeat(256 * 1024),
+                },
+                Timestamp::from_millis(2),
+            )
+            .expect_err("a full database must reject a large append");
+        match &error {
+            EventStoreError::Append {
+                source: rusqlite::Error::SqliteFailure(code, _),
+                ..
+            } => assert_eq!(
+                code.code,
+                rusqlite::ErrorCode::DiskFull,
+                "unexpected SQLite error: {error:?}"
+            ),
+            other => panic!("expected a SQLite disk-full append failure, found {other:?}"),
+        }
+        assert_eq!(
+            store.events(&session).expect("events should read").len(),
+            1,
+            "the failed append must not leave a row"
+        );
+        assert_eq!(
+            store.last_seq(&session).expect("sequence should read"),
+            Some(1),
+            "the failed append must not allocate a sequence"
+        );
+
+        store
+            .connection
+            .pragma_update(None, "max_page_count", 1_000_000i64)
+            .expect("the page limit should lift");
+        store
+            .append(
+                &session,
+                &AgentEvent::ModelDelta {
+                    text: "after".to_owned(),
+                },
+                Timestamp::from_millis(3),
+            )
+            .expect("the store should accept writes after the rollback");
+        assert_eq!(
+            store.last_seq(&session).expect("sequence should read"),
+            Some(2)
+        );
     }
 }
