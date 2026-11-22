@@ -28,12 +28,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jessica_core::tool::{Tool, ToolSchema};
 use jessica_core::types::ToolResult;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+use crate::tools::{CatalogCandidate, ToolAnnotations, ToolMetadata, ToolSource};
 
 /// Maximum MCP servers accepted for one ACP session.
 pub(crate) const MAX_MCP_SERVERS_PER_SESSION: usize = 8;
@@ -174,8 +177,8 @@ pub(crate) enum McpError {
 pub(crate) struct McpSession {
     /// Live connections in request order.
     connections: Vec<Arc<McpConnection>>,
-    /// Namespaced tool handles.
-    tools: Vec<Arc<dyn Tool>>,
+    /// Namespaced tool handles and their untrusted annotations.
+    tools: Vec<Arc<McpTool>>,
 }
 
 impl McpSession {
@@ -216,7 +219,7 @@ impl McpSession {
         }
 
         let mut connections: Vec<Arc<McpConnection>> = Vec::new();
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut tools: Vec<Arc<McpTool>> = Vec::new();
         let mut tool_names = HashSet::new();
 
         for (config, name, namespace) in validated {
@@ -267,6 +270,7 @@ impl McpSession {
                     remote_name: tool.name,
                     description: tool.description,
                     schema: tool.schema,
+                    annotations: tool.annotations,
                     connection: Arc::clone(&connection),
                 }));
             }
@@ -275,9 +279,22 @@ impl McpSession {
         Ok(Arc::new(Self { connections, tools }))
     }
 
-    /// Returns the namespaced tool handles discovered during startup.
-    pub(crate) fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.tools.clone()
+    /// Returns the namespaced tool candidates discovered during startup.
+    ///
+    /// Each candidate carries the server's advisory annotations. The catalog
+    /// still classifies capabilities and approval; annotations are never
+    /// trusted as proof that a server-side tool is safe.
+    pub(crate) fn tools(&self) -> Vec<CatalogCandidate> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                CatalogCandidate::from_tool(Arc::clone(tool) as Arc<dyn Tool>, ToolSource::Mcp)
+                    .with_metadata(ToolMetadata {
+                        version: None,
+                        annotations: tool.annotations,
+                    })
+            })
+            .collect()
     }
 
     /// Shuts down every child process. Called on close, delete, and shutdown.
@@ -317,6 +334,35 @@ fn sanitize_component(value: &str) -> String {
         .collect()
 }
 
+/// Advisory MCP `annotations` object.
+///
+/// Unknown fields are ignored because the MCP schema is additive. Missing
+/// fields stay `None`; the catalog applies conservative defaults instead of
+/// assuming a safe value.
+#[derive(Debug, Default, Deserialize)]
+struct AnnotationHints {
+    /// `readOnlyHint`.
+    #[serde(rename = "readOnlyHint", default)]
+    read_only: Option<bool>,
+    /// `destructiveHint`.
+    #[serde(rename = "destructiveHint", default)]
+    destructive: Option<bool>,
+    /// `openWorldHint`.
+    #[serde(rename = "openWorldHint", default)]
+    open_world: Option<bool>,
+}
+
+impl AnnotationHints {
+    /// Converts server hints into host annotations.
+    fn to_annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: self.read_only,
+            destructive: self.destructive,
+            open_world: self.open_world,
+        }
+    }
+}
+
 /// A tool discovered from an MCP server.
 struct DiscoveredTool {
     /// Original MCP tool name used for `tools/call`.
@@ -325,6 +371,8 @@ struct DiscoveredTool {
     description: String,
     /// Provider-facing input schema.
     schema: Value,
+    /// Advisory annotations supplied by the server.
+    annotations: ToolAnnotations,
 }
 
 /// One MCP tool exposed through Jessica's [`Tool`] contract.
@@ -337,6 +385,8 @@ struct McpTool {
     description: String,
     /// Input schema.
     schema: Value,
+    /// Advisory annotations supplied by the server.
+    annotations: ToolAnnotations,
     /// Connection that owns the server process.
     connection: Arc<McpConnection>,
 }
@@ -1009,10 +1059,19 @@ fn parse_tool(value: &Value, server: &str) -> Result<DiscoveredTool, McpError> {
         }
         None => json!({"type": "object", "properties": {}}),
     };
+    // A malformed annotations object is treated like absent hints, not as a
+    // discovery failure: the host's conservative baseline is safe, and one
+    // bad optional field must not hide an otherwise usable tool.
+    let annotations = object
+        .get("annotations")
+        .and_then(|value| serde_json::from_value::<AnnotationHints>(value.clone()).ok())
+        .unwrap_or_default()
+        .to_annotations();
     Ok(DiscoveredTool {
         name,
         description,
         schema,
+        annotations,
     })
 }
 
@@ -1095,6 +1154,51 @@ mod tests {
         let tool = parse_tool(&json!({"name": "ping"}), "server").expect("valid tool");
         assert_eq!(tool.name, "ping");
         assert_eq!(tool.schema, json!({"type": "object", "properties": {}}));
+        assert!(
+            tool.annotations.is_empty(),
+            "an omitted annotations object must stay unclaimed"
+        );
+    }
+
+    #[test]
+    fn discovery_reads_read_only_destructive_and_open_world_hints() {
+        let tool = parse_tool(
+            &json!({
+                "name": "search",
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "openWorldHint": true,
+                    "title": "ignored additive field"
+                }
+            }),
+            "server",
+        )
+        .expect("valid tool");
+        assert_eq!(
+            tool.annotations,
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(false),
+                open_world: Some(true),
+            }
+        );
+
+        let malformed = parse_tool(
+            &json!({
+                "name": "search",
+                "annotations": {
+                    "readOnlyHint": "yes",
+                    "destructiveHint": false
+                }
+            }),
+            "server",
+        )
+        .expect("a malformed optional annotation must not reject the tool");
+        assert!(
+            malformed.annotations.is_empty(),
+            "a partially malformed annotations object must fall back to none"
+        );
     }
 
     #[tokio::test]

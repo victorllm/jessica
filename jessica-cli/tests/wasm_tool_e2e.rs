@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,11 +30,44 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Unique temporary workspace removed on drop.
+struct TempDir {
+    /// Directory path.
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// Creates an empty temporary directory.
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "jessica-wasm-e2e-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("temporary workspace must be created");
+        Self {
+            path: std::fs::canonicalize(&path).expect("temporary workspace must resolve"),
+        }
+    }
+
+    /// Returns the workspace path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 #[test]
 fn cli_calls_a_wasm_tool_and_hides_an_unlisted_native_tool() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
     let address = listener.local_addr().expect("mock server address");
-    let server = thread::spawn(move || serve(listener));
+    let server = thread::spawn(move || serve(listener, 3, response_for));
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
         .current_dir(workspace_root())
@@ -116,6 +150,121 @@ fn cli_calls_a_wasm_tool_and_hides_an_unlisted_native_tool() {
     );
 }
 
+#[test]
+fn an_oversized_wasm_result_becomes_a_workspace_artifact() {
+    let workspace = TempDir::new("large-result");
+    let manifest = workspace_root().join("examples/plugins/echo/manifest.json");
+    let config = workspace.path().join("harness.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[budget]\nmax_tokens = 20000\ntool_timeout_ms = 5000\nmax_rounds = 6\n\
+             max_stuck_rounds = 2\nmax_result_bytes = 4096\n\n\
+             [policy]\nallowed_tools = [\"echo_json\"]\n\n\
+             [tools]\ninline_threshold_bytes = 64\nmax_inline_bytes = 512\n\
+             max_artifact_bytes = 8192\n\n\
+             [wasm]\nmanifests = [\"{}\"]\n",
+            manifest.display()
+        ),
+    )
+    .expect("configuration must be written");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+    let address = listener.local_addr().expect("mock server address");
+    let server = thread::spawn(move || serve(listener, 2, large_result_response_for));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_jessica"))
+        .current_dir(workspace.path())
+        .env("OPENAI_API_KEY", "test-key")
+        .env("OPENAI_BASE_URL", format!("http://{address}/v1"))
+        .env("OPENAI_MODEL", "test-model")
+        .arg("--config")
+        .arg(&config)
+        .arg("run the wasm echo tool")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start");
+    let status = wait_with_timeout(&mut child);
+    let output = child
+        .wait_with_output()
+        .expect("CLI output should be collected");
+    let requests = server.join().expect("mock server should finish");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.success(),
+        "CLI failed with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(requests.len(), 2, "expected two model requests");
+
+    let follow_up: serde_json::Value =
+        serde_json::from_str(&requests[1]).expect("provider request must be JSON");
+    let tool_content = follow_up["messages"]
+        .as_array()
+        .expect("request messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("the tool result must reach the model");
+    assert!(
+        tool_content.contains("result_artifact") && tool_content.contains("sha256:"),
+        "the oversized wasm result must reach the model as an artifact envelope: {tool_content}"
+    );
+    assert!(
+        !tool_content.contains(&"z".repeat(128)) && tool_content.len() <= 512,
+        "the model must receive only a bounded preview, got {} bytes",
+        tool_content.len()
+    );
+    assert!(
+        stdout.contains("result_artifact") && stdout.contains("sha256:"),
+        "the CLI must render the artifact envelope:\n{stdout}"
+    );
+
+    let artifacts = artifact_files(workspace.path());
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "one data file and one sidecar must be stored: {artifacts:?}"
+    );
+    let data = artifacts
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() == 64)
+        })
+        .expect("the data artifact must exist");
+    let stored = std::fs::read(data).expect("artifact must be readable");
+    assert!(
+        stored.len() >= 2_000 && stored.iter().filter(|byte| **byte == b'z').count() >= 2_000,
+        "the artifact must retain the oversized payload, got {} bytes",
+        stored.len()
+    );
+}
+
+/// Returns every regular file under the default artifact directory.
+fn artifact_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(shards) = std::fs::read_dir(root.join(".jessica/artifacts")) else {
+        return files;
+    };
+    for shard in shards.flatten() {
+        let Ok(entries) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 /// Waits for the child, killing it when the overall budget expires.
 fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + CHILD_TIMEOUT;
@@ -132,15 +281,15 @@ fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-/// Serves three scripted chat-completion responses and returns request bodies.
-fn serve(listener: TcpListener) -> Vec<String> {
+/// Serves `expected` scripted chat-completion responses and returns request bodies.
+fn serve(listener: TcpListener, expected: usize, response_for: fn(usize) -> String) -> Vec<String> {
     listener
         .set_nonblocking(true)
         .expect("listener should become non-blocking");
     let deadline = Instant::now() + SERVER_TIMEOUT;
     let mut bodies = Vec::new();
 
-    while bodies.len() < 3 && Instant::now() < deadline {
+    while bodies.len() < expected && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream
@@ -215,6 +364,23 @@ fn response_for(index: usize) -> String {
             finish_chunk("tool_calls"),
         ],
         _ => vec![content_chunk("wasm tool completed"), finish_chunk("stop")],
+    };
+    sse(&payloads)
+}
+
+/// Returns the scripted responses for the oversized-result scenario.
+fn large_result_response_for(index: usize) -> String {
+    let payloads = if index == 0 {
+        let arguments = serde_json::json!({"text": "z".repeat(2_000)}).to_string();
+        vec![
+            tool_call_chunk("call_big", "echo_json", &arguments),
+            finish_chunk("tool_calls"),
+        ]
+    } else {
+        vec![
+            content_chunk("large wasm result handled"),
+            finish_chunk("stop"),
+        ]
     };
     sse(&payloads)
 }

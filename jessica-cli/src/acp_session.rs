@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::v1::schema::ContentBlock;
-use jessica_core::tool::Tool;
 use jessica_core::types::{Message, Role, SessionId};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::McpSession;
+use crate::tools::CatalogCandidate;
 
 /// Process-wide session sequence.
 ///
@@ -231,7 +231,7 @@ impl AcpSession {
     /// Every turn receives the same handles; the underlying connection and
     /// child processes stay owned by the session. Closed sessions have no
     /// tools because their lifetime shutdown discarded the MCP session.
-    pub(crate) fn mcp_tools(&self) -> Vec<Arc<dyn Tool>> {
+    pub(crate) fn mcp_tools(&self) -> Vec<CatalogCandidate> {
         self.mcp.get().map(|mcp| mcp.tools()).unwrap_or_default()
     }
 

@@ -48,7 +48,10 @@ pub use list_dir::{
     DEFAULT_LIST_DIR_ENTRIES, DEFAULT_LIST_DIR_IGNORES, ListDirOptions, ListDirTool,
 };
 pub use patch::{ApplyPatchTool, MAX_PATCH_BYTES, PatchSummary, summarize_patch};
-pub use wasm::{WasmTool, WasmToolError, register_wasm_tool};
+pub use wasm::{
+    MANIFEST_VERSION_V1, MANIFEST_VERSION_V2, WasmAnnotations, WasmTool, WasmToolError,
+    register_wasm_tool,
+};
 
 use jessica_core::types::ToolResult;
 

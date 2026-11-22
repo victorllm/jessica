@@ -45,7 +45,10 @@ use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
-use crate::tools::{CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates};
+use crate::tools::{
+    CatalogCandidate, CatalogError, ToolAnnotations, ToolCatalog, ToolMetadata, ToolSource,
+    native_candidates,
+};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -238,18 +241,21 @@ pub(crate) struct TurnRequest {
     /// Session-scoped tools registered in addition to the built-in and WASM
     /// tools.
     ///
-    /// ACP uses this for MCP tools discovered for one session. Every tool is
-    /// still wrapped in [`GovernedTool`], so policy, timeout, and result-size
-    /// rules apply exactly as they do to native tools. The CLI and resume
-    /// paths pass an empty slice.
-    pub(crate) extra_tools: Vec<Arc<dyn Tool>>,
+    /// ACP uses this for MCP tools discovered for one session. Candidates keep
+    /// the server's advisory annotations so the catalog can classify
+    /// destructive or open-world tools conservatively. Every executable tool
+    /// is still wrapped in [`GovernedTool`], so policy, timeout, approval, and
+    /// result-size rules apply exactly as they do to native tools. The CLI and
+    /// resume paths pass an empty vector.
+    pub(crate) extra_tools: Vec<CatalogCandidate>,
     /// Optional approval gate for sensitive native tools.
     ///
     /// ACP supplies a gate that asks the client through
     /// `session/request_permission`. The CLI and resume paths pass `None`,
-    /// leaving `bash`, `exec`, `write_file`, and `delegate_task` governed by policy
-    /// alone. The fixed sensitive set is evaluated inside [`GovernedTool`];
-    /// configured WASM and MCP tools never request permission.
+    /// leaving sensitive tools governed by policy alone. The fixed native
+    /// sensitive set plus destructive or open-world WASM/MCP descriptors are
+    /// evaluated inside [`GovernedTool`]; read-only annotated external tools do
+    /// not request permission.
     pub(crate) permission_gate: Option<Arc<dyn ToolPermissionGate>>,
 }
 
@@ -277,6 +283,18 @@ pub(crate) struct TurnOutcome {
     pub(crate) lagged: bool,
 }
 
+/// A compiled WASM tool plus the manifest metadata used by the catalog.
+///
+/// The executable handle is process-wide because compilation is expensive.
+/// Metadata is copied into a descriptor-only view for each turn; annotations
+/// never grant capabilities beyond the sandbox policy.
+pub(crate) struct LoadedWasmTool {
+    /// Compiled tool handle.
+    pub(crate) tool: Arc<dyn Tool>,
+    /// Manifest version and advisory annotations.
+    pub(crate) metadata: ToolMetadata,
+}
+
 /// Owns the provider, configuration snapshot source, and workspace.
 pub(crate) struct CliRuntime {
     provider: Arc<dyn LlmProvider>,
@@ -287,7 +305,7 @@ pub(crate) struct CliRuntime {
     /// the startup configuration.
     config: watch::Receiver<Arc<HarnessConfig>>,
     root: PathBuf,
-    wasm_tools: Vec<Arc<dyn Tool>>,
+    wasm_tools: Vec<LoadedWasmTool>,
     recorder: Option<Arc<EventRecorder>>,
     memory: Option<MemoryAssembly>,
     skills: Option<SkillsAssembly>,
@@ -317,7 +335,7 @@ impl CliRuntime {
         provider: Arc<dyn LlmProvider>,
         config: watch::Receiver<Arc<HarnessConfig>>,
         root: PathBuf,
-        wasm_tools: Vec<Arc<dyn Tool>>,
+        wasm_tools: Vec<LoadedWasmTool>,
         recorder: Option<Arc<EventRecorder>>,
         memory: Option<MemoryAssembly>,
         skills: Option<SkillsAssembly>,
@@ -904,7 +922,7 @@ impl CliRuntime {
         allow_delegation: bool,
         config: &HarnessConfig,
         update_sink: Option<Arc<dyn UpdateSink>>,
-        extra_tools: &[Arc<dyn Tool>],
+        extra_tools: &[CatalogCandidate],
         permission_gate: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Result<TurnSetup, CliError> {
         let timeout = config.budget.tool_timeout();
@@ -973,6 +991,7 @@ impl CliRuntime {
             journal.child_sink(),
             events.clone(),
             ParentCapabilities::new(base.exposed_names(), base.exposed_native_names()),
+            Arc::clone(&result_manager),
         )?;
 
         let catalog = if let Some(executor) = delegation {
@@ -1070,13 +1089,21 @@ impl CliRuntime {
         child_sink: Option<Arc<dyn ChildEventSink>>,
         events: broadcast::Sender<AgentEvent>,
         parent: ParentCapabilities,
+        result_manager: Arc<ResultManager>,
     ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
         if !allow_delegation || !config.delegation.enabled {
             return Ok(None);
         }
 
-        let factory: Arc<dyn ChildToolFactory> =
-            Arc::new(NativeChildToolFactory::new(scope.root().to_path_buf()));
+        // The child factory receives the same resolved supervisor settings and
+        // result manager as the parent turn. Child bash/exec therefore share
+        // the environment allowlist, deadlines, output caps, and artifact
+        // storage instead of falling back to bare tool defaults.
+        let factory: Arc<dyn ChildToolFactory> = Arc::new(NativeChildToolFactory::new(
+            scope.root().to_path_buf(),
+            config,
+            result_manager,
+        ));
         let mut executor =
             AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
         if let Some(sink) = sink {
@@ -1098,19 +1125,14 @@ impl CliRuntime {
         &self,
         scope: &TurnScope,
         config: &HarnessConfig,
-        extra_tools: &[Arc<dyn Tool>],
+        extra_tools: &[CatalogCandidate],
     ) -> Vec<CatalogCandidate> {
         let mut candidates = native_candidates(scope.root(), config);
-        candidates.extend(
-            self.wasm_tools
-                .iter()
-                .map(|tool| CatalogCandidate::from_tool(Arc::clone(tool), ToolSource::Wasm)),
-        );
-        candidates.extend(
-            extra_tools
-                .iter()
-                .map(|tool| CatalogCandidate::from_tool(Arc::clone(tool), ToolSource::Mcp)),
-        );
+        candidates.extend(self.wasm_tools.iter().map(|loaded| {
+            CatalogCandidate::from_tool(Arc::clone(&loaded.tool), ToolSource::Wasm)
+                .with_metadata(loaded.metadata.clone())
+        }));
+        candidates.extend(extra_tools.iter().cloned());
         candidates
     }
 
@@ -1172,11 +1194,12 @@ impl CliRuntime {
 /// Manifest reading and wasm compilation are blocking, so all manifests are
 /// loaded in one `spawn_blocking` task. Relative manifest paths resolve
 /// against the workspace root. The returned tools are shared across turns;
-/// each turn still wraps them in fresh governance.
+/// each turn still wraps them in fresh governance. Manifest version and
+/// annotations are captured once alongside the compiled handle.
 pub(crate) async fn load_wasm_tools(
     config: &HarnessConfig,
     root: &Path,
-) -> Result<Vec<Arc<dyn Tool>>, CliError> {
+) -> Result<Vec<LoadedWasmTool>, CliError> {
     if config.wasm.manifests.is_empty() {
         return Ok(Vec::new());
     }
@@ -1197,12 +1220,31 @@ pub(crate) async fn load_wasm_tools(
     tokio::task::spawn_blocking(move || {
         paths
             .iter()
-            .map(|path| WasmTool::load(path).map(|tool| Arc::new(tool) as Arc<dyn Tool>))
+            .map(|path| {
+                WasmTool::load(path).map(|tool| LoadedWasmTool {
+                    metadata: wasm_metadata(&tool),
+                    tool: Arc::new(tool) as Arc<dyn Tool>,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
     })
     .await
     .map_err(CliError::WasmToolTask)?
     .map_err(CliError::WasmTool)
+}
+
+/// Converts manifest metadata into catalog metadata.
+fn wasm_metadata(tool: &WasmTool) -> ToolMetadata {
+    ToolMetadata {
+        version: Some(format!("manifest-v{}", tool.manifest_version())),
+        annotations: tool
+            .annotations()
+            .map_or_else(ToolAnnotations::none, |annotations| ToolAnnotations {
+                read_only: Some(annotations.read_only),
+                destructive: Some(annotations.destructive),
+                open_world: Some(annotations.open_world),
+            }),
+    }
 }
 
 /// Outcome of racing the pump wait against a journal failure.

@@ -26,11 +26,34 @@ use crate::{failure, success};
 
 /// Default maximum bytes a wasm tool may return.
 const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024;
+/// Original manifest schema version. A missing `version` selects this value.
+pub const MANIFEST_VERSION_V1: u32 = 1;
+/// Manifest schema version that adds advisory descriptor annotations.
+pub const MANIFEST_VERSION_V2: u32 = 2;
+
+/// Advisory annotations a v2 manifest declares about its guest.
+///
+/// Annotations are untrusted provider metadata. The sandbox policy still
+/// enforces no write preopens and no network; the host only uses these values
+/// to classify the tool more conservatively and to require approval for
+/// declared destructive or open-world behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmAnnotations {
+    /// Guest claims it does not mutate host state.
+    pub read_only: bool,
+    /// Guest claims it can destroy or overwrite existing state.
+    pub destructive: bool,
+    /// Guest claims it interacts with external entities.
+    pub open_world: bool,
+}
 
 /// Parsed manifest before paths and sandbox policy are resolved.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    /// Manifest schema version; absent means version 1.
+    #[serde(default)]
+    version: Option<u32>,
     /// Stable tool name exposed to the model.
     name: String,
     /// Human-readable description copied into the provider schema.
@@ -46,6 +69,42 @@ struct Manifest {
     /// Sandbox permissions and resource limits.
     #[serde(default)]
     permissions: PermissionManifest,
+    /// Advisory descriptor annotations; only valid in version 2.
+    #[serde(default)]
+    annotations: Option<AnnotationManifest>,
+}
+
+/// Provider annotations declared by a version 2 manifest.
+///
+/// All three fields are required when the object is present so a v2 manifest
+/// cannot silently omit a classification the host would have to guess.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnnotationManifest {
+    /// Guest claims it does not mutate host state.
+    read_only: bool,
+    /// Guest claims it can destroy or overwrite existing state.
+    destructive: bool,
+    /// Guest claims it interacts with external entities.
+    open_world: bool,
+}
+
+impl Manifest {
+    /// Returns the effective manifest version.
+    fn version(&self) -> u32 {
+        self.version.unwrap_or(MANIFEST_VERSION_V1)
+    }
+
+    /// Returns the validated annotations, when declared.
+    fn wasm_annotations(&self) -> Option<WasmAnnotations> {
+        self.annotations
+            .as_ref()
+            .map(|annotations| WasmAnnotations {
+                read_only: annotations.read_only,
+                destructive: annotations.destructive,
+                open_world: annotations.open_world,
+            })
+    }
 }
 
 /// Buffer ABI export names declared by a manifest.
@@ -126,6 +185,8 @@ pub struct WasmTool {
     abi: BufferAbi,
     policy: Arc<SandboxPolicy>,
     max_result_bytes: usize,
+    manifest_version: u32,
+    annotations: Option<WasmAnnotations>,
     execution_lock: Arc<Mutex<()>>,
 }
 
@@ -166,6 +227,8 @@ impl WasmTool {
         let engine = WasmEngine::new()?;
         let module = engine.load_file(&module_path)?;
 
+        let manifest_version = manifest.version();
+        let annotations = manifest.wasm_annotations();
         Ok(Self {
             name: manifest.name,
             description: manifest.description,
@@ -174,14 +237,52 @@ impl WasmTool {
             abi: BufferAbi::new(manifest.abi.alloc, manifest.abi.invoke),
             policy: Arc::new(policy),
             max_result_bytes: manifest.permissions.result_limit(),
+            manifest_version,
+            annotations,
             execution_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Returns the manifest schema version that produced this tool.
+    pub fn manifest_version(&self) -> u32 {
+        self.manifest_version
+    }
+
+    /// Returns the advisory annotations declared by a v2 manifest.
+    ///
+    /// `None` means the manifest used the v1 shape or omitted optional v2
+    /// annotations; the host then applies the conservative sandbox baseline.
+    pub fn annotations(&self) -> Option<WasmAnnotations> {
+        self.annotations
     }
 }
 
 impl Manifest {
     /// Rejects manifests that would produce an unusable or unsupported tool.
     fn validate(&self) -> Result<(), String> {
+        let version = self.version();
+        if version != MANIFEST_VERSION_V1 && version != MANIFEST_VERSION_V2 {
+            return Err(format!(
+                "version must be {MANIFEST_VERSION_V1} or {MANIFEST_VERSION_V2}"
+            ));
+        }
+        if self.annotations.is_some() && version != MANIFEST_VERSION_V2 {
+            return Err("annotations require manifest version 2".to_owned());
+        }
+        if let Some(annotations) = &self.annotations {
+            if annotations.read_only && annotations.destructive {
+                return Err(
+                    "annotations.read_only and annotations.destructive cannot both be true"
+                        .to_owned(),
+                );
+            }
+            if annotations.read_only && annotations.open_world {
+                return Err(
+                    "annotations.read_only and annotations.open_world cannot both be true"
+                        .to_owned(),
+                );
+            }
+        }
         if self.name.trim().is_empty() {
             return Err("name must not be empty".to_owned());
         }

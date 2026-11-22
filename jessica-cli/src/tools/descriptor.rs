@@ -33,6 +33,47 @@ impl ToolSource {
     }
 }
 
+/// Advisory metadata supplied by a tool provider.
+///
+/// MCP `annotations` and WASM manifest v2 annotations are untrusted
+/// self-descriptions. The host uses them only to narrow or widen capability
+/// classification conservatively; it never treats a claim as proof of safety.
+/// `None` means the provider did not state a value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ToolAnnotations {
+    /// Provider claims the tool does not mutate state.
+    pub read_only: Option<bool>,
+    /// Provider claims the tool can destroy existing state.
+    pub destructive: Option<bool>,
+    /// Provider claims the tool can interact with external entities.
+    pub open_world: Option<bool>,
+}
+
+impl ToolAnnotations {
+    /// Returns annotations with no provider claim.
+    pub(crate) const fn none() -> Self {
+        Self {
+            read_only: None,
+            destructive: None,
+            open_world: None,
+        }
+    }
+
+    /// Returns whether no provider claimed any field.
+    pub(crate) fn is_empty(self) -> bool {
+        self.read_only.is_none() && self.destructive.is_none() && self.open_world.is_none()
+    }
+}
+
+/// Provider metadata attached to one catalog candidate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ToolMetadata {
+    /// Explicit source version, such as `manifest-v2`.
+    pub version: Option<String>,
+    /// Provider annotations.
+    pub annotations: ToolAnnotations,
+}
+
 /// Capability classes assigned by the host.
 ///
 /// Every flag is conservative: a capability is set when the tool can plausibly
@@ -117,6 +158,65 @@ impl Capabilities {
             network: false,
             destructive: false,
             parallel_safe: false,
+        }
+    }
+
+    /// Assigns capabilities using provider annotations where they exist.
+    ///
+    /// Native and delegation classification never consult annotations: those
+    /// tools are compiled into the host and reviewed here. WASM and MCP
+    /// classification is conservative:
+    ///
+    /// - MCP is read-only only when `readOnlyHint` is true and
+    ///   `destructiveHint` is explicitly false; a missing or conflicting
+    ///   destructive hint keeps the destructive baseline. A missing
+    ///   `openWorldHint` keeps the network baseline.
+    /// - WASM keeps the v1 sandbox baseline (read-only, no network) when no
+    ///   annotations are present. Declared destructive or open-world behavior
+    ///   escalates the descriptor; annotations can never grant more privilege
+    ///   than the sandbox already enforces.
+    pub(crate) fn for_metadata(
+        source: ToolSource,
+        name: &str,
+        annotations: ToolAnnotations,
+    ) -> Self {
+        if annotations.is_empty() {
+            return Self::for_tool(source, name);
+        }
+        match source {
+            ToolSource::Native | ToolSource::Delegation => Self::for_tool(source, name),
+            ToolSource::Mcp => {
+                let read_only =
+                    annotations.read_only == Some(true) && annotations.destructive == Some(false);
+                if read_only {
+                    Self {
+                        read_only: true,
+                        network: annotations.open_world.unwrap_or(true),
+                        ..Self::none()
+                    }
+                } else {
+                    Self {
+                        executes: true,
+                        network: annotations.open_world.unwrap_or(true),
+                        destructive: annotations.destructive.unwrap_or(true),
+                        writes_files: annotations.destructive.unwrap_or(true),
+                        ..Self::none()
+                    }
+                }
+            }
+            ToolSource::Wasm => {
+                let destructive = annotations.destructive.unwrap_or(false);
+                let network = annotations.open_world.unwrap_or(false);
+                let read_only = !destructive && !network;
+                Self {
+                    read_only,
+                    writes_files: !read_only,
+                    executes: destructive,
+                    network,
+                    destructive,
+                    parallel_safe: false,
+                }
+            }
         }
     }
 }
@@ -228,16 +328,20 @@ impl ToolDescriptor {
         schema: ToolSchema,
         limits: ToolLimits,
         approval: ApprovalPolicy,
+        metadata: &ToolMetadata,
     ) -> Result<Self, serde_json::Error> {
         let (schema_digest, schema_bytes) = digest_schema(&schema)?;
         Ok(Self {
             name: name.clone(),
             source,
-            version: version_for(source).to_owned(),
+            version: metadata
+                .version
+                .clone()
+                .unwrap_or_else(|| version_for(source).to_owned()),
             schema,
             schema_digest,
             schema_bytes,
-            capabilities: Capabilities::for_tool(source, &name),
+            capabilities: Capabilities::for_metadata(source, &name, metadata.annotations),
             limits,
             approval,
             policy_hints: policy_hints_for(source, &name),
@@ -476,6 +580,7 @@ mod tests {
             schema,
             limits,
             ApprovalPolicy::Interactive,
+            &ToolMetadata::default(),
         )
         .expect("descriptor must build");
         assert_eq!(descriptor.version, env!("CARGO_PKG_VERSION"));
@@ -507,5 +612,145 @@ mod tests {
                 .as_deref(),
             Some("program")
         );
+    }
+
+    #[test]
+    fn mcp_annotations_narrow_capabilities_only_when_fully_consistent() {
+        let read_only = Capabilities::for_metadata(
+            ToolSource::Mcp,
+            "mcp__srv__search",
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(false),
+                open_world: Some(false),
+            },
+        );
+        assert!(read_only.read_only);
+        assert!(!read_only.destructive && !read_only.network && !read_only.writes_files);
+
+        let open_world = Capabilities::for_metadata(
+            ToolSource::Mcp,
+            "mcp__srv__search",
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(false),
+                open_world: Some(true),
+            },
+        );
+        assert!(
+            open_world.read_only && open_world.network && !open_world.destructive,
+            "a read-only tool may still reach the open world: {open_world:?}"
+        );
+
+        for annotations in [
+            ToolAnnotations::none(),
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: None,
+                open_world: Some(false),
+            },
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(true),
+                open_world: Some(false),
+            },
+            ToolAnnotations {
+                read_only: Some(false),
+                destructive: Some(false),
+                open_world: Some(false),
+            },
+        ] {
+            let capabilities =
+                Capabilities::for_metadata(ToolSource::Mcp, "mcp__srv__tool", annotations);
+            assert!(
+                !capabilities.read_only,
+                "missing or conflicting hints must not be treated as read-only: {annotations:?}"
+            );
+        }
+
+        let missing_open_world = Capabilities::for_metadata(
+            ToolSource::Mcp,
+            "mcp__srv__tool",
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(false),
+                open_world: None,
+            },
+        );
+        assert!(
+            missing_open_world.network,
+            "a missing open-world hint must keep the conservative network classification"
+        );
+    }
+
+    #[test]
+    fn wasm_annotations_escalate_but_never_widen_the_sandbox() {
+        let v1 = Capabilities::for_metadata(ToolSource::Wasm, "echo_json", ToolAnnotations::none());
+        assert!(v1.read_only && !v1.writes_files && !v1.network && !v1.destructive);
+
+        let destructive = Capabilities::for_metadata(
+            ToolSource::Wasm,
+            "echo_json",
+            ToolAnnotations {
+                read_only: Some(false),
+                destructive: Some(true),
+                open_world: Some(false),
+            },
+        );
+        assert!(
+            destructive.destructive && destructive.writes_files && !destructive.read_only,
+            "declared destructive wasm must be classified conservatively: {destructive:?}"
+        );
+
+        let open_world = Capabilities::for_metadata(
+            ToolSource::Wasm,
+            "echo_json",
+            ToolAnnotations {
+                read_only: Some(true),
+                destructive: Some(false),
+                open_world: Some(true),
+            },
+        );
+        assert!(
+            open_world.network && !open_world.destructive,
+            "declared open-world wasm must expose the network capability: {open_world:?}"
+        );
+
+        let native = Capabilities::for_metadata(
+            ToolSource::Native,
+            "read_file",
+            ToolAnnotations {
+                read_only: Some(false),
+                destructive: Some(true),
+                open_world: Some(true),
+            },
+        );
+        assert!(
+            native.read_only && !native.destructive,
+            "native classification must ignore provider annotations"
+        );
+    }
+
+    #[test]
+    fn descriptor_version_uses_explicit_metadata_when_present() {
+        let descriptor = ToolDescriptor::new(
+            "echo_json".to_owned(),
+            ToolSource::Wasm,
+            json!({"type": "function", "function": {"name": "echo_json"}}),
+            ToolLimits {
+                timeout_ms: 1_000,
+                max_args_bytes: None,
+                max_inline_bytes: 1_024,
+                max_artifact_bytes: Some(4_096),
+                max_output_lines: None,
+            },
+            ApprovalPolicy::NotRequired,
+            &ToolMetadata {
+                version: Some("manifest-v2".to_owned()),
+                annotations: ToolAnnotations::none(),
+            },
+        )
+        .expect("descriptor must build");
+        assert_eq!(descriptor.version, "manifest-v2");
     }
 }
