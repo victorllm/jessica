@@ -22,7 +22,9 @@ use thiserror::Error;
 use crate::config::{HarnessConfig, ToolProfile};
 use crate::governance::permission_required;
 
-use super::descriptor::{ApprovalPolicy, ToolDescriptor, ToolLimits, ToolSource};
+use super::descriptor::{
+    ApprovalPolicy, Capabilities, ToolDescriptor, ToolLimits, ToolMetadata, ToolSource,
+};
 
 /// Error raised while building or querying the catalog.
 #[derive(Debug, Error)]
@@ -112,6 +114,8 @@ pub(crate) struct CatalogCandidate {
     /// `None` is allowed only for descriptor-only commands such as
     /// `tools list`; a runtime turn fails closed if such an entry is exposed.
     pub tool: Option<Arc<dyn Tool>>,
+    /// Provider-supplied version and annotations.
+    pub metadata: ToolMetadata,
 }
 
 impl CatalogCandidate {
@@ -124,6 +128,7 @@ impl CatalogCandidate {
             schema,
             source,
             tool: Some(tool),
+            metadata: ToolMetadata::default(),
         }
     }
 
@@ -138,7 +143,17 @@ impl CatalogCandidate {
             schema,
             source,
             tool: None,
+            metadata: ToolMetadata::default(),
         }
+    }
+
+    /// Attaches provider metadata to this candidate.
+    ///
+    /// Metadata is advisory. The catalog still owns the final capability and
+    /// approval classification.
+    pub(crate) fn with_metadata(mut self, metadata: ToolMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -202,7 +217,19 @@ impl ToolCatalog {
                 max_artifact_bytes: Some(config.tools.max_artifact_bytes),
                 max_output_lines: max_output_lines(&candidate.name, config),
             };
-            let approval = if permission_required(&candidate.name) {
+            let capabilities = Capabilities::for_metadata(
+                candidate.source,
+                &candidate.name,
+                candidate.metadata.annotations,
+            );
+            // External tools run outside the host's sandbox. A destructive or
+            // open-world classification always needs one-time approval when a
+            // gate exists, even without an explicit `[approval]` section.
+            // Read-only annotated MCP/WASM tools stay on the allowlist path.
+            let external_requires_approval =
+                matches!(candidate.source, ToolSource::Mcp | ToolSource::Wasm)
+                    && (capabilities.destructive || capabilities.network);
+            let approval = if permission_required(&candidate.name) || external_requires_approval {
                 ApprovalPolicy::Interactive
             } else {
                 ApprovalPolicy::NotRequired
@@ -213,6 +240,7 @@ impl ToolCatalog {
                 candidate.schema,
                 limits,
                 approval,
+                &candidate.metadata,
             )
             .map_err(|source| CatalogError::Schema {
                 name: candidate.name.clone(),
@@ -870,5 +898,151 @@ mod tests {
         assert_eq!(first.schema_digest, second.schema_digest);
         assert_eq!(first.schema_bytes, second.schema_bytes);
         assert_eq!(first.schema_digest.len(), 71);
+    }
+
+    fn annotated(
+        name: &str,
+        source: ToolSource,
+        annotations: super::super::descriptor::ToolAnnotations,
+    ) -> CatalogCandidate {
+        candidate(name, source).with_metadata(super::super::descriptor::ToolMetadata {
+            version: None,
+            annotations,
+        })
+    }
+
+    fn wasm_v2(
+        name: &str,
+        annotations: super::super::descriptor::ToolAnnotations,
+    ) -> CatalogCandidate {
+        annotated(name, ToolSource::Wasm, annotations).with_metadata(
+            super::super::descriptor::ToolMetadata {
+                version: Some("manifest-v2".to_owned()),
+                annotations,
+            },
+        )
+    }
+
+    #[test]
+    fn mcp_annotations_drive_capabilities_version_and_approval() {
+        use super::super::descriptor::ToolAnnotations;
+
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"mcp__srv__search\", \"mcp__srv__wipe\", \"mcp__srv__raw\"]\n\
+             [tools]\nprofile = \"full\"\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                annotated(
+                    "mcp__srv__search",
+                    ToolSource::Mcp,
+                    ToolAnnotations {
+                        read_only: Some(true),
+                        destructive: Some(false),
+                        open_world: Some(false),
+                    },
+                ),
+                annotated(
+                    "mcp__srv__wipe",
+                    ToolSource::Mcp,
+                    ToolAnnotations {
+                        read_only: Some(false),
+                        destructive: Some(true),
+                        open_world: Some(false),
+                    },
+                ),
+                candidate("mcp__srv__raw", ToolSource::Mcp),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        let search = catalog
+            .find("mcp__srv__search")
+            .expect("search must exist")
+            .descriptor
+            .clone();
+        assert!(search.capabilities.read_only);
+        assert!(!search.capabilities.destructive && !search.capabilities.network);
+        assert_eq!(search.approval, ApprovalPolicy::NotRequired);
+        assert_eq!(search.version, "mcp-2025-06-18");
+
+        let wipe = catalog.find("mcp__srv__wipe").expect("wipe must exist");
+        assert!(
+            wipe.descriptor.capabilities.destructive,
+            "destructiveHint must be honored"
+        );
+        assert_eq!(
+            wipe.descriptor.approval,
+            ApprovalPolicy::Interactive,
+            "destructive MCP tools must always require one-time approval"
+        );
+
+        let raw = catalog.find("mcp__srv__raw").expect("raw must exist");
+        assert!(
+            raw.descriptor.capabilities.destructive
+                && raw.descriptor.capabilities.network
+                && !raw.descriptor.capabilities.read_only,
+            "unannotated MCP tools must keep the conservative baseline"
+        );
+        assert_eq!(raw.descriptor.approval, ApprovalPolicy::Interactive);
+    }
+
+    #[test]
+    fn wasm_annotations_and_manifest_version_are_visible() {
+        use super::super::descriptor::ToolAnnotations;
+
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"echo_json\", \"wipe_json\"]\n\
+             [tools]\nprofile = \"full\"\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                wasm_v2(
+                    "echo_json",
+                    ToolAnnotations {
+                        read_only: Some(true),
+                        destructive: Some(false),
+                        open_world: Some(false),
+                    },
+                ),
+                wasm_v2(
+                    "wipe_json",
+                    ToolAnnotations {
+                        read_only: Some(false),
+                        destructive: Some(true),
+                        open_world: Some(false),
+                    },
+                ),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        let echo = catalog.find("echo_json").expect("echo must exist");
+        assert!(echo.descriptor.capabilities.read_only);
+        assert_eq!(echo.descriptor.version, "manifest-v2");
+        assert_eq!(echo.descriptor.approval, ApprovalPolicy::NotRequired);
+
+        let wipe = catalog.find("wipe_json").expect("wipe must exist");
+        assert!(wipe.descriptor.capabilities.destructive);
+        assert_eq!(
+            wipe.descriptor.approval,
+            ApprovalPolicy::Interactive,
+            "a destructive wasm declaration must require approval"
+        );
+    }
+
+    #[test]
+    fn descriptor_only_candidates_keep_the_default_metadata() {
+        let candidate = CatalogCandidate::descriptor_only(
+            "delegate_task",
+            json!({"type": "function", "function": {"name": "delegate_task"}}),
+            ToolSource::Delegation,
+        );
+        assert!(candidate.metadata.version.is_none());
+        assert!(candidate.metadata.annotations.is_empty());
     }
 }

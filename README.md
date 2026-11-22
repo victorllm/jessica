@@ -342,11 +342,23 @@ An `ask` rule enables the terminal prompt on its own, even without an
 `[approval]` section. It does not start prompting for legacy-sensitive tools
 that no rule mentions.
 
-The sensitive set is `bash`, `exec`, `write_file`, `apply_patch`, `edit_file`,
-and `delegate_task`. With an explicit `[approval]` section, destructive MCP
-tools also become sensitive; WASM tools keep their read-only capability
-classification. Approval requests carry only the tool name, a bounded argument
-summary, and a reason. For `write_file` the summary is a bounded line-diff
+The fixed sensitive set is `bash`, `exec`, `write_file`, `apply_patch`,
+`edit_file`, and `delegate_task`. External tools are classified by the host,
+not by their own claims: an MCP or WASM descriptor whose host classification is
+destructive or open-world also requires one-time approval whenever a
+permission gate is installed, even without an explicit `[approval]` section.
+Provider annotations are advisory. An MCP tool
+is treated as read-only only when `readOnlyHint = true` and
+`destructiveHint = false`; a missing or conflicting `destructiveHint` keeps the
+destructive baseline, and a missing `openWorldHint` keeps the network baseline.
+An unannotated MCP tool is therefore destructive and open-world, while a
+read-only annotated MCP tool stays policy-only. WASM manifest v2 annotations
+can escalate a tool to destructive or open-world, which requires approval;
+manifest v1 and unannotated v2 WASM tools keep the read-only sandbox baseline.
+The host always owns the final classification: an annotation can make the host
+more cautious, never prove a tool safe. Approval requests carry only the tool
+name, a bounded argument summary, and a reason. For `write_file` the summary is
+a bounded line-diff
 summary rather than the file body; for `edit_file` it reports the path plus old
 and new byte/line counts; for `apply_patch` it reports the target path, hunk
 counts, added/removed lines, and whether the call is a dry run. Neither editor
@@ -358,10 +370,15 @@ never read or sent.
 
 #### Migration from 9.1
 
-- Existing configurations need no changes. `policy.allowed_tools` keeps its
+- Existing configurations still load. `policy.allowed_tools` keeps its
   meaning, and an empty `rules` list plus no `[approval]` section preserves the
-  pre-v2 behavior: ACP asks for the fixed sensitive set, while a CLI turn
-  without a permission gate runs allowlisted tools.
+  native split: ACP asks for the fixed sensitive set, while a CLI turn without
+  a permission gate runs allowlisted native tools.
+- External tools now follow their host classification. Under an ACP gate,
+  destructive or open-world MCP/WASM descriptors ask even without `[approval]`.
+  Unannotated MCP tools take the conservative destructive/open-world baseline,
+  so they prompt; read-only annotated MCP tools and v1 or unannotated WASM
+  tools do not.
 - Adding `[approval] mode = "ask"` is an explicit choice: a CLI turn without a
   terminal gate now fails closed for sensitive tools instead of running them
   silently.
@@ -492,6 +509,39 @@ overrides the global tool timeout for that tool. The whole `[tools]` section,
 including `[tools.bash]` and `[tools.supervisor]`, is hot-reloadable and applies
 to the next turn.
 
+### WASM tool manifests
+
+WASM plugins are declared with `[wasm] manifests = [...]`; a tool must also be
+in `policy.allowed_tools` and exposed by the `full` profile. A manifest's
+optional `version` selects the schema: missing means version 1, and the only
+accepted values are 1 and 2. The catalog reports `manifest-v1` or
+`manifest-v2` as the descriptor version.
+
+Both versions keep the same sandbox boundary: the guest runs with read-only
+preopens, no write directory, no network capability, a fresh instance per call,
+and fuel, wall-clock, memory, table, and instance limits. A v1 manifest has no
+annotations and is classified as read-only and policy-only.
+
+A v2 manifest may add an `annotations` object with required `read_only`,
+`destructive`, and `open_world` booleans. Every field must be present; unknown
+fields, a v1 manifest with `annotations`, or an unsupported version is rejected
+at load time. `read_only = true` together with `destructive = true` or
+`open_world = true` is rejected as a conflicting declaration. The host derives
+the descriptor capabilities from the declaration: `destructive` or `open_world`
+escalates the tool, makes it non-read-only, and requires one-time approval
+under an ACP permission gate, while a fully read-only declaration keeps the
+policy-only path. The host computes `read_only` as
+`!destructive && !open_world`, so a declaration can make the host more cautious
+but can never widen the sandbox; even a tool that declares destructive behavior
+still has no write preopens and no network.
+
+Results from every manifest version pass through the result manager. A result
+above `tools.inline_threshold_bytes` is stored as a workspace artifact and the
+model receives only a bounded preview, digest, and `read_artifact` cursor. See
+[Result manager and artifacts](#result-manager-and-artifacts). The
+`examples/plugins/echo/manifest.json` fixture is a v2 manifest with fully
+read-only annotations.
+
 ### Execution supervisor
 
 `bash`, `exec`, `git_status`, `git_diff`, the command sensor, and the
@@ -539,9 +589,16 @@ keeps its exit code; only spawn, timeout, read, and wait failures are supervisor
 errors.
 
 `[tools.supervisor]` is rebuilt for each turn, so changes apply to the next turn
-and never to an already running child. Child-agent commands are aligned with the
-same supervisor in a later task; the current delegation path keeps its existing
-fixed limits.
+and never to an already running child. Delegated child `bash` and `exec` use
+the same resolved supervisor settings: the environment allowlist, the
+per-tool deadlines, and the per-stream output caps. Child `exec` runs through
+the same `HarnessCommandRunner` path as native `exec`, and every child result
+passes through the parent turn's result manager, so an oversized child result
+becomes a workspace artifact with a bounded preview. Each child tool call is
+still bounded by the fixed 5-second child tool timeout in addition to the
+configured deadline. Process-group termination and rlimits remain deferred to
+Task 9.3b, so a child command that spawns descendants can still leave them
+behind exactly as native `bash` can. See `PLAN.md` for the Deferred list.
 
 ```bash
 jessica --config ~/.jessica/harness.toml tools list
@@ -556,6 +613,30 @@ schema digest is `sha256:` plus the SHA-256 of the canonical schema JSON with
 object keys sorted recursively, so the same configuration always produces the
 same output. These commands never open a provider, event store, memory or
 skills database, or MCP connection; they also do not create `.jessica/`.
+
+### Delegated child agents
+
+`delegate_task` is exposed only by the `full` profile, only when
+`policy.allowed_tools` names it, and only when `[delegation] enabled = true`.
+Its descriptor is destructive and interactive: under an ACP permission gate the
+top-level call asks for approval before any child starts, and the decision is
+recorded as a `PermissionDecided` trace event. The child's own tools never send
+separate permission requests; the single parent approval covers the child run.
+
+Delegation is single-level. A child may request only names the parent currently
+exposes: the requested names are checked against the parent's exposed set, and
+the child then receives only the native subset (`read_file`, `write_file`,
+`bash`, and `exec`). WASM, MCP, and `delegate_task` are always removed, so a
+child cannot reach a tool the parent did not expose or start a nested
+delegation. A request for a name outside the parent's exposed set fails before
+any child provider request is made.
+
+Child `bash` and `exec` use the resolved supervisor settings described above,
+including the environment allowlist, deadlines, and output caps. Every child
+tool result passes through the parent turn's result manager, so oversized
+output becomes a workspace artifact with a bounded preview. The child transcript
+is trace-only and linked to the parent `delegate_task` call; see
+[Trace verification and digests](#trace-verification-and-digests).
 
 ### Result manager and artifacts
 
@@ -851,10 +932,35 @@ allowed_tools = ["read_file", "mcp__filesystem__read_file"]
 profile = "full"
 ```
 
+MCP tool `annotations` are passed into the host catalog, where they are treated
+as advisory claims and never as proof of safety. The host derives the
+descriptor conservatively:
+
+- `readOnlyHint = true` marks the tool `read_only` **only** when
+  `destructiveHint` is explicitly `false`. A missing or conflicting destructive
+  hint is interpreted as destructive.
+- `destructiveHint = true` marks the tool destructive and requires one-time
+  approval under an ACP permission gate.
+- `openWorldHint = true` marks the tool as network-capable and also requires
+  one-time approval. A missing `openWorldHint` keeps the conservative network
+  classification, so approval is still required.
+- A tool with no annotations keeps the baseline
+  execute+network+destructive classification.
+
+Consequently a fully read-only annotated MCP tool stays on the allowlist path
+and does not prompt, while an unannotated or destructive/open-world MCP tool
+requests permission even when the configuration has no `[approval]` section.
+The host descriptor records the resulting capabilities, approval policy, and
+`mcp-2025-06-18` version. MCP tools are never auto-allowed: the allowlist still
+decides whether the tool is exposed at all.
+
 Policy is reloadable, so a later turn can pick up a changed allowlist. Every
 MCP call still passes through the same policy, `budget.tool_timeout_ms`,
 `ToolTimeoutGuard`, result manager, and `ResultSizeGuard` path as native and
-WASM tools.
+WASM tools. A result above `tools.inline_threshold_bytes` is stored as a
+workspace artifact and the model receives only the bounded preview, digest,
+and `read_artifact` cursor; the full payload never enters the transcript or
+trace.
 MCP `isError` results become failed `ToolResult`s; protocol and transport
 failures also become tool errors rather than panics. Text content is preserved,
 while image/audio payloads and other binary data are represented by short
@@ -1028,11 +1134,15 @@ client's ACP documentation if it differs.
 Before running a sensitive tool, Jessica sends ACP
 `session/request_permission` and waits for the client. The fixed sensitive set is
 `bash`, `exec`, `write_file`, `apply_patch`, `edit_file`, and `delegate_task`;
-`read_file`, `list_dir`, `grep`, `git_status`, `git_diff`, and WASM tools
-remain governed only by the policy allowlist. Configured MCP tools are policy-only as well, unless the
-configuration contains an explicit `[approval]` section: then destructive MCP
-tools also request permission. Policy v2 `ask` rules request permission for any
-exposed tool they match. The request's `rawInput` is a bounded, redacted
+`read_file`, `list_dir`, `grep`, `git_status`, and `git_diff` remain governed
+only by the policy allowlist. Configured WASM and MCP tools are also policy-only
+when the host classifies them read-only. A destructive or open-world descriptor
+— from an MCP `destructiveHint`/`openWorldHint` or a WASM v2 declaration —
+requests permission even without an `[approval]` section. For MCP, only a
+consistent read-only claim (`readOnlyHint = true`, `destructiveHint = false`,
+and `openWorldHint = false`) avoids the prompt; unannotated or conflicting
+tools take the conservative baseline. Policy v2 `ask` rules request permission
+for any exposed tool they match. The request's `rawInput` is a bounded, redacted
 argument summary and never contains the full environment or secret-looking
 values.
 
@@ -1069,11 +1179,11 @@ values.
   are rejected, and `session/load`/`session/resume` still reject non-empty
   `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
 - **Permissions**: `bash`, `exec`, `write_file`, `apply_patch`, `edit_file`, and
-  `delegate_task` ask through `session/request_permission` before execution. An explicit `[approval]`
-  section extends this to destructive MCP tools, and policy v2 `ask` rules can
-  request permission for other exposed tools; see
-  [Permission requests](#permission-requests). A denied call produces a failed
-  `tool_call_update`.
+  `delegate_task` ask through `session/request_permission` before execution.
+  Destructive or open-world MCP/WASM descriptors ask as well, even without an
+  `[approval]` section, and policy v2 `ask` rules can request permission for
+  other exposed tools; see [Permission requests](#permission-requests). A
+  denied call produces a failed `tool_call_update`.
 - **No archive/fork/status/set_title**: the stable v1 `list`, `delete`,
   `resume`, and `close` lifecycle methods are implemented, but archive, fork,
   status, session titles, and other unstable lifecycle extensions are not.

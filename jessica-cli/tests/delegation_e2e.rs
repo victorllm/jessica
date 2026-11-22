@@ -80,6 +80,14 @@ struct Settings<'a> {
     max_result_bytes: usize,
     /// Maximum child tool calls.
     max_child_tool_calls: u32,
+    /// Optional child `bash` deadline.
+    bash_timeout_ms: Option<u64>,
+    /// Optional result size below which a child result stays inline.
+    inline_threshold_bytes: Option<usize>,
+    /// Optional hard cap on a managed child result.
+    max_inline_bytes: Option<usize>,
+    /// Optional maximum bytes stored for one child artifact.
+    max_artifact_bytes: Option<usize>,
 }
 
 impl Default for Settings<'_> {
@@ -92,6 +100,10 @@ impl Default for Settings<'_> {
             timeout_ms: 8_000,
             max_result_bytes: 32_768,
             max_child_tool_calls: 20,
+            bash_timeout_ms: None,
+            inline_threshold_bytes: None,
+            max_inline_bytes: None,
+            max_artifact_bytes: None,
         }
     }
 }
@@ -104,13 +116,35 @@ fn enabled_config(settings: &Settings<'_>) -> String {
         .map(|name| format!("\"{name}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let mut tools = String::new();
+    if settings.inline_threshold_bytes.is_some()
+        || settings.max_inline_bytes.is_some()
+        || settings.max_artifact_bytes.is_some()
+    {
+        tools.push_str("[tools]\n");
+        if let Some(bytes) = settings.inline_threshold_bytes {
+            tools.push_str(&format!("inline_threshold_bytes = {bytes}\n"));
+        }
+        if let Some(bytes) = settings.max_inline_bytes {
+            tools.push_str(&format!("max_inline_bytes = {bytes}\n"));
+        }
+        if let Some(bytes) = settings.max_artifact_bytes {
+            tools.push_str(&format!("max_artifact_bytes = {bytes}\n"));
+        }
+        tools.push('\n');
+    }
+    let bash_timeout = settings
+        .bash_timeout_ms
+        .map_or_else(String::new, |milliseconds| {
+            format!("timeout_ms = {milliseconds}\n")
+        });
     format!(
         "[events]\npath = \"events.sqlite\"\n\n\
          [budget]\nmax_tokens = {}\ntool_timeout_ms = {}\nmax_rounds = 16\n\n\
          [policy]\nallowed_tools = [{allowed}]\n\n\
          [delegation]\nenabled = true\nmax_rounds = {}\ntimeout_ms = {}\n\
          max_task_bytes = 8192\nmax_result_bytes = {}\nmax_child_tool_calls = {}\n\n\
-         [tools.bash]\nenabled = true\n",
+         {tools}[tools.bash]\nenabled = true\n{bash_timeout}",
         settings.max_tokens,
         settings.tool_timeout_ms,
         settings.max_rounds,
@@ -1131,6 +1165,201 @@ fn child_timeout_is_bounded_by_the_delegation_timeout() {
         String::from_utf8_lossy(&run.output.stdout).contains("parent after timeout"),
         "the parent must complete after the child timeout"
     );
+}
+
+#[test]
+fn child_bash_does_not_inherit_provider_credentials() {
+    let temp = TempDir::new("child-env");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, &enabled_config(&Settings::default()));
+
+    let run = run_turn(
+        &temp.path,
+        &config,
+        "delegate an environment check",
+        vec![
+            Plan::Sse(tool_calls_response(&[(
+                "call_delegate",
+                DELEGATE_TASK_TOOL_NAME,
+                json!({"task": "check the environment", "tools": ["bash"]}),
+            )])),
+            Plan::Sse(tool_calls_response(&[(
+                "child_env",
+                "bash",
+                json!({
+                    "command": "printf '%s' \"${OPENAI_API_KEY:-UNSET}\" > child-env.txt"
+                }),
+            )])),
+            Plan::Sse(text_response("the child checked its environment")),
+            Plan::Sse(text_response("parent done")),
+        ],
+    );
+
+    assert_success(&run.output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path.join("child-env.txt"))
+            .expect("the child command must write its observation"),
+        "UNSET",
+        "the supervisor must clear the provider credential from child bash"
+    );
+    let children = run.child_requests();
+    assert_eq!(children.len(), 2);
+    assert!(
+        !children[1].contains("test-key"),
+        "the provider key must never enter the child transcript"
+    );
+
+    let results = tool_result_jsons(run.parent_requests()[1]);
+    assert_eq!(results[0]["status"], "ok");
+}
+
+#[test]
+fn child_bash_is_killed_by_the_supervisor_deadline() {
+    let temp = TempDir::new("child-bash-timeout");
+    let config = temp.path.join("harness.toml");
+    let settings = Settings {
+        bash_timeout_ms: Some(250),
+        ..Settings::default()
+    };
+    write_config(&config, &enabled_config(&settings));
+
+    let run = run_turn(
+        &temp.path,
+        &config,
+        "delegate a hanging child command",
+        vec![
+            Plan::Sse(tool_calls_response(&[(
+                "call_delegate",
+                DELEGATE_TASK_TOOL_NAME,
+                json!({"task": "run a slow child command", "tools": ["bash"]}),
+            )])),
+            Plan::Sse(tool_calls_response(&[(
+                "child_slow",
+                "bash",
+                json!({"command": "sleep 2; printf finished > finished.txt"}),
+            )])),
+            Plan::Sse(text_response("the child saw the timeout")),
+            Plan::Sse(text_response("parent done")),
+        ],
+    );
+
+    assert_success(&run.output);
+    let children = run.child_requests();
+    assert_eq!(children.len(), 2);
+    assert!(
+        children[1].contains("timed out after 0.25 seconds"),
+        "child bash must use the configured supervisor deadline: {}",
+        children[1]
+    );
+    assert!(
+        !temp.path.join("finished.txt").exists(),
+        "the supervisor must terminate the child command before it writes"
+    );
+
+    let results = tool_result_jsons(run.parent_requests()[1]);
+    assert_eq!(results[0]["status"], "error");
+    assert!(
+        results[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("child tool failure")),
+        "the parent must observe the child tool failure: {}",
+        results[0]
+    );
+}
+
+#[test]
+fn oversized_child_tool_results_become_workspace_artifacts() {
+    let temp = TempDir::new("child-artifact");
+    let config = temp.path.join("harness.toml");
+    let settings = Settings {
+        inline_threshold_bytes: Some(1024),
+        max_inline_bytes: Some(2048),
+        max_artifact_bytes: Some(8192),
+        ..Settings::default()
+    };
+    write_config(&config, &enabled_config(&settings));
+
+    let run = run_turn(
+        &temp.path,
+        &config,
+        "delegate a verbose child command",
+        vec![
+            Plan::Sse(tool_calls_response(&[(
+                "call_delegate",
+                DELEGATE_TASK_TOOL_NAME,
+                json!({"task": "produce a large child result", "tools": ["bash"]}),
+            )])),
+            Plan::Sse(tool_calls_response(&[(
+                "child_large",
+                "bash",
+                json!({"command": "printf 'y%.0s' {1..2000}"}),
+            )])),
+            Plan::Sse(text_response("the child read the artifact")),
+            Plan::Sse(text_response("parent done")),
+        ],
+    );
+
+    assert_success(&run.output);
+    let children = run.child_requests();
+    assert_eq!(children.len(), 2);
+    let child_follow_up = request_messages(children[1]);
+    let tool_content = child_follow_up[3]["content"]
+        .as_str()
+        .expect("the child tool result must be text");
+    assert!(
+        tool_content.contains("[result artifact]") && tool_content.contains("digest: sha256:"),
+        "the child must receive the artifact envelope instead of the payload: {tool_content}"
+    );
+    assert!(
+        !tool_content.contains(&"y".repeat(1_500)) && tool_content.len() <= 2048,
+        "the oversized child output must enter the transcript only as a bounded preview"
+    );
+
+    let artifacts = artifact_files(&temp.path);
+    let data = artifacts
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() == 64)
+                && std::fs::read(path)
+                    .is_ok_and(|bytes| bytes.iter().filter(|byte| **byte == b'y').count() >= 2_000)
+        })
+        .expect("the child output artifact must exist");
+    let stored = std::fs::read(data).expect("artifact must be readable");
+    assert!(
+        stored.iter().filter(|byte| **byte == b'y').count() >= 2_000,
+        "the artifact must retain the child output, got {} bytes",
+        stored.len()
+    );
+    assert!(
+        data.with_extension("json").is_file(),
+        "the child artifact must have a sidecar: {artifacts:?}"
+    );
+
+    let results = tool_result_jsons(run.parent_requests()[1]);
+    assert_eq!(results[0]["status"], "ok");
+    assert_eq!(results[0]["answer"], "the child read the artifact");
+}
+
+/// Returns every regular file under the default artifact directory.
+fn artifact_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(shards) = std::fs::read_dir(root.join(".jessica/artifacts")) else {
+        return files;
+    };
+    for shard in shards.flatten() {
+        let Ok(entries) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 #[test]

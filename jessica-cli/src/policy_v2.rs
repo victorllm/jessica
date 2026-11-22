@@ -105,7 +105,10 @@ pub(crate) struct PolicyTool {
     pub capabilities: Capabilities,
     /// Argument field carrying a filesystem path, when the tool has one.
     pub path_field: Option<String>,
-    /// Whether the pre-v2 host required one-time approval for this tool.
+    /// Whether the host descriptor requires one-time approval for this tool.
+    ///
+    /// This covers the pre-v2 native sensitive set and external WASM/MCP
+    /// tools the host classifies as destructive or open-world.
     pub legacy_sensitive: bool,
 }
 
@@ -123,10 +126,10 @@ impl PolicyTool {
 
     /// Returns whether approval v2 treats this tool as sensitive.
     ///
-    /// Legacy-sensitive native tools stay sensitive. With an explicit
-    /// `[approval]` section, any descriptor marked destructive is also
-    /// sensitive, which covers MCP tools conservatively. WASM tools currently
-    /// report read-only capabilities and therefore are not widened.
+    /// Descriptors the host marks interactive stay sensitive, including
+    /// destructive MCP tools, declared-destructive or open-world WASM tools,
+    /// and `delegate_task`. With an explicit `[approval]` section, any other
+    /// descriptor marked destructive is also sensitive.
     fn sensitive(&self, approval_explicit: bool) -> bool {
         self.legacy_sensitive || (approval_explicit && self.capabilities.destructive)
     }

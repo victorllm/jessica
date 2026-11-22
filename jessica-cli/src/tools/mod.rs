@@ -19,12 +19,13 @@ use crate::config::HarnessConfig;
 
 pub(crate) use catalog::{CatalogCandidate, CatalogEntry, CatalogError, ToolCatalog};
 pub(crate) use descriptor::{
-    ApprovalPolicy, Capabilities, ResultFormat, ToolDescriptor, ToolSource,
+    ApprovalPolicy, Capabilities, ResultFormat, ToolAnnotations, ToolDescriptor, ToolMetadata,
+    ToolSource, result_format_for,
 };
 
 use std::sync::Arc;
 
-use runner::HarnessCommandRunner;
+pub(crate) use runner::HarnessCommandRunner;
 
 /// Subcommand requested under `jessica tools`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +160,11 @@ pub(crate) async fn inspection_catalog(
     root: &Path,
 ) -> Result<ToolCatalog, CliError> {
     let mut candidates = native_candidates(root, config);
-    for tool in load_wasm_tools(config, root).await? {
-        candidates.push(CatalogCandidate::from_tool(tool, ToolSource::Wasm));
+    for loaded in load_wasm_tools(config, root).await? {
+        candidates.push(
+            CatalogCandidate::from_tool(loaded.tool, ToolSource::Wasm)
+                .with_metadata(loaded.metadata),
+        );
     }
     if config.delegation.enabled {
         candidates.push(delegation_candidate());

@@ -774,6 +774,27 @@ fn write_mcp_config(workspace: &TempDir, allowed_tools: &[&str], tool_timeout_ms
     path
 }
 
+/// Writes an MCP configuration with a low result-inlining threshold.
+///
+/// The values keep `budget.max_result_bytes` above the rendered artifact
+/// envelope while forcing any realistic MCP payload into artifact storage.
+fn write_mcp_artifact_config(workspace: &TempDir, allowed_tools: &[&str]) -> PathBuf {
+    let path = workspace.path.join("harness.toml");
+    let allowed_tools =
+        serde_json::to_string(allowed_tools).expect("allowlist must serialize as JSON");
+    std::fs::write(
+        &path,
+        format!(
+            "[budget]\nmax_rounds = 4\nmax_tokens = 100000\n\
+             tool_timeout_ms = 10000\nmax_result_bytes = 4096\n\n\
+             [policy]\nallowed_tools = {allowed_tools}\n\n\
+             [tools]\ninline_threshold_bytes = 64\nmax_inline_bytes = 256\nmax_artifact_bytes = 4096\n"
+        ),
+    )
+    .expect("harness configuration must be written");
+    path
+}
+
 /// Creates a session declaring exactly one stdio MCP server.
 async fn create_mcp_session(acp: &mut AcpProcess, id: u64, cwd: &Path, server: Value) -> Value {
     acp.send(json!({
@@ -3085,7 +3106,8 @@ async fn acp_delegation_asks_only_for_the_parent_call() {
     let config = workspace.path.join("harness.toml");
     std::fs::write(
         &config,
-        "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
+        "[events]\npath = \"events.db\"\n\n\
+         [budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
          [policy]\nallowed_tools = [\"bash\", \"delegate_task\"]\n\n\
          [tools.bash]\nenabled = true\n\n\
          [delegation]\nenabled = true\n",
@@ -3160,6 +3182,31 @@ async fn acp_delegation_asks_only_for_the_parent_call() {
             .is_some_and(|output| output.contains("child wrote the marker")),
         "the delegated answer must reach the parent: {completed}"
     );
+
+    // Permission decisions are trace-only audit facts; the legacy event
+    // stream intentionally omits them.
+    let connection = rusqlite::Connection::open(workspace.path.join("events.db"))
+        .expect("the event database must open");
+    let mut statement = connection
+        .prepare(
+            "SELECT payload_json FROM trace_events \
+             WHERE payload_json LIKE '%permission_decided%'",
+        )
+        .expect("permission records must be queryable");
+    let permission_records: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .expect("permission records must read")
+        .collect::<Result<_, _>>()
+        .expect("permission records must decode");
+    assert!(
+        permission_records.iter().any(|payload| {
+            payload.contains("call_delegate")
+                && payload.contains("delegate_task")
+                && payload.contains("\"allow\"")
+        }),
+        "the delegate_task approval decision must be recorded in the trace: {permission_records:?}"
+    );
+
     assert_eq!(
         provider.finish().len(),
         4,
@@ -3994,6 +4041,217 @@ async fn acp_mcp_stdio_discovers_and_invokes_namespaced_tool() {
         !stderr.contains(secret),
         "the drained MCP stderr must not be logged: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn acp_destructive_mcp_tool_requires_approval_and_rejection_prevents_the_call() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-destructive");
+    // No explicit [approval] section: the destructiveHint alone must trigger
+    // the one-time ACP permission gate.
+    let config = write_mcp_config(&workspace, &["mcp__stub__wipe"], 10_000);
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[(
+            "call_wipe",
+            "mcp__stub__wipe",
+            json!({"target": "everything"}),
+        )]),
+        text_response("adapted after the denial"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", None)),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stdio MCP session must be created: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+    acp.set_permission_mode(PermissionMode::RejectOnce);
+
+    let (updates, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "wipe the remote state"}]),
+    )
+    .await;
+
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "the model may adapt after the denial: {prompt_response}"
+    );
+    assert_eq!(
+        acp.permission_requests().len(),
+        1,
+        "a destructive MCP annotation must produce exactly one request"
+    );
+    let requested = &acp.permission_requests()[0]["params"]["toolCall"];
+    assert_eq!(requested["toolCallId"], "call_wipe");
+    assert!(
+        requested["rawInput"]["target"].as_str() == Some("everything"),
+        "the client must see the MCP arguments: {requested}"
+    );
+    let failed = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_wipe"
+        })
+        .unwrap_or_else(|| panic!("the denied MCP call must finish: {updates:?}"));
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("denied by the user")),
+        "the denial must be observable: {failed}"
+    );
+    assert_eq!(
+        mcp_call_log(&workspace),
+        "",
+        "a rejected MCP tool must never send tools/call to the server"
+    );
+
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].contains("denied by the user"),
+        "the denial must be returned to the model"
+    );
+
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+    wait_for_process_gone(pid).await;
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
+}
+
+#[tokio::test]
+async fn acp_read_only_mcp_tool_does_not_prompt_and_large_results_become_artifacts() {
+    assert_mcp_fixture_available();
+    let workspace = TempDir::new("mcp-artifact");
+    let config = write_mcp_artifact_config(&workspace, &["mcp__stub__big"]);
+    let provider = MockProvider::start(vec![
+        tool_calls_response(&[("call_big", "mcp__stub__big", json!({"size": 2000}))]),
+        text_response("artifact turn complete"),
+    ]);
+    let mut acp = AcpProcess::spawn_in(
+        Some(&workspace.path),
+        &[
+            ("OPENAI_API_KEY", "test-key".to_owned()),
+            ("OPENAI_BASE_URL", provider.url()),
+            ("OPENAI_MODEL", "test-model".to_owned()),
+        ],
+        &["--config", config.to_str().expect("utf-8 config path")],
+    )
+    .await;
+    handshake(&mut acp).await;
+
+    let response = create_mcp_session(
+        &mut acp,
+        2,
+        &workspace.path,
+        mcp_stdio_server(&mcp_stub_env(&workspace, "normal", None)),
+    )
+    .await;
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("stdio MCP session must be created: {response}"))
+        .to_owned();
+    let pid = wait_for_mcp_pid(&workspace.path.join("mcp.pid")).await;
+
+    let (updates, prompt_response) = prompt_until_response(
+        &mut acp,
+        3,
+        &session,
+        json!([{"type": "text", "text": "fetch a large MCP result"}]),
+    )
+    .await;
+
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "the MCP artifact turn must complete: {prompt_response}"
+    );
+    assert_eq!(
+        acp.permission_requests().len(),
+        0,
+        "a fully read-only MCP tool must not prompt"
+    );
+    assert_eq!(mcp_call_log(&workspace).trim(), "big");
+
+    let artifact_update = updates
+        .iter()
+        .find(|update| {
+            update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_big"
+        })
+        .unwrap_or_else(|| panic!("the MCP call must finish: {updates:?}"));
+    assert_eq!(artifact_update["status"], "completed");
+    let raw_output = artifact_update["rawOutput"]
+        .as_str()
+        .expect("the completed MCP result must be text");
+    assert!(
+        raw_output.contains("[result artifact]") && raw_output.contains("digest: sha256:"),
+        "the oversized MCP result must be replaced by an artifact envelope: {raw_output}"
+    );
+    assert!(
+        !raw_output.contains("zzzzzzzz"),
+        "the raw oversized payload must not enter the protocol update"
+    );
+
+    let requests = provider.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].contains("[result artifact]") && requests[1].contains("sha256:"),
+        "the model must receive the artifact digest instead of the payload"
+    );
+    assert!(
+        !requests[1].contains(&"z".repeat(100)),
+        "the oversized payload must not reach the provider"
+    );
+
+    let artifact_dir = workspace.path.join(".jessica").join("artifacts");
+    assert!(
+        artifact_dir.is_dir(),
+        "the artifact must be stored in the session workspace: {}",
+        artifact_dir.display()
+    );
+    let mut artifact_files = Vec::new();
+    for shard in std::fs::read_dir(&artifact_dir).expect("artifact directory must be readable") {
+        let shard = shard.expect("shard entry must be readable");
+        if shard.path().is_dir() {
+            for entry in std::fs::read_dir(shard.path()).expect("shard must be readable") {
+                let entry = entry.expect("artifact entry must be readable");
+                if entry.path().is_file() {
+                    artifact_files.push(entry.path());
+                }
+            }
+        }
+    }
+    assert_eq!(
+        artifact_files.len(),
+        2,
+        "one data file and one sidecar must exist: {artifact_files:?}"
+    );
+
+    let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;
+    assert!(close.get("result").is_some(), "close must succeed: {close}");
+    wait_for_process_gone(pid).await;
+    acp.close_stdin();
+    assert_eq!(acp.wait().await.code(), Some(0));
 }
 
 #[tokio::test]

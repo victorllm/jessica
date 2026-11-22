@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jessica_core::tool::{Tool, ToolRegistry};
-use jessica_tools::{ReadFileTool, WasmTool, WasmToolError, register_wasm_tool};
+use jessica_tools::{
+    MANIFEST_VERSION_V1, MANIFEST_VERSION_V2, ReadFileTool, WasmAnnotations, WasmTool,
+    WasmToolError, register_wasm_tool,
+};
 use serde_json::{Value, json};
 
 const FIXTURE_WASM: &str = concat!(
@@ -325,6 +328,125 @@ async fn duplicate_wasm_names_are_rejected_by_the_registry() {
         WasmToolError::Registry { name, .. } => assert_eq!(name, "echo_json"),
         other => panic!("expected Registry error, got {other}"),
     }
+}
+
+#[tokio::test]
+async fn v1_manifests_remain_loadable_without_annotations() {
+    let directory = TempDir::new("v1-compat");
+    let tool = load_tool(&directory, &manifest("echo")).await;
+
+    assert_eq!(tool.manifest_version(), MANIFEST_VERSION_V1);
+    assert_eq!(tool.annotations(), None);
+    let result = tool.execute(json!({"text": "still works"})).await;
+    assert!(!result.is_error, "v1 behavior changed: {}", result.content);
+    assert_eq!(result.content, "{\"text\":\"still works\"}");
+}
+
+#[tokio::test]
+async fn v2_manifests_expose_validated_annotations() {
+    let directory = TempDir::new("v2-annotations");
+    let mut manifest = manifest("echo");
+    manifest["version"] = json!(2);
+    manifest["annotations"] = json!({
+        "read_only": true,
+        "destructive": false,
+        "open_world": false
+    });
+    let tool = load_tool(&directory, &manifest).await;
+
+    assert_eq!(tool.manifest_version(), MANIFEST_VERSION_V2);
+    assert_eq!(
+        tool.annotations(),
+        Some(WasmAnnotations {
+            read_only: true,
+            destructive: false,
+            open_world: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn annotations_require_v2_and_conflicts_are_rejected() {
+    let directory = TempDir::new("annotation-version");
+    let mut manifest_v1 = manifest("echo");
+    manifest_v1["annotations"] = json!({
+        "read_only": true,
+        "destructive": false,
+        "open_world": false
+    });
+    let path = directory.write_manifest(&manifest_v1);
+    let error = load(path).await.expect_err("v1 annotations must fail");
+    assert!(
+        error.to_string().contains("require manifest version 2"),
+        "unexpected error: {error}"
+    );
+
+    let directory = TempDir::new("annotation-conflict");
+    let mut conflicting = manifest("echo");
+    conflicting["version"] = json!(2);
+    conflicting["annotations"] = json!({
+        "read_only": true,
+        "destructive": true,
+        "open_world": false
+    });
+    let path = directory.write_manifest(&conflicting);
+    let error = load(path)
+        .await
+        .expect_err("conflicting annotations must fail");
+    assert!(
+        error.to_string().contains("cannot both be true"),
+        "unexpected error: {error}"
+    );
+
+    let directory = TempDir::new("annotation-open-world-conflict");
+    let mut conflicting = manifest("echo");
+    conflicting["version"] = json!(2);
+    conflicting["annotations"] = json!({
+        "read_only": true,
+        "destructive": false,
+        "open_world": true
+    });
+    let path = directory.write_manifest(&conflicting);
+    let error = load(path)
+        .await
+        .expect_err("read-only open-world annotations must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("read_only and annotations.open_world"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_versions_and_unknown_annotation_fields_are_rejected() {
+    let directory = TempDir::new("version-unsupported");
+    let mut future = manifest("echo");
+    future["version"] = json!(3);
+    let path = directory.write_manifest(&future);
+    let error = load(path).await.expect_err("unknown version must fail");
+    assert!(
+        error.to_string().contains("version must be 1 or 2"),
+        "unexpected error: {error}"
+    );
+
+    let directory = TempDir::new("annotation-unknown-field");
+    let mut unknown = manifest("echo");
+    unknown["version"] = json!(2);
+    unknown["annotations"] = json!({
+        "read_only": true,
+        "destructive": false,
+        "open_world": false,
+        "network": true
+    });
+    let path = directory.write_manifest(&unknown);
+    let error = load(path)
+        .await
+        .expect_err("unknown annotation fields must fail");
+    assert!(
+        matches!(error, WasmToolError::ParseManifest { .. }),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

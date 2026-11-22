@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6、9.7a 已完成，9.3b/9.7b 待依赖审批，9.8 待确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6、9.7a、9.8 已完成，9.3b/9.7b 待依赖审批）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2047,7 +2047,7 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☑ |
 | **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☑ |
 | **9.7** | 原生工具 B：`apply_patch`、`edit_file`（9.7a 已完成）；glob、regex grep（9.7b 待审批） | 否 | 9.7b 需 `globset`/`regex` 审批 | 9.5/9.6 | ☑（9.7a） |
-| **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☐ |
+| **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☑ |
 
 说明：9.2 与 9.4 都只依赖 9.1，可互换顺序；推荐先 9.2 再 9.4，以便 `exec` 和结果管理在 9.5 前同时就绪。9.3b 与 9.7b 受第三方依赖审批门约束，未批准前只交付对应的无依赖子集，不得用自实现或 unsafe 绕过审批。
 
@@ -2263,7 +2263,7 @@ Task 9.7b（待依赖审批）：`glob`、regex grep
 
 ---
 
-Task 9.8（待确认）：MCP/WASM descriptor、子 Agent 工具安全对齐
+Task 9.8（2026-11-22 完成）：MCP/WASM descriptor、子 Agent 工具安全对齐
 
 范围与约束：
 
@@ -2276,6 +2276,16 @@ Task 9.8（待确认）：MCP/WASM descriptor、子 Agent 工具安全对齐
 - 测试：MCP `readOnlyHint` 映射、`destructiveHint` 默认审批/拒绝、大结果 artifact；WASM manifest v2 校验与 v1 兼容、大结果 artifact；子 bash 环境不含 provider key、子 bash 超时被 supervisor 终止、子结果截断/artifact、`delegate_task` 审批记录；子 Agent 不能获得父未暴露工具。
 
 完成标准：fmt/clippy/test 全绿；真实 CLI/ACP E2E 至少覆盖一个 MCP 工具与一个子 Agent 工具调用；README/示例更新 MCP/WASM descriptor、子 Agent 安全边界；未改 core、未新增第三方 crate。
+
+实施记录（2026-11-22，实际耗时约 150 分钟）：
+
+- `jessica-tools`：`WasmTool` manifest 支持可选 `version`（缺省 1，仅接受 1/2）与 v2 `annotations`（三项必填、拒绝未知字段）；v1 带 annotations、未知版本、`read_only` 与 `destructive`/`open_world` 冲突均在加载期拒绝；新增 `manifest_version()`/`annotations()`，沙箱策略（无写目录、无网络、只读 preopen、每次调用新实例、fuel/wall/memory/table/instance 限制）不变。
+- CLI descriptor/catalog：新增 `ToolAnnotations`/`ToolMetadata`；`Capabilities::for_metadata` 按来源分配：MCP 仅在 `readOnlyHint=true` 且 `destructiveHint=false` 时视为只读，缺失或冲突 destructive 保持 destructive，缺失 `openWorldHint` 保持 network；WASM 以 `read_only = !destructive && !open_world` 从 v2 声明升级，v1 保持只读基线；Native/Delegation 忽略 annotations。Catalog 对 MCP/WASM 的 destructive 或 network descriptor 强制 `ApprovalPolicy::Interactive`，`PolicyTool::from_descriptor` 将其纳入 sensitive；WASM descriptor 版本报告为 `manifest-v1`/`manifest-v2`。
+- MCP：`parse_tool` 读取 `readOnlyHint`/`destructiveHint`/`openWorldHint`（malformed annotations 视为缺失，不阻断发现）；`McpSession::tools()` 返回带 metadata 的 `CatalogCandidate`，ACP 原样传入每轮 catalog；MCP 仍仅支持 stdio、仍必须进入 `policy.allowed_tools`，结果继续经 `GovernedTool` 的 Result Manager/ResultSizeGuard。
+- 子 Agent：`NativeChildToolFactory` 接收 `HarnessConfig` 与父轮 `ResultManager`；child `bash` 使用 supervisor 的 env allowlist、per-tool deadline、per-stream output cap，child `exec` 额外通过 `HarnessCommandRunner`；每个 child 工具结果由 `ManagedChildTool` 交给 Result Manager。父能力集来自 `base.exposed_names()`/`base.exposed_native_names()`，子 Agent 只能拿到父已暴露的 native 子集，`delegate_task` 与 WASM/MCP 始终被移除；runtime 未新增公共契约。
+- 测试：`jessica-tools` 覆盖 v1 兼容、v2 注解、版本/冲突/未知字段拒绝；CLI 单测覆盖 MCP annotations 保守映射、WASM 注解升级、descriptor 版本、child factory 的 supervisor 输出上限/超时/artifact/cleared env；`acp_stdio` 新增 destructive MCP 审批拒绝（server 未收到 tools/call）、read-only MCP 大结果 artifact、`delegate_task` 审批的 `PermissionDecided` trace 记录；`delegation_e2e` 新增 child bash 无 provider key、supervisor deadline 终止、child 大结果 artifact，父未暴露工具被拒的既有用例继续通过；`wasm_tool_e2e` 新增大结果 artifact。
+- 偏离/说明：1) 进程组 `SIGTERM`→`SIGKILL` 与 rlimits 仍属未获批的 9.3b，本次 child bash/exec 复用现有 supervisor（env allowlist/timeout/output cap），未实现进程组，README 与 PLAN 明确该边界；2) runtime 仍保留固定的 5s child tool 外层超时，child bash/exec 的实际截止时间取配置值与 5s 的较小者；3) malformed MCP annotations 按“缺失”处理并采用保守基线，而非拒绝整个 server；4) WASM v2 的 `read_only` 仅用于冲突校验，descriptor 的 read-only 由 `!destructive && !open_world` 推导，避免单独声明 `read_only: false` 反而虚增能力；5) 子 Agent 沿用既有单次 `delegate_task` 审批语义：CLI 构造的受治理 registry 负责父已暴露 native 子集的收窄、supervisor 限制与 Result Manager，不在每次 child 工具调用上重新执行 CLI policy v2 规则或受保护路径门，与“单次委派审批覆盖子运行”的既有契约一致；6) 未修改 `jessica-core`，未新增第三方 crate，`DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1145 passed, 0 failed, 2 ignored。
 
 ---
 

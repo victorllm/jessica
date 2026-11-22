@@ -78,7 +78,6 @@ use agent_client_protocol::{
     Agent, Client, Error, ErrorCode, Stdio, is_connection_terminated, is_incoming_transport_closed,
 };
 use async_trait::async_trait;
-use jessica_core::tool::Tool;
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId, ToolCall};
 use serde_json::json;
 use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
@@ -101,6 +100,7 @@ use crate::hot_reload::ConfigWatcher;
 use crate::mcp::{MAX_MCP_SERVERS_PER_SESSION, McpError, McpSession, StdioServerConfig};
 use crate::pump::UpdateSink;
 use crate::shutdown::ShutdownController;
+use crate::tools::CatalogCandidate;
 
 /// Maximum time spent waiting for active prompts to finish during shutdown.
 const PROMPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1128,9 +1128,9 @@ struct PreparedPrompt {
     activity: PromptActivity,
     /// Session-scoped MCP tools snapshotted before the worker starts.
     ///
-    /// The worker drops the session handle early, so the tool `Arc`s must
-    /// travel with the prepared prompt.
-    mcp_tools: Vec<Arc<dyn Tool>>,
+    /// The worker drops the session handle early, so the executable tool
+    /// handles and their annotations must travel with the prepared prompt.
+    mcp_tools: Vec<CatalogCandidate>,
 }
 
 /// Counts active prompt workers and stops accepting new ones during shutdown.
@@ -1404,8 +1404,8 @@ struct PromptExecutionRequest {
     sink: Arc<dyn UpdateSink>,
     /// Budget observations shared with the sink.
     observations: Arc<PromptObservations>,
-    /// Session-scoped MCP tools to register for this turn.
-    extra_tools: Vec<Arc<dyn Tool>>,
+    /// Session-scoped MCP tool candidates to register for this turn.
+    extra_tools: Vec<CatalogCandidate>,
     /// Approval gate for sensitive native tools.
     ///
     /// `None` keeps policy-only behavior for direct in-process test turns.

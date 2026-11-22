@@ -184,10 +184,12 @@ impl LlmProvider for TokenCountingProvider {
 /// Names of native tools that require explicit approval before running.
 ///
 /// The set is deliberately fixed: `read_file`, `list_dir`, `grep`,
-/// `git_status`, `git_diff`, and every configured WASM or MCP tool remain
-/// governed by the allowlist policy alone. Delegated child tools are also
-/// outside this set because the single top-level `delegate_task` approval
-/// covers the child run.
+/// `git_status`, and `git_diff` remain governed by the allowlist policy alone.
+/// Configured WASM and MCP tools are not named here because the catalog assigns
+/// their approval from host-owned capability classification, where a
+/// destructive or open-world descriptor becomes interactive. Delegated child
+/// tools are also outside this set because the single top-level
+/// `delegate_task` approval covers the child run.
 pub(crate) fn permission_required(name: &str) -> bool {
     matches!(
         name,

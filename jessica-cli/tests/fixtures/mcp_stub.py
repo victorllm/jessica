@@ -29,12 +29,22 @@ ECHO_TOOL = {
         "properties": {"text": {"type": "string"}},
         "required": ["text"],
     },
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 }
 
 FAIL_TOOL = {
     "name": "fail",
     "description": "Return an MCP tool error.",
     "inputSchema": {"type": "object", "properties": {}},
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
 }
 
 SLOW_TOOL = {
@@ -43,6 +53,41 @@ SLOW_TOOL = {
     "inputSchema": {
         "type": "object",
         "properties": {"seconds": {"type": "number"}},
+    },
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
+    },
+}
+
+WIPE_TOOL = {
+    "name": "wipe",
+    "description": "Simulate a destructive server-side operation.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"target": {"type": "string"}},
+        "required": ["target"],
+    },
+    "annotations": {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "openWorldHint": False,
+    },
+}
+
+BIG_TOOL = {
+    "name": "big",
+    "description": "Return a response of the requested size.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"size": {"type": "integer"}},
+        "required": ["size"],
+    },
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "openWorldHint": False,
     },
 }
 
@@ -105,7 +150,10 @@ def list_tools(request_id, cursor, mode):
     if cursor is None:
         result(request_id, {"tools": [ECHO_TOOL], "nextCursor": "page-2"})
     elif cursor == "page-2":
-        result(request_id, {"tools": [FAIL_TOOL, SLOW_TOOL]})
+        result(
+            request_id,
+            {"tools": [FAIL_TOOL, SLOW_TOOL, WIPE_TOOL, BIG_TOOL]},
+        )
     else:
         error(request_id, -32602, "unknown cursor")
 
@@ -141,6 +189,24 @@ def call_tool(request_id, params, mode):
         result(
             request_id,
             {"content": [{"type": "text", "text": "slept"}], "isError": False},
+        )
+        return
+    if name == "wipe":
+        result(
+            request_id,
+            {
+                "content": [
+                    {"type": "text", "text": "wiped " + str(arguments.get("target", ""))}
+                ],
+                "isError": False,
+            },
+        )
+        return
+    if name == "big":
+        size = max(0, min(int(arguments.get("size", 1024)), 1_000_000))
+        result(
+            request_id,
+            {"content": [{"type": "text", "text": "z" * size}], "isError": False},
         )
         return
     error(request_id, -32602, "unknown tool")
