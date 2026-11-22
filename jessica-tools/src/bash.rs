@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use crate::{failure, success};
 
 /// Default wall-clock timeout for one command.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default cap for each captured stream.
 const DEFAULT_OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -62,7 +62,7 @@ impl BashTool {
 impl Default for BashTool {
     fn default() -> Self {
         Self {
-            timeout: DEFAULT_TIMEOUT,
+            timeout: DEFAULT_BASH_TIMEOUT,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             current_dir: None,
         }

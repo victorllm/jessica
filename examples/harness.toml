@@ -5,8 +5,8 @@
 #   cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml \
 #     "修改 examples/typo.md 中的拼写错误并验证"
 #
-# The tool policy intentionally omits `bash`: calls to it reach the policy,
-# are denied, and return an error result to the model.
+# The tool policy intentionally omits `bash`: it is absent from the provider
+# tool schema, and an attempted call returns an `unknown tool` error result.
 #
 # The acceptance command intentionally fails until examples/typo.md contains the
 # correct spelling. The first model attempt can therefore fail acceptance and

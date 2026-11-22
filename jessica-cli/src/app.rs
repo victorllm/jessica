@@ -21,17 +21,17 @@ use jessica_harness::{
     ToolTimeoutGuard, TurnSignals,
 };
 use jessica_runtime::{
-    AgentChildExecutor, AgentLoop, ChildEventSink, ChildToolFactory, DELEGATE_TASK_TOOL_NAME,
-    DelegateTaskTool, DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
+    AgentChildExecutor, AgentLoop, ChildEventSink, ChildToolFactory, DelegateTaskTool,
+    DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
 };
-use jessica_tools::{BashTool, ReadFileTool, WasmTool, WriteFileTool};
+use jessica_tools::WasmTool;
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::acp_store::AcpStoreError;
-use crate::config::{ConfigError, HarnessConfig, NATIVE_CHILD_TOOLS};
+use crate::config::{ConfigError, HarnessConfig};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventJournal, EventRecorder, RecorderError};
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
@@ -41,6 +41,9 @@ use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
+use crate::tools::{
+    ApprovalPolicy, CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates,
+};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -907,6 +910,13 @@ impl CliRuntime {
             Arc::clone(&governance),
             Arc::clone(&token_guard),
         ));
+        // Build the base catalog before delegation so a child can be granted
+        // only tools the parent profile actually exposes. The final catalog is
+        // rebuilt with the executable delegate tool and then checked against
+        // the exposure budgets.
+        let mut candidates = self.turn_candidates(scope, extra_tools);
+        let base = ToolCatalog::build(candidates.clone(), config).map_err(CliError::ToolCatalog)?;
+
         // The child executor receives the same counting provider, so every
         // child call charges the parent token guard and can cancel the turn.
         let delegation = self.build_child_executor(
@@ -917,17 +927,28 @@ impl CliRuntime {
             journal.sink(),
             journal.child_sink(),
             events.clone(),
+            ParentCapabilities::new(base.exposed_names(), base.exposed_native_names()),
         )?;
 
+        let catalog = if let Some(executor) = delegation {
+            candidates.push(CatalogCandidate::from_tool(
+                Arc::new(DelegateTaskTool::new(executor)),
+                ToolSource::Delegation,
+            ));
+            ToolCatalog::build(candidates, config).map_err(CliError::ToolCatalog)?
+        } else {
+            base
+        };
+        catalog
+            .enforce_budget(config)
+            .map_err(CliError::ToolCatalog)?;
+
         let registry = self.build_tool_registry(
-            scope,
+            &catalog,
             Arc::clone(&harness),
             Arc::clone(&governance),
-            timeout,
             Arc::clone(&timeout_guard),
             Arc::clone(&result_guard),
-            delegation,
-            extra_tools,
             permission_gate,
         )?;
         let agent = AgentLoop::new(
@@ -996,6 +1017,7 @@ impl CliRuntime {
         sink: Option<Arc<dyn EventSink>>,
         child_sink: Option<Arc<dyn ChildEventSink>>,
         events: broadcast::Sender<AgentEvent>,
+        parent: ParentCapabilities,
     ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
         if !allow_delegation || !config.delegation.enabled {
             return Ok(None);
@@ -1003,10 +1025,6 @@ impl CliRuntime {
 
         let factory: Arc<dyn ChildToolFactory> =
             Arc::new(NativeChildToolFactory::new(scope.root().to_path_buf()));
-        let parent = ParentCapabilities::new(
-            config.policy.allowed_tools.clone(),
-            NATIVE_CHILD_TOOLS.iter().map(|name| (*name).to_owned()),
-        );
         let mut executor =
             AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
         if let Some(sink) = sink {
@@ -1019,121 +1037,69 @@ impl CliRuntime {
         Ok(Some(Arc::new(executor)))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_tool_registry(
+    /// Builds candidate tools available to this turn before catalog filtering.
+    ///
+    /// Native tools are rebuilt per turn because they are bound to the turn's
+    /// canonical root. WASM tools are process-wide compiled plugins; MCP tools
+    /// arrive per session as `extra_tools`.
+    fn turn_candidates(
         &self,
         scope: &TurnScope,
+        extra_tools: &[Arc<dyn Tool>],
+    ) -> Vec<CatalogCandidate> {
+        let mut candidates = native_candidates(scope.root());
+        candidates.extend(
+            self.wasm_tools
+                .iter()
+                .map(|tool| CatalogCandidate::from_tool(Arc::clone(tool), ToolSource::Wasm)),
+        );
+        candidates.extend(
+            extra_tools
+                .iter()
+                .map(|tool| CatalogCandidate::from_tool(Arc::clone(tool), ToolSource::Mcp)),
+        );
+        candidates
+    }
+
+    /// Wraps exactly the exposed catalog entries for the agent loop.
+    ///
+    /// Hidden tools are not registered, so they are absent from the provider
+    /// schema and an attempted call is an unknown tool. Each exposed tool uses
+    /// its descriptor's effective timeout and optional argument-size limit;
+    /// approval gates attach only to entries the host classified as
+    /// interactive.
+    fn build_tool_registry(
+        &self,
+        catalog: &ToolCatalog,
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
-        timeout: Duration,
         timeout_guard: Arc<ToolTimeoutGuard>,
         result_guard: Arc<ResultSizeGuard>,
-        delegation: Option<Arc<AgentChildExecutor>>,
-        extra_tools: &[Arc<dyn Tool>],
         permission_gate: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
-
-        let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(scope.root().to_path_buf()));
-        let read = GovernedTool::new(
-            read,
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            timeout,
-            Arc::clone(&timeout_guard),
-            Arc::clone(&result_guard),
-        );
-        registry
-            .register(Arc::new(read))
-            .map_err(|source| CliError::RegisterTool {
-                name: "read_file".to_owned(),
-                source,
-            })?;
-
-        let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(scope.root().to_path_buf()));
-        let write = GovernedTool::new(
-            write,
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            timeout,
-            Arc::clone(&timeout_guard),
-            Arc::clone(&result_guard),
-        )
-        .with_permission_gate(permission_gate.clone());
-        registry
-            .register(Arc::new(write))
-            .map_err(|source| CliError::RegisterTool {
-                name: "write_file".to_owned(),
-                source,
-            })?;
-
-        for tool in &self.wasm_tools {
-            let name = tool.name().to_owned();
-            let governed = GovernedTool::new(
+        for entry in catalog.exposed() {
+            let name = entry.descriptor.name.clone();
+            let tool = entry
+                .tool
+                .as_ref()
+                .ok_or_else(|| CatalogError::MissingImplementation { name: name.clone() })?;
+            let mut governed = GovernedTool::new(
                 Arc::clone(tool),
                 Arc::clone(&harness),
                 Arc::clone(&governance),
-                timeout,
+                Duration::from_millis(entry.descriptor.limits.timeout_ms),
                 Arc::clone(&timeout_guard),
                 Arc::clone(&result_guard),
-            );
-            registry
-                .register(Arc::new(governed))
-                .map_err(|source| CliError::RegisterTool { name, source })?;
-        }
-
-        for tool in extra_tools {
-            let name = tool.name().to_owned();
-            let governed = GovernedTool::new(
-                Arc::clone(tool),
-                Arc::clone(&harness),
-                Arc::clone(&governance),
-                timeout,
-                Arc::clone(&timeout_guard),
-                Arc::clone(&result_guard),
-            );
-            registry
-                .register(Arc::new(governed))
-                .map_err(|source| CliError::RegisterTool { name, source })?;
-        }
-
-        let bash: Arc<dyn Tool> =
-            Arc::new(BashTool::new().with_current_dir(scope.root().to_path_buf()));
-        let bash = GovernedTool::new(
-            bash,
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            timeout,
-            Arc::clone(&timeout_guard),
-            Arc::clone(&result_guard),
-        )
-        .with_permission_gate(permission_gate.clone());
-        registry
-            .register(Arc::new(bash))
-            .map_err(|source| CliError::RegisterTool {
-                name: "bash".to_owned(),
-                source,
-            })?;
-
-        if let Some(executor) = delegation {
-            let delegate: Arc<dyn Tool> = Arc::new(DelegateTaskTool::new(executor));
-            let delegate = GovernedTool::new(
-                delegate,
-                harness,
-                governance,
-                timeout,
-                timeout_guard,
-                result_guard,
             )
-            .with_permission_gate(permission_gate);
+            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes);
+            if entry.descriptor.approval == ApprovalPolicy::Interactive {
+                governed = governed.with_permission_gate(permission_gate.clone());
+            }
             registry
-                .register(Arc::new(delegate))
-                .map_err(|source| CliError::RegisterTool {
-                    name: DELEGATE_TASK_TOOL_NAME.to_owned(),
-                    source,
-                })?;
+                .register(Arc::new(governed))
+                .map_err(|source| CliError::RegisterTool { name, source })?;
         }
-
         Ok(registry)
     }
 }
@@ -1527,6 +1493,15 @@ pub(crate) enum CliError {
     /// The harness configuration could not be loaded or validated.
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
+    /// The tool catalog could not be built or queried.
+    #[error("tool catalog error: {0}")]
+    ToolCatalog(#[from] CatalogError),
+    /// A `tools` subcommand argument was missing, unknown, or malformed.
+    #[error("invalid tools command: {message}")]
+    InvalidToolsCommand {
+        /// Human-readable parse failure.
+        message: String,
+    },
     /// A tool could not be registered.
     #[error("failed to register the `{name}` tool: {source}")]
     RegisterTool {
@@ -1830,7 +1805,7 @@ mod tests {
     use jessica_core::trace::{TraceEvent, TracePayload};
     use jessica_core::types::{TokenUsage, ToolCall};
     use jessica_memory::{EventStore, StoredTraceTurn, Timestamp};
-    use jessica_runtime::CHILD_AGENT_SYSTEM_PROMPT;
+    use jessica_runtime::{CHILD_AGENT_SYSTEM_PROMPT, DELEGATE_TASK_TOOL_NAME};
     use serde_json::json;
 
     use crate::shutdown::ShutdownSignal;
@@ -1949,12 +1924,17 @@ mod tests {
 
     /// Builds a parent response that requests one delegation.
     fn delegate_request() -> Vec<LlmEvent> {
+        delegate_request_for(&["read_file"])
+    }
+
+    /// Builds a delegation request naming exactly `tools`.
+    fn delegate_request_for(tools: &[&str]) -> Vec<LlmEvent> {
         vec![
             LlmEvent::ToolCallRequested {
                 call: ToolCall::new(
                     "parent-call",
                     DELEGATE_TASK_TOOL_NAME,
-                    json!({"task": "child task", "tools": ["read_file"]}),
+                    json!({"task": "child task", "tools": tools}),
                 ),
             },
             LlmEvent::Done {
@@ -2100,11 +2080,20 @@ mod tests {
 
     /// Builds a runtime over the given provider and config.
     fn runtime_with(provider: Arc<ScriptedProvider>, config: HarnessConfig) -> CliRuntime {
+        runtime_at(provider, config, PathBuf::from("."))
+    }
+
+    /// Builds a runtime with an explicit workspace root.
+    fn runtime_at(
+        provider: Arc<ScriptedProvider>,
+        config: HarnessConfig,
+        root: PathBuf,
+    ) -> CliRuntime {
         let (_sender, receiver) = watch::channel(Arc::new(config));
         CliRuntime::new(
             provider,
             receiver,
-            PathBuf::from("."),
+            root,
             Vec::new(),
             None,
             None,
@@ -2277,6 +2266,218 @@ mod tests {
             resume_names,
             vec!["bash", "read_file", "write_file"],
             "the resume path must not register delegate_task"
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_profile_omits_mutating_tools_and_unknown_calls_do_not_write() {
+        let workspace = TempDir::new("readonly-profile");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            write_request("call_write", "escaped.txt", "must not be written"),
+            done_text("adapted", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str("[tools]\nprofile = \"readonly\"\n")
+            .expect("readonly config must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("write a file".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let calls = provider.calls();
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["read_file"],
+            "the readonly profile must hide write_file and bash"
+        );
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1]
+                .messages
+                .last()
+                .expect("the unknown tool must produce a result")
+                .content
+                .contains("unknown tool `write_file`"),
+            "a hidden tool must be unknown: {:?}",
+            calls[1].messages.last()
+        );
+        assert!(
+            !workspace.path().join("escaped.txt").exists(),
+            "a hidden write_file call must have no filesystem effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn exposure_budgets_fail_turn_startup_before_the_model_is_called() {
+        for (toml, expected) in [
+            (
+                "[tools]\nmax_exposed_tools = 2\n",
+                "tools.max_exposed_tools",
+            ),
+            (
+                "[tools]\nmax_tool_schema_bytes = 1\n",
+                "tools.max_tool_schema_bytes",
+            ),
+        ] {
+            let provider = Arc::new(ScriptedProvider::new(vec![done_text("unused", 1)]));
+            let config = HarnessConfig::from_toml_str(toml).expect("budgets must parse");
+            let runtime = runtime_with(Arc::clone(&provider), config);
+            let error = runtime
+                .run_turn("hi".to_owned())
+                .await
+                .expect_err("an over-budget catalog must fail the turn");
+            assert!(
+                matches!(error, CliError::ToolCatalog(_)),
+                "expected a catalog error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "the error must name the exceeded budget: {error}"
+            );
+            assert!(
+                provider.calls().is_empty(),
+                "turn startup must fail before any model request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_tool_max_args_bytes_blocks_execution_before_side_effects() {
+        let workspace = TempDir::new("max-args");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            write_request("call_write", "blocked.txt", "must not be written"),
+            done_text("adapted", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str("[tools.write_file]\nmax_args_bytes = 1\n")
+            .expect("per-tool limits must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        runtime
+            .run_turn("write a file".to_owned())
+            .await
+            .expect("the turn must finish");
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1]
+                .messages
+                .last()
+                .expect("the rejected call must produce a result")
+                .content
+                .contains("max_args_bytes"),
+            "the argument limit must reach the model: {:?}",
+            calls[1].messages.last()
+        );
+        assert!(
+            !workspace.path().join("blocked.txt").exists(),
+            "oversized arguments must be rejected before execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_tool_timeout_overrides_the_global_timeout() {
+        let provider = Arc::new(ScriptedProvider::new(vec![bash_request(
+            "slow-command",
+            "sleep 2",
+        )]));
+        let config = HarnessConfig::from_toml_str("[tools.bash]\ntimeout_ms = 1\n")
+            .expect("per-tool timeout must parse");
+        let runtime = runtime_with(Arc::clone(&provider), config);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            runtime
+                .run_turn("run a slow command".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::BudgetExceeded,
+            "the per-tool timeout must abort the turn"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the 1 ms per-tool timeout must win over the 10 s global timeout"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "a timed-out tool must cancel the turn before another model request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrow_profile_hides_delegation_even_when_policy_allows_it() {
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
+        let config = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [policy]\nallowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n\
+             [tools]\nprofile = \"coding\"\n",
+        )
+        .expect("coding config must parse");
+        let runtime = runtime_with(Arc::clone(&provider), config);
+
+        runtime
+            .run_turn("hi".to_owned())
+            .await
+            .expect("the turn must finish");
+
+        assert_eq!(
+            schema_names(&provider.calls()[0].tools),
+            vec!["read_file", "write_file"],
+            "the coding profile must hide bash and delegate_task"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_cannot_grant_a_tool_the_parent_catalog_hides() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            delegate_request_for(&["write_file"]),
+            done_text("adapted", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [policy]\nallowed_tools = [\"read_file\", \"delegate_task\"]\n",
+        )
+        .expect("delegation config must parse");
+        let runtime = runtime_with(Arc::clone(&provider), config);
+
+        runtime
+            .run_turn("delegate".to_owned())
+            .await
+            .expect("the turn must finish");
+
+        let calls = provider.calls();
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["delegate_task", "read_file"],
+            "hidden native tools must not be advertised"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "a rejected delegation must not start a child model call"
+        );
+        let result = calls[1]
+            .messages
+            .last()
+            .expect("the rejected delegation must produce a result")
+            .content
+            .clone();
+        assert!(
+            result.contains("not permitted"),
+            "the child tool grant must be rejected: {result}"
         );
     }
 

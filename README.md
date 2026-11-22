@@ -162,6 +162,63 @@ opening a provider, event store, memory or skills database, or wasm module:
 jessica --config ~/.jessica/harness.toml config
 ```
 
+## Tool catalog and exposure
+
+Every turn rebuilds a host-side tool catalog. A tool is exposed to the model
+only when all three host decisions agree:
+
+1. its source is available this turn (native, configured WASM, session MCP, or
+   enabled delegation);
+2. its name is in `policy.allowed_tools`;
+3. `tools.profile` permits that source/name pair.
+
+```toml
+[tools]
+profile = "full"          # default; also "readonly", "coding", "ops"
+max_exposed_tools = 64
+max_tool_schema_bytes = 131072
+
+[tools.read_file]
+timeout_ms = 5000         # defaults to budget.tool_timeout_ms
+max_args_bytes = 65536    # optional pre-execution argument limit
+
+[tools.bash]
+timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
+```
+
+| Profile | Native tools exposed |
+| --- | --- |
+| `readonly` | `read_file` |
+| `coding` | `read_file`, `write_file` |
+| `ops` | `read_file`, `bash` |
+| `full` | every allowlisted tool, including WASM, MCP, and `delegate_task` |
+
+Narrow profiles never expose WASM, MCP, or delegation tools. The default is
+`full` so existing configurations keep their tool surface; choose a narrower
+profile to enforce least privilege.
+
+Hidden tools are not registered, so they never appear in the provider tool
+schema and cannot execute. A model that hallucinates a hidden name receives an
+`unknown tool` error result. Exceeding either exposure budget fails turn
+startup with an actionable error instead of silently dropping tools. Per-tool
+`max_args_bytes` is checked before policy, approval, and execution; `timeout_ms`
+overrides the global tool timeout for that tool. The whole `[tools]` section is
+hot-reloadable and applies to the next turn.
+
+```bash
+jessica --config ~/.jessica/harness.toml tools list
+jessica --config ~/.jessica/harness.toml tools list --all
+jessica --config ~/.jessica/harness.toml tools inspect write_file
+```
+
+`list` prints exposed tools sorted by name. `--all` adds hidden tools and the
+reason each is hidden. `inspect` prints the descriptor, capabilities, effective
+limits, approval policy, argument-field hints, and the schema digest. The
+schema digest is `sha256:` plus the SHA-256 of the canonical schema JSON with
+object keys sorted recursively, so the same configuration always produces the
+same output. These commands never open a provider, event store, memory or
+skills database, or MCP connection; they also do not create `.jessica/`.
+
 ## Trace verification and digests
 
 `jessica trace verify` audits recorded turn traces without creating or
@@ -364,8 +421,8 @@ past `max_sessions` returns `-32602` with
 prompt returns `-32602` with a stable, actionable message.
 
 The `[acp]` section is startup-only. ACP reuses the REPL configuration watcher:
-changes to reloadable sections such as `[budget]`, `[policy]`, `[sensor]`,
-`[acceptance]`, and `[delegation]` apply to the next prompt, while changes to
+changes to reloadable sections such as `[budget]`, `[policy]`, `[tools]`,
+`[sensor]`, `[acceptance]`, and `[delegation]` apply to the next prompt, while changes to
 `profile`, `events`, `memory`, `skills`, `wasm`, `reliability`, or `acp` reject
 the whole reload and keep the startup value. WASM tools are loaded once at
 startup.
@@ -383,12 +440,16 @@ on the inherited process environment.
 Each discovered tool is exposed to the model as
 `mcp__<server>__<tool>`. Characters that providers commonly reject are replaced
 with `_` in that provider-visible name; the original MCP tool name is still
-used for `tools/call`. MCP tools are **not** automatically allowed. Add the
-namespaced name to the policy allowlist explicitly:
+used for `tools/call`. MCP tools are **not** automatically exposed. Add the
+namespaced name to the policy allowlist explicitly and use the `full` tool
+profile:
 
 ```toml
 [policy]
 allowed_tools = ["read_file", "mcp__filesystem__read_file"]
+
+[tools]
+profile = "full"
 ```
 
 Policy is reloadable, so a later turn can pick up a changed allowlist. Every

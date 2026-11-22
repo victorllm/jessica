@@ -16,6 +16,7 @@ use jessica_providers::{
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
+use jessica_tools::DEFAULT_BASH_TIMEOUT;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,8 +26,10 @@ const NATIVE_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
 const SAFE_TOOLS: &[&str] = &["read_file"];
 /// Default event-store path, relative to the workspace root.
 const DEFAULT_EVENTS_PATH: &str = ".jessica/events.db";
-/// Native tools a delegated child may be granted.
-pub(crate) const NATIVE_CHILD_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
+/// Default maximum number of tool schemas sent to the model in one turn.
+const DEFAULT_MAX_EXPOSED_TOOLS: usize = 64;
+/// Default maximum total schema bytes sent to the model in one turn.
+const DEFAULT_MAX_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
 
 /// Default token budget for a session (prompt plus completion tokens).
 const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
@@ -172,6 +175,169 @@ impl ProfileConfig {
     }
 }
 
+/// Which tools a turn is allowed to expose to the model.
+///
+/// A profile narrows the configured policy; it never expands it. The `full`
+/// profile preserves the behavior of configurations written before tool
+/// profiles existed and is therefore the default. Third-party tools (WASM and
+/// MCP) are exposed only by `full`; native tools follow the table below.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProfile {
+    /// Only read-only native tools.
+    Readonly,
+    /// Read-only tools plus `write_file`.
+    Coding,
+    /// Read-only tools plus `bash`.
+    Ops,
+    /// Every native tool and every allowlisted third-party tool. This is the
+    /// default so existing configurations keep their tool surface.
+    #[default]
+    Full,
+}
+
+/// Optional per-tool limits.
+///
+/// Both fields are optional. An absent timeout falls back to
+/// `budget.tool_timeout_ms`; an absent argument limit disables the precheck.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolLimitConfig {
+    /// Wall-clock timeout for this tool, in milliseconds.
+    ///
+    /// Must be at least 1 and must not exceed `budget.tool_timeout_ms`. The
+    /// `bash` tool additionally cannot exceed its internal 10-second timeout.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    ///
+    /// Must be at least 1 when present. The check runs before policy,
+    /// permission, and execution.
+    pub max_args_bytes: Option<usize>,
+}
+
+/// Tool catalog and exposure settings.
+///
+/// The catalog is rebuilt for every turn from the configured policy, this
+/// profile, native tools, WASM manifests, session MCP tools, and delegation.
+/// Tools outside the resulting set are not registered, so they are neither
+/// sent to the model nor executable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolsConfig {
+    /// Tool profile applied on top of `policy.allowed_tools`.
+    pub profile: ToolProfile,
+    /// Maximum number of exposed tools. Exceeding it fails turn startup.
+    pub max_exposed_tools: usize,
+    /// Maximum total serialized schema bytes exposed in one turn.
+    pub max_tool_schema_bytes: usize,
+    /// Optional limits for the native `read_file` tool.
+    pub read_file: ToolLimitConfig,
+    /// Optional limits for the native `write_file` tool.
+    pub write_file: ToolLimitConfig,
+    /// Optional limits for the native `bash` tool.
+    pub bash: ToolLimitConfig,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            profile: ToolProfile::Full,
+            max_exposed_tools: DEFAULT_MAX_EXPOSED_TOOLS,
+            max_tool_schema_bytes: DEFAULT_MAX_TOOL_SCHEMA_BYTES,
+            read_file: ToolLimitConfig::default(),
+            write_file: ToolLimitConfig::default(),
+            bash: ToolLimitConfig::default(),
+        }
+    }
+}
+
+impl ToolsConfig {
+    /// Returns the configured limits for a native tool, if any.
+    pub fn limits(&self, name: &str) -> Option<&ToolLimitConfig> {
+        match name {
+            "read_file" => Some(&self.read_file),
+            "write_file" => Some(&self.write_file),
+            "bash" => Some(&self.bash),
+            _ => None,
+        }
+    }
+
+    /// Returns the effective timeout for one tool.
+    ///
+    /// A per-tool override replaces `fallback`. Validation has already ensured
+    /// it is positive and no larger than the global timeout.
+    pub fn timeout_for(&self, name: &str, fallback: Duration) -> Duration {
+        self.limits(name)
+            .and_then(|limits| limits.timeout_ms)
+            .map(Duration::from_millis)
+            .unwrap_or(fallback)
+    }
+
+    /// Returns the argument-size limit for one tool, if configured.
+    pub fn max_args_bytes(&self, name: &str) -> Option<usize> {
+        self.limits(name).and_then(|limits| limits.max_args_bytes)
+    }
+
+    /// Rejects unusable exposure budgets and per-tool limits.
+    ///
+    /// `global_timeout_ms` is `budget.tool_timeout_ms`; per-tool overrides must
+    /// not exceed it. The bash override is also capped by the tool's internal
+    /// timeout so the descriptor cannot advertise a deadline the tool ignores.
+    pub fn validate(&self, global_timeout_ms: u64) -> Result<(), ConfigError> {
+        if self.max_exposed_tools == 0 {
+            return Err(invalid("tools.max_exposed_tools must be at least 1"));
+        }
+        if self.max_tool_schema_bytes == 0 {
+            return Err(invalid("tools.max_tool_schema_bytes must be at least 1"));
+        }
+        validate_tool_limits("tools.read_file", &self.read_file, global_timeout_ms, None)?;
+        validate_tool_limits(
+            "tools.write_file",
+            &self.write_file,
+            global_timeout_ms,
+            None,
+        )?;
+        validate_tool_limits(
+            "tools.bash",
+            &self.bash,
+            global_timeout_ms,
+            Some(DEFAULT_BASH_TIMEOUT.as_millis() as u64),
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_tool_limits(
+    prefix: &str,
+    limits: &ToolLimitConfig,
+    global_timeout_ms: u64,
+    timeout_cap_ms: Option<u64>,
+) -> Result<(), ConfigError> {
+    if let Some(timeout_ms) = limits.timeout_ms {
+        if timeout_ms == 0 {
+            return Err(invalid(format!("{prefix}.timeout_ms must be at least 1")));
+        }
+        if timeout_ms > global_timeout_ms {
+            return Err(invalid(format!(
+                "{prefix}.timeout_ms must not exceed budget.tool_timeout_ms"
+            )));
+        }
+        if let Some(cap_ms) = timeout_cap_ms
+            && timeout_ms > cap_ms
+        {
+            return Err(invalid(format!(
+                "{prefix}.timeout_ms must not exceed the bash tool's internal {cap_ms} ms timeout"
+            )));
+        }
+    }
+    if limits.max_args_bytes == Some(0) {
+        return Err(invalid(format!(
+            "{prefix}.max_args_bytes must be at least 1"
+        )));
+    }
+    Ok(())
+}
+
 /// Complete harness configuration loaded from a TOML file.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -182,6 +348,8 @@ pub struct HarnessConfig {
     pub budget: BudgetConfig,
     /// Tool allowlist.
     pub policy: PolicyConfig,
+    /// Tool catalog profile, exposure budgets, and per-tool limits.
+    pub tools: ToolsConfig,
     /// Optional child-agent delegation.
     pub delegation: DelegationConfig,
     /// Provider retry and timeout settings. Disabled by default.
@@ -273,6 +441,7 @@ impl HarnessConfig {
         if self.budget.max_stuck_rounds == 0 {
             return Err(invalid("budget.max_stuck_rounds must be at least 1"));
         }
+        self.tools.validate(self.budget.tool_timeout_ms)?;
         self.delegation.validate()?;
         self.reliability.validate()?;
         if self.delegation.enabled {
@@ -350,9 +519,9 @@ impl HarnessConfig {
 
 /// Returns the first non-reloadable section that differs between two configs.
 ///
-/// The REPL may hot-reload `budget`, `policy`, `delegation`, `sensor`, and
-/// `acceptance` because each turn rebuilds those components from its snapshot.
-/// The remaining sections own long-lived resources, limits, or startup
+/// The REPL may hot-reload `budget`, `policy`, `tools`, `delegation`, `sensor`,
+/// and `acceptance` because each turn rebuilds those components from its
+/// snapshot. The remaining sections own long-lived resources, limits, or startup
 /// resolution created once at startup (the profile, event recorder, memory and
 /// skill databases, wasm modules, the provider reliability wrapper, and ACP
 /// session limits), so any change to them rejects the whole reload. The
@@ -1101,6 +1270,107 @@ mod tests {
         let config = HarnessConfig::from_toml_str("[policy]\nallowed_tools = []\n")
             .expect("empty allowlist is valid");
         assert!(config.policy.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn omitted_tools_use_the_full_profile_and_safe_budgets() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(config.tools.profile, ToolProfile::Full);
+        assert_eq!(config.tools.max_exposed_tools, 64);
+        assert_eq!(config.tools.max_tool_schema_bytes, 128 * 1024);
+        assert_eq!(config.tools.read_file, ToolLimitConfig::default());
+        assert_eq!(config.tools.write_file, ToolLimitConfig::default());
+        assert_eq!(config.tools.bash, ToolLimitConfig::default());
+    }
+
+    #[test]
+    fn tool_profiles_parse_and_reject_unknown_names() {
+        for (name, expected) in [
+            ("readonly", ToolProfile::Readonly),
+            ("coding", ToolProfile::Coding),
+            ("ops", ToolProfile::Ops),
+            ("full", ToolProfile::Full),
+        ] {
+            let config = HarnessConfig::from_toml_str(&format!("[tools]\nprofile = \"{name}\"\n"))
+                .expect("every documented profile must parse");
+            assert_eq!(config.tools.profile, expected, "profile {name}");
+        }
+        let error = HarnessConfig::from_toml_str("[tools]\nprofile = \"superuser\"\n")
+            .expect_err("unknown profiles must fail instead of widening access");
+        assert!(error.to_string().contains("superuser"));
+    }
+
+    #[test]
+    fn per_tool_limits_are_validated_against_global_and_internal_deadlines() {
+        let cases = [
+            (
+                "[tools]\nmax_exposed_tools = 0\n",
+                "tools.max_exposed_tools",
+            ),
+            (
+                "[tools]\nmax_tool_schema_bytes = 0\n",
+                "tools.max_tool_schema_bytes",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.read_file]\ntimeout_ms = 0\n",
+                "tools.read_file.timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.write_file]\ntimeout_ms = 5001\n",
+                "tools.write_file.timeout_ms",
+            ),
+            (
+                "[tools.bash]\ntimeout_ms = 10001\n",
+                "tools.bash.timeout_ms",
+            ),
+            (
+                "[tools.read_file]\nmax_args_bytes = 0\n",
+                "tools.read_file.max_args_bytes",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("unusable tool limits must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+
+        let accepted = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 20000\n\
+             [tools.read_file]\ntimeout_ms = 3000\nmax_args_bytes = 128\n\
+             [tools.bash]\ntimeout_ms = 10000\n",
+        )
+        .expect("limits at the boundaries must be accepted");
+        assert_eq!(
+            accepted
+                .tools
+                .timeout_for("read_file", Duration::from_secs(20)),
+            Duration::from_millis(3000)
+        );
+        assert_eq!(
+            accepted.tools.timeout_for("bash", Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(accepted.tools.max_args_bytes("read_file"), Some(128));
+        assert_eq!(accepted.tools.max_args_bytes("bash"), None);
+    }
+
+    #[test]
+    fn tools_changes_are_hot_reloadable() {
+        let current = HarnessConfig::from_toml_str("[tools]\nprofile = \"full\"\n")
+            .expect("current config must parse");
+        let next = HarnessConfig::from_toml_str(
+            "[tools]\nprofile = \"readonly\"\n\
+             [tools.read_file]\ntimeout_ms = 2000\n",
+        )
+        .expect("next config must parse");
+        assert_eq!(
+            changed_immutable_section(&current, &next),
+            None,
+            "the catalog is rebuilt per turn, so [tools] must reload"
+        );
     }
 
     #[test]

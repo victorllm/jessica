@@ -16,7 +16,7 @@ mod bash;
 mod file;
 mod wasm;
 
-pub use bash::BashTool;
+pub use bash::{BashTool, DEFAULT_BASH_TIMEOUT};
 pub use file::{ReadFileTool, WriteFileTool};
 pub use wasm::{WasmTool, WasmToolError, register_wasm_tool};
 

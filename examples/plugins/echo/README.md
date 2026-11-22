@@ -26,5 +26,6 @@ Run the CLI example from the repository root:
 cargo run -p jessica-cli -- --config examples/wasm_tool.toml "echo hello"
 ```
 
-The example allowlist contains only `echo_json`, so a call to a native tool is
-denied with a `PolicyDenied` event and an error tool result.
+The example allowlist contains only `echo_json`, so native tools are absent
+from the provider tool schema and an attempted call returns an `unknown tool`
+error result.

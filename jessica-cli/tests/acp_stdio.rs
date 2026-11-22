@@ -3979,7 +3979,7 @@ async fn acp_mcp_stdio_discovers_and_invokes_namespaced_tool() {
 }
 
 #[tokio::test]
-async fn acp_mcp_tool_is_denied_by_policy_without_reaching_server() {
+async fn acp_mcp_tool_hidden_by_policy_is_unknown_to_the_model() {
     assert_mcp_fixture_available();
     let workspace = TempDir::new("mcp-denied");
     let config = write_mcp_config(&workspace, &["read_file"], 10_000);
@@ -3989,7 +3989,7 @@ async fn acp_mcp_tool_is_denied_by_policy_without_reaching_server() {
             "mcp__stub__echo",
             json!({"text": "must not reach stub"}),
         )]),
-        text_response("adapted after policy denial"),
+        text_response("adapted after an unknown tool"),
     ]);
     let mut acp = AcpProcess::spawn_in(
         Some(&workspace.path),
@@ -4025,32 +4025,36 @@ async fn acp_mcp_tool_is_denied_by_policy_without_reaching_server() {
     .await;
     assert_eq!(
         prompt_response["result"]["stopReason"], "end_turn",
-        "the model may adapt after a policy denial: {prompt_response}"
+        "the model may adapt after an unknown tool: {prompt_response}"
     );
     let failed = updates
         .iter()
         .find(|update| {
             update_kind(update) == "tool_call_update" && update["toolCallId"] == "call_denied"
         })
-        .unwrap_or_else(|| panic!("the denied MCP tool must finish: {updates:?}"));
+        .unwrap_or_else(|| panic!("the hidden MCP tool call must finish: {updates:?}"));
     assert_eq!(failed["status"], "failed");
     assert!(
         failed["content"][0]["content"]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("denied by policy")),
-        "the model must see the policy denial: {failed}"
+            .is_some_and(|text| text.contains("unknown tool `mcp__stub__echo`")),
+        "a hidden tool must be unknown to the model: {failed}"
     );
     assert_eq!(
         mcp_call_log(&workspace),
         "",
-        "a policy-denied MCP tool must never reach the child process"
+        "a policy-hidden MCP tool must never reach the child process"
     );
 
     let requests = provider.finish();
     assert_eq!(requests.len(), 2);
     assert!(
-        requests[1].contains("denied by policy"),
-        "the denial must be returned to the model"
+        !requests[0].contains("mcp__stub__echo"),
+        "the provider schema must not advertise a policy-hidden tool"
+    );
+    assert!(
+        requests[1].contains("unknown tool `mcp__stub__echo`"),
+        "the unknown-tool error must be returned to the model"
     );
 
     let close = request_response(&mut acp, 4, "session/close", json!({"sessionId": session})).await;

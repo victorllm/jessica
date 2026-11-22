@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0 已完成，9.1+ 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1 已完成，9.2+ 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2050,6 +2050,27 @@ Task 9.0（2026-11-22）：Profile preset、effective config、默认 trace
 - 默认 trace 会改变所有未配置 `[events]` 的运行；README、热加载不可变 section 列表与受影响测试必须同步更新；`.jessica/` 加入 `.gitignore`。`install.sh` 已显式生成绝对 `[events].path`，本 Task 不改其行为。
 
 完成标准：fmt/clippy/test 全绿；新增行为测试覆盖默认值、preset 覆盖、safe allowlist、trace off/冲突、非法 preset、effective JSON、`jessica config` 无副作用、父目录创建与热加载拒绝；README 与进度追踪更新。
+
+---
+
+Task 9.1（2026-11-22）：Tool Catalog、descriptor、per-tool limits、schema 过滤、tools list/inspect
+
+范围与约束：
+
+- 不修改 `jessica-core`；不新增第三方 crate（`sha2` 已在 workspace 依赖中，本 Task 仅为 `jessica-cli` 显式引用）；不实现 9.2 的执行监督（env allowlist、输出上限、sensor/acceptance 超时）、9.3 的工具策略 v2、9.4 的结果管理、9.5+ 的 MCP/WASM descriptor 配置、额外原生工具或嵌套委派。
+- `ToolDescriptor` 是宿主侧治理分类，不进入 core；core 继续只暴露 `Tool`、`ToolSchema`、`ToolRegistry`、`ToolCall`、`ToolResult`。第三方工具不得自报能力，source/capabilities/approval/policy hints 由宿主按来源与配置赋值。
+- 新增 `[tools]`：`profile`（`readonly`/`coding`/`ops`/`full`，默认 `full`）、`max_exposed_tools`（默认 64）、`max_tool_schema_bytes`（默认 131072）、`[tools.read_file]`/`[tools.write_file]`/`[tools.bash]` 的可选 `timeout_ms` 与 `max_args_bytes`。profile 默认采用 `full` 而不是设计示例的 `coding`，以保持既有未配置行为；收窄必须显式 opt-in，并记入偏离。
+- 校验：所有新数值必须 ≥1；per-tool `timeout_ms` 不得超过 `budget.tool_timeout_ms`；`bash` 的 per-tool `timeout_ms` 不得超过 BashTool 内部 10s 上限。非法值在配置加载期返回字段级 `ConfigError`。
+- Catalog 可用来源：native、已配置 WASM、当前 session 的 MCP extra tools、启用且允许委派时的 `delegate_task`；再与 `policy.allowed_tools` 和 profile 取交集。第三方工具（WASM/MCP）只允许在 `full` 下暴露，且仍必须在 allowlist 中。未暴露工具不注册进 `ToolRegistry`，因此不发送给模型；模型幻觉调用得到 `unknown tool`，不会到达 policy/permission/执行。
+- descriptor 至少包含 name、source、version、schema、schema digest、capabilities、limits、approval、policy hints、result format；排序稳定。schema digest 为 canonical schema 字节的 `sha256:<64 hex>`，重复构建可复现。重复工具名在目录构建期 fail-closed。
+- 暴露预算：`max_exposed_tools` 与 `max_tool_schema_bytes` 任一超限时 turn 启动失败并给出可行动错误，绝不静默丢弃；`tools list` 对同一超限只提示而不失败，便于诊断。
+- per-tool limit 执行：有效 timeout = per-tool 覆盖或全局 `budget.tool_timeout_ms`，仍由既有 `GovernedTool` 超时 wrapper 强制；`max_args_bytes` 在执行前按序列化参数长度检查，超限返回错误结果且不执行工具、不触发预算 trip、不进入 policy/permission/执行。
+- 委派能力收窄使用 Catalog 实际暴露的 native 名称，profile 隐藏的工具不能授予子 Agent。
+- `jessica tools list [--all]` 与 `jessica tools inspect <name>`：只加载配置与（如有）WASM manifest，不创建 provider、事件库、memory/skills DB，不需要 API key，不写 `.jessica`；输出顺序稳定，`--all` 显示隐藏原因，inspect 显示 descriptor、schema digest、limits、policy hints。未知名返回非零结构化错误。
+- `[tools]` 是每 turn 重新构建 Catalog 的可热加载 section，不加入 `changed_immutable_section`；修改 profile 必须影响下一 turn 的 provider schema 与可执行工具。
+- 既有“越权工具进入 schema 后被 policy 拒绝”的行为改为“不进入 schema、调用得到 unknown tool”；受影响 E2E、examples 注释与 README 必须同步。事件流的 PolicyDenied 语义只保留给已暴露但被 policy 拒绝的调用（正常情况下不应发生，仍作为纵深防御）。
+
+完成标准：fmt/clippy/test 全绿；新增行为测试覆盖配置默认/边界、descriptor digest 稳定性、Catalog 过滤/排序/隐藏原因/重复名/预算、`max_args_bytes` 边界、per-tool timeout、readonly profile 的 schema 与 unknown tool、委派能力收窄、`tools list/inspect` 真实 CLI 无副作用、`[tools]` 热加载；README、examples 与受影响 E2E 更新。
 
 ---
 
@@ -2149,9 +2170,16 @@ Task 8.6 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实�
 
 Task 9.0 ☑ 耗时未精确计时（含方案确认、实现、测试与全量验收） — 交付 profile preset、effective config 与默认 trace。`jessica-cli`：新增 `ProfilePreset`（`safe`/`dev`/`ci`/`lab`）、`TraceMode`（`strict`/`off`）与 `ProfileConfig`；`HarnessConfig.profile` 默认 `dev`+`strict`；`from_toml_str` 改用 raw `toml::Table` 合并，显式字段 > preset > 内建默认，preset 只补 `policy.allowed_tools`，不自动启用 memory/skills/reliability；`EventsConfig::default().path = ".jessica/events.db"`，`trace = "off"` 清除隐式路径但拒绝显式 `events.path`；`validate` 强制 strict 需要路径、off 禁止路径、ACP `state_dir` 需要 trace；`profile` 加入不可热更新 section；配置类型派生 `Serialize` 并新增 `to_effective_json`；新增无副作用 `jessica config` 命令与 `parse_args_from`；`EventRecorder::open` 创建缺失父目录并以 `CreateParent` fail-closed。测试覆盖默认值、preset/显式覆盖、safe allowlist、trace off/冲突、非法 preset、effective JSON、真实 CLI config 输出与无副作用、父目录创建、热加载拒绝。README、`.gitignore`（`/.jessica/`）与 PLAN 同步；未改 `install.sh`，因为它已显式生成 `[events].path`。测试净增 10 个（945→955）：配置默认/preset/覆盖/trace off/非法值/effective JSON、`jessica config` 真实 E2E 2 个、EventRecorder 父目录创建与路径阻塞 2 个、`config` 参数解析 1 个；另更新 ACP 依赖默认 trace、热加载不可变 section 与受影响 E2E。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 955 passed, 0 failed, 2 ignored。偏离/说明：1) 计划中的“effective config 和 preset 名写入 trace”未实现，冻结的 core trace payload 无配置承载变体，复用既有 payload 会污染审计语义，已记入 Deferred 待单独批准；2) preset 当前只影响工具 allowlist，memory/skills/reliability 始终 opt-in；3) 默认事件库位于 workspace root 的 `.jessica/events.db`，`install.sh` 仍显式写入 `$JESSICA_HOME/events.db`；4) 未修改 `jessica-core`、未新增第三方 crate、未改 SQLite schema、未提交/未推送，`DESIGN.md` 保持未跟踪。
 
+Task 9.1 ☑ 耗时未精确计时（含方案确认、实现、测试与全量验收） — 交付 Tool Catalog、descriptor、per-tool limits、schema 过滤与 `tools list/inspect`。`jessica-cli`：新增 `tools/{descriptor,catalog,mod}.rs`；descriptor 由宿主按 source 赋值 capabilities/approval/version/policy hints/result format，schema digest 为递归排序键后的 compact JSON `sha256:<64 hex>`；Catalog 对 native、配置 WASM、session MCP extra tools、启用委派的 `delegate_task` 与 `policy.allowed_tools`、`tools.profile` 取交集，未暴露项保留隐藏原因但不注册；重复名、预算超限 fail-closed。新增 `[tools]`（`profile` 默认 `full`、`max_exposed_tools` 64、`max_tool_schema_bytes` 131072、三个原生工具的 `timeout_ms`/`max_args_bytes`）与字段级校验（≥1、per-tool ≤ 全局、bash ≤ 内部 10s）；`[tools]` 每 turn 重建，可热加载。`GovernedTool` 新增 `max_args_bytes`，在预算检查后、policy/permission/执行前按序列化参数长度拒绝。`build_turn` 只注册 exposed entries，per-tool timeout/approval 从 descriptor 装配；委派 `ParentCapabilities` 改用 Catalog 实际暴露的 native 名称。新增无副作用 `jessica tools list [--all]` / `inspect <name>`，稳定排序、隐藏原因、descriptor、digest 与 schema；预算超限时 list 只警告仍可诊断。`jessica-tools` 公开 `DEFAULT_BASH_TIMEOUT`；`jessica-cli` 显式引用 workspace 已有 `sha2`。隐藏工具语义由“进入 schema 后被 policy 拒绝”改为“不进入 schema、调用得到 unknown tool”，同步更新 ACP/WASM E2E、examples 注释与 README。测试净增 28 个（955→983）：descriptor 4、catalog 7、tools 模块 2、配置 4、governance 2、app 6、真实 CLI tools E2E 3。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 983 passed, 0 failed, 2 ignored。偏离/说明：1) profile 默认采用 `full` 而非设计示例的 `coding`，避免既有未配置行为收窄；2) policy hints 按当前实际参数适配为 path/command 字段，`protected_paths` 留空待策略 v2；3) descriptor 的 `max_inline_bytes` 复用 `budget.max_result_bytes`，`max_artifact_bytes`/`max_output_lines` 尚无执行语义，报告为不存在；4) 未修改 `jessica-core`、未新增第三方 crate、未改 SQLite schema、未提交/未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
+
+· Task 9.1 的系统提示仍展示完整 `policy.allowed_tools`，而不是 Catalog 的 profile 过滤后暴露集。窄 profile 下模型可能在提示中看到未暴露名称并尝试调用，随后得到 `unknown tool`。若要求提示与 schema 严格一致，需把按 turn 构建的 exposed 集传入 `initial_messages`，并决定 WASM/MCP/委派名称在提示中的呈现方式；不在 9.1 顺手改。
+· Task 9.1 的 per-tool `timeout_ms`/`max_args_bytes` 只覆盖 `read_file`、`write_file`、`bash` 三个原生工具；WASM manifest、MCP server 与 `delegate_task` 尚无独立 per-tool 配置，仍分别受 manifest 限额、MCP 固定边界和委派 limits 约束。若需要统一配置面，需单开 Task 扩展 `[tools]` 并定义第三方工具的默认来源。
+· Task 9.1 的 descriptor `version` 对 WASM 固定为 `manifest-v1`、对 MCP 固定为协议日期，未读取 manifest 或 server 自报版本；`schema_bytes` 只统计 host 侧 canonical schema，不含 provider 可能追加的包装。若需要版本审计或 provider 级字节预算，需定义来源契约。
+· Task 9.1 的 `tools list/inspect` 会编译配置中的 WASM manifest（与 turn 一致），manifest 损坏时命令失败；这与 `jessica config` 完全不触碰 wasm 的行为不同，属于有意取舍，但尚无绕过编译的纯元数据检查模式。
 
 · Task 9.0 未把 effective config 或 preset 名写入 trace。冻结的 `jessica-core` `TracePayload` 没有承载配置快照的变体；用 `TurnStarted.messages`、普通 `AgentEvent`、`Gap` 或 `ChildAgent` 夹带配置会破坏审计语义、replay parity 与 bundle/digest 契约。若需要，须单开 Task 并明确批准 core 公共 API/schema 变更：新增配置 payload 或包络字段、版本号、旧 reader 拒绝规则、verifier/digest/export/bundle 兼容性、敏感配置脱敏与保留策略；不得在 CLI 侧静默编码。
 
