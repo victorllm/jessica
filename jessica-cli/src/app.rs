@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::acp_store::AcpStoreError;
+use crate::artifacts::ResultManager;
 use crate::config::{ConfigError, HarnessConfig};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventJournal, EventRecorder, RecorderError};
@@ -62,6 +63,22 @@ enum AttemptStart {
         /// Checkpoint rebuilt from the recorded events.
         checkpoint: SessionCheckpoint,
     },
+}
+
+/// Shared governance objects wrapped around every exposed tool in one turn.
+struct ToolWiring {
+    /// Harness owning policy, guards, and sensors.
+    harness: Arc<Harness>,
+    /// Turn budget and cancellation state.
+    governance: Arc<GovernanceState>,
+    /// Timeout guard shared with the harness.
+    timeout_guard: Arc<ToolTimeoutGuard>,
+    /// Result-size guard shared with the harness.
+    result_guard: Arc<ResultSizeGuard>,
+    /// Result manager applied before the result-size guard.
+    result_manager: Arc<ResultManager>,
+    /// Optional approval gate used by interactive tools.
+    permission_gate: Option<Arc<dyn ToolPermissionGate>>,
 }
 
 /// Per-turn middleware, agent, and pump wiring.
@@ -881,6 +898,7 @@ impl CliRuntime {
         let timeout_guard = Arc::new(ToolTimeoutGuard::new(timeout));
         let stuck_guard = Arc::new(StuckDetectionGuard::new(config.budget.max_stuck_rounds));
         let result_guard = Arc::new(ResultSizeGuard::new(config.budget.max_result_bytes));
+        let result_manager = Arc::new(ResultManager::new(scope.root(), config));
 
         let guards: Vec<Arc<dyn Guard>> = vec![
             Arc::clone(&token_guard) as Arc<dyn Guard>,
@@ -944,14 +962,15 @@ impl CliRuntime {
             .enforce_budget(config)
             .map_err(CliError::ToolCatalog)?;
 
-        let registry = self.build_tool_registry(
-            &catalog,
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            Arc::clone(&timeout_guard),
-            Arc::clone(&result_guard),
+        let wiring = ToolWiring {
+            harness: Arc::clone(&harness),
+            governance: Arc::clone(&governance),
+            timeout_guard: Arc::clone(&timeout_guard),
+            result_guard: Arc::clone(&result_guard),
+            result_manager,
             permission_gate,
-        )?;
+        };
+        let registry = self.build_tool_registry(&catalog, &wiring)?;
         let agent = AgentLoop::new(
             provider,
             Arc::new(registry),
@@ -1077,11 +1096,7 @@ impl CliRuntime {
     fn build_tool_registry(
         &self,
         catalog: &ToolCatalog,
-        harness: Arc<Harness>,
-        governance: Arc<GovernanceState>,
-        timeout_guard: Arc<ToolTimeoutGuard>,
-        result_guard: Arc<ResultSizeGuard>,
-        permission_gate: Option<Arc<dyn ToolPermissionGate>>,
+        wiring: &ToolWiring,
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
         for entry in catalog.exposed() {
@@ -1092,15 +1107,19 @@ impl CliRuntime {
                 .ok_or_else(|| CatalogError::MissingImplementation { name: name.clone() })?;
             let mut governed = GovernedTool::new(
                 Arc::clone(tool),
-                Arc::clone(&harness),
-                Arc::clone(&governance),
+                Arc::clone(&wiring.harness),
+                Arc::clone(&wiring.governance),
                 Duration::from_millis(entry.descriptor.limits.timeout_ms),
-                Arc::clone(&timeout_guard),
-                Arc::clone(&result_guard),
+                Arc::clone(&wiring.timeout_guard),
+                Arc::clone(&wiring.result_guard),
             )
-            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes);
+            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes)
+            .with_result_manager(
+                Some(Arc::clone(&wiring.result_manager)),
+                entry.descriptor.result_format,
+            );
             if entry.descriptor.approval == ApprovalPolicy::Interactive {
-                governed = governed.with_permission_gate(permission_gate.clone());
+                governed = governed.with_permission_gate(wiring.permission_gate.clone());
             }
             registry
                 .register(Arc::new(governed))
@@ -2504,6 +2523,141 @@ mod tests {
             provider.calls().len(),
             1,
             "a timed-out tool must cancel the turn before another model request"
+        );
+    }
+
+    /// Extracts the digest header from a managed result.
+    fn managed_digest(content: &str) -> String {
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("digest: "))
+            .expect("a managed result must carry a digest")
+            .to_owned()
+    }
+
+    /// Resolves the content-addressed artifact path under `root`.
+    fn artifact_path(root: &Path, digest: &str) -> PathBuf {
+        let hex = digest
+            .strip_prefix("sha256:")
+            .expect("digest must be namespaced");
+        root.join(".jessica/artifacts").join(&hex[..2]).join(hex)
+    }
+
+    #[tokio::test]
+    async fn a_large_read_file_result_becomes_a_preview_and_artifact() {
+        let workspace = TempDir::new("large-read");
+        let content = "r".repeat(100 * 1024);
+        std::fs::write(workspace.path().join("big.txt"), &content)
+            .expect("large file must be written");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            read_request("call_read", "big.txt"),
+            done_text("read complete", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\"]\n",
+        )
+        .expect("read config must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("read the large file".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        let tool_result = calls[1]
+            .messages
+            .last()
+            .expect("the read result must reach the model")
+            .content
+            .clone();
+        assert!(tool_result.starts_with("[result artifact]"));
+        assert!(tool_result.contains("original_bytes: 102400"));
+        assert!(tool_result.contains("truncated: false"));
+        assert!(
+            tool_result.len() <= 64 * 1024,
+            "only a bounded preview may enter the model context: {}",
+            tool_result.len()
+        );
+        assert_ne!(tool_result, content, "the full result must not be inline");
+
+        let digest = managed_digest(&tool_result);
+        let artifact = artifact_path(workspace.path(), &digest);
+        assert_eq!(
+            std::fs::read(&artifact).expect("artifact must exist"),
+            content.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_bash_result_does_not_trip_the_result_size_guard() {
+        let workspace = TempDir::new("large-bash");
+        let command = "i=0; while [ $i -lt 20000 ]; do printf 'abcdefghij'; i=$((i+1)); done";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call_bash", command),
+            done_text("bash complete", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n\
+             [budget]\nmax_result_bytes = 300000\n\
+             [policy]\nallowed_tools = [\"bash\"]\n\
+             [tools.bash]\nenabled = true\n\
+             [tools.supervisor]\n\
+             command_timeout_ms = 5000\n\
+             max_output_bytes = 250000\n",
+        )
+        .expect("bash config must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("produce a large command result".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed,
+            "a managed large result must not trip the result-size guard"
+        );
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        let tool_result = calls[1]
+            .messages
+            .last()
+            .expect("the bash result must reach the model")
+            .content
+            .clone();
+        assert!(tool_result.starts_with("[result artifact]"));
+        assert!(tool_result.contains("digest: sha256:"));
+        assert!(tool_result.contains("next_offset: 32768"));
+        assert!(
+            tool_result.len() <= 64 * 1024,
+            "the managed preview must stay within the inline cap: {}",
+            tool_result.len()
+        );
+        assert!(
+            tool_result.matches("abcdefghij").count() < 20_000,
+            "the full 200 KiB command output must not enter the model context"
+        );
+
+        let digest = managed_digest(&tool_result);
+        let artifact = artifact_path(workspace.path(), &digest);
+        let stored = std::fs::read_to_string(&artifact).expect("artifact must exist");
+        assert!(
+            stored.matches("abcdefghij").count() >= 20_000,
+            "the artifact must retain the full command output"
         );
     }
 

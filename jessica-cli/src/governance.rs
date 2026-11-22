@@ -32,6 +32,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::artifacts::ResultManager;
+use crate::tools::ResultFormat;
+
 /// Shared budget state for one CLI turn.
 pub(crate) struct GovernanceState {
     events: broadcast::Sender<AgentEvent>,
@@ -239,6 +242,8 @@ pub(crate) struct GovernedTool {
     result_guard: Arc<ResultSizeGuard>,
     max_args_bytes: Option<usize>,
     permission: Option<Arc<dyn ToolPermissionGate>>,
+    result_manager: Option<Arc<ResultManager>>,
+    result_format: ResultFormat,
 }
 
 impl GovernedTool {
@@ -263,6 +268,8 @@ impl GovernedTool {
             result_guard,
             max_args_bytes: None,
             permission: None,
+            result_manager: None,
+            result_format: ResultFormat::Text,
         }
     }
 
@@ -285,6 +292,22 @@ impl GovernedTool {
         permission: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Self {
         self.permission = permission;
+        self
+    }
+
+    /// Attaches the turn's result manager and the tool's descriptor format.
+    ///
+    /// Managed results replace oversized content with a bounded preview and a
+    /// digest before the result-size guard, sensor, transcript, trace, or model
+    /// observes them. `read_artifact` skips management inside the manager so
+    /// pagination cannot recurse.
+    pub(crate) fn with_result_manager(
+        mut self,
+        result_manager: Option<Arc<ResultManager>>,
+        result_format: ResultFormat,
+    ) -> Self {
+        self.result_manager = result_manager;
+        self.result_format = result_format;
         self
     }
 
@@ -398,6 +421,23 @@ impl GovernedTool {
                 self.timeout_result(call, elapsed.max(crossed)).await
             }
             Ok(result) => {
+                // A tool may enforce the same deadline internally and return a
+                // regular error just before the outer `tokio::time::timeout`
+                // fires. Treat that result as a timeout too, so the session is
+                // tripped deterministically instead of depending on which
+                // timer wins the race.
+                if elapsed >= self.timeout {
+                    let crossed = self.timeout + Duration::from_nanos(1);
+                    return self.timeout_result(call, elapsed.max(crossed)).await;
+                }
+                let result = match &self.result_manager {
+                    Some(manager) => {
+                        manager
+                            .manage(self.inner.name(), self.result_format, result)
+                            .await
+                    }
+                    None => result,
+                };
                 let context = GuardContext::new(0, self.governance.tokens_used(), "")
                     .with_tool_result(&result, Some(elapsed));
                 if let GuardDecision::Exceeded { kind, reason } = self.result_guard.check(&context)

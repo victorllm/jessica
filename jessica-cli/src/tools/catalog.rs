@@ -199,7 +199,7 @@ impl ToolCatalog {
                 timeout_ms: duration_millis(timeout),
                 max_args_bytes: config.tools.max_args_bytes(&candidate.name),
                 max_inline_bytes: max_inline_bytes(candidate.source, config),
-                max_artifact_bytes: None,
+                max_artifact_bytes: Some(config.tools.max_artifact_bytes),
                 max_output_lines: None,
             };
             let approval = if permission_required(&candidate.name) {
@@ -329,11 +329,16 @@ impl ToolCatalog {
 fn profile_allows(profile: ToolProfile, source: ToolSource, name: &str) -> bool {
     match profile {
         ToolProfile::Full => true,
-        ToolProfile::Readonly => source == ToolSource::Native && name == "read_file",
-        ToolProfile::Coding => {
-            source == ToolSource::Native && matches!(name, "read_file" | "write_file")
+        ToolProfile::Readonly => {
+            source == ToolSource::Native && matches!(name, "read_file" | "read_artifact")
         }
-        ToolProfile::Ops => source == ToolSource::Native && matches!(name, "read_file" | "bash"),
+        ToolProfile::Coding => {
+            source == ToolSource::Native
+                && matches!(name, "read_file" | "read_artifact" | "write_file")
+        }
+        ToolProfile::Ops => {
+            source == ToolSource::Native && matches!(name, "read_file" | "read_artifact" | "bash")
+        }
     }
 }
 
@@ -342,13 +347,13 @@ fn duration_millis(timeout: Duration) -> u64 {
 }
 
 fn max_inline_bytes(source: ToolSource, config: &HarnessConfig) -> usize {
+    let configured = config
+        .tools
+        .effective_max_inline_bytes(config.budget.max_result_bytes);
     if source == ToolSource::Delegation {
-        config
-            .delegation
-            .max_result_bytes
-            .min(config.budget.max_result_bytes)
+        configured.min(config.delegation.max_result_bytes)
     } else {
-        config.budget.max_result_bytes
+        configured
     }
 }
 

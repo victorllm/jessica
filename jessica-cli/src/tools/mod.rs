@@ -10,10 +10,11 @@ use jessica_runtime::{DELEGATE_TASK_TOOL_NAME, delegate_task_schema};
 use jessica_tools::{BashTool, ReadFileTool, WriteFileTool};
 
 use crate::app::{CliError, load_wasm_tools};
+use crate::artifacts::ReadArtifactTool;
 use crate::config::HarnessConfig;
 
 pub(crate) use catalog::{CatalogCandidate, CatalogEntry, CatalogError, ToolCatalog};
-pub(crate) use descriptor::{ApprovalPolicy, ToolSource};
+pub(crate) use descriptor::{ApprovalPolicy, ResultFormat, ToolSource};
 
 use std::sync::Arc;
 
@@ -47,6 +48,7 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
         .timeout_for("bash", config.budget.tool_timeout());
     let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(root.to_path_buf()));
     let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(root.to_path_buf()));
+    let read_artifact: Arc<dyn Tool> = Arc::new(ReadArtifactTool::from_config(root, config));
     let bash: Arc<dyn Tool> = Arc::new(
         BashTool::with_limits(bash_timeout, supervisor.max_output_bytes)
             .with_content_limit(supervisor.max_output_bytes)
@@ -56,6 +58,7 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
     vec![
         CatalogCandidate::from_tool(read, ToolSource::Native),
         CatalogCandidate::from_tool(write, ToolSource::Native),
+        CatalogCandidate::from_tool(read_artifact, ToolSource::Native),
         CatalogCandidate::from_tool(bash, ToolSource::Native),
     ]
 }
@@ -254,7 +257,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_candidates_are_the_three_native_tools_in_any_order() {
+    fn native_candidates_are_the_four_native_tools_in_any_order() {
         let config = HarnessConfig::default();
         let candidates = native_candidates(Path::new("."), &config);
         let mut names: Vec<&str> = candidates
@@ -262,7 +265,7 @@ mod tests {
             .map(|candidate| candidate.name.as_str())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, ["bash", "read_file", "write_file"]);
+        assert_eq!(names, ["bash", "read_artifact", "read_file", "write_file"]);
         assert!(
             candidates.iter().all(|candidate| candidate.tool.is_some()),
             "native candidates must be executable"

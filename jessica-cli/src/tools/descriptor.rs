@@ -59,7 +59,7 @@ impl Capabilities {
     /// Assigns capabilities from the tool source and native tool name.
     pub(crate) fn for_tool(source: ToolSource, name: &str) -> Self {
         match (source, name) {
-            (ToolSource::Native, "read_file") => Self {
+            (ToolSource::Native, "read_file" | "read_artifact") => Self {
                 read_only: true,
                 ..Self::none()
             },
@@ -121,15 +121,18 @@ impl Capabilities {
 /// Limits reported for one tool.
 ///
 /// `timeout_ms` and `max_args_bytes` are enforced by the CLI governance
-/// wrapper. `max_inline_bytes` is the existing result-size guard. Artifact and
-/// line limits are not implemented in this phase and are reported as absent.
+/// wrapper. `max_inline_bytes` is the effective result-manager cap; the
+/// configured cap is additionally bounded by `budget.max_result_bytes`.
+/// `max_artifact_bytes` reports the host artifact limit. Artifact storage is
+/// shared by all tools, so `read_artifact` reports the same limits even though
+/// its own output never creates another artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolLimits {
     /// Effective wall-clock timeout in milliseconds.
     pub timeout_ms: u64,
     /// Maximum serialized argument bytes, or `None` when unlimited.
     pub max_args_bytes: Option<usize>,
-    /// Maximum inline result bytes retained by the result-size guard.
+    /// Maximum inline result bytes entering the model context.
     pub max_inline_bytes: usize,
     /// Maximum artifact bytes, or `None` when artifacts are unsupported.
     pub max_artifact_bytes: Option<usize>,
@@ -379,6 +382,15 @@ mod tests {
         assert!(read.read_only);
         assert!(!read.writes_files && !read.executes && !read.network && !read.destructive);
 
+        let read_artifact = Capabilities::for_tool(ToolSource::Native, "read_artifact");
+        assert!(read_artifact.read_only);
+        assert!(
+            !read_artifact.writes_files
+                && !read_artifact.executes
+                && !read_artifact.network
+                && !read_artifact.destructive
+        );
+
         let write = Capabilities::for_tool(ToolSource::Native, "write_file");
         assert!(write.writes_files && write.destructive);
         assert!(!write.read_only && !write.executes);
@@ -390,7 +402,7 @@ mod tests {
         assert!(wasm.read_only);
         assert!(!wasm.writes_files && !wasm.network && !wasm.destructive);
 
-        for capabilities in [read, write, bash, wasm] {
+        for capabilities in [read, read_artifact, write, bash, wasm] {
             assert!(
                 !capabilities.parallel_safe,
                 "no tool is parallel-safe in this phase"

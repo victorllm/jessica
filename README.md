@@ -191,6 +191,12 @@ Being in the allowlist is necessary but never sufficient.
 profile = "full"          # default; also "readonly", "coding", "ops"
 max_exposed_tools = 64
 max_tool_schema_bytes = 131072
+inline_threshold_bytes = 32768    # results up to this size stay inline
+max_inline_bytes = 65536          # hard cap entering the model context
+max_artifact_bytes = 16777216     # bytes stored for one artifact
+artifact_dir = ".jessica/artifacts"
+artifact_retention_days = 7
+artifact_max_bytes = 268435456
 
 [tools.read_file]
 timeout_ms = 5000         # defaults to budget.tool_timeout_ms
@@ -202,12 +208,19 @@ sandbox = "process"       # only supported value in this build
 timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
 ```
 
-| Profile | Native tools exposed |
+| Profile | Native tools exposed when allowlisted |
 | --- | --- |
-| `readonly` | `read_file` |
-| `coding` | `read_file`, `write_file` |
-| `ops` | `read_file`, `bash` |
+| `readonly` | `read_file`, `read_artifact` |
+| `coding` | `read_file`, `read_artifact`, `write_file` |
+| `ops` | `read_file`, `read_artifact`, `bash` |
 | `full` | every allowlisted tool, including WASM, MCP, and `delegate_task` |
+
+`read_artifact` is not in the default allowlist. Add it to
+`policy.allowed_tools` if the model should paginate artifacts created by large
+tool results; profile filtering is necessary but not sufficient, exactly as for
+every other tool. It is read-only, accepts only an artifact digest (never a
+filesystem path), and its own results bypass result management so pagination
+cannot recursively create more artifacts.
 
 Narrow profiles never expose WASM, MCP, or delegation tools. The default is
 `full`; choose a narrower profile to enforce least privilege. `ops` and `full`
@@ -261,11 +274,12 @@ a whole. Real isolation depends on the execution sandbox; until process-group
 handling and rlimits land, run bash only in trusted workspaces.
 
 Output beyond `max_output_bytes` per stream is truncated with a notice that
-records the original byte count. The rendered `bash` result is also capped at the same
-value, so a large command output cannot trip `ResultSizeGuard` or turn into
-`BudgetExceeded`. A non-zero exit still means “the command ran and failed” and
-keeps its exit code; only spawn, timeout, read, and wait failures are supervisor
-errors.
+records the original byte count. The rendered `bash` result is also capped at
+the same value, and any tool result above `inline_threshold_bytes` is stored as
+an artifact with a bounded preview, so a large command output cannot trip
+`ResultSizeGuard` or turn into `BudgetExceeded`. A non-zero exit still means
+“the command ran and failed” and keeps its exit code; only spawn, timeout, read,
+and wait failures are supervisor errors.
 
 `[tools.supervisor]` is rebuilt for each turn, so changes apply to the next turn
 and never to an already running child. Child-agent commands are aligned with the
@@ -285,6 +299,67 @@ schema digest is `sha256:` plus the SHA-256 of the canonical schema JSON with
 object keys sorted recursively, so the same configuration always produces the
 same output. These commands never open a provider, event store, memory or
 skills database, or MCP connection; they also do not create `.jessica/`.
+
+### Result manager and artifacts
+
+Every tool result passes through the host result manager before it reaches the
+transcript, trace, sensor, or model. The manager is applied after execution and
+before `ResultSizeGuard`; the guard remains the final backstop, but a managed
+result never needs to trip it. Only `read_artifact`'s own output bypasses
+management, so pagination cannot recursively create artifacts.
+
+- A result at or below `inline_threshold_bytes` is returned unchanged.
+- A larger result is stored as a content-addressed artifact. The model receives
+  a bounded preview plus the `sha256:` digest, original byte count, `truncated`
+  flag, and the next `read_artifact` offset.
+- A result larger than `max_artifact_bytes` is truncated at a UTF-8 boundary,
+  marked `truncated: true`, and its digest covers the stored bytes.
+- `max_inline_bytes` is a hard cap on the text delivered to the model. The
+  effective caps are additionally clamped to `budget.max_result_bytes`, so an
+  existing configuration with a small result budget keeps working instead of
+  producing `BudgetExceeded`.
+
+The transcript and trace record this managed envelope — digest, byte counts,
+truncation flag, cursor, and bounded preview — not the full stored artifact.
+The complete bytes are only read back through `read_artifact` under its own
+bounds.
+
+All `[tools]` numeric artifact limits must be at least 1, and
+`inline_threshold_bytes <= max_inline_bytes <= max_artifact_bytes` must hold.
+`artifact_dir` must be a relative path inside the workspace; empty paths,
+absolute paths, `..`, and paths that resolve outside the workspace through a
+symlink are rejected at load time.
+
+Artifacts are stored at `<artifact_dir>/<first two digest hex>/<64 hex digest>`.
+Each artifact has a `.json` sidecar recording the version, digest, stored size,
+tool name, creation time, original size, and truncation flag. The sidecar never
+contains provider credentials, environment variables, tool arguments, or
+command text. Writes use a same-directory temporary file, `fsync`, and rename;
+directories are created with mode `0700` and files with mode `0600`. Existing
+artifacts are content-addressed, so writing the same bytes again reuses the
+same path.
+
+`read_artifact` accepts `digest`, optional `offset`, and optional `limit`. It
+returns one UTF-8 page with the artifact digest, actual offset, page byte count,
+total size, and next offset. Offsets past the end, unknown or malformed digests,
+symlinked paths, and missing or inconsistent sidecars produce structured tool
+errors. The tool reads only files selected by digest under the configured
+artifact directory; it never executes a tool, accepts a filesystem path, or
+creates another artifact.
+
+Once per turn, before the first oversized write, the manager runs one bounded
+cleanup pass: artifacts older than `artifact_retention_days` are deleted first,
+then the oldest remaining artifacts are deleted until the total is at most
+`artifact_max_bytes`. Cleanup only considers well-formed artifact files and
+sidecars under the configured directory, skips symlinks and corrupt entries,
+and logs failures as warnings. A cleanup or write failure never fails the tool
+call; the model receives a bounded fallback preview marked as unavailable.
+
+> **Privacy:** artifacts contain raw tool output, are stored unencrypted inside
+> the workspace, and may include secrets printed by a command or file. The
+> sidecar omits credentials, but the artifact body does not redact anything.
+> Keep `artifact_dir` out of version control, choose a short retention period,
+> and avoid enabling tools that emit secrets in untrusted workspaces.
 
 ## Trace verification and digests
 
@@ -521,7 +596,8 @@ profile = "full"
 
 Policy is reloadable, so a later turn can pick up a changed allowlist. Every
 MCP call still passes through the same policy, `budget.tool_timeout_ms`,
-`ToolTimeoutGuard`, and `ResultSizeGuard` path as native and WASM tools.
+`ToolTimeoutGuard`, result manager, and `ResultSizeGuard` path as native and
+WASM tools.
 MCP `isError` results become failed `ToolResult`s; protocol and transport
 failures also become tool errors rather than panics. Text content is preserved,
 while image/audio payloads and other binary data are represented by short
