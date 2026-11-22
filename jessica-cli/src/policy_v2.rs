@@ -8,10 +8,11 @@
 //! Evaluation order is fixed:
 //!
 //! 1. every matching `deny` rule, in configuration order;
-//! 2. every matching `ask` rule, in configuration order;
-//! 3. every matching `allow` rule, in configuration order;
-//! 4. the approval mode for sensitive tools;
-//! 5. otherwise the existing allowlist decision stands.
+//! 2. protected paths for the editor tools, unless an `allow` rule matched;
+//! 3. every matching `ask` rule, in configuration order;
+//! 4. every matching `allow` rule, in configuration order;
+//! 5. the approval mode for sensitive tools;
+//! 6. otherwise the existing allowlist decision stands.
 //!
 //! Paths are canonicalized before matching. A canonical target outside the
 //! workspace root, a dangling symlink, or an uncanonicalizable path is a
@@ -81,6 +82,12 @@ pub(crate) enum PolicyError {
         glob: String,
         /// Why it was rejected.
         reason: &'static str,
+    },
+    /// The `apply_patch` input could not be parsed for path matching.
+    #[error("invalid apply_patch input: {reason}")]
+    InvalidPatch {
+        /// Parser explanation.
+        reason: String,
     },
 }
 
@@ -308,6 +315,25 @@ impl PolicyV2 {
             });
         }
 
+        // The protected-path default is a deny, so it must run before an `ask`
+        // rule could turn it into a prompt (and before `approval.mode = "allow"`
+        // could auto-approve it). Only an explicit `allow` rule overrides it.
+        if matches!(tool.name.as_str(), "apply_patch" | "edit_file")
+            && let Some(path) = self.matching_path(tool, call).await?
+            && is_protected_path(&path)
+            && self
+                .first_rule(RuleAction::Allow, tool, call)
+                .await?
+                .is_none()
+        {
+            return Ok(PolicyVerdict::Deny {
+                reason: format!(
+                    "`{path}` is a protected path; add an explicit allow rule to edit it"
+                ),
+                rule: None,
+            });
+        }
+
         if let Some(rule) = self.first_rule(RuleAction::Ask, tool, call).await? {
             return Ok(match self.approval {
                 ApprovalMode::Deny => PolicyVerdict::Deny {
@@ -472,6 +498,14 @@ impl PolicyV2 {
                 .unwrap_or(".");
             return self.resolve_relative(raw, false).await.map(Some);
         }
+        if tool.name == "apply_patch" {
+            let Some(patch) = call.arguments.get("patch").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            let summary = jessica_tools::summarize_patch(patch)
+                .map_err(|reason| PolicyError::InvalidPatch { reason })?;
+            return self.resolve_relative(&summary.path, false).await.map(Some);
+        }
         let Some(field) = &tool.path_field else {
             return Ok(None);
         };
@@ -599,6 +633,34 @@ impl PolicyV2 {
 ///
 /// `..` is resolved before any filesystem access. A path that walks above the
 /// filesystem root or above an absolute input root is rejected as an escape.
+/// Returns whether an edit target is protected by default.
+///
+/// The editor tools refuse to modify repository metadata, Jessica's own state,
+/// environment files, SSH material, and common private-key files unless an
+/// explicit `allow` rule matches the call. `write_file` keeps its pre-9.7
+/// behavior and is not covered here.
+fn is_protected_path(path: &str) -> bool {
+    for component in path.split('/') {
+        if matches!(component, ".git" | ".jessica" | ".ssh") {
+            return true;
+        }
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
+    ) {
+        return true;
+    }
+    [".pem", ".key", ".p12", ".pfx"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
 fn lexical_absolute(root: &Path, raw: &str) -> Result<PathBuf, PolicyError> {
     let raw_path = Path::new(raw);
     let mut output = if raw_path.is_absolute() {
@@ -772,8 +834,12 @@ mod tests {
             name: name.to_owned(),
             source: ToolSource::Native,
             capabilities: Capabilities::for_tool(ToolSource::Native, name),
-            path_field: Some("path".to_owned()),
-            legacy_sensitive: matches!(name, "write_file"),
+            path_field: Some(if name == "apply_patch" {
+                "patch".to_owned()
+            } else {
+                "path".to_owned()
+            }),
+            legacy_sensitive: matches!(name, "write_file" | "apply_patch" | "edit_file"),
         }
     }
 
@@ -1167,5 +1233,213 @@ mod tests {
             verdict.explain(),
             (FinalDecision::Allow, ApprovalDisposition::NotRequired)
         ));
+    }
+
+    #[tokio::test]
+    async fn editor_tools_use_path_rules_and_apply_is_parsed_for_matching() {
+        let temp = TempDir::new("editor-rules");
+        std::fs::create_dir_all(temp.path.join("src")).expect("source dir must exist");
+        std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("file must exist");
+        let patch = "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n";
+        let config = config(
+            vec![
+                rule(
+                    "deny-edit",
+                    RuleAction::Deny,
+                    Some(ToolSelector::One("edit_file".to_owned())),
+                    Some("src/**"),
+                ),
+                rule(
+                    "ask-patch",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("apply_patch".to_owned())),
+                    Some("src/**"),
+                ),
+            ],
+            approval(ApprovalMode::Ask, false),
+        );
+        let policy = evaluator(&temp.path, &config).await;
+
+        let edit = policy
+            .evaluate(
+                &file_tool("edit_file"),
+                &call(
+                    "edit_file",
+                    json!({"path": "src/app.txt", "old": "alpha", "new": "beta"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(edit.rule_id(), Some("deny-edit"));
+
+        let patch_verdict = policy
+            .evaluate(
+                &file_tool("apply_patch"),
+                &call("apply_patch", json!({"patch": patch})),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(patch_verdict.rule_id(), Some("ask-patch"));
+        assert!(matches!(patch_verdict, PolicyVerdict::Ask { .. }));
+    }
+
+    #[tokio::test]
+    async fn protected_paths_are_denied_unless_an_allow_rule_matches() {
+        let temp = TempDir::new("protected");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        std::fs::create_dir_all(temp.path.join(".git")).expect("git dir must exist");
+        std::fs::write(temp.path.join(".git/config"), "[core]\n").expect("config must exist");
+        let edit = file_tool("edit_file");
+
+        let no_rules = config(vec![], approval(ApprovalMode::Allow, true));
+        let policy = evaluator(&temp.path, &no_rules).await;
+        for path in [".env", ".git/config"] {
+            let verdict = policy
+                .evaluate(
+                    &edit,
+                    &call("edit_file", json!({"path": path, "old": "a", "new": "b"})),
+                )
+                .await
+                .expect("policy must evaluate");
+            match verdict {
+                PolicyVerdict::Deny { reason, .. } => assert!(
+                    reason.contains("protected path"),
+                    "the denial must explain the protection: {reason}"
+                ),
+                other => panic!("protected path `{path}` must be denied, got {other:?}"),
+            }
+        }
+
+        let allowed = config(
+            vec![rule(
+                "allow-env",
+                RuleAction::Allow,
+                Some(ToolSelector::One("edit_file".to_owned())),
+                Some(".env"),
+            )],
+            approval(ApprovalMode::Allow, true),
+        );
+        let policy = evaluator(&temp.path, &allowed).await;
+        let verdict = policy
+            .evaluate(
+                &edit,
+                &call(
+                    "edit_file",
+                    json!({"path": ".env", "old": "SECRET", "new": "PUBLIC"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(verdict.rule_id(), Some("allow-env"));
+        assert!(matches!(verdict, PolicyVerdict::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_does_not_turn_a_protected_default_denial_into_a_prompt() {
+        let temp = TempDir::new("protected-ask");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        let policy = evaluator(
+            &temp.path,
+            &config(
+                vec![rule(
+                    "review-env",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("edit_file".to_owned())),
+                    Some(".env"),
+                )],
+                approval(ApprovalMode::Allow, true),
+            ),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(
+                &file_tool("edit_file"),
+                &call(
+                    "edit_file",
+                    json!({"path": ".env", "old": "SECRET", "new": "PUBLIC"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        match verdict {
+            PolicyVerdict::Deny { reason, .. } => assert!(
+                reason.contains("protected path"),
+                "the protected default must run before ask rules: {reason}"
+            ),
+            other => panic!("an ask rule must not bypass the protected default denial: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_keeps_its_pre_9_7_protected_path_behavior() {
+        let temp = TempDir::new("write-protected");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        let policy = evaluator(
+            &temp.path,
+            &config(vec![], approval(ApprovalMode::Ask, false)),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(
+                &file_tool("write_file"),
+                &call("write_file", json!({"path": ".env", "content": "x"})),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        assert!(
+            matches!(verdict, PolicyVerdict::Legacy { sensitive: true }),
+            "write_file must retain its legacy approval path: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_apply_patch_is_a_structured_policy_error() {
+        let temp = TempDir::new("bad-patch");
+        let policy = evaluator(
+            &temp.path,
+            &config(vec![], approval(ApprovalMode::Ask, true)),
+        )
+        .await;
+
+        let error = policy
+            .evaluate(
+                &file_tool("apply_patch"),
+                &call("apply_patch", json!({"patch": "not a unified diff"})),
+            )
+            .await
+            .expect_err("a malformed patch must not receive a verdict");
+
+        assert!(
+            matches!(error, PolicyError::InvalidPatch { .. }),
+            "the failure must be structured: {error:?}"
+        );
+    }
+
+    #[test]
+    fn protected_path_classification_covers_metadata_environment_and_keys() {
+        for path in [
+            ".git/config",
+            "nested/.jessica/events.db",
+            ".env",
+            ".env.local",
+            "keys/server.pem",
+            "keys/server.key",
+            "id_rsa",
+            "home/.ssh/id_ed25519",
+        ] {
+            assert!(is_protected_path(path), "`{path}` must be protected");
+        }
+        for path in [
+            "src/main.rs",
+            ".environment",
+            "id_rsa.pub",
+            "docs/private-key.md",
+        ] {
+            assert!(!is_protected_path(path), "`{path}` must not be protected");
+        }
     }
 }

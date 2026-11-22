@@ -17,13 +17,16 @@
 
 #![deny(missing_docs)]
 
+mod atomic;
 mod bash;
 mod command;
+mod edit;
 mod exec;
 mod file;
 mod git;
 mod grep;
 mod list_dir;
+mod patch;
 #[cfg(test)]
 mod test_support;
 mod wasm;
@@ -31,6 +34,7 @@ mod workspace;
 
 pub use bash::{BashTool, DEFAULT_BASH_TIMEOUT};
 pub use command::{CommandError, CommandOutput, CommandRequest, CommandRunner, CommandStream};
+pub use edit::{EditFileTool, MAX_EDIT_FILE_BYTES};
 pub use exec::ExecTool;
 pub use file::{
     DEFAULT_READ_FILE_LINES, MAX_READ_FILE_BYTES, MAX_READ_FILE_LINES, ReadFileTool, WriteFileTool,
@@ -43,6 +47,7 @@ pub use grep::{
 pub use list_dir::{
     DEFAULT_LIST_DIR_ENTRIES, DEFAULT_LIST_DIR_IGNORES, ListDirOptions, ListDirTool,
 };
+pub use patch::{ApplyPatchTool, MAX_PATCH_BYTES, PatchSummary, summarize_patch};
 pub use wasm::{WasmTool, WasmToolError, register_wasm_tool};
 
 use jessica_core::types::ToolResult;

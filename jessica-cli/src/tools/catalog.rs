@@ -333,7 +333,10 @@ fn profile_allows(profile: ToolProfile, source: ToolSource, name: &str) -> bool 
     match profile {
         ToolProfile::Full => true,
         ToolProfile::Readonly => is_read_only_native(name),
-        ToolProfile::Coding => is_read_only_native(name) || matches!(name, "write_file" | "exec"),
+        ToolProfile::Coding => {
+            is_read_only_native(name)
+                || matches!(name, "write_file" | "apply_patch" | "edit_file" | "exec")
+        }
         ToolProfile::Ops => is_read_only_native(name) || matches!(name, "bash" | "exec"),
     }
 }
