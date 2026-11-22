@@ -177,14 +177,15 @@ impl LlmProvider for TokenCountingProvider {
 
 /// Names of native tools that require explicit approval before running.
 ///
-/// The set is deliberately fixed: `read_file` and every configured WASM or MCP
-/// tool remain governed by the allowlist policy alone. Delegated child tools
-/// are also outside this set because the single top-level `delegate_task`
-/// approval covers the child run.
+/// The set is deliberately fixed: `read_file`, `list_dir`, `grep`,
+/// `git_status`, `git_diff`, and every configured WASM or MCP tool remain
+/// governed by the allowlist policy alone. Delegated child tools are also
+/// outside this set because the single top-level `delegate_task` approval
+/// covers the child run.
 pub(crate) fn permission_required(name: &str) -> bool {
     matches!(
         name,
-        "bash" | "write_file" | jessica_runtime::DELEGATE_TASK_TOOL_NAME
+        "bash" | "exec" | "write_file" | jessica_runtime::DELEGATE_TASK_TOOL_NAME
     )
 }
 
@@ -922,6 +923,7 @@ mod tests {
     fn permission_required_is_a_fixed_native_set() {
         for name in [
             "bash",
+            "exec",
             "write_file",
             jessica_runtime::DELEGATE_TASK_TOOL_NAME,
         ] {
@@ -932,11 +934,16 @@ mod tests {
         }
         for name in [
             "read_file",
+            "list_dir",
+            "grep",
+            "git_status",
+            "git_diff",
             "wasm_echo",
             "mcp__stub__echo",
             "",
             "Bash",
             "bash ",
+            "exec ",
         ] {
             assert!(
                 !permission_required(name),

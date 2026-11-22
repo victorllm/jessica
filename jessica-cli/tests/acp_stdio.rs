@@ -1338,10 +1338,13 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
     let finished = &second_updates[1];
     assert_eq!(finished["toolCallId"], "call_read");
     assert_eq!(finished["status"], "completed");
-    assert_eq!(finished["rawOutput"], "note contents");
+    assert_eq!(finished["rawOutput"], "1\tnote contents\n");
     assert_eq!(finished["content"][0]["type"], "content");
     assert_eq!(finished["content"][0]["content"]["type"], "text");
-    assert_eq!(finished["content"][0]["content"]["text"], "note contents");
+    assert_eq!(
+        finished["content"][0]["content"]["text"],
+        "1\tnote contents\n"
+    );
     assert_eq!(second_updates[2]["content"]["text"], "second answer");
     assert!(
         acp.permission_requests().is_empty(),
@@ -1496,7 +1499,7 @@ async fn acp_session_load_after_restart_replays_history_and_continues_context() 
     assert_eq!(replayed[1]["status"], "in_progress");
     assert_eq!(replayed[2]["toolCallId"], "call_read");
     assert_eq!(replayed[2]["status"], "completed");
-    assert_eq!(replayed[2]["rawOutput"], "note contents");
+    assert_eq!(replayed[2]["rawOutput"], "1\tnote contents\n");
     assert_eq!(replayed[3]["content"]["text"], "read result answer");
     assert_ne!(
         replayed[0]["messageId"], replayed[3]["messageId"],
@@ -1548,7 +1551,7 @@ async fn acp_session_load_after_restart_replays_history_and_continues_context() 
     assert!(
         messages
             .iter()
-            .any(|message| message["role"] == "tool" && message["content"] == "note contents"),
+            .any(|message| message["role"] == "tool" && message["content"] == "1\tnote contents\n"),
         "the restored tool result must reach the provider: {messages:?}"
     );
     assert!(

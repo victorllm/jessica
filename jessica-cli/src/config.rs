@@ -19,7 +19,11 @@ use jessica_providers::{
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
-use jessica_tools::DEFAULT_BASH_TIMEOUT;
+use jessica_tools::{
+    DEFAULT_BASH_TIMEOUT, DEFAULT_GREP_FILE_BYTES, DEFAULT_GREP_FILES, DEFAULT_GREP_IGNORES,
+    DEFAULT_GREP_MATCHES, DEFAULT_GREP_OUTPUT_BYTES, DEFAULT_LIST_DIR_ENTRIES,
+    DEFAULT_LIST_DIR_IGNORES,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -295,6 +299,140 @@ impl BashToolConfig {
     }
 }
 
+/// Configuration for the native `list_dir` tool.
+///
+/// The ignored names are matched against entries at the listed directory level.
+/// An empty list disables skipping. Every entry must be a single normal path
+/// component such as `.git` or `target`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirToolConfig {
+    /// Wall-clock timeout for this tool, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    pub max_args_bytes: Option<usize>,
+    /// Entry names skipped by `list_dir`.
+    #[serde(default = "default_list_dir_ignores")]
+    pub ignore_dirs: Vec<String>,
+    /// Maximum number of entries rendered.
+    #[serde(default = "default_list_dir_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for ListDirToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            max_args_bytes: None,
+            ignore_dirs: default_list_dir_ignores(),
+            max_entries: default_list_dir_entries(),
+        }
+    }
+}
+
+impl ListDirToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
+/// Returns the default `list_dir` ignored entry names.
+fn default_list_dir_ignores() -> Vec<String> {
+    DEFAULT_LIST_DIR_IGNORES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Returns the default `list_dir` entry cap.
+fn default_list_dir_entries() -> usize {
+    DEFAULT_LIST_DIR_ENTRIES
+}
+
+/// Configuration for the native literal `grep` tool.
+///
+/// The ignored names apply to traversed directories. All numeric limits must be
+/// at least 1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrepToolConfig {
+    /// Wall-clock timeout for this tool, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    pub max_args_bytes: Option<usize>,
+    /// Directory names skipped during the walk.
+    #[serde(default = "default_grep_ignores")]
+    pub ignore_dirs: Vec<String>,
+    /// Maximum number of regular files read.
+    #[serde(default = "default_grep_files")]
+    pub max_files: usize,
+    /// Maximum file size in bytes; larger files are skipped.
+    #[serde(default = "default_grep_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Maximum number of matching lines returned.
+    #[serde(default = "default_grep_matches")]
+    pub max_matches: usize,
+    /// Maximum bytes of rendered match output.
+    #[serde(default = "default_grep_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+impl Default for GrepToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            max_args_bytes: None,
+            ignore_dirs: default_grep_ignores(),
+            max_files: default_grep_files(),
+            max_file_bytes: default_grep_file_bytes(),
+            max_matches: default_grep_matches(),
+            max_output_bytes: default_grep_output_bytes(),
+        }
+    }
+}
+
+impl GrepToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
+/// Returns the default `grep` ignored directory names.
+fn default_grep_ignores() -> Vec<String> {
+    DEFAULT_GREP_IGNORES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Returns the default `grep` file cap.
+fn default_grep_files() -> usize {
+    DEFAULT_GREP_FILES
+}
+
+/// Returns the default `grep` per-file byte cap.
+fn default_grep_file_bytes() -> usize {
+    DEFAULT_GREP_FILE_BYTES
+}
+
+/// Returns the default `grep` match cap.
+fn default_grep_matches() -> usize {
+    DEFAULT_GREP_MATCHES
+}
+
+/// Returns the default `grep` rendered-output cap.
+fn default_grep_output_bytes() -> usize {
+    DEFAULT_GREP_OUTPUT_BYTES
+}
+
 /// Execution supervisor settings shared by command-backed components.
 ///
 /// The supervisor starts every command with an empty environment, passes only
@@ -446,6 +584,16 @@ pub struct ToolsConfig {
     pub write_file: ToolLimitConfig,
     /// Enable gate and optional limits for the native `bash` tool.
     pub bash: BashToolConfig,
+    /// Ignore list and limits for the native `list_dir` tool.
+    pub list_dir: ListDirToolConfig,
+    /// Ignore list, search bounds, and limits for the native `grep` tool.
+    pub grep: GrepToolConfig,
+    /// Optional limits for the native `git_status` tool.
+    pub git_status: ToolLimitConfig,
+    /// Optional limits for the native `git_diff` tool.
+    pub git_diff: ToolLimitConfig,
+    /// Optional limits for the native `exec` tool.
+    pub exec: ToolLimitConfig,
     /// Execution supervisor settings.
     pub supervisor: SupervisorConfig,
 }
@@ -465,6 +613,11 @@ impl Default for ToolsConfig {
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
             bash: BashToolConfig::default(),
+            list_dir: ListDirToolConfig::default(),
+            grep: GrepToolConfig::default(),
+            git_status: ToolLimitConfig::default(),
+            git_diff: ToolLimitConfig::default(),
+            exec: ToolLimitConfig::default(),
             supervisor: SupervisorConfig::default(),
         }
     }
@@ -495,6 +648,11 @@ impl ToolsConfig {
             "read_file" => self.read_file.timeout_ms,
             "write_file" => self.write_file.timeout_ms,
             "bash" => self.bash.timeout_ms,
+            "list_dir" => self.list_dir.timeout_ms,
+            "grep" => self.grep.timeout_ms,
+            "git_status" => self.git_status.timeout_ms,
+            "git_diff" => self.git_diff.timeout_ms,
+            "exec" => self.exec.timeout_ms,
             _ => None,
         }
         .map(Duration::from_millis)
@@ -537,6 +695,11 @@ impl ToolsConfig {
             "read_file" => self.read_file.max_args_bytes,
             "write_file" => self.write_file.max_args_bytes,
             "bash" => self.bash.max_args_bytes,
+            "list_dir" => self.list_dir.max_args_bytes,
+            "grep" => self.grep.max_args_bytes,
+            "git_status" => self.git_status.max_args_bytes,
+            "git_diff" => self.git_diff.max_args_bytes,
+            "exec" => self.exec.max_args_bytes,
             _ => None,
         }
     }
@@ -627,8 +790,53 @@ impl ToolsConfig {
             global_timeout_ms,
             Some(bash_cap_ms),
         )?;
+        validate_tool_limits(
+            "tools.list_dir",
+            &self.list_dir.limits(),
+            global_timeout_ms,
+            None,
+        )?;
+        validate_ignore_dirs("tools.list_dir.ignore_dirs", &self.list_dir.ignore_dirs)?;
+        if self.list_dir.max_entries == 0 {
+            return Err(invalid("tools.list_dir.max_entries must be at least 1"));
+        }
+        validate_tool_limits("tools.grep", &self.grep.limits(), global_timeout_ms, None)?;
+        validate_ignore_dirs("tools.grep.ignore_dirs", &self.grep.ignore_dirs)?;
+        for (field, value) in [
+            ("tools.grep.max_files", self.grep.max_files),
+            ("tools.grep.max_file_bytes", self.grep.max_file_bytes),
+            ("tools.grep.max_matches", self.grep.max_matches),
+            ("tools.grep.max_output_bytes", self.grep.max_output_bytes),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("{field} must be at least 1")));
+            }
+        }
+        validate_tool_limits(
+            "tools.git_status",
+            &self.git_status,
+            global_timeout_ms,
+            None,
+        )?;
+        validate_tool_limits("tools.git_diff", &self.git_diff, global_timeout_ms, None)?;
+        validate_tool_limits("tools.exec", &self.exec, global_timeout_ms, None)?;
         Ok(())
     }
+}
+
+/// Rejects ignore-list entries that are not single normal path components.
+fn validate_ignore_dirs(field: &str, names: &[String]) -> Result<(), ConfigError> {
+    for name in names {
+        let mut components = Path::new(name).components();
+        let valid =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !valid {
+            return Err(invalid(format!(
+                "{field} entry `{name}` must be a single normal path component"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_tool_limits(
@@ -1934,6 +2142,56 @@ mod tests {
                 "[tools.read_file]\nmax_args_bytes = 0\n",
                 "tools.read_file.max_args_bytes",
             ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.exec]\ntimeout_ms = 5001\n",
+                "tools.exec.timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.git_status]\ntimeout_ms = 5001\n",
+                "tools.git_status.timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.git_diff]\ntimeout_ms = 0\n",
+                "tools.git_diff.timeout_ms",
+            ),
+            (
+                "[tools.exec]\nmax_args_bytes = 0\n",
+                "tools.exec.max_args_bytes",
+            ),
+            (
+                "[tools.git_status]\nmax_args_bytes = 0\n",
+                "tools.git_status.max_args_bytes",
+            ),
+            (
+                "[tools.git_diff]\nmax_args_bytes = 0\n",
+                "tools.git_diff.max_args_bytes",
+            ),
+            (
+                "[tools.list_dir]\nmax_entries = 0\n",
+                "tools.list_dir.max_entries",
+            ),
+            (
+                "[tools.list_dir]\nignore_dirs = [\"../escape\"]\n",
+                "tools.list_dir.ignore_dirs",
+            ),
+            (
+                "[tools.list_dir]\nignore_dirs = [\"nested/name\"]\n",
+                "tools.list_dir.ignore_dirs",
+            ),
+            ("[tools.grep]\nmax_files = 0\n", "tools.grep.max_files"),
+            (
+                "[tools.grep]\nmax_file_bytes = 0\n",
+                "tools.grep.max_file_bytes",
+            ),
+            ("[tools.grep]\nmax_matches = 0\n", "tools.grep.max_matches"),
+            (
+                "[tools.grep]\nmax_output_bytes = 0\n",
+                "tools.grep.max_output_bytes",
+            ),
+            (
+                "[tools.grep]\nignore_dirs = [\"..\"]\n",
+                "tools.grep.ignore_dirs",
+            ),
         ];
         for (toml, expected) in cases {
             let error = HarnessConfig::from_toml_str(toml)
@@ -1962,6 +2220,43 @@ mod tests {
         );
         assert_eq!(accepted.tools.max_args_bytes("read_file"), Some(128));
         assert_eq!(accepted.tools.max_args_bytes("bash"), None);
+    }
+
+    #[test]
+    fn native_tool_sections_default_to_bounded_search_and_directory_limits() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(config.tools.list_dir.ignore_dirs, [".git", "target"]);
+        assert_eq!(config.tools.list_dir.max_entries, 500);
+        assert_eq!(config.tools.grep.ignore_dirs, [".git", "target"]);
+        assert_eq!(config.tools.grep.max_files, 2_000);
+        assert_eq!(config.tools.grep.max_file_bytes, 1024 * 1024);
+        assert_eq!(config.tools.grep.max_matches, 200);
+        assert_eq!(config.tools.grep.max_output_bytes, 64 * 1024);
+        for key in [
+            "read_file",
+            "write_file",
+            "list_dir",
+            "grep",
+            "git_status",
+            "git_diff",
+            "exec",
+        ] {
+            assert_eq!(
+                config.tools.timeout_for(key, Duration::from_secs(30)),
+                Duration::from_secs(30),
+                "`{key}` must inherit the global timeout"
+            );
+            assert_eq!(
+                config.tools.max_args_bytes(key),
+                None,
+                "`{key}` must not invent an argument limit"
+            );
+        }
+        assert_eq!(
+            config.tools.timeout_for("bash", Duration::from_secs(30)),
+            Duration::from_secs(10),
+            "bash keeps its internal deadline"
+        );
     }
 
     #[test]

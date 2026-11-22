@@ -296,9 +296,9 @@ pub(crate) enum BudgetStopReason {
 /// Maps a tool name to its ACP category.
 fn tool_kind(name: &str) -> ToolKind {
     match name {
-        "read_file" => ToolKind::Read,
+        "read_file" | "list_dir" | "grep" | "git_status" | "git_diff" => ToolKind::Read,
         "write_file" => ToolKind::Edit,
-        "bash" | "delegate_task" => ToolKind::Execute,
+        "bash" | "exec" | "delegate_task" => ToolKind::Execute,
         _ => ToolKind::Other,
     }
 }
@@ -306,8 +306,12 @@ fn tool_kind(name: &str) -> ToolKind {
 /// Builds a concise, bounded title from a tool's key argument.
 fn tool_title(name: &str, arguments: &Value) -> String {
     let detail = match name {
-        "read_file" | "write_file" => string_argument(arguments, "path"),
+        "read_file" | "write_file" | "list_dir" => string_argument(arguments, "path"),
+        "grep" => {
+            string_argument(arguments, "pattern").or_else(|| string_argument(arguments, "path"))
+        }
         "bash" => string_argument(arguments, "command"),
+        "exec" => string_argument(arguments, "program"),
         "delegate_task" => string_argument(arguments, "task"),
         _ => string_argument(arguments, "path")
             .or_else(|| string_argument(arguments, "command"))
@@ -336,9 +340,9 @@ fn single_line(value: &str) -> String {
         .collect()
 }
 
-/// Builds absolute file locations for read and write tools.
+/// Builds absolute file locations for path-taking file tools.
 fn tool_locations(cwd: &Path, name: &str, arguments: &Value) -> Vec<ToolCallLocation> {
-    if !matches!(name, "read_file" | "write_file") {
+    if !matches!(name, "read_file" | "write_file" | "list_dir" | "grep") {
         return Vec::new();
     }
     let Some(path) = string_argument(arguments, "path").filter(|path| !path.is_empty()) else {
@@ -469,9 +473,14 @@ mod tests {
         let mapper = mapper();
         for (name, expected) in [
             ("bash", ToolCallStatus::Pending),
+            ("exec", ToolCallStatus::Pending),
             ("write_file", ToolCallStatus::Pending),
             ("delegate_task", ToolCallStatus::Pending),
             ("read_file", ToolCallStatus::InProgress),
+            ("list_dir", ToolCallStatus::InProgress),
+            ("grep", ToolCallStatus::InProgress),
+            ("git_status", ToolCallStatus::InProgress),
+            ("git_diff", ToolCallStatus::InProgress),
             ("mcp__stub__echo", ToolCallStatus::InProgress),
         ] {
             let update = mapper
@@ -644,7 +653,12 @@ mod tests {
         let mapper = mapper();
         let cases = [
             ("write_file", ToolKind::Edit),
+            ("exec", ToolKind::Execute),
             ("delegate_task", ToolKind::Execute),
+            ("list_dir", ToolKind::Read),
+            ("grep", ToolKind::Read),
+            ("git_status", ToolKind::Read),
+            ("git_diff", ToolKind::Read),
             ("wasm_echo", ToolKind::Other),
         ];
         for (name, expected) in cases {
@@ -657,6 +671,53 @@ mod tests {
                 panic!("expected tool call");
             };
             assert_eq!(call.kind, expected, "wrong kind for {name}");
+        }
+    }
+
+    #[test]
+    fn new_native_tools_map_their_primary_argument_to_kind_and_location() {
+        let mapper = mapper();
+        let cases = [
+            (
+                "exec",
+                json!({"program": "git", "args": ["status"]}),
+                ToolKind::Execute,
+                "exec: git",
+                None,
+            ),
+            (
+                "grep",
+                json!({"pattern": "needle", "path": "src"}),
+                ToolKind::Read,
+                "grep: needle",
+                Some(PathBuf::from("/workspace/src")),
+            ),
+            (
+                "list_dir",
+                json!({"path": "src"}),
+                ToolKind::Read,
+                "list_dir: src",
+                Some(PathBuf::from("/workspace/src")),
+            ),
+            ("git_status", json!({}), ToolKind::Read, "git_status", None),
+            ("git_diff", json!({}), ToolKind::Read, "git_diff", None),
+        ];
+        for (name, arguments, expected_kind, expected_title, expected_location) in cases {
+            let update = mapper
+                .map(&AgentEvent::ToolCallStarted {
+                    call: ToolCall::new("id", name, arguments),
+                })
+                .expect("tool start must map");
+            let SessionUpdate::ToolCall(call) = update else {
+                panic!("expected a tool call");
+            };
+            assert_eq!(call.kind, expected_kind, "wrong kind for {name}");
+            assert_eq!(call.title, expected_title, "wrong title for {name}");
+            assert_eq!(
+                call.locations.first().map(|location| location.path.clone()),
+                expected_location,
+                "wrong location for {name}"
+            );
         }
     }
 

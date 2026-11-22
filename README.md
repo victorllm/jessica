@@ -13,7 +13,7 @@ event-sourced persistence.
 | `jessica-runtime` | Agent loop and session execution |
 | `jessica-harness` | Guards, policy, sensors, and acceptance orchestration |
 | `jessica-providers` | OpenAI-compatible streaming provider |
-| `jessica-tools` | Native file and bash tools |
+| `jessica-tools` | Native file, search, git, and command tools |
 | `jessica-cli` | Governed executable entry point |
 
 See `CLAUDE.md` for project rules and `PLAN.md` for the delivery plan.
@@ -202,6 +202,26 @@ artifact_max_bytes = 268435456
 timeout_ms = 5000         # defaults to budget.tool_timeout_ms
 max_args_bytes = 65536    # optional pre-execution argument limit
 
+[tools.list_dir]
+ignore_dirs = [".git", "target"]  # only single path components
+max_entries = 500
+
+[tools.grep]
+ignore_dirs = [".git", "target"]
+max_files = 2000
+max_file_bytes = 1048576
+max_matches = 200
+max_output_bytes = 65536
+
+[tools.git_status]
+timeout_ms = 5000
+[tools.git_diff]
+timeout_ms = 5000
+
+[tools.exec]
+timeout_ms = 10000
+max_args_bytes = 65536
+
 [tools.bash]
 enabled = false           # explicit opt-in; bash stays hidden when false
 sandbox = "process"       # only supported value in this build
@@ -210,10 +230,58 @@ timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
 
 | Profile | Native tools exposed when allowlisted |
 | --- | --- |
-| `readonly` | `read_file`, `read_artifact` |
-| `coding` | `read_file`, `read_artifact`, `write_file` |
-| `ops` | `read_file`, `read_artifact`, `bash` |
+| `readonly` | `read_file`, `read_artifact`, `list_dir`, `grep`, `git_status`, `git_diff` |
+| `coding` | the read-only set plus `write_file`, `exec` |
+| `ops` | the read-only set plus `bash`, `exec` |
 | `full` | every allowlisted tool, including WASM, MCP, and `delegate_task` |
+
+The six read-only tools in the table are `read_file`, `read_artifact`,
+`list_dir`, `grep`, `git_status`, and `git_diff`. `exec` adds arbitrary
+program execution, so it is exposed only by `coding`, `ops`, and `full`, must
+appear in `policy.allowed_tools`, and still asks for interactive approval when
+an ACP permission gate is installed. Reads, searches, and git inspection are
+governed by the allowlist alone.
+
+### Native tools
+
+- `read_file` accepts a workspace-relative `path`, plus optional `offset` and
+  `limit`. `offset` is a **1-based line number** (not a byte offset); `limit`
+  is a line count defaulting to 2000 and capped at 10000. Output is always
+  prefixed with one-based line numbers (`\t` separator). Files are capped at
+  16 MiB; a NUL byte or invalid UTF-8 is reported as a binary/invalid text
+  error instead of being returned. A footer reports the next offset when more
+  lines are available. Paths are canonicalized and must remain inside the
+  workspace, so `..` and symlink escapes are rejected.
+- `list_dir` accepts an optional workspace-relative `path`. Entries are sorted
+  by name, capped at `tools.list_dir.max_entries`, and `.git`/`target` are
+  skipped by default (`ignore_dirs` is configurable; entries must be single
+  path components). Symlinks are reported with their target but never
+  followed. The listing summarizes directories, files with byte sizes, and
+  symlinks, and appends an explicit truncation notice when the cap is hit.
+- `grep` performs a **literal substring search**; regex metacharacters are
+  matched as plain text. It accepts `pattern`, an optional workspace-relative
+  `path`, and optional `case_sensitive`. Directories in `ignore_dirs` are
+  skipped, as are binary files (NUL or invalid UTF-8), files larger than
+  `max_file_bytes`, and unreadable entries. The tool caps scanned files,
+  matches, and total output bytes; output is `relative/path:line:text`. A
+  summary reports skips and truncation instead of silently dropping them.
+- `git_status` and `git_diff` run the `git` binary directly with fixed
+  read-only arguments (`status --porcelain=v1 --untracked-files=all` and
+  `diff --no-ext-diff --no-color --`). They accept no arguments, so callers
+  cannot inject git options or a shell command. The working directory is the
+  canonical workspace root. Outside a repository the tool returns a structured
+  hint instead of panicking; a spawn failure, timeout, or non-zero git exit is
+  a tool error, while a clean tree or empty diff returns a normal message.
+- `exec` accepts `{program, args, cwd?, timeout_ms?}`. It runs one program with
+  an explicit argument array, never through a shell, so spaces, `$()`, and
+  globs are literal. `cwd` must resolve inside the workspace. A non-zero exit
+  is a **completed** call with `is_error = false` and a JSON result carrying
+  `status`, `exit_code`, `duration_ms`, and capped stdout/stderr plus their
+  byte counts and truncation flags. Only spawn, timeout, and I/O failures set
+  `is_error = true`. Executions use the Phase 9.2 supervisor: empty inherited
+  environment, credential filtering, one deadline, and per-stream output
+  caps. `exec` requires policy and ACP approval; unlike `bash` it has no
+  separate enable gate.
 
 `read_artifact` is not in the default allowlist. Add it to
 `policy.allowed_tools` if the model should paginate artifacts created by large
@@ -225,7 +293,14 @@ cannot recursively create more artifacts.
 Narrow profiles never expose WASM, MCP, or delegation tools. The default is
 `full`; choose a narrower profile to enforce least privilege. `ops` and `full`
 still need the `[tools.bash] enabled = true` opt-in before bash is exposed, and
-the system prompt does not advertise a disabled bash tool.
+the system prompt does not advertise a disabled bash tool. Adding `exec` to the
+profile is necessary but not sufficient: it must also be in the allowlist, and
+ACP clients receive a permission request before it runs.
+
+New native tools are never exposed by a narrow profile merely because they
+exist. `jessica tools list --all` shows each hidden reason, and `inspect`
+reports whether a tool is read-only, its result format, and its effective
+limits.
 
 Hidden tools are not registered, so they never appear in the provider tool
 schema and cannot execute. A model that hallucinates a hidden name receives an
@@ -241,7 +316,8 @@ to the next turn.
 
 ### Execution supervisor
 
-`bash`, the command sensor, and the acceptance check run under one supervisor:
+`bash`, `exec`, `git_status`, `git_diff`, the command sensor, and the
+acceptance check run under one supervisor:
 
 ```toml
 [tools.supervisor]
@@ -268,18 +344,21 @@ applies no resource limits. Process-group `SIGTERM`→`SIGKILL` cleanup and
 rlimits belong to Task 9.3b and are not enabled here; adding `enabled = true`
 does not change that boundary.
 
-Policy is not a complete security boundary for bash. Jessica does not parse
-command strings, so `policy.allowed_tools` can only permit or block the tool as
-a whole. Real isolation depends on the execution sandbox; until process-group
-handling and rlimits land, run bash only in trusted workspaces.
+Policy is not a complete security boundary for `bash` or `exec`. Jessica does
+not parse command strings, and `exec` deliberately accepts an arbitrary
+program path plus argument array, so `policy.allowed_tools` can only permit or
+block the tool as a whole. Real isolation depends on the execution sandbox;
+until process-group handling and rlimits land, run either tool only in trusted
+workspaces.
 
 Output beyond `max_output_bytes` per stream is truncated with a notice that
-records the original byte count. The rendered `bash` result is also capped at
-the same value, and any tool result above `inline_threshold_bytes` is stored as
-an artifact with a bounded preview, so a large command output cannot trip
-`ResultSizeGuard` or turn into `BudgetExceeded`. A non-zero exit still means
-“the command ran and failed” and keeps its exit code; only spawn, timeout, read,
-and wait failures are supervisor errors.
+records the original byte count. The rendered `bash`, `exec`, and git results
+are also capped at the same value, and any tool result above
+`inline_threshold_bytes` is stored as an artifact with a bounded preview, so a
+large command output cannot trip `ResultSizeGuard` or turn into
+`BudgetExceeded`. A non-zero exit still means “the command ran and failed” and
+keeps its exit code; only spawn, timeout, read, and wait failures are supervisor
+errors.
 
 `[tools.supervisor]` is rebuilt for each turn, so changes apply to the next turn
 and never to an already running child. Child-agent commands are aligned with the
@@ -770,8 +849,9 @@ client's ACP documentation if it differs.
 
 Before running a sensitive native tool, Jessica sends ACP
 `session/request_permission` and waits for the client. The fixed sensitive set is
-`bash`, `write_file`, and `delegate_task`; `read_file`, configured MCP tools, and
-WASM tools remain governed only by the policy allowlist.
+`bash`, `exec`, `write_file`, and `delegate_task`; `read_file`, `list_dir`,
+`grep`, `git_status`, `git_diff`, configured MCP tools, and WASM tools remain
+governed only by the policy allowlist.
 
 - Every request offers exactly `allow_once` ("Allow this execution") and
   `reject_once` ("Reject this execution"). Jessica keeps no persistent approval
@@ -805,7 +885,7 @@ WASM tools remain governed only by the policy allowlist.
   namespaced and go through the normal policy and guards. HTTP/SSE transports
   are rejected, and `session/load`/`session/resume` still reject non-empty
   `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
-- **Permissions**: `bash`, `write_file`, and `delegate_task` ask through
+- **Permissions**: `bash`, `exec`, `write_file`, and `delegate_task` ask through
   `session/request_permission` before execution; see
   [Permission requests](#permission-requests). A denied call produces a failed
   `tool_call_update`.

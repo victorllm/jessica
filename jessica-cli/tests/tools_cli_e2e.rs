@@ -122,7 +122,7 @@ fn tools_list_is_sorted_reproducible_and_creates_no_runtime_state() {
         "the source column must identify the native tool: {stdout}"
     );
     assert!(
-        lines[3].starts_with("exposed 2/5 tools;"),
+        lines[3].starts_with("exposed 2/10 tools;"),
         "the summary must count hidden tools: {stdout}"
     );
 
@@ -194,6 +194,12 @@ fn tools_list_all_and_inspect_explain_every_hidden_reason() {
             && write_line.contains("not in tools.profile"),
         "write_file must report both reasons: {write_line}"
     );
+    let exec_line = tool_line(&all_stdout, "exec");
+    assert!(
+        exec_line.contains("not in policy.allowed_tools")
+            && exec_line.contains("not in tools.profile"),
+        "exec must explain both gates: {exec_line}"
+    );
 
     let inspect = run_tools(temp.path(), &config, &["inspect", "write_file"]);
     assert!(inspect.status.success());
@@ -208,6 +214,26 @@ fn tools_list_all_and_inspect_explain_every_hidden_reason() {
         inspected.contains(&format!("schema_digest: {}", digest_in(write_line))),
         "inspect and list must report the same digest:\n{inspected}"
     );
+
+    let exec_inspect = run_tools(temp.path(), &config, &["inspect", "exec"]);
+    assert!(exec_inspect.status.success());
+    let exec_inspected = String::from_utf8_lossy(&exec_inspect.stdout);
+    assert!(exec_inspected.contains("exposed: no"));
+    assert!(exec_inspected.contains("approval: interactive"));
+    assert!(exec_inspected.contains("result_format: json"));
+    assert!(exec_inspected.contains("executes: yes"));
+    assert!(exec_inspected.contains("command_field: program"));
+    assert!(
+        exec_inspected.contains(&format!("schema_digest: {}", digest_in(exec_line))),
+        "exec inspect and list must report the same digest:\n{exec_inspected}"
+    );
+
+    let list_dir_inspect = run_tools(temp.path(), &config, &["inspect", "list_dir"]);
+    assert!(list_dir_inspect.status.success());
+    let list_dir_inspected = String::from_utf8_lossy(&list_dir_inspect.stdout);
+    assert!(list_dir_inspected.contains("result_format: text"));
+    assert!(list_dir_inspected.contains("path_field: path"));
+    assert!(list_dir_inspected.contains("max_output_lines: 500"));
 
     let unknown = run_tools(temp.path(), &config, &["inspect", "not_a_tool"]);
     assert!(!unknown.status.success(), "an unknown tool must fail");
@@ -233,7 +259,7 @@ fn an_over_budget_catalog_is_still_inspectable() {
     let stdout = String::from_utf8_lossy(&listed.stdout);
     let stderr = String::from_utf8_lossy(&listed.stderr);
     assert!(
-        stdout.starts_with("NAME") && stdout.contains("exposed 2/4 tools;"),
+        stdout.starts_with("NAME") && stdout.contains("exposed 2/9 tools;"),
         "every enabled configured tool must still be shown: {stdout}"
     );
     assert!(
@@ -281,7 +307,7 @@ fn disabled_bash_is_omitted_from_listing_and_explained_on_demand() {
         "allowlisting bash is not enough while it is disabled: {stdout}"
     );
     assert!(
-        stdout.contains("exposed 1/4 tools;"),
+        stdout.contains("exposed 1/9 tools;"),
         "the summary must count the hidden bash tool: {stdout}"
     );
 
