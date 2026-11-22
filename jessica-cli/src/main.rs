@@ -18,6 +18,7 @@ mod pump;
 mod replay;
 mod shutdown;
 mod skills;
+mod tools;
 mod trace_bundle;
 mod trace_digest;
 mod trace_replay;
@@ -41,6 +42,7 @@ use crate::hot_reload::ConfigWatcher;
 use crate::memory::MemoryAssembly;
 use crate::shutdown::{ShutdownController, ShutdownSignal, SignalListener};
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
+use crate::tools::{ToolsCommand, run_tools_command};
 use crate::trace_verify::{TraceCommand, TraceSelection, run_command as run_trace_command};
 
 #[tokio::main]
@@ -140,6 +142,20 @@ async fn run() -> RunOutcome {
             // opens the event store.
             let result: Result<Option<SessionEndReason>, CliError> = async {
                 run_skill_command(&config.skills, &root, command).await?;
+                Ok(None)
+            }
+            .await;
+            RunOutcome {
+                result,
+                signal: None,
+            }
+        }
+        Mode::Tools { command } => {
+            // Catalog inspection loads configuration and, if configured, wasm
+            // manifests. It never creates a provider, event store, memory or
+            // skill database, MCP connection, or `.jessica` directory.
+            let result: Result<Option<SessionEndReason>, CliError> = async {
+                run_tools_command(&config, &root, command).await?;
                 Ok(None)
             }
             .await;
@@ -405,6 +421,11 @@ enum Mode {
         /// Review command to execute.
         command: SkillCommand,
     },
+    /// Lists or inspects the configured tool catalog.
+    Tools {
+        /// Catalog command to execute.
+        command: ToolsCommand,
+    },
     /// Verifies recorded turn traces offline.
     Trace {
         /// Parsed trace command.
@@ -421,8 +442,8 @@ enum Mode {
 /// An interactive REPL (a `Turn` with neither `--resume` nor a prompt) and
 /// the long-lived ACP server own a config watcher. The ACP watcher starts when
 /// the lazy runtime is assembled, so every later prompt reads the newest
-/// reloadable snapshot. One-shot, resume, replay, skills, trace, and config
-/// return `None`, so they load the startup configuration exactly once.
+/// reloadable snapshot. One-shot, resume, replay, skills, tools, trace, and
+/// config return `None`, so they load the startup configuration exactly once.
 fn watched_config_path(mode: &Mode, config_path: &Option<PathBuf>) -> Option<PathBuf> {
     match mode {
         Mode::Turn {
@@ -484,6 +505,15 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Option<Opti
                 return Ok(Some(Options {
                     config,
                     mode: Mode::Skills { command },
+                }));
+            }
+            "tools" if resume.is_none() && prompt_parts.is_empty() => {
+                let Some(command) = parse_tools_args(args)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(Options {
+                    config,
+                    mode: Mode::Tools { command },
                 }));
             }
             "trace" if resume.is_none() && prompt_parts.is_empty() => {
@@ -704,6 +734,73 @@ fn parse_skill_args(
             message: format!(
                 "unknown subcommand `{other}`; expected list, show, activate, or delete"
             ),
+        }),
+    }
+}
+
+/// Parses the arguments following the `tools` subcommand.
+///
+/// Only `list [--all]` and `inspect <name>` are accepted. Unexpected
+/// arguments fail instead of being ignored, so a typo cannot produce a
+/// misleading catalog report.
+fn parse_tools_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<ToolsCommand>, CliError> {
+    let Some(command) = args.next() else {
+        return Err(CliError::InvalidToolsCommand {
+            message: "missing subcommand; expected `list` or `inspect <name>`".to_owned(),
+        });
+    };
+    if command == "--help" || command == "-h" {
+        print_usage();
+        return Ok(None);
+    }
+
+    match command.as_str() {
+        "list" => {
+            let mut all = false;
+            for arg in args {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        print_usage();
+                        return Ok(None);
+                    }
+                    "--all" => all = true,
+                    other => {
+                        return Err(CliError::InvalidToolsCommand {
+                            message: format!("unexpected `tools list` argument `{other}`"),
+                        });
+                    }
+                }
+            }
+            Ok(Some(ToolsCommand::List { all }))
+        }
+        "inspect" => {
+            let mut name = None;
+            for arg in args {
+                if arg == "--help" || arg == "-h" {
+                    print_usage();
+                    return Ok(None);
+                }
+                if arg.starts_with('-') {
+                    return Err(CliError::InvalidToolsCommand {
+                        message: format!("unexpected `tools inspect` argument `{arg}`"),
+                    });
+                }
+                if name.is_some() {
+                    return Err(CliError::InvalidToolsCommand {
+                        message: "`tools inspect` accepts exactly one tool name".to_owned(),
+                    });
+                }
+                name = Some(arg);
+            }
+            let name = name.ok_or_else(|| CliError::InvalidToolsCommand {
+                message: "`tools inspect` requires a tool name".to_owned(),
+            })?;
+            Ok(Some(ToolsCommand::Inspect { name }))
+        }
+        other => Err(CliError::InvalidToolsCommand {
+            message: format!("unknown subcommand `{other}`; expected `list` or `inspect`"),
         }),
     }
 }
@@ -1233,6 +1330,16 @@ fn print_usage() {
          portable bundle\n\
          entirely offline. See `jessica trace --help` for problem kinds and exit\n\
          codes.\n\
+         \n\
+         Usage: jessica [--config <path>] tools list [--all]\n\
+         \x20      jessica [--config <path>] tools inspect <name>\n\
+         \n\
+         Lists the configured tool catalog in stable name order, with each\n\
+         exposed tool's source, effective timeout, and schema digest. `--all`\n\
+         also shows hidden tools and why they are hidden. `tools inspect` prints\n\
+         one tool's descriptor, capabilities, limits, policy hints, and schema.\n\
+         Both commands are side-effect free: they do not create a provider,\n\
+         event store, memory or skill database, or MCP connection.\n\
          \n\
          Usage: jessica [--config <path>] acp\n\
          \n\

@@ -237,6 +237,7 @@ pub(crate) struct GovernedTool {
     timeout: Duration,
     timeout_guard: Arc<ToolTimeoutGuard>,
     result_guard: Arc<ResultSizeGuard>,
+    max_args_bytes: Option<usize>,
     permission: Option<Arc<dyn ToolPermissionGate>>,
 }
 
@@ -260,8 +261,19 @@ impl GovernedTool {
             timeout,
             timeout_guard,
             result_guard,
+            max_args_bytes: None,
             permission: None,
         }
+    }
+
+    /// Sets the optional serialized-argument size limit.
+    ///
+    /// The precheck runs before policy, permission, and execution, so an
+    /// oversized call cannot reach any of them. Exceeding the limit returns an
+    /// error result without tripping the session budget.
+    pub(crate) fn with_max_args_bytes(mut self, max_args_bytes: Option<usize>) -> Self {
+        self.max_args_bytes = max_args_bytes;
+        self
     }
 
     /// Attaches the optional approval gate for sensitive tools.
@@ -283,6 +295,30 @@ impl GovernedTool {
                 String::new(),
                 "tool execution skipped because the session budget was exceeded",
             );
+        }
+
+        if let Some(limit) = self.max_args_bytes {
+            let bytes = match serde_json::to_vec(&call.arguments) {
+                Ok(bytes) => bytes.len(),
+                Err(error) => {
+                    return ToolResult::error(
+                        String::new(),
+                        format!(
+                            "tool `{}` arguments could not be serialized for the size check: {error}",
+                            self.inner.name()
+                        ),
+                    );
+                }
+            };
+            if bytes > limit {
+                return ToolResult::error(
+                    String::new(),
+                    format!(
+                        "tool `{}` arguments are {bytes} bytes, exceeding the configured max_args_bytes of {limit}",
+                        self.inner.name()
+                    ),
+                );
+            }
         }
 
         if let Some(event) = self.harness.authorize_tool_call(call) {
@@ -528,6 +564,89 @@ mod tests {
             }
             other => panic!("expected PolicyDenied, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn max_args_bytes_allows_the_exact_limit_and_rejects_one_byte_over() {
+        let args = serde_json::json!({"value": 1});
+        let limit = serde_json::to_vec(&args)
+            .expect("arguments must serialize")
+            .len();
+
+        let inner = Arc::new(MockTool::new("fits", "ran", Duration::ZERO));
+        let (fits_governance, _, _events) = governance();
+        let fits = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["fits"]),
+            Arc::clone(&fits_governance),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_max_args_bytes(Some(limit));
+        let result = fits.execute(args.clone()).await;
+        assert!(!result.is_error, "the exact limit must pass: {result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+
+        let inner = Arc::new(MockTool::new("too_big", "ran", Duration::ZERO));
+        let (governance, cancel, mut events) = governance();
+        let too_big = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["too_big"]),
+            Arc::clone(&governance),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_max_args_bytes(Some(limit - 1));
+        let result = too_big.execute(args).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("max_args_bytes"),
+            "the error must explain the configured limit: {}",
+            result.content
+        );
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "oversized arguments must never reach the tool"
+        );
+        assert!(!governance.tripped());
+        assert!(!cancel.is_cancelled());
+        assert!(
+            events.try_recv().is_err(),
+            "the argument check must not emit a policy or budget event"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_args_bytes_is_checked_before_policy_authorization() {
+        let inner = Arc::new(MockTool::new("blocked", "must not run", Duration::ZERO));
+        let (governance, _, mut events) = governance();
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&[]),
+            governance,
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_max_args_bytes(Some(1));
+
+        let result = tool.execute(serde_json::json!({"value": 1})).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("max_args_bytes"),
+            "the argument precheck must win over the policy denial: {}",
+            result.content
+        );
+        assert!(!result.content.contains("denied by policy"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            events.try_recv().is_err(),
+            "no PolicyDenied event may be recorded when the call never reaches policy"
+        );
     }
 
     #[tokio::test]

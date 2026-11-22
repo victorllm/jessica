@@ -4,7 +4,8 @@
 //! wasm echo plugin, and asserts that:
 //!
 //! - the wasm tool schema is registered and visible to the provider;
-//! - a native tool outside the allowlist is denied by policy;
+//! - a native tool outside the allowlist is absent from the provider schema and
+//!   an attempted call is reported as an unknown tool;
 //! - the wasm tool executes and its JSON result reaches the next model request.
 //!
 //! No API key or network access is involved; the server is a local listener.
@@ -29,7 +30,7 @@ fn workspace_root() -> PathBuf {
 }
 
 #[test]
-fn cli_calls_a_wasm_tool_and_policy_denies_an_unlisted_native_tool() {
+fn cli_calls_a_wasm_tool_and_hides_an_unlisted_native_tool() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
     let address = listener.local_addr().expect("mock server address");
     let server = thread::spawn(move || serve(listener));
@@ -69,18 +70,31 @@ fn cli_calls_a_wasm_tool_and_policy_denies_an_unlisted_native_tool() {
         requests.len()
     );
 
+    let first_request: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("provider request must be JSON");
+    let offered: Vec<&str> = first_request["tools"]
+        .as_array()
+        .expect("the provider request must carry a tool list")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
     assert!(
-        requests[0].contains("\"echo_json\""),
-        "wasm tool schema was not offered to the provider: {}",
-        requests[0]
+        offered.contains(&"echo_json"),
+        "wasm tool schema was not offered to the provider: {offered:?}"
     );
     assert!(
-        stdout.contains("[policy] denied read_file"),
-        "missing policy denial in stdout:\n{stdout}"
+        !offered.contains(&"read_file")
+            && !offered.contains(&"write_file")
+            && !offered.contains(&"bash"),
+        "tools outside the allowlist must not be advertised: {offered:?}"
     );
     assert!(
-        requests[1].contains("denied by policy"),
-        "denial result was not fed back to the model: {}",
+        stdout.contains("[tool:error] unknown tool `read_file`"),
+        "missing unknown-tool result in stdout:\n{stdout}"
+    );
+    assert!(
+        requests[1].contains("unknown tool `read_file`"),
+        "unknown-tool result was not fed back to the model: {}",
         requests[1]
     );
     assert!(
