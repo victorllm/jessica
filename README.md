@@ -202,6 +202,14 @@ artifact_max_bytes = 268435456
 timeout_ms = 5000         # defaults to budget.tool_timeout_ms
 max_args_bytes = 65536    # optional pre-execution argument limit
 
+[tools.edit_file]
+timeout_ms = 5000
+max_args_bytes = 65536
+
+[tools.apply_patch]
+timeout_ms = 5000
+max_args_bytes = 65536
+
 [tools.list_dir]
 ignore_dirs = [".git", "target"]  # only single path components
 max_entries = 500
@@ -231,7 +239,7 @@ timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
 | Profile | Native tools exposed when allowlisted |
 | --- | --- |
 | `readonly` | `read_file`, `read_artifact`, `list_dir`, `grep`, `git_status`, `git_diff` |
-| `coding` | the read-only set plus `write_file`, `exec` |
+| `coding` | the read-only set plus `write_file`, `apply_patch`, `edit_file`, `exec` |
 | `ops` | the read-only set plus `bash`, `exec` |
 | `full` | every allowlisted tool, including WASM, MCP, and `delegate_task` |
 
@@ -240,7 +248,10 @@ The six read-only tools in the table are `read_file`, `read_artifact`,
 program execution, so it is exposed only by `coding`, `ops`, and `full`, must
 appear in `policy.allowed_tools`, and still asks for interactive approval when
 an ACP permission gate is installed. Reads, searches, and git inspection are
-governed by the allowlist alone.
+governed by the allowlist alone. The three file writers (`write_file`,
+`apply_patch`, and `edit_file`) are exposed only by `coding` and `full`; being
+in a compatible profile is still necessary but not sufficient, because the
+allowlist must name them too.
 
 ### Policy rules v2 and approval modes
 
@@ -279,7 +290,7 @@ must match (logical AND):
 | Field | Meaning |
 | --- | --- |
 | `tool` | One name or an array of names. Omit it to match every tool. |
-| `path_glob` | Glob matched against the canonical workspace-relative path. Native file tools use their path argument; `exec` uses its canonical `cwd`. |
+| `path_glob` | Glob matched against the canonical workspace-relative path. Native file tools use their `path` argument; `apply_patch` uses the single target path extracted from its `---`/`+++` headers; `exec` uses its canonical `cwd`. |
 | `program` | Exact `exec.program`. Only meaningful for `exec`; `bash` is accepted by validation but never matched. |
 | `args_prefix` | Required prefix of `exec.args`. Only meaningful for `exec`; `bash` is never tokenized. |
 
@@ -307,6 +318,18 @@ Character classes, brace expansion, and backslash escapes are literal
 characters. Matching always uses slash-separated workspace-relative paths, so
 there are no platform-specific path semantics.
 
+`apply_patch` and `edit_file` also refuse protected paths by default. This
+check runs after `deny` rules and before `ask` rules and the approval fallback,
+so an `ask` rule cannot turn the default denial into a prompt and
+`approval.mode = "allow"` cannot auto-approve it. A protected path has a
+`.git`, `.jessica`, or `.ssh` component; is named `.env` or starts with
+`.env.`; is named `id_rsa`, `id_dsa`, `id_ecdsa`, or `id_ed25519`; or ends in
+`.pem`, `.key`, `.p12`, or `.pfx`. This default denial exists because those
+files commonly hold credentials and repository control state. Only an explicit
+`allow` rule that matches the path overrides it, so an operator who really
+means to edit `.env` can say so in one place. `write_file` keeps its pre-9.7
+behavior and is not covered by this extra gate.
+
 Approval modes:
 
 | Mode | Behavior |
@@ -319,14 +342,19 @@ An `ask` rule enables the terminal prompt on its own, even without an
 `[approval]` section. It does not start prompting for legacy-sensitive tools
 that no rule mentions.
 
-The sensitive set remains `bash`, `exec`, `write_file`, and `delegate_task`.
-With an explicit `[approval]` section, destructive MCP tools also become
-sensitive; WASM tools keep their read-only capability classification.
-Approval requests carry only the tool name, a bounded argument summary, and a
-reason. For `write_file` the summary is a bounded line-diff summary rather than
-the file body; for `exec` it is program, argument list, and `cwd`. Unknown
-tools keep their argument shape with secret-looking keys redacted and oversized
-values truncated. Environments and credentials are never read or sent.
+The sensitive set is `bash`, `exec`, `write_file`, `apply_patch`, `edit_file`,
+and `delegate_task`. With an explicit `[approval]` section, destructive MCP
+tools also become sensitive; WASM tools keep their read-only capability
+classification. Approval requests carry only the tool name, a bounded argument
+summary, and a reason. For `write_file` the summary is a bounded line-diff
+summary rather than the file body; for `edit_file` it reports the path plus old
+and new byte/line counts; for `apply_patch` it reports the target path, hunk
+counts, added/removed lines, and whether the call is a dry run. Neither editor
+summary contains patch or file content, and a malformed patch is summarized as
+unparseable rather than echoed. For `exec` the summary is program, argument
+list, and `cwd`. Unknown tools keep their argument shape with secret-looking
+keys redacted and oversized values truncated. Environments and credentials are
+never read or sent.
 
 #### Migration from 9.1
 
@@ -408,6 +436,30 @@ structured diagnostic. `--tool <name> --args '<json>'` and the `--tool=...` /
   environment, credential filtering, one deadline, and per-stream output
   caps. `exec` requires policy and ACP approval; unlike `bash` it has no
   separate enable gate.
+- `edit_file` accepts `{path, old, new, expected_occurrences?}` and performs a
+  **literal** replacement (no regex). `old` must occur exactly the expected
+  number of times: one occurrence succeeds without `expected_occurrences`,
+  multiple occurrences require an explicit count, and a zero or mismatched
+  count is an error instead of a partial edit. The file must already exist,
+  be regular, decode as UTF-8, and be at most 16 MiB. The write is atomic: a
+  sibling temporary file is flushed and synced, then renamed over the target,
+  so a failure leaves the original untouched and no temporary file behind.
+- `apply_patch` accepts `{patch, dry_run?}` and applies a minimal single-file
+  unified diff. It supports `---`/`+++` headers with optional `a/`/`b/`
+  prefixes and `@@ -start[,count] +start[,count] @@` hunks made of context,
+  addition, and removal lines. Multiple files, renames, `/dev/null`, CRLF,
+  `\ No newline at end of file`, and `.`/`..` path components are rejected.
+  Every hunk is verified against the current content before anything is
+  written; `dry_run = true` reports the would-be result and writes nothing.
+  Like `edit_file`, a successful patch replaces the target atomically and
+  never leaves a partially written file. Patch size is capped at 1 MiB and
+  the target at 16 MiB. Both editor tools are destructive writers, require
+  interactive approval under the fixed sensitive set, and honor the protected
+  path gate described above.
+- These are the dependency-free 9.7a editor tools. The 9.7b additions -- a
+  `glob` tool and regex `grep` -- are **not implemented**, and this build
+  adds no `globset` or `regex` dependency; literal `grep` remains the only
+  search tool.
 
 `read_artifact` is not in the default allowlist. Add it to
 `policy.allowed_tools` if the model should paginate artifacts created by large
@@ -975,9 +1027,9 @@ client's ACP documentation if it differs.
 
 Before running a sensitive tool, Jessica sends ACP
 `session/request_permission` and waits for the client. The fixed sensitive set is
-`bash`, `exec`, `write_file`, and `delegate_task`; `read_file`, `list_dir`,
-`grep`, `git_status`, `git_diff`, and WASM tools remain governed only by the
-policy allowlist. Configured MCP tools are policy-only as well, unless the
+`bash`, `exec`, `write_file`, `apply_patch`, `edit_file`, and `delegate_task`;
+`read_file`, `list_dir`, `grep`, `git_status`, `git_diff`, and WASM tools
+remain governed only by the policy allowlist. Configured MCP tools are policy-only as well, unless the
 configuration contains an explicit `[approval]` section: then destructive MCP
 tools also request permission. Policy v2 `ask` rules request permission for any
 exposed tool they match. The request's `rawInput` is a bounded, redacted
@@ -1016,8 +1068,8 @@ values.
   namespaced and go through the normal policy and guards. HTTP/SSE transports
   are rejected, and `session/load`/`session/resume` still reject non-empty
   `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
-- **Permissions**: `bash`, `exec`, `write_file`, and `delegate_task` ask through
-  `session/request_permission` before execution. An explicit `[approval]`
+- **Permissions**: `bash`, `exec`, `write_file`, `apply_patch`, `edit_file`, and
+  `delegate_task` ask through `session/request_permission` before execution. An explicit `[approval]`
   section extends this to destructive MCP tools, and policy v2 `ask` rules can
   request permission for other exposed tools; see
   [Permission requests](#permission-requests). A denied call produces a failed

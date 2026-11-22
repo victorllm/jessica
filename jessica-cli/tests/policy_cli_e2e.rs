@@ -360,3 +360,70 @@ fn policy_simulate_rejects_invalid_rule_configuration_before_evaluating() {
     );
     assert_no_runtime_state(temp.path());
 }
+
+#[test]
+fn editor_paths_are_protected_by_default_and_an_allow_rule_can_override() {
+    let temp = TempDir::new("editor-protected");
+    std::fs::write(temp.path().join(".env"), "SECRET=value\n").expect(".env should exist");
+    let denied_config = temp.path().join("denied.toml");
+    std::fs::write(
+        &denied_config,
+        "[policy]\nallowed_tools = [\"edit_file\", \"apply_patch\"]\n",
+    )
+    .expect("configuration should be written");
+
+    let edit_args =
+        serde_json::json!({"path": ".env", "old": "SECRET", "new": "PUBLIC"}).to_string();
+    let edit = run_policy(temp.path(), &denied_config, "edit_file", &edit_args);
+    assert!(edit.status.success());
+    let stdout = String::from_utf8_lossy(&edit.stdout);
+    assert_eq!(field(&stdout, "decision"), "deny");
+    assert_eq!(field(&stdout, "rule"), "-");
+    assert!(
+        field(&stdout, "reason").contains("protected path"),
+        "the reason must explain the default protection: {stdout}"
+    );
+
+    let patch_args = serde_json::json!({
+        "patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-SECRET=value\n+PUBLIC=value\n"
+    })
+    .to_string();
+    let patch = run_policy(temp.path(), &denied_config, "apply_patch", &patch_args);
+    assert!(patch.status.success());
+    let stdout = String::from_utf8_lossy(&patch.stdout);
+    assert_eq!(field(&stdout, "decision"), "deny");
+    assert_eq!(field(&stdout, "rule"), "-");
+    assert!(field(&stdout, "reason").contains("protected path"));
+
+    let allowed_config = temp.path().join("allowed.toml");
+    std::fs::write(
+        &allowed_config,
+        "[policy]\nallowed_tools = [\"edit_file\", \"apply_patch\"]\n\
+         [[policy.rules]]\n\
+         id = \"allow-env\"\n\
+         tool = [\"edit_file\", \"apply_patch\"]\n\
+         path_glob = \".env\"\n\
+         action = \"allow\"\n\
+         reason = \"the operator explicitly allows environment edits\"\n",
+    )
+    .expect("configuration should be written");
+
+    let edit = run_policy(temp.path(), &allowed_config, "edit_file", &edit_args);
+    assert!(edit.status.success());
+    let stdout = String::from_utf8_lossy(&edit.stdout);
+    assert_eq!(field(&stdout, "decision"), "allow");
+    assert_eq!(field(&stdout, "rule"), "allow-env");
+
+    let patch = run_policy(temp.path(), &allowed_config, "apply_patch", &patch_args);
+    assert!(patch.status.success());
+    let stdout = String::from_utf8_lossy(&patch.stdout);
+    assert_eq!(field(&stdout, "decision"), "allow");
+    assert_eq!(field(&stdout, "rule"), "allow-env");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".env")).expect(".env must still exist"),
+        "SECRET=value\n",
+        "simulation must not modify the protected target"
+    );
+    assert_no_runtime_state(temp.path());
+}

@@ -191,7 +191,12 @@ impl LlmProvider for TokenCountingProvider {
 pub(crate) fn permission_required(name: &str) -> bool {
     matches!(
         name,
-        "bash" | "exec" | "write_file" | jessica_runtime::DELEGATE_TASK_TOOL_NAME
+        "bash"
+            | "exec"
+            | "write_file"
+            | "apply_patch"
+            | "edit_file"
+            | jessica_runtime::DELEGATE_TASK_TOOL_NAME
     )
 }
 
@@ -1162,6 +1167,8 @@ mod tests {
             "bash",
             "exec",
             "write_file",
+            "apply_patch",
+            "edit_file",
             jessica_runtime::DELEGATE_TASK_TOOL_NAME,
         ] {
             assert!(
@@ -1657,6 +1664,8 @@ mod tests {
                     "exec".to_owned(),
                     "read_file".to_owned(),
                     "write_file".to_owned(),
+                    "apply_patch".to_owned(),
+                    "edit_file".to_owned(),
                     "delegate_task".to_owned(),
                 ],
                 rules,
@@ -1667,8 +1676,15 @@ mod tests {
     }
 
     fn policy_tool_for(name: &str) -> PolicyTool {
-        let path_field = matches!(name, "read_file" | "read_artifact" | "list_dir" | "grep")
-            .then(|| "path".to_owned());
+        let path_field = if matches!(name, "read_file" | "read_artifact" | "list_dir" | "grep") {
+            Some("path".to_owned())
+        } else if name == "apply_patch" {
+            Some("patch".to_owned())
+        } else if name == "edit_file" {
+            Some("path".to_owned())
+        } else {
+            None
+        };
         PolicyTool {
             name: name.to_owned(),
             source: ToolSource::Native,
@@ -2203,6 +2219,59 @@ mod tests {
             0,
             "the delegated child run must not start after a rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn editor_tools_require_approval_under_explicit_ask_mode() {
+        for (name, arguments) in [
+            (
+                "edit_file",
+                serde_json::json!({"path": "file.txt", "old": "alpha", "new": "beta"}),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({
+                    "patch": "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-alpha\n+beta\n"
+                }),
+            ),
+        ] {
+            let temp = PolicyTempDir::new(name);
+            std::fs::write(temp.path.join("file.txt"), "alpha\n").expect("target must exist");
+            let config = policy_config(Vec::new(), ApprovalMode::Ask, true);
+            let inner = Arc::new(MockTool::new(name, "must not run", Duration::ZERO));
+            let gate = Arc::new(MockGate::new(
+                ToolPermissionDecision::Reject,
+                Duration::ZERO,
+            ));
+            let (governance, _, _events) = governance();
+            let tool = governed_with_policy(
+                Arc::clone(&inner) as Arc<dyn Tool>,
+                harness(&[name]),
+                governance,
+                &temp.path,
+                &config,
+                policy_tool_for(name),
+                Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+            )
+            .await;
+
+            let result = tool
+                .execute_with_call(&ToolCall::new("call-editor", name, arguments))
+                .await;
+
+            assert!(result.is_error, "a rejected `{name}` call must not run");
+            assert!(result.content.contains("denied by the user"));
+            assert_eq!(
+                gate.calls().len(),
+                1,
+                "explicit ask mode must send `{name}` to the approval gate"
+            );
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                0,
+                "`{name}` must not execute after a rejection"
+            );
+        }
     }
 
     #[cfg(unix)]

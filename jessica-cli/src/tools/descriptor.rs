@@ -66,7 +66,7 @@ impl Capabilities {
                 read_only: true,
                 ..Self::none()
             },
-            (ToolSource::Native, "write_file") => Self {
+            (ToolSource::Native, "write_file" | "apply_patch" | "edit_file") => Self {
                 writes_files: true,
                 destructive: true,
                 ..Self::none()
@@ -270,8 +270,14 @@ pub(crate) fn result_format_for(source: ToolSource, name: &str) -> ResultFormat 
 
 fn policy_hints_for(source: ToolSource, name: &str) -> PolicyHints {
     match (source, name) {
-        (ToolSource::Native, "read_file" | "write_file" | "list_dir" | "grep") => PolicyHints {
-            path_field: Some("path".to_owned()),
+        (ToolSource::Native, "read_file" | "write_file" | "edit_file" | "list_dir" | "grep") => {
+            PolicyHints {
+                path_field: Some("path".to_owned()),
+                ..PolicyHints::default()
+            }
+        }
+        (ToolSource::Native, "apply_patch") => PolicyHints {
+            path_field: Some("patch".to_owned()),
             ..PolicyHints::default()
         },
         (ToolSource::Native, "bash") => PolicyHints {
@@ -419,9 +425,15 @@ mod tests {
         assert!(exec.executes && exec.network && exec.destructive);
         assert!(!exec.read_only && !exec.writes_files);
 
+        for name in ["write_file", "apply_patch", "edit_file"] {
+            let write = Capabilities::for_tool(ToolSource::Native, name);
+            assert!(
+                write.writes_files && write.destructive,
+                "{name} must be a destructive writer"
+            );
+            assert!(!write.read_only && !write.executes);
+        }
         let write = Capabilities::for_tool(ToolSource::Native, "write_file");
-        assert!(write.writes_files && write.destructive);
-        assert!(!write.read_only && !write.executes);
 
         let bash = Capabilities::for_tool(ToolSource::Native, "bash");
         assert!(bash.executes && bash.network && bash.destructive);

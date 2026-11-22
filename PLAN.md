@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6 已完成，9.3b 待依赖审批，9.7–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6、9.7a 已完成，9.3b/9.7b 待依赖审批，9.8 待确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2046,7 +2046,7 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☑ |
 | **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☑ |
 | **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☑ |
-| **9.7** | 原生工具 B：glob、regex grep、`apply_patch`、`edit_file` | 否 | `globset`/`regex` 审批 | 9.5/9.6 | ☐ |
+| **9.7** | 原生工具 B：`apply_patch`、`edit_file`（9.7a 已完成）；glob、regex grep（9.7b 待审批） | 否 | 9.7b 需 `globset`/`regex` 审批 | 9.5/9.6 | ☑（9.7a） |
 | **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☐ |
 
 说明：9.2 与 9.4 都只依赖 9.1，可互换顺序；推荐先 9.2 再 9.4，以便 `exec` 和结果管理在 9.5 前同时就绪。9.3b 与 9.7b 受第三方依赖审批门约束，未批准前只交付对应的无依赖子集，不得用自实现或 unsafe 绕过审批。
@@ -2226,20 +2226,40 @@ Task 9.6（已完成）：Policy v2、approval modes、`policy simulate`
 
 ---
 
-Task 9.7（待确认；依赖审批）：原生工具 B — glob、regex grep、`apply_patch`、`edit_file`
+Task 9.7a（已完成）：原生工具 B（无依赖子集）— `apply_patch`、`edit_file`
 
 范围与约束：
 
-- 不修改 `jessica-core`；除 `globset`/`regex` 外不新增第三方 crate；不实现 9.8 MCP/WASM 对齐；不改变 9.5 已交付工具语义。
-- 本 Task 分两阶段：
-  - **9.7a（无新依赖）**：`apply_patch` 使用最小 unified diff 解析，先 dry-run 校验再原子应用，失败不写文件；`edit_file` 做 old/new 替换并要求显式出现次数（0/1/多次的可观察行为必须明确），保持 UTF-8 边界与原子写。两者都必须接入 9.6 policy 的路径规则、approval、descriptor、limits，并拒绝 `.git/`、`.jessica/`、`.env`、私钥等受保护路径，除非 policy 显式 allow。
-  - **9.7b（仅在用户批准 `globset`/`regex` 后）**：`glob` 使用 `globset`；`grep` 增加 regex 模式，限制 pattern 长度、文件数、单文件大小、总输出与匹配耗时，避免灾难性回溯；未批准前只保留 9.5 的字面量 grep 与无 glob 的目录遍历，不得用自实现正则或 glob 冒充。
-- 写安全：临时文件 + fsync + rename 原子写；`apply_patch` 先 dry-run，失败不触碰原文件；`edit_file` 在多处匹配且未指定次数时拒绝而非猜测；写入前原文件 checkpoint artifact 可作为后续 Task，但本 Task 必须保证失败路径不破坏原文件。
-- `glob`/`regex` 不得跟随 symlink 逃逸 workspace；结果必须有条目/字节上限并截断提示；regex 编译失败、超时、输出超限均返回结构化错误，不 panic。
-- 依赖审批门：未批准前不得把 `globset`/`regex` 写入 workspace `Cargo.toml`；9.7b 保持未开始，9.7a 仍可独立交付；不得用自实现的正则/glob 引擎绕过审批后声称等价。
-- 测试：apply_patch 成功/上下文不匹配/dry-run 不写/路径逃逸/受保护路径；edit_file 出现 0/1/多次、UTF-8 边界、原子性；glob/regex 仅在批准后加入测试；依赖未批准时 `cargo tree`/Cargo.toml 不得出现相关 crate。
+- 不修改 `jessica-core`；不新增第三方 crate；不实现 9.8 MCP/WASM 对齐；不改变 9.5 已交付工具语义。
+- `apply_patch` 使用最小 unified diff 解析，先校验全部 hunk 再原子应用，失败不写文件；`edit_file` 做字面量 old/new 替换并要求显式出现次数（0 次报错、1 次可省略、多次必须显式次数且不匹配即报错），保持 UTF-8 边界与原子写。
+- 写安全：同目录 `create_new` 临时文件 + `flush`/`sync_all` + `rename` 原子替换，保留原权限，失败清理临时文件且不触碰原文件；`apply_patch` 的 `dry_run` 只校验和描述结果；`edit_file` 在多处匹配且未指定次数时拒绝而非猜测。
+- 两者都必须接入 9.6 policy 的路径规则、approval、descriptor、limits，并拒绝 `.git`、`.jessica`、`.ssh` 组件、`.env`/`.env.*`、SSH 私钥名与 `.pem`/`.key`/`.p12`/`.pfx` 扩展名等受保护路径，除非 policy 显式 allow。
+- `apply_patch` 仅支持单文件、LF、`---`/`+++`（可带 `a/`/`b/` 前缀）与 `@@` hunk；拒绝多文件、rename、`/dev/null`、CRLF、`\ No newline at end of file` 与 `.`/`..` 组件；patch 上限 1 MiB，目标文件上限 16 MiB。
+- 不实现 9.7b 的 `glob` 与 regex grep；不得把 `globset`/`regex` 写入 workspace `Cargo.toml`，也不得用自实现正则/glob 冒充。
 
-完成标准：9.7a 在无新依赖下 fmt/clippy/test 全绿；9.7b 在依赖批准后完成 glob/regex 行为测试；README 工具表、审批与安全边界更新；未改 core。
+完成标准：无新依赖下 fmt/clippy/test 全绿；apply_patch/edit_file 的真实行为测试与真实 CLI E2E；README 工具表、审批与安全边界更新；未改 core、未新增依赖。
+
+实施记录（2026-11-22，实际耗时约 90 分钟）：
+
+- `jessica-tools` 新增 `atomic.rs`（同级临时文件、`write_all`/`flush`/`sync_all`、复制原权限、`rename`、unix 下 best-effort 父目录 fsync、失败清理）、`edit.rs`（`EditFileTool`、16 MiB 上限、UTF-8 校验、`match_indices` 计数、`replacen`、显式出现次数）与 `patch.rs`（`ApplyPatchTool`、1 MiB patch 上限、unified diff 解析/校验/应用、`dry_run`、`PatchSummary`/`summarize_patch`）。
+- CLI：`policy_v2` 的 `matching_path` 对 `apply_patch` 解析 patch 目标路径，格式错误映射为结构化 `InvalidPatch`；新增受保护路径默认拒绝（在 deny 规则之后、ask 规则与批准兜底之前；存在匹配的显式 allow 规则时跳过，因此 ask 规则不能把默认拒绝降级为提示，`approval.mode = "allow"` 也不能自动批准）。`approval` 新增两种仅含元数据的摘要，绝不回显 patch/文件内容。`descriptor` 将两者标记为 `writes_files`、`destructive`，`edit_file` 的 `path_field` 为 `path`，`apply_patch` 为 `patch`。`governance` 将两者加入固定敏感集。`config` 新增 `[tools.apply_patch]`、`[tools.edit_file]` 的 timeout/max_args_bytes 校验。`catalog` 的 `coding` profile 纳入 `write_file`、`apply_patch`、`edit_file`。系统提示词同步列出新工具。
+- 默认 `NATIVE_TOOLS` allowlist 仍为 `bash`、`read_file`、`write_file`，因此既有配置的工具面不变；新工具需同时在 `policy.allowed_tools` 与兼容 profile 中才会暴露。
+- 测试：`jessica-tools` 覆盖成功替换、0/1/多次出现、次数不匹配、UTF-8 emoji、非法 UTF-8、symlink 逃逸、无临时文件残留；patch 成功、上下文不匹配、dry-run 不写、插入、无结尾换行保持、`..` 逃逸、symlink 逃逸、多文件拒绝与摘要计数。CLI 覆盖 descriptor/capability、敏感集审批拒绝后不执行、审批摘要不泄露内容、config 边界，以及真实 `policy simulate` E2E：`.env` 对 `edit_file`/`apply_patch` 默认 deny 且不写盘、显式 allow 规则覆盖后只报告 allow、不创建运行时状态。
+- 偏离/说明：1) `apply_patch` 限定单文件以保持原子性与路径匹配可判定，多文件留待后续；2) 受保护路径门只加在 9.7a 两个编辑工具上，`write_file` 保持 9.5/9.6 语义不变；3) 受保护路径判定基于 canonical 后的 workspace 相对路径组件，不读取文件内容或环境；4) `dry_run` 只做校验与结果描述，不写文件、不写 trace；5) 未新增依赖，`glob`/regex grep 留给 9.7b；6) `DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1125 passed, 0 failed, 2 ignored（含 `policy_cli_e2e` 7 个 E2E、ask 规则不得绕过受保护路径的回归测试，以及 `jessica-tools` 新增 edit/patch 行为测试）。
+
+---
+
+Task 9.7b（待依赖审批）：`glob`、regex grep
+
+范围与约束：
+
+- 仅在用户批准 `globset`/`regex` 后实施：`glob` 使用 `globset`；`grep` 增加 regex 模式，限制 pattern 长度、文件数、单文件大小、总输出与匹配耗时，避免灾难性回溯；未批准前只保留 9.5 的字面量 grep 与无 glob 的目录遍历，不得用自实现正则或 glob 冒充。
+- `glob`/regex 不得跟随 symlink 逃逸 workspace；结果必须有条目/字节上限并截断提示；regex 编译失败、超时、输出超限均返回结构化错误，不 panic。
+- 依赖审批门：未批准前不得把 `globset`/`regex` 写入 workspace `Cargo.toml`。
+- 测试：glob/regex 仅在批准后加入测试；依赖未批准时 `cargo tree`/Cargo.toml 不得出现相关 crate。
+
+完成标准：在依赖批准后完成 glob/regex 行为测试，并保持既有字面量 grep 语义或明确迁移。
 
 ---
 

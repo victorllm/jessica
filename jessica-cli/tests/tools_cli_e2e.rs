@@ -122,7 +122,7 @@ fn tools_list_is_sorted_reproducible_and_creates_no_runtime_state() {
         "the source column must identify the native tool: {stdout}"
     );
     assert!(
-        lines[3].starts_with("exposed 2/10 tools;"),
+        lines[3].starts_with("exposed 2/12 tools;"),
         "the summary must count hidden tools: {stdout}"
     );
 
@@ -235,6 +235,22 @@ fn tools_list_all_and_inspect_explain_every_hidden_reason() {
     assert!(list_dir_inspected.contains("path_field: path"));
     assert!(list_dir_inspected.contains("max_output_lines: 500"));
 
+    let edit_inspect = run_tools(temp.path(), &config, &["inspect", "edit_file"]);
+    assert!(edit_inspect.status.success());
+    let edit_inspected = String::from_utf8_lossy(&edit_inspect.stdout);
+    assert!(edit_inspected.contains("approval: interactive"));
+    assert!(edit_inspected.contains("writes_files: yes"));
+    assert!(edit_inspected.contains("destructive: yes"));
+    assert!(edit_inspected.contains("path_field: path"));
+
+    let patch_inspect = run_tools(temp.path(), &config, &["inspect", "apply_patch"]);
+    assert!(patch_inspect.status.success());
+    let patch_inspected = String::from_utf8_lossy(&patch_inspect.stdout);
+    assert!(patch_inspected.contains("approval: interactive"));
+    assert!(patch_inspected.contains("writes_files: yes"));
+    assert!(patch_inspected.contains("destructive: yes"));
+    assert!(patch_inspected.contains("path_field: patch"));
+
     let unknown = run_tools(temp.path(), &config, &["inspect", "not_a_tool"]);
     assert!(!unknown.status.success(), "an unknown tool must fail");
     let stderr = String::from_utf8_lossy(&unknown.stderr);
@@ -259,7 +275,7 @@ fn an_over_budget_catalog_is_still_inspectable() {
     let stdout = String::from_utf8_lossy(&listed.stdout);
     let stderr = String::from_utf8_lossy(&listed.stderr);
     assert!(
-        stdout.starts_with("NAME") && stdout.contains("exposed 2/9 tools;"),
+        stdout.starts_with("NAME") && stdout.contains("exposed 2/11 tools;"),
         "every enabled configured tool must still be shown: {stdout}"
     );
     assert!(
@@ -307,7 +323,7 @@ fn disabled_bash_is_omitted_from_listing_and_explained_on_demand() {
         "allowlisting bash is not enough while it is disabled: {stdout}"
     );
     assert!(
-        stdout.contains("exposed 1/9 tools;"),
+        stdout.contains("exposed 1/11 tools;"),
         "the summary must count the hidden bash tool: {stdout}"
     );
 

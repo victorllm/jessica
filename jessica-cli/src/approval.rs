@@ -49,8 +49,63 @@ pub(crate) async fn approval_request_input(root: &Path, call: &ToolCall) -> Valu
             "task": bounded_string(call.arguments.get("task")),
         }),
         "write_file" => write_file_summary(root, call).await,
+        "apply_patch" => apply_patch_summary(call),
+        "edit_file" => edit_file_summary(call),
         _ => summarize(&call.arguments, 0),
     }
+}
+
+/// Builds a patch summary with only the target, hunk counts, and dry-run flag.
+///
+/// A malformed patch is reported generically: parser diagnostics can quote
+/// hunk lines, which may contain secrets and must not enter approval output.
+fn apply_patch_summary(call: &ToolCall) -> Value {
+    let Some(patch) = call.arguments.get("patch").and_then(Value::as_str) else {
+        return json!({"valid": false, "reason": "patch argument is missing or not a string"});
+    };
+    match jessica_tools::summarize_patch(patch) {
+        Ok(summary) => json!({
+            "path": truncate(&summary.path),
+            "hunks": summary.hunks,
+            "lines_added": summary.lines_added,
+            "lines_removed": summary.lines_removed,
+            "dry_run": call
+                .arguments
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        Err(_) => json!({"valid": false, "reason": "patch could not be parsed"}),
+    }
+}
+
+/// Builds an edit summary with sizes and counts instead of file bodies.
+fn edit_file_summary(call: &ToolCall) -> Value {
+    let mut summary = Map::new();
+    summary.insert(
+        "path".to_owned(),
+        bounded_string(call.arguments.get("path")),
+    );
+    for (field, output) in [("old", "old"), ("new", "new")] {
+        if let Some(text) = call.arguments.get(field).and_then(Value::as_str) {
+            summary.insert(
+                format!("{output}_bytes"),
+                Value::Number(serde_json::Number::from(text.len())),
+            );
+            summary.insert(
+                format!("{output}_lines"),
+                Value::Number(serde_json::Number::from(text.lines().count())),
+            );
+        }
+    }
+    summary.insert(
+        "expected_occurrences".to_owned(),
+        call.arguments
+            .get("expected_occurrences")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    Value::Object(summary)
 }
 
 /// Builds the write-file summary with a bounded diff instead of the content.
@@ -349,6 +404,55 @@ mod tests {
         assert_eq!(payload.chars().count(), MAX_STRING_CHARS + 3);
         assert!(!summary.to_string().contains("secret-key"));
         assert!(!summary.to_string().contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn apply_patch_summary_reports_counts_without_patch_content() {
+        let temp = TempDir::new("apply-patch");
+        let call = ToolCall::new(
+            "call",
+            "apply_patch",
+            json!({
+                "dry_run": true,
+                "patch": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n-secret-body\n+replacement\n second\n"
+            }),
+        );
+
+        let summary = approval_request_input(&temp.path, &call).await;
+
+        assert_eq!(summary["path"], "notes.txt");
+        assert_eq!(summary["hunks"], 1);
+        assert_eq!(summary["lines_added"], 1);
+        assert_eq!(summary["lines_removed"], 1);
+        assert_eq!(summary["dry_run"], true);
+        let rendered = summary.to_string();
+        assert!(!rendered.contains("secret-body"));
+        assert!(!rendered.contains("replacement"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_summary_reports_sizes_without_replacement_text() {
+        let temp = TempDir::new("edit-file");
+        let call = ToolCall::new(
+            "call",
+            "edit_file",
+            json!({
+                "path": "notes.txt",
+                "old": "secret-body",
+                "new": "replacement-body",
+                "expected_occurrences": 2
+            }),
+        );
+
+        let summary = approval_request_input(&temp.path, &call).await;
+
+        assert_eq!(summary["path"], "notes.txt");
+        assert_eq!(summary["old_bytes"], 11);
+        assert_eq!(summary["new_bytes"], 16);
+        assert_eq!(summary["expected_occurrences"], 2);
+        let rendered = summary.to_string();
+        assert!(!rendered.contains("secret-body"));
+        assert!(!rendered.contains("replacement-body"));
     }
 
     #[test]

@@ -582,6 +582,10 @@ pub struct ToolsConfig {
     pub read_file: ToolLimitConfig,
     /// Optional limits for the native `write_file` tool.
     pub write_file: ToolLimitConfig,
+    /// Optional limits for the native `apply_patch` tool.
+    pub apply_patch: ToolLimitConfig,
+    /// Optional limits for the native `edit_file` tool.
+    pub edit_file: ToolLimitConfig,
     /// Enable gate and optional limits for the native `bash` tool.
     pub bash: BashToolConfig,
     /// Ignore list and limits for the native `list_dir` tool.
@@ -612,6 +616,8 @@ impl Default for ToolsConfig {
             artifact_max_bytes: DEFAULT_ARTIFACT_MAX_BYTES,
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
+            apply_patch: ToolLimitConfig::default(),
+            edit_file: ToolLimitConfig::default(),
             bash: BashToolConfig::default(),
             list_dir: ListDirToolConfig::default(),
             grep: GrepToolConfig::default(),
@@ -647,6 +653,8 @@ impl ToolsConfig {
         let configured = match name {
             "read_file" => self.read_file.timeout_ms,
             "write_file" => self.write_file.timeout_ms,
+            "apply_patch" => self.apply_patch.timeout_ms,
+            "edit_file" => self.edit_file.timeout_ms,
             "bash" => self.bash.timeout_ms,
             "list_dir" => self.list_dir.timeout_ms,
             "grep" => self.grep.timeout_ms,
@@ -694,6 +702,8 @@ impl ToolsConfig {
         match name {
             "read_file" => self.read_file.max_args_bytes,
             "write_file" => self.write_file.max_args_bytes,
+            "apply_patch" => self.apply_patch.max_args_bytes,
+            "edit_file" => self.edit_file.max_args_bytes,
             "bash" => self.bash.max_args_bytes,
             "list_dir" => self.list_dir.max_args_bytes,
             "grep" => self.grep.max_args_bytes,
@@ -778,6 +788,13 @@ impl ToolsConfig {
             global_timeout_ms,
             None,
         )?;
+        validate_tool_limits(
+            "tools.apply_patch",
+            &self.apply_patch,
+            global_timeout_ms,
+            None,
+        )?;
+        validate_tool_limits("tools.edit_file", &self.edit_file, global_timeout_ms, None)?;
         let bash_internal_ms = DEFAULT_BASH_TIMEOUT.as_millis() as u64;
         let bash_cap_ms = self
             .supervisor
@@ -2067,6 +2084,8 @@ mod tests {
         assert_eq!(config.tools.artifact_max_bytes, 256 * 1024 * 1024);
         assert_eq!(config.tools.read_file, ToolLimitConfig::default());
         assert_eq!(config.tools.write_file, ToolLimitConfig::default());
+        assert_eq!(config.tools.apply_patch, ToolLimitConfig::default());
+        assert_eq!(config.tools.edit_file, ToolLimitConfig::default());
         assert_eq!(config.tools.bash, BashToolConfig::default());
         assert!(
             !config.tools.bash.enabled,
@@ -2332,6 +2351,14 @@ mod tests {
                 "tools.write_file.timeout_ms",
             ),
             (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.apply_patch]\ntimeout_ms = 5001\n",
+                "tools.apply_patch.timeout_ms",
+            ),
+            (
+                "[tools.edit_file]\nmax_args_bytes = 0\n",
+                "tools.edit_file.max_args_bytes",
+            ),
+            (
                 "[tools.bash]\ntimeout_ms = 10001\n",
                 "tools.bash.timeout_ms",
             ),
@@ -2402,9 +2429,18 @@ mod tests {
         let accepted = HarnessConfig::from_toml_str(
             "[budget]\ntool_timeout_ms = 20000\n\
              [tools.read_file]\ntimeout_ms = 3000\nmax_args_bytes = 128\n\
+             [tools.apply_patch]\ntimeout_ms = 2500\nmax_args_bytes = 4096\n\
+             [tools.edit_file]\ntimeout_ms = 1500\nmax_args_bytes = 2048\n\
              [tools.bash]\ntimeout_ms = 10000\n",
         )
         .expect("limits at the boundaries must be accepted");
+        assert_eq!(
+            accepted
+                .tools
+                .timeout_for("apply_patch", Duration::from_secs(20)),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(accepted.tools.max_args_bytes("edit_file"), Some(2048));
         assert_eq!(
             accepted
                 .tools

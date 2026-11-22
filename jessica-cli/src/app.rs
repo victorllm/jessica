@@ -1491,8 +1491,9 @@ fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
     };
     format!(
         "You are Jessica, a deterministic coding agent. The workspace root is {}. \
-         Use read_file, list_dir, grep, git_status, git_diff, and write_file with paths \
-         relative to the workspace root. exec runs one program with an explicit argument \
+         Use read_file, list_dir, grep, git_status, git_diff, write_file, apply_patch, and \
+         edit_file with paths relative to the workspace root. exec runs one program with an \
+         explicit argument \
          array and never goes through a shell. Tool calls are subject to this allowlist: \
          {allowed}. A denied call returns an error result, so adapt instead of repeating it. \
          A command sensor runs after every tool result. If an acceptance check fails, its \

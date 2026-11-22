@@ -9,8 +9,8 @@ use std::path::Path;
 use jessica_core::tool::Tool;
 use jessica_runtime::{DELEGATE_TASK_TOOL_NAME, delegate_task_schema};
 use jessica_tools::{
-    BashTool, CommandRunner, ExecTool, GitOperation, GitTool, GrepOptions, GrepTool,
-    ListDirOptions, ListDirTool, ReadFileTool, WriteFileTool,
+    ApplyPatchTool, BashTool, CommandRunner, EditFileTool, ExecTool, GitOperation, GitTool,
+    GrepOptions, GrepTool, ListDirOptions, ListDirTool, ReadFileTool, WriteFileTool,
 };
 
 use crate::app::{CliError, load_wasm_tools};
@@ -66,6 +66,8 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
         .timeout_for("git_diff", config.budget.tool_timeout());
     let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(root.to_path_buf()));
     let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(root.to_path_buf()));
+    let apply_patch: Arc<dyn Tool> = Arc::new(ApplyPatchTool::new(root.to_path_buf()));
+    let edit_file: Arc<dyn Tool> = Arc::new(EditFileTool::new(root.to_path_buf()));
     let read_artifact: Arc<dyn Tool> = Arc::new(ReadArtifactTool::from_config(root, config));
     let list_dir: Arc<dyn Tool> = Arc::new(ListDirTool::new(
         root.to_path_buf(),
@@ -122,6 +124,8 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
     vec![
         CatalogCandidate::from_tool(read, ToolSource::Native),
         CatalogCandidate::from_tool(write, ToolSource::Native),
+        CatalogCandidate::from_tool(apply_patch, ToolSource::Native),
+        CatalogCandidate::from_tool(edit_file, ToolSource::Native),
         CatalogCandidate::from_tool(read_artifact, ToolSource::Native),
         CatalogCandidate::from_tool(list_dir, ToolSource::Native),
         CatalogCandidate::from_tool(grep, ToolSource::Native),
@@ -340,7 +344,9 @@ mod tests {
         assert_eq!(
             names,
             [
+                "apply_patch",
                 "bash",
+                "edit_file",
                 "exec",
                 "git_diff",
                 "git_status",
