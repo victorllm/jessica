@@ -119,13 +119,17 @@ impl AcpEventMapper {
     /// The request repeats the identity and display fields of the call the
     /// client already received through `tool_call`, using the same provider
     /// id. It carries no command output or environment data.
-    pub(crate) fn permission_request_update(&self, call: &ToolCall) -> ToolCallUpdate {
+    pub(crate) fn permission_request_update(
+        &self,
+        call: &ToolCall,
+        raw_input: Value,
+    ) -> ToolCallUpdate {
         let mut fields = ToolCallUpdateFields::new()
             .title(tool_title(&call.name, &call.arguments))
             .name(call.name.clone())
             .kind(tool_kind(&call.name))
             .status(ToolCallStatus::Pending)
-            .raw_input(truncate_raw_input(&call.arguments));
+            .raw_input(raw_input);
         let locations = tool_locations(&self.cwd, &call.name, &call.arguments);
         if !locations.is_empty() {
             fields = fields.locations(locations);
@@ -504,7 +508,8 @@ mod tests {
             json!({"path": "out/result.txt", "content": "data"}),
         );
 
-        let update = mapper.permission_request_update(&call);
+        let update = mapper
+            .permission_request_update(&call, json!({"path": "out/result.txt", "content": "data"}));
 
         assert_eq!(update.tool_call_id.to_string(), "call_write");
         assert_eq!(update.fields.status, Some(ToolCallStatus::Pending));

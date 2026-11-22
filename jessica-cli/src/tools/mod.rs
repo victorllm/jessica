@@ -18,7 +18,9 @@ use crate::artifacts::ReadArtifactTool;
 use crate::config::HarnessConfig;
 
 pub(crate) use catalog::{CatalogCandidate, CatalogEntry, CatalogError, ToolCatalog};
-pub(crate) use descriptor::{ApprovalPolicy, ResultFormat, ToolSource};
+pub(crate) use descriptor::{
+    ApprovalPolicy, Capabilities, ResultFormat, ToolDescriptor, ToolSource,
+};
 
 use std::sync::Arc;
 
@@ -148,7 +150,10 @@ pub(crate) fn delegation_candidate() -> CatalogCandidate {
 /// The command loads WASM manifests because they are part of the configured
 /// catalog, but it never constructs a provider, event store, memory database,
 /// skill database, or MCP connection.
-async fn inspection_catalog(config: &HarnessConfig, root: &Path) -> Result<ToolCatalog, CliError> {
+pub(crate) async fn inspection_catalog(
+    config: &HarnessConfig,
+    root: &Path,
+) -> Result<ToolCatalog, CliError> {
     let mut candidates = native_candidates(root, config);
     for tool in load_wasm_tools(config, root).await? {
         candidates.push(CatalogCandidate::from_tool(tool, ToolSource::Wasm));

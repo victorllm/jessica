@@ -35,16 +35,17 @@ use crate::artifacts::ResultManager;
 use crate::config::{ConfigError, HarnessConfig};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventJournal, EventRecorder, RecorderError};
-use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
+use crate::governance::{
+    GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate, cli_permission_gate,
+};
 use crate::journal::TurnJournal;
 use crate::memory::MemoryAssembly;
+use crate::policy_v2::{PolicyError, PolicyTool, PolicyV2};
 use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
-use crate::tools::{
-    ApprovalPolicy, CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates,
-};
+use crate::tools::{CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -77,8 +78,16 @@ struct ToolWiring {
     result_guard: Arc<ResultSizeGuard>,
     /// Result manager applied before the result-size guard.
     result_manager: Arc<ResultManager>,
-    /// Optional approval gate used by interactive tools.
+    /// Optional protocol gate preserving the legacy sensitive-tool flow.
     permission_gate: Option<Arc<dyn ToolPermissionGate>>,
+    /// Optional gate used by policy `ask` verdicts.
+    ///
+    /// ACP reuses its permission gate here. A terminal CLI turn supplies a
+    /// one-shot prompt when an `ask` rule exists, without changing the legacy
+    /// behavior of sensitive tools that no rule mentions.
+    ask_gate: Option<Arc<dyn ToolPermissionGate>>,
+    /// Policy v2 evaluator shared by every governed tool in the turn.
+    policy_v2: Arc<PolicyV2>,
 }
 
 /// Per-turn middleware, agent, and pump wiring.
@@ -405,14 +414,16 @@ impl CliRuntime {
         // `initial_messages` must never mix a newer published config with an
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
-        let setup = self.build_turn(
-            &scope,
-            true,
-            &config,
-            update_sink,
-            &extra_tools,
-            permission_gate,
-        )?;
+        let setup = self
+            .build_turn(
+                &scope,
+                true,
+                &config,
+                update_sink,
+                &extra_tools,
+                permission_gate,
+            )
+            .await?;
         let first_session = session_id.unwrap_or_else(next_session_id);
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
@@ -767,7 +778,9 @@ impl CliRuntime {
 
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
-        let setup = self.build_turn(&scope, false, &config, None, &[], None)?;
+        let setup = self
+            .build_turn(&scope, false, &config, None, &[], None)
+            .await?;
         let trace_messages = checkpoint.messages().to_vec();
         if setup.cancel.is_cancelled() {
             let turn_id = next_turn_id();
@@ -882,9 +895,10 @@ impl CliRuntime {
     /// sink the pump keeps rendering to the terminal. `extra_tools` contains
     /// session-scoped tools such as MCP discoveries; each is still wrapped in
     /// [`GovernedTool`] by [`CliRuntime::build_tool_registry`].
-    /// `permission_gate` is attached to the sensitive native tools only; it is
-    /// `None` outside the ACP path.
-    fn build_turn(
+    /// `permission_gate` is the ACP protocol gate. A terminal CLI turn also
+    /// installs an ask-only prompt for policy v2 `ask` verdicts; neither gate
+    /// changes the legacy sensitive-tool flow when no approval is configured.
+    async fn build_turn(
         &self,
         scope: &TurnScope,
         allow_delegation: bool,
@@ -908,6 +922,18 @@ impl CliRuntime {
         ];
         let policy: Arc<dyn Policy> =
             Arc::new(AllowlistPolicy::new(config.policy.allowed_tools.clone()));
+        let policy_v2 = Arc::new(
+            PolicyV2::new(scope.root(), config)
+                .await
+                .map_err(CliError::PolicyV2)?,
+        );
+        // ACP supplies its protocol gate. A CLI turn installs a terminal
+        // prompt for `ask` verdicts (an explicit `ask` mode or an `ask` rule);
+        // without any gate an ask outcome fails closed. The CLI prompt is not
+        // used as the legacy sensitive-tool gate, so adding one `ask` rule
+        // does not start prompting for unrelated sensitive tools.
+        let cli_ask_gate = cli_permission_gate(scope.root(), config);
+        let ask_gate = permission_gate.clone().or(cli_ask_gate);
         let sensors = self.build_sensors(scope, config);
         let harness = Arc::new(
             Harness::with_event_capacity(Vec::new(), DEFAULT_EVENT_CAPACITY)
@@ -969,6 +995,8 @@ impl CliRuntime {
             result_guard: Arc::clone(&result_guard),
             result_manager,
             permission_gate,
+            ask_gate,
+            policy_v2,
         };
         let registry = self.build_tool_registry(&catalog, &wiring)?;
         let agent = AgentLoop::new(
@@ -1117,9 +1145,19 @@ impl CliRuntime {
             .with_result_manager(
                 Some(Arc::clone(&wiring.result_manager)),
                 entry.descriptor.result_format,
+            )
+            .with_policy_v2(
+                Arc::clone(&wiring.policy_v2),
+                PolicyTool::from_descriptor(&entry.descriptor),
             );
-            if entry.descriptor.approval == ApprovalPolicy::Interactive {
+            // A policy `ask` rule can target a tool that the legacy approval
+            // set never covered, so the ask gate is attached to every exposed
+            // tool. The evaluator decides which gate is consulted.
+            if wiring.permission_gate.is_some() {
                 governed = governed.with_permission_gate(wiring.permission_gate.clone());
+            }
+            if wiring.ask_gate.is_some() {
+                governed = governed.with_ask_gate(wiring.ask_gate.clone());
             }
             registry
                 .register(Arc::new(governed))
@@ -1530,10 +1568,25 @@ pub(crate) enum CliError {
     /// The tool catalog could not be built or queried.
     #[error("tool catalog error: {0}")]
     ToolCatalog(#[from] CatalogError),
+    /// Policy v2 could not be initialized or evaluated.
+    #[error("policy error: {0}")]
+    PolicyV2(#[from] PolicyError),
     /// A `tools` subcommand argument was missing, unknown, or malformed.
     #[error("invalid tools command: {message}")]
     InvalidToolsCommand {
         /// Human-readable parse failure.
+        message: String,
+    },
+    /// A `policy` subcommand argument was missing, unknown, or malformed.
+    #[error("invalid policy command: {message}")]
+    InvalidPolicyCommand {
+        /// Human-readable parse failure.
+        message: String,
+    },
+    /// `policy simulate` could not evaluate the requested call.
+    #[error("policy simulation failed: {message}")]
+    PolicySimulation {
+        /// Structured reason such as hidden tool, invalid JSON, or path error.
         message: String,
     },
     /// A tool could not be registered.
@@ -2225,6 +2278,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         let reason = setup
             .agent
@@ -2257,6 +2311,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         setup
             .agent
@@ -2288,6 +2343,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         setup
             .agent
@@ -2742,6 +2798,7 @@ mod tests {
         let config = runtime.config_snapshot();
         let setup = runtime
             .build_turn(&test_scope().await, true, &config, None, &[], None)
+            .await
             .expect("turn should build");
 
         let reason = setup
@@ -3351,9 +3408,11 @@ mod tests {
             .expect("scope b must build");
         let setup_a = runtime
             .build_turn(&scope_a, false, &config, None, &[], None)
+            .await
             .expect("turn a must build");
         let setup_b = runtime
             .build_turn(&scope_b, false, &config, None, &[], None)
+            .await
             .expect("turn b must build");
 
         parent_a.cancel();

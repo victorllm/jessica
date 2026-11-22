@@ -6,6 +6,7 @@ mod acp_events;
 mod acp_session;
 mod acp_store;
 mod app;
+mod approval;
 mod artifacts;
 mod config;
 mod delegation;
@@ -15,6 +16,8 @@ mod hot_reload;
 mod journal;
 mod mcp;
 mod memory;
+mod policy_command;
+mod policy_v2;
 mod pump;
 mod replay;
 mod shutdown;
@@ -41,6 +44,7 @@ use crate::config::{HarnessConfig, ReliabilityConfig as CliReliabilityConfig};
 use crate::events::EventRecorder;
 use crate::hot_reload::ConfigWatcher;
 use crate::memory::MemoryAssembly;
+use crate::policy_command::{PolicyCommand, run_policy_command};
 use crate::shutdown::{ShutdownController, ShutdownSignal, SignalListener};
 use crate::skills::{SkillCommand, SkillsAssembly, default_list_limit, run_skill_command};
 use crate::tools::{ToolsCommand, run_tools_command};
@@ -157,6 +161,20 @@ async fn run() -> RunOutcome {
             // skill database, MCP connection, or `.jessica` directory.
             let result: Result<Option<SessionEndReason>, CliError> = async {
                 run_tools_command(&config, &root, command).await?;
+                Ok(None)
+            }
+            .await;
+            RunOutcome {
+                result,
+                signal: None,
+            }
+        }
+        Mode::Policy { command } => {
+            // Policy simulation loads the catalog and evaluates one synthetic
+            // call. It never assembles a provider, event store, memory, skills,
+            // or MCP session, and it never executes a tool.
+            let result: Result<Option<SessionEndReason>, CliError> = async {
+                run_policy_command(&config, &root, command).await?;
                 Ok(None)
             }
             .await;
@@ -427,6 +445,11 @@ enum Mode {
         /// Catalog command to execute.
         command: ToolsCommand,
     },
+    /// Simulates the effective policy for one tool call.
+    Policy {
+        /// Policy command to execute.
+        command: PolicyCommand,
+    },
     /// Verifies recorded turn traces offline.
     Trace {
         /// Parsed trace command.
@@ -515,6 +538,15 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Option<Opti
                 return Ok(Some(Options {
                     config,
                     mode: Mode::Tools { command },
+                }));
+            }
+            "policy" if resume.is_none() && prompt_parts.is_empty() => {
+                let Some(command) = parse_policy_args(args)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(Options {
+                    config,
+                    mode: Mode::Policy { command },
                 }));
             }
             "trace" if resume.is_none() && prompt_parts.is_empty() => {
@@ -804,6 +836,105 @@ fn parse_tools_args(
             message: format!("unknown subcommand `{other}`; expected `list` or `inspect`"),
         }),
     }
+}
+
+/// Parses the arguments following the `policy` subcommand.
+///
+/// Only `simulate --tool <name> --args <json>` is accepted. Repeated or
+/// missing options fail instead of falling back to a default tool or empty
+/// arguments.
+fn parse_policy_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<Option<PolicyCommand>, CliError> {
+    let Some(subcommand) = args.next() else {
+        return Err(CliError::InvalidPolicyCommand {
+            message: "missing subcommand; expected `simulate`".to_owned(),
+        });
+    };
+    if subcommand == "--help" || subcommand == "-h" {
+        print_usage();
+        return Ok(None);
+    }
+    if subcommand != "simulate" {
+        return Err(CliError::InvalidPolicyCommand {
+            message: format!("unknown subcommand `{subcommand}`; expected `simulate`"),
+        });
+    }
+
+    let mut tool = None;
+    let mut arguments = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(None);
+            }
+            "--tool" => {
+                let value = args.next().ok_or(CliError::InvalidPolicyCommand {
+                    message: "`policy simulate --tool` requires a tool name".to_owned(),
+                })?;
+                if tool.is_some() {
+                    return Err(CliError::InvalidPolicyCommand {
+                        message: "`--tool` may be given only once".to_owned(),
+                    });
+                }
+                tool = Some(value);
+            }
+            _ if arg.starts_with("--tool=") => {
+                let value = arg
+                    .strip_prefix("--tool=")
+                    .filter(|value| !value.is_empty())
+                    .ok_or(CliError::InvalidPolicyCommand {
+                        message: "`--tool` requires a tool name".to_owned(),
+                    })?;
+                if tool.is_some() {
+                    return Err(CliError::InvalidPolicyCommand {
+                        message: "`--tool` may be given only once".to_owned(),
+                    });
+                }
+                tool = Some(value.to_owned());
+            }
+            "--args" => {
+                let value = args.next().ok_or(CliError::InvalidPolicyCommand {
+                    message: "`policy simulate --args` requires a JSON object".to_owned(),
+                })?;
+                if arguments.is_some() {
+                    return Err(CliError::InvalidPolicyCommand {
+                        message: "`--args` may be given only once".to_owned(),
+                    });
+                }
+                arguments = Some(value);
+            }
+            _ if arg.starts_with("--args=") => {
+                let value = arg
+                    .strip_prefix("--args=")
+                    .filter(|value| !value.is_empty())
+                    .ok_or(CliError::InvalidPolicyCommand {
+                        message: "`policy simulate --args` requires a JSON object".to_owned(),
+                    })?;
+                if arguments.is_some() {
+                    return Err(CliError::InvalidPolicyCommand {
+                        message: "`--args` may be given only once".to_owned(),
+                    });
+                }
+                arguments = Some(value.to_owned());
+            }
+            other => {
+                return Err(CliError::InvalidPolicyCommand {
+                    message: format!("unexpected `policy simulate` argument `{other}`"),
+                });
+            }
+        }
+    }
+
+    Ok(Some(PolicyCommand::Simulate {
+        tool: tool.ok_or_else(|| CliError::InvalidPolicyCommand {
+            message: "`policy simulate` requires `--tool <name>`".to_owned(),
+        })?,
+        args: arguments.ok_or_else(|| CliError::InvalidPolicyCommand {
+            message: "`policy simulate` requires `--args '<json>'`".to_owned(),
+        })?,
+    }))
 }
 
 /// Parses the arguments following the `trace` subcommand.
@@ -1340,6 +1471,13 @@ fn print_usage() {
          also shows hidden tools and why they are hidden. `tools inspect` prints\n\
          one tool's descriptor, capabilities, limits, policy hints, and schema.\n\
          Both commands are side-effect free: they do not create a provider,\n\
+         event store, memory or skill database, or MCP connection.\n\
+         \n\
+         Usage: jessica [--config <path>] policy simulate --tool <name> --args '<json>'\n\
+         \n\
+         Evaluates the effective policy v2 rules and approval mode for one\n\
+         synthetic tool call and prints the matched rule, decision, and reason.\n\
+         The tool is never executed. The command does not create a provider,\n\
          event store, memory or skill database, or MCP connection.\n\
          \n\
          Usage: jessica [--config <path>] acp\n\

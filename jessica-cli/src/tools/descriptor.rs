@@ -430,7 +430,17 @@ mod tests {
         assert!(wasm.read_only);
         assert!(!wasm.writes_files && !wasm.network && !wasm.destructive);
 
-        for capabilities in [read, read_artifact, exec, write, bash, wasm] {
+        let delegation = Capabilities::for_tool(
+            ToolSource::Delegation,
+            jessica_runtime::DELEGATE_TASK_TOOL_NAME,
+        );
+        assert!(
+            delegation.destructive && delegation.writes_files && delegation.executes,
+            "delegation runs a child agent and must be treated as destructive"
+        );
+        assert!(!delegation.read_only);
+
+        for capabilities in [read, read_artifact, exec, write, bash, wasm, delegation] {
             assert!(
                 !capabilities.parallel_safe,
                 "no tool is parallel-safe in this phase"

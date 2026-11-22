@@ -242,6 +242,132 @@ appear in `policy.allowed_tools`, and still asks for interactive approval when
 an ACP permission gate is installed. Reads, searches, and git inspection are
 governed by the allowlist alone.
 
+### Policy rules v2 and approval modes
+
+`policy.allowed_tools` remains the top-level exposure allowlist: a tool outside
+it is never registered, and `jessica policy simulate` reports it as hidden.
+Parameter-level rules then decide individual calls for tools that are already
+exposed. Rules are optional and additive; an empty `rules` list preserves the
+original allowlist-only behavior.
+
+```toml
+[policy]
+allowed_tools = ["read_file", "write_file", "exec", "delegate_task"]
+
+[[policy.rules]]
+id = "protect-secrets"
+tool = "read_file"
+path_glob = "secrets/**"
+action = "deny"
+reason = "classified material stays unread"
+
+[[policy.rules]]
+id = "ask-push"
+tool = "exec"
+program = "git"
+args_prefix = ["push"]
+action = "ask"
+reason = "pushing needs review"
+
+[approval]
+mode = "ask" # "ask" | "deny" | "allow"; default "ask"
+```
+
+A rule may set any combination of these conditions; every present condition
+must match (logical AND):
+
+| Field | Meaning |
+| --- | --- |
+| `tool` | One name or an array of names. Omit it to match every tool. |
+| `path_glob` | Glob matched against the canonical workspace-relative path. Native file tools use their path argument; `exec` uses its canonical `cwd`. |
+| `program` | Exact `exec.program`. Only meaningful for `exec`; `bash` is accepted by validation but never matched. |
+| `args_prefix` | Required prefix of `exec.args`. Only meaningful for `exec`; `bash` is never tokenized. |
+
+`bash` is deliberately opaque: its command string is never split or parsed, so
+`program`/`args_prefix` rules never match bash and `path_glob` never inspects
+its command. Paths are canonicalized before matching; `..` escapes, symlink
+escapes, and uncanonicalizable paths are structured denials rather than silent
+non-matches. `write_file` may name a missing target as long as its nearest
+existing ancestor is inside the workspace.
+
+Rules must have a unique non-empty `id`, at least one matching condition,
+`action` set to `deny`, `ask`, or `allow`, and no unknown fields. An empty
+`path_glob`, `program`, or `args_prefix` is rejected.
+
+Evaluation order is fixed and independent of configuration order: every
+matching `deny`, then every matching `ask`, then every matching `allow`.
+Within one priority the first configured match wins. If no rule matches, the
+approval mode applies to sensitive tools; tools outside the sensitive set stay
+allowlisted.
+
+The glob subset is intentionally small and dependency-free: `*` matches zero or
+more characters within one segment, `**` is recognized only as a complete
+segment and matches zero or more segments, and `?` matches one character.
+Character classes, brace expansion, and backslash escapes are literal
+characters. Matching always uses slash-separated workspace-relative paths, so
+there are no platform-specific path semantics.
+
+Approval modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `ask` (default) | Sensitive tools and matching `ask` rules need one-time approval. A terminal CLI turn prompts on stderr and accepts `y`/`yes`; ACP uses `session/request_permission`. Without a gate, an explicit `ask` fails closed. |
+| `deny` | Sensitive tools and `ask` rules are denied unless a matching `allow` rule permits the call. Use this mode for unattended CI. |
+| `allow` | Policy-allowed sensitive tools and `ask` rules run without a prompt, but Jessica records a `PermissionDecided { Allow }` event before execution. If that event cannot be recorded, the call does not run. |
+
+An `ask` rule enables the terminal prompt on its own, even without an
+`[approval]` section. It does not start prompting for legacy-sensitive tools
+that no rule mentions.
+
+The sensitive set remains `bash`, `exec`, `write_file`, and `delegate_task`.
+With an explicit `[approval]` section, destructive MCP tools also become
+sensitive; WASM tools keep their read-only capability classification.
+Approval requests carry only the tool name, a bounded argument summary, and a
+reason. For `write_file` the summary is a bounded line-diff summary rather than
+the file body; for `exec` it is program, argument list, and `cwd`. Unknown
+tools keep their argument shape with secret-looking keys redacted and oversized
+values truncated. Environments and credentials are never read or sent.
+
+#### Migration from 9.1
+
+- Existing configurations need no changes. `policy.allowed_tools` keeps its
+  meaning, and an empty `rules` list plus no `[approval]` section preserves the
+  pre-v2 behavior: ACP asks for the fixed sensitive set, while a CLI turn
+  without a permission gate runs allowlisted tools.
+- Adding `[approval] mode = "ask"` is an explicit choice: a CLI turn without a
+  terminal gate now fails closed for sensitive tools instead of running them
+  silently.
+- Rules cannot expose a tool. Add the name to `policy.allowed_tools` (and use a
+  compatible `tools.profile`) before a rule can affect it.
+- Prefer a `deny` rule over removing a tool from the allowlist when the model
+  should see an explicit, explainable denial.
+
+#### Simulating a decision
+
+```bash
+jessica --config harness.toml policy simulate \
+  --tool read_file --args '{"path":"secrets/token.txt"}'
+```
+
+The output names the tool and source, the final decision, the matched rule (or
+`-`), the approval disposition, and the reason:
+
+```text
+tool: read_file
+source: native
+decision: deny
+rule: protect-secrets
+approval: denied
+reason: classified material stays unread
+```
+
+Simulation loads the same catalog as `jessica tools` (including WASM manifests)
+but never constructs a provider, event store, memory or skill database, MCP
+session, or executes a tool. Unknown tools, hidden tools, invalid JSON,
+non-object arguments, and uncanonicalizable paths exit nonzero with a
+structured diagnostic. `--tool <name> --args '<json>'` and the `--tool=...` /
+`--args=...` forms are equivalent.
+
 ### Native tools
 
 - `read_file` accepts a workspace-relative `path`, plus optional `offset` and
@@ -847,11 +973,16 @@ client's ACP documentation if it differs.
 
 ### Permission requests
 
-Before running a sensitive native tool, Jessica sends ACP
+Before running a sensitive tool, Jessica sends ACP
 `session/request_permission` and waits for the client. The fixed sensitive set is
 `bash`, `exec`, `write_file`, and `delegate_task`; `read_file`, `list_dir`,
-`grep`, `git_status`, `git_diff`, configured MCP tools, and WASM tools remain
-governed only by the policy allowlist.
+`grep`, `git_status`, `git_diff`, and WASM tools remain governed only by the
+policy allowlist. Configured MCP tools are policy-only as well, unless the
+configuration contains an explicit `[approval]` section: then destructive MCP
+tools also request permission. Policy v2 `ask` rules request permission for any
+exposed tool they match. The request's `rawInput` is a bounded, redacted
+argument summary and never contains the full environment or secret-looking
+values.
 
 - Every request offers exactly `allow_once` ("Allow this execution") and
   `reject_once` ("Reject this execution"). Jessica keeps no persistent approval
@@ -886,7 +1017,9 @@ governed only by the policy allowlist.
   are rejected, and `session/load`/`session/resume` still reject non-empty
   `mcpServers`. See [Stdio MCP servers](#stdio-mcp-servers).
 - **Permissions**: `bash`, `exec`, `write_file`, and `delegate_task` ask through
-  `session/request_permission` before execution; see
+  `session/request_permission` before execution. An explicit `[approval]`
+  section extends this to destructive MCP tools, and policy v2 `ask` rules can
+  request permission for other exposed tools; see
   [Permission requests](#permission-requests). A denied call produces a failed
   `tool_call_update`.
 - **No archive/fork/status/set_title**: the stable v1 `list`, `delete`,

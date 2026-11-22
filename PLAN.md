@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5 已完成，9.3b 待依赖审批，9.6–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6 已完成，9.3b 待依赖审批，9.7–9.8 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2045,7 +2045,7 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.3b** | Supervisor B（依赖门）：进程组 kill、SIGTERM→SIGKILL、rlimits | 否 | `libc`/`nix` 审批 | 9.3a | ☐ |
 | **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☑ |
 | **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☑ |
-| **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☐ |
+| **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☑ |
 | **9.7** | 原生工具 B：glob、regex grep、`apply_patch`、`edit_file` | 否 | `globset`/`regex` 审批 | 9.5/9.6 | ☐ |
 | **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☐ |
 
@@ -2198,7 +2198,7 @@ Task 9.5（已完成）：原生工具 A — read ranges、`list_dir`、literal 
 
 ---
 
-Task 9.6（待确认）：Policy v2、approval modes、`policy simulate`
+Task 9.6（已完成）：Policy v2、approval modes、`policy simulate`
 
 范围与约束：
 
@@ -2212,6 +2212,17 @@ Task 9.6（待确认）：Policy v2、approval modes、`policy simulate`
 - 测试：deny 优先于 ask/allow；ask 优先于 allow；同优先级首条命中；path canonicalize/symlink 逃逸；exec program/args prefix；bash 不做字符串解析；delegate destructive；approval ask/deny/allow 的可观察行为；simulate 不执行工具且输出命中 id；配置重复 id/空条件/未知 action/未知字段拒绝。
 
 完成标准：fmt/clippy/test 全绿；真实 CLI `policy simulate` E2E；README policy v2、approval 与迁移说明；未改 core、未新增第三方 crate。
+
+实施记录（2026-11-22，实际耗时约 100 分钟，含一次上下文压缩后继续）：
+
+- 完成情况：`jessica-cli` 新增 `policy_v2.rs`、`approval.rs`、`policy_command.rs`。`[policy]` 新增 `[[policy.rules]]`，支持 `tool` 字符串/数组、`path_glob`、`program`、`args_prefix`、`action`、`reason`，`deny_unknown_fields`；加载期校验 id 唯一非空、至少一个条件、action 合法、path_glob/program/args_prefix 非空、program/args_prefix 仅用于 exec/bash。`[approval] mode` 支持 ask/deny/allow，默认 ask。
+- 评估：宿主侧 `PolicyV2` 在 harness allowlist 之后、permission gate 与执行之前评估。固定顺序为全部 deny → 全部 ask → 全部 allow → 敏感工具批准模式；同一优先级取配置顺序第一条。路径先做词法归一化，再 canonicalize 最近存在祖先；拒绝 `..`/symlink 逃逸、悬空 symlink、workspace 外路径与非 UTF-8。文件工具按 descriptor 的 `path_field` 匹配，`exec` 按 `program` + `args` 前缀 + canonical `cwd`，`bash` 从不解析命令字符串。最小 glob 仅实现 `*`/`**`/`?`，字符类、花括号与反斜杠按字面量处理并在 README 明示。
+- 批准行为：无 `[approval]` 时保持 9.1 行为（ACP 对固定敏感集请求，CLI 无 gate 时运行已允许工具）；显式 `ask` 或任一 ask 规则在 CLI TTY 上启用专用 ask gate，以 stderr 一次性 `y/yes` 询问（120 s 超时），ACP 的 ask verdict 复用协议 gate，无 gate 时 fail closed。ask gate 与 legacy sensitive gate 分离，因此仅添加一条 ask 规则不会让未被规则提及的敏感工具开始询问。`deny` 拒绝敏感工具与 ask 规则，除非显式 allow；`allow` 自动批准但仍先写入 `PermissionDecided { Allow }`，写入失败则不执行。显式 `[approval]` 下 destructive MCP 也视为敏感；WASM 维持既有只读能力分类；`delegate_task` 保持 legacy 敏感且 destructive。
+- 审批摘要：`exec` 仅 program/args/cwd，`bash` 仅 command，`delegate_task` 仅 task，`write_file` 返回 path、字节/行数与有界公共前后缀 diff（最多读取 256 KiB，且 canonical 后必须在 workspace 内）；未知/MCP 工具递归脱敏 secret/token/password/api_key/credential 等键并截断。ACP `rawInput` 改用该摘要，不再传原始完整参数。
+- `policy simulate`：同一 inspection catalog（含 WASM manifest）评估合成 `ToolCall`，输出 tool/source/decision/rule/approval/reason。未知/隐藏工具、非法 JSON、非对象参数、不可 canonicalize 路径均结构化失败。命令在 `assemble_runtime` 之前处理，不创建 provider、事件库、memory/skills DB、MCP 连接，也不执行工具。
+- 测试：config 规则/批准模式边界；`policy_v2` glob、优先级、首条命中、路径规范化与 symlink 逃逸、exec 匹配、bash 不解析、MCP/approval 组合；`approval` 摘要与脱敏；`governance` 集成测试覆盖 deny 不询问不执行、ask allow/reject、ask 无 gate fail closed、ask-only gate 不改变 legacy 敏感工具、deny/allow 模式、自动批准先记录后执行、allow 规则覆盖 deny 模式、MCP 敏感性与 9.1 兼容、symlink 逃逸、`delegate_task` 的 Delegation capability 为 destructive 且显式 ask 模式下拒绝后不执行；真实 CLI E2E `policy_cli_e2e` 覆盖 deny 命中输出、write_file 不落盘、非法 JSON/未知/隐藏工具、symlink 逃逸、exec program/args、重复 id 配置拒绝，并断言不创建 events/memory/skills/.jessica/artifacts。
+- 偏离/说明：1) `jessica-core` 的冻结 `PolicyDecision` 只有 Allow/Deny，故 `ask` 作为 CLI 宿主内三态判定实现，未改 core，也未替换 harness allowlist；2) 计划中的“默认拒绝”按既有 allowlist/未知工具语义落地：未暴露工具仍拒绝，已暴露的非敏感工具在无规则命中时保持 9.1 的允许行为，避免破坏兼容性；敏感工具由显式批准模式或 legacy gate 决定；计划文字中的“`deny` 为 CI 默认”未做成 preset 的隐式默认，否则会改变未写 `[approval]` 的既有 `ci` 配置行为；当前默认仍为 `ask`，CI 需显式写 `[approval] mode = "deny"`；3) 校验允许 `program`/`args_prefix` 与 `bash` 组合以匹配计划文字，但评估器只在 `exec` 上匹配，bash 规则因不解析命令而永不命中；4) `jessica governance explain` 为可选项，本 Task 未实现；5) `path_glob` 仅对 Native 工具求值，MCP/WASM 的参数不当作 workspace 路径；6) 显式 `ask` 需要 gate，非 TTY CLI 无内置 gate 时 fail closed；7) `build_turn` 改为 async 以 canonicalize workspace root，属 CLI 内部装配变化；8) `DESIGN.md` 保持未跟踪，未修改 `jessica-core`，未新增第三方 crate。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1098 passed, 0 failed, 2 ignored（含 `policy_cli_e2e` 6 个 E2E 与 `governance` 新增集成测试）。
 
 ---
 

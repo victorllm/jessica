@@ -16,6 +16,8 @@
 //! error result and may adapt. Permission denial, cancellation, timeout, and
 //! delivery failure are also model-facing errors and never run the tool.
 
+use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -29,10 +31,14 @@ use jessica_core::tool::{Tool, ToolSchema};
 use jessica_core::types::{AgentEvent, BudgetKind, PermissionDecision, ToolCall, ToolResult};
 use jessica_harness::{Harness, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard};
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::approval_request_input;
 use crate::artifacts::ResultManager;
+use crate::config::{ApprovalMode, HarnessConfig, RuleAction};
+use crate::policy_v2::{PolicyTool, PolicyV2, PolicyVerdict, RuleMatch};
 use crate::tools::ResultFormat;
 
 /// Shared budget state for one CLI turn.
@@ -232,6 +238,66 @@ pub(crate) trait ToolPermissionGate: Send + Sync {
     async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision;
 }
 
+/// Returns the interactive terminal gate for policy `ask` verdicts.
+///
+/// One-shot and REPL turns have no protocol client. If stdin is a terminal and
+/// the configuration needs an answer (an explicit `ask` mode or at least one
+/// `ask` rule), the CLI prompts for a one-time decision. Otherwise no gate is
+/// installed and an `ask` outcome fails closed. ACP always supplies its own
+/// gate. This gate is not used for the legacy sensitive-tool flow.
+pub(crate) fn cli_permission_gate(
+    root: &Path,
+    config: &HarnessConfig,
+) -> Option<Arc<dyn ToolPermissionGate>> {
+    let explicit_ask = config.approval.explicit && config.approval.mode == ApprovalMode::Ask;
+    let rule_asks = config
+        .policy
+        .rules
+        .iter()
+        .any(|rule| rule.action == RuleAction::Ask);
+    if (explicit_ask || rule_asks) && std::io::stdin().is_terminal() {
+        Some(Arc::new(CliPermissionGate {
+            root: root.to_path_buf(),
+            timeout: Duration::from_secs(120),
+        }))
+    } else {
+        None
+    }
+}
+
+/// Permission gate that prompts on stderr and reads one line from stdin.
+struct CliPermissionGate {
+    /// Workspace root used for the bounded write-file diff summary.
+    root: std::path::PathBuf,
+    /// Maximum time to wait for an answer.
+    timeout: Duration,
+}
+
+#[async_trait]
+impl ToolPermissionGate for CliPermissionGate {
+    async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision {
+        let summary = approval_request_input(&self.root, call).await;
+        eprintln!(
+            "[approval] tool `{}` requires approval for this execution",
+            call.name
+        );
+        eprintln!("[approval] arguments: {summary}");
+        eprintln!("[approval] allow once? [y/N]");
+
+        let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut answer = String::new();
+        match tokio::time::timeout(self.timeout, reader.read_line(&mut answer)).await {
+            Err(_) => ToolPermissionDecision::TimedOut,
+            Ok(Err(_)) => ToolPermissionDecision::TransportFailed,
+            Ok(Ok(0)) => ToolPermissionDecision::Reject,
+            Ok(Ok(_)) => match answer.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => ToolPermissionDecision::Allow,
+                _ => ToolPermissionDecision::Reject,
+            },
+        }
+    }
+}
+
 /// Tool adapter that applies policy, permission, timeout, and result-size
 /// governance.
 pub(crate) struct GovernedTool {
@@ -243,8 +309,11 @@ pub(crate) struct GovernedTool {
     result_guard: Arc<ResultSizeGuard>,
     max_args_bytes: Option<usize>,
     permission: Option<Arc<dyn ToolPermissionGate>>,
+    ask_gate: Option<Arc<dyn ToolPermissionGate>>,
     result_manager: Option<Arc<ResultManager>>,
     result_format: ResultFormat,
+    policy_v2: Option<Arc<PolicyV2>>,
+    policy_tool: Option<PolicyTool>,
 }
 
 impl GovernedTool {
@@ -269,9 +338,23 @@ impl GovernedTool {
             result_guard,
             max_args_bytes: None,
             permission: None,
+            ask_gate: None,
             result_manager: None,
             result_format: ResultFormat::Text,
+            policy_v2: None,
+            policy_tool: None,
         }
+    }
+
+    /// Attaches the policy v2 evaluator and the host facts for this tool.
+    ///
+    /// The evaluator runs after the harness allowlist and before any
+    /// permission gate or execution. Without it the wrapper keeps the pre-v2
+    /// approval behavior.
+    pub(crate) fn with_policy_v2(mut self, policy: Arc<PolicyV2>, tool: PolicyTool) -> Self {
+        self.policy_v2 = Some(policy);
+        self.policy_tool = Some(tool);
+        self
     }
 
     /// Sets the optional serialized-argument size limit.
@@ -284,15 +367,26 @@ impl GovernedTool {
         self
     }
 
-    /// Attaches the optional approval gate for sensitive tools.
+    /// Attaches the optional legacy approval gate for sensitive tools.
     ///
-    /// The gate is consulted only for names accepted by
-    /// [`permission_required`]; other tools keep policy-only governance.
+    /// The gate is consulted only when policy returns
+    /// [`PolicyVerdict::Legacy`] for a sensitive tool. ACP supplies it; a CLI
+    /// turn normally leaves it absent to preserve pre-v2 behavior.
     pub(crate) fn with_permission_gate(
         mut self,
         permission: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Self {
         self.permission = permission;
+        self
+    }
+
+    /// Attaches the optional gate used by policy `ask` verdicts.
+    ///
+    /// This gate covers `ask` rules and explicit approval modes. It is
+    /// separate from [`Self::with_permission_gate`] so a CLI `ask` rule does
+    /// not start prompting for unrelated legacy-sensitive tools.
+    pub(crate) fn with_ask_gate(mut self, ask_gate: Option<Arc<dyn ToolPermissionGate>>) -> Self {
+        self.ask_gate = ask_gate;
         self
     }
 
@@ -353,56 +447,55 @@ impl GovernedTool {
             );
         }
 
-        if permission_required(self.inner.name())
-            && let Some(gate) = &self.permission
-        {
-            // ACP requires the provider's real tool-call id. A wrapper without
-            // one must fail closed instead of inventing an id for the client.
-            if call.id.is_empty() {
-                return ToolResult::error(
-                    String::new(),
-                    format!(
-                        "tool `{}` requires a provider tool-call id for permission",
-                        self.inner.name()
-                    ),
-                );
-            }
-            let decision = gate.request_permission(call).await;
-            // The decision is recorded before the tool runs and before a
-            // denial is returned. An `Allow` whose event cannot be persisted
-            // must not execute: the trace would claim an unexplained run.
-            let recorded = self
-                .governance
-                .emit(AgentEvent::PermissionDecided {
-                    call: call.clone(),
-                    decision: permission_decision(decision),
-                })
-                .await;
-            match decision {
-                ToolPermissionDecision::Allow if recorded => {}
-                ToolPermissionDecision::Allow => {
+        let verdict = match (&self.policy_v2, &self.policy_tool) {
+            (Some(policy), Some(tool)) => match policy.evaluate(tool, call).await {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    // A path that cannot be canonicalized or that escapes the
+                    // workspace must fail closed instead of falling through to
+                    // the allowlist decision.
+                    let reason = error.to_string();
+                    self.governance
+                        .emit(AgentEvent::PolicyDenied {
+                            call: call.clone(),
+                            reason: reason.clone(),
+                        })
+                        .await;
                     return ToolResult::error(
                         String::new(),
                         format!(
-                            "tool `{}` was not executed because the permission decision could not be recorded",
+                            "tool `{}` was denied by policy: {reason}",
                             self.inner.name()
                         ),
                     );
                 }
-                decision => {
-                    let outcome = match decision {
-                        ToolPermissionDecision::Reject => "was denied by the user",
-                        ToolPermissionDecision::Cancelled => "permission request was cancelled",
-                        ToolPermissionDecision::TimedOut => "permission request timed out",
-                        ToolPermissionDecision::TransportFailed => {
-                            "permission request could not be completed"
-                        }
-                        ToolPermissionDecision::Allow => unreachable!("allow is handled above"),
-                    };
-                    return ToolResult::error(
-                        String::new(),
-                        format!("tool `{}` {outcome}", self.inner.name()),
-                    );
+            },
+            _ => PolicyVerdict::Legacy {
+                sensitive: permission_required(self.inner.name()),
+            },
+        };
+
+        match verdict {
+            PolicyVerdict::Deny { reason, rule } => {
+                return self.policy_denial(call, reason, rule).await;
+            }
+            PolicyVerdict::Ask { reason, .. } => {
+                if let Err(result) = self.require_approval(call, reason).await {
+                    return result;
+                }
+            }
+            PolicyVerdict::AutoApprove { reason, .. } => {
+                if let Err(result) = self.record_auto_approval(call, &reason).await {
+                    return result;
+                }
+            }
+            PolicyVerdict::Allow { .. } => {}
+            PolicyVerdict::Legacy { sensitive } => {
+                if sensitive
+                    && let Some(gate) = &self.permission
+                    && let Err(result) = self.request_gate_decision(gate, call).await
+                {
+                    return result;
                 }
             }
         }
@@ -454,6 +547,147 @@ impl GovernedTool {
                 result
             }
         }
+    }
+
+    /// Emits a policy denial and returns the model-facing error result.
+    async fn policy_denial(
+        &self,
+        call: &ToolCall,
+        reason: String,
+        rule: Option<RuleMatch>,
+    ) -> ToolResult {
+        let reason = match rule {
+            Some(rule) => format!("policy rule `{}`: {reason}", rule.rule_id),
+            None => reason,
+        };
+        self.governance
+            .emit(AgentEvent::PolicyDenied {
+                call: call.clone(),
+                reason: reason.clone(),
+            })
+            .await;
+        ToolResult::error(
+            String::new(),
+            format!(
+                "tool `{}` was denied by policy: {reason}",
+                self.inner.name()
+            ),
+        )
+    }
+
+    /// Requires a one-time approval decision from an installed gate.
+    ///
+    /// The ask gate takes precedence because it exists specifically for policy
+    /// `ask` verdicts. Without either gate this fails closed. A rule that asks
+    /// must not silently become an allow just because the host cannot prompt.
+    async fn require_approval(&self, call: &ToolCall, reason: String) -> Result<(), ToolResult> {
+        let Some(gate) = self.ask_gate.as_ref().or(self.permission.as_ref()) else {
+            let message = format!(
+                "tool `{}` requires approval ({reason}) but no permission gate is available",
+                self.inner.name()
+            );
+            self.governance
+                .emit(AgentEvent::PolicyDenied {
+                    call: call.clone(),
+                    reason: message.clone(),
+                })
+                .await;
+            return Err(ToolResult::error(String::new(), message));
+        };
+        self.request_gate_decision(gate, call).await
+    }
+
+    /// Runs the selected permission gate and records its decision.
+    async fn request_gate_decision(
+        &self,
+        gate: &Arc<dyn ToolPermissionGate>,
+        call: &ToolCall,
+    ) -> Result<(), ToolResult> {
+        // ACP requires the provider's real tool-call id. A wrapper without one
+        // must fail closed instead of inventing an id for the client.
+        if call.id.is_empty() {
+            return Err(ToolResult::error(
+                String::new(),
+                format!(
+                    "tool `{}` requires a provider tool-call id for permission",
+                    self.inner.name()
+                ),
+            ));
+        }
+        let decision = gate.request_permission(call).await;
+        // The decision is recorded before the tool runs and before a denial is
+        // returned. An `Allow` whose event cannot be persisted must not
+        // execute: the trace would claim an unexplained run.
+        let recorded = self
+            .governance
+            .emit(AgentEvent::PermissionDecided {
+                call: call.clone(),
+                decision: permission_decision(decision),
+            })
+            .await;
+        match decision {
+            ToolPermissionDecision::Allow if recorded => Ok(()),
+            ToolPermissionDecision::Allow => Err(ToolResult::error(
+                String::new(),
+                format!(
+                    "tool `{}` was not executed because the permission decision could not be recorded",
+                    self.inner.name()
+                ),
+            )),
+            decision => {
+                let outcome = match decision {
+                    ToolPermissionDecision::Reject => "was denied by the user",
+                    ToolPermissionDecision::Cancelled => "permission request was cancelled",
+                    ToolPermissionDecision::TimedOut => "permission request timed out",
+                    ToolPermissionDecision::TransportFailed => {
+                        "permission request could not be completed"
+                    }
+                    ToolPermissionDecision::Allow => unreachable!("allow is handled above"),
+                };
+                Err(ToolResult::error(
+                    String::new(),
+                    format!("tool `{}` {outcome}", self.inner.name()),
+                ))
+            }
+        }
+    }
+
+    /// Records an auto-approval before execution.
+    ///
+    /// `approval.mode = "allow"` still produces a permission event so a trace
+    /// shows why a sensitive tool ran without a prompt.
+    async fn record_auto_approval(&self, call: &ToolCall, reason: &str) -> Result<(), ToolResult> {
+        if call.id.is_empty() {
+            return Err(ToolResult::error(
+                String::new(),
+                format!(
+                    "tool `{}` requires a provider tool-call id for an approval record",
+                    self.inner.name()
+                ),
+            ));
+        }
+        let recorded = self
+            .governance
+            .emit(AgentEvent::PermissionDecided {
+                call: call.clone(),
+                decision: PermissionDecision::Allow,
+            })
+            .await;
+        if !recorded {
+            return Err(ToolResult::error(
+                String::new(),
+                format!(
+                    "tool `{}` was not executed because the auto-approval could not be recorded",
+                    self.inner.name()
+                ),
+            ));
+        }
+        tracing::debug!(
+            tool = self.inner.name(),
+            reason,
+            "policy auto-approved a sensitive tool"
+        );
+        Ok(())
     }
 
     /// Reports a timeout and returns the model-facing error result.
@@ -511,11 +745,14 @@ mod tests {
     use jessica_core::types::{Message, TokenUsage};
     use jessica_harness::AllowlistPolicy;
 
+    use crate::config::{ApprovalConfig, PolicyConfig, PolicyRuleConfig, RuleAction, ToolSelector};
+    use crate::tools::{Capabilities, ToolSource};
+
     struct MockTool {
         name: &'static str,
         content: String,
         delay: Duration,
-        calls: AtomicU32,
+        calls: Arc<AtomicU32>,
     }
 
     impl MockTool {
@@ -524,7 +761,7 @@ mod tests {
                 name,
                 content: content.into(),
                 delay,
-                calls: AtomicU32::new(0),
+                calls: Arc::new(AtomicU32::new(0)),
             }
         }
     }
@@ -1369,6 +1606,727 @@ mod tests {
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty),
             "a rejected event must not be broadcast"
+        );
+    }
+
+    /// Temporary policy workspace removed recursively.
+    struct PolicyTempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl PolicyTempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "jessica-governance-policy-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("policy temp dir must be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for PolicyTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn policy_rule(id: &str, action: RuleAction, tool: &str) -> PolicyRuleConfig {
+        PolicyRuleConfig {
+            id: id.to_owned(),
+            tool: Some(ToolSelector::One(tool.to_owned())),
+            path_glob: None,
+            program: None,
+            args_prefix: None,
+            action,
+            reason: Some(format!("test reason for {id}")),
+        }
+    }
+
+    fn policy_config(
+        rules: Vec<PolicyRuleConfig>,
+        mode: ApprovalMode,
+        explicit: bool,
+    ) -> HarnessConfig {
+        HarnessConfig {
+            policy: PolicyConfig {
+                allowed_tools: vec![
+                    "bash".to_owned(),
+                    "exec".to_owned(),
+                    "read_file".to_owned(),
+                    "write_file".to_owned(),
+                    "delegate_task".to_owned(),
+                ],
+                rules,
+            },
+            approval: ApprovalConfig { mode, explicit },
+            ..HarnessConfig::default()
+        }
+    }
+
+    fn policy_tool_for(name: &str) -> PolicyTool {
+        let path_field = matches!(name, "read_file" | "read_artifact" | "list_dir" | "grep")
+            .then(|| "path".to_owned());
+        PolicyTool {
+            name: name.to_owned(),
+            source: ToolSource::Native,
+            capabilities: Capabilities::for_tool(ToolSource::Native, name),
+            path_field,
+            legacy_sensitive: permission_required(name),
+        }
+    }
+
+    /// Builds a governed tool with policy v2 attached.
+    async fn governed_with_policy(
+        inner: Arc<dyn Tool>,
+        harness: Arc<Harness>,
+        governance: Arc<GovernanceState>,
+        root: &Path,
+        config: &HarnessConfig,
+        policy_tool: PolicyTool,
+        gate: Option<Arc<dyn ToolPermissionGate>>,
+    ) -> GovernedTool {
+        let policy = Arc::new(
+            PolicyV2::new(root, config)
+                .await
+                .expect("policy evaluator must build"),
+        );
+        GovernedTool::new(
+            inner,
+            harness,
+            governance,
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(16 * 1024)),
+        )
+        .with_permission_gate(gate)
+        .with_policy_v2(policy, policy_tool)
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_emits_policy_denied_without_asking_or_running() {
+        let temp = PolicyTempDir::new("deny");
+        let config = policy_config(
+            vec![policy_rule("no-bash", RuleAction::Deny, "bash")],
+            ApprovalMode::Ask,
+            true,
+        );
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (governance, cancel, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            Arc::clone(&governance),
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+        let call = ToolCall::new("call-1", "bash", serde_json::json!({"command": "rm -rf /"}));
+
+        let result = tool.execute_with_call(&call).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("no-bash"),
+            "the model-facing error must name the rule: {}",
+            result.content
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            gate.calls().is_empty(),
+            "a deny rule must be decided before any permission prompt"
+        );
+        assert!(!governance.tripped());
+        assert!(!cancel.is_cancelled());
+        match events.try_recv() {
+            Ok(AgentEvent::PolicyDenied {
+                call: denied_call,
+                reason,
+            }) => {
+                assert_eq!(denied_call, call);
+                assert!(reason.contains("policy rule `no-bash`"));
+                assert!(reason.contains("test reason for no-bash"));
+            }
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "exactly one denial event must be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_runs_only_after_the_gate_allows_and_records_the_decision() {
+        let temp = PolicyTempDir::new("ask-allow");
+        let config = policy_config(
+            vec![policy_rule("ask-read", RuleAction::Ask, "read_file")],
+            ApprovalMode::Ask,
+            true,
+        );
+        let inner = Arc::new(MockTool::new("read_file", "contents", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["read_file"]),
+            Arc::clone(&governance),
+            &temp.path,
+            &config,
+            policy_tool_for("read_file"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+        let call = ToolCall::new(
+            "call-read",
+            "read_file",
+            serde_json::json!({"path": "a.txt"}),
+        );
+
+        let result = tool.execute_with_call(&call).await;
+
+        assert!(!result.is_error, "an allowed ask rule must run: {result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.calls(), vec![call.clone()]);
+        match events.try_recv() {
+            Ok(AgentEvent::PermissionDecided {
+                call: decided_call,
+                decision,
+            }) => {
+                assert_eq!(decided_call, call);
+                assert_eq!(decision, PermissionDecision::Allow);
+            }
+            other => panic!("expected PermissionDecided(Allow), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_rejection_fails_closed_and_records_the_denial() {
+        let temp = PolicyTempDir::new("ask-reject");
+        let config = policy_config(
+            vec![policy_rule("ask-read", RuleAction::Ask, "read_file")],
+            ApprovalMode::Ask,
+            true,
+        );
+        let inner = Arc::new(MockTool::new("read_file", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["read_file"]),
+            Arc::clone(&governance),
+            &temp.path,
+            &config,
+            policy_tool_for("read_file"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-read",
+                "read_file",
+                serde_json::json!({"path": "a.txt"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("denied by the user"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.calls().len(), 1);
+        match events.try_recv() {
+            Ok(AgentEvent::PermissionDecided { decision, .. }) => {
+                assert_eq!(decision, PermissionDecision::Deny);
+            }
+            other => panic!("expected PermissionDecided(Deny), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_without_a_gate_fails_closed() {
+        let temp = PolicyTempDir::new("ask-no-gate");
+        let config = policy_config(
+            vec![policy_rule("ask-bash", RuleAction::Ask, "bash")],
+            ApprovalMode::Ask,
+            true,
+        );
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            Arc::clone(&governance),
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            None,
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("no permission gate"),
+            "the failure must explain the missing gate: {}",
+            result.content
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        match events.try_recv() {
+            Ok(AgentEvent::PolicyDenied { reason, .. }) => {
+                assert!(reason.contains("requires approval"));
+            }
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_deny_mode_denies_sensitive_tools_before_the_gate() {
+        let temp = PolicyTempDir::new("mode-deny");
+        let config = policy_config(Vec::new(), ApprovalMode::Deny, true);
+        let inner = Arc::new(MockTool::new("bash", "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            Arc::clone(&governance),
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("approval mode `deny`"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert!(gate.calls().is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::PolicyDenied { .. })
+        ));
+    }
+
+    /// Sink that remembers how many tool executions had happened when each
+    /// event was recorded.
+    struct ExecutionProbe {
+        calls: Arc<AtomicU32>,
+        events: Mutex<Vec<AgentEvent>>,
+        calls_at_emit: Mutex<Vec<u32>>,
+    }
+
+    #[async_trait]
+    impl EventSink for ExecutionProbe {
+        async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+            let calls = self.calls.load(Ordering::SeqCst);
+            self.calls_at_emit
+                .lock()
+                .expect("probe mutex must not be poisoned")
+                .push(calls);
+            self.events
+                .lock()
+                .expect("probe mutex must not be poisoned")
+                .push(event);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_allow_mode_auto_approves_and_records_before_execution() {
+        let temp = PolicyTempDir::new("mode-allow");
+        let config = policy_config(Vec::new(), ApprovalMode::Allow, true);
+        let inner = Arc::new(MockTool::new("bash", "ran", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let probe = Arc::new(ExecutionProbe {
+            calls: Arc::clone(&inner.calls),
+            events: Mutex::new(Vec::new()),
+            calls_at_emit: Mutex::new(Vec::new()),
+        });
+        let (events, _receiver) = broadcast::channel(16);
+        let governance = Arc::new(
+            GovernanceState::new(events, CancellationToken::new())
+                .with_event_sink(Some(Arc::clone(&probe) as Arc<dyn EventSink>)),
+        );
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            governance,
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+        let call = ToolCall::new("call-bash", "bash", serde_json::json!({"command": "true"}));
+
+        let result = tool.execute_with_call(&call).await;
+
+        assert!(!result.is_error, "auto-approved call must run: {result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            gate.calls().is_empty(),
+            "approval mode `allow` must not prompt"
+        );
+        let recorded = probe
+            .events
+            .lock()
+            .expect("probe events must not be poisoned")
+            .clone();
+        assert_eq!(recorded.len(), 1, "exactly one approval event is required");
+        match &recorded[0] {
+            AgentEvent::PermissionDecided {
+                call: decided_call,
+                decision,
+            } => {
+                assert_eq!(decided_call, &call);
+                assert_eq!(*decision, PermissionDecision::Allow);
+            }
+            other => panic!("expected PermissionDecided(Allow), got {other:?}"),
+        }
+        assert_eq!(
+            probe
+                .calls_at_emit
+                .lock()
+                .expect("probe counters must not be poisoned")
+                .as_slice(),
+            [0],
+            "the auto-approval must be recorded before the tool executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_rule_overrides_explicit_deny_mode_without_asking() {
+        let temp = PolicyTempDir::new("allow-overrides-deny");
+        let config = policy_config(
+            vec![policy_rule("allow-bash", RuleAction::Allow, "bash")],
+            ApprovalMode::Deny,
+            true,
+        );
+        let inner = Arc::new(MockTool::new("bash", "ran", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            governance,
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+
+        assert!(!result.is_error, "an allow rule must win: {result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(gate.calls().is_empty());
+        assert!(
+            events.try_recv().is_err(),
+            "an explicit allow rule is not an auto-approval and records no decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_approval_extends_sensitivity_to_destructive_mcp_tools() {
+        let temp = PolicyTempDir::new("mcp-explicit");
+        let name = "mcp__srv__wipe";
+        let config = policy_config(Vec::new(), ApprovalMode::Ask, true);
+        let inner = Arc::new(MockTool::new(name, "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let (governance, _, _events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&[name]),
+            governance,
+            &temp.path,
+            &config,
+            PolicyTool {
+                name: name.to_owned(),
+                source: ToolSource::Mcp,
+                capabilities: Capabilities::for_tool(ToolSource::Mcp, "wipe"),
+                path_field: None,
+                legacy_sensitive: false,
+            },
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-mcp",
+                name,
+                serde_json::json!({"target": "everything"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("denied by the user"));
+        assert_eq!(gate.calls().len(), 1);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_keep_legacy_behavior_without_an_explicit_approval_section() {
+        let temp = PolicyTempDir::new("mcp-legacy");
+        let name = "mcp__srv__wipe";
+        let config = policy_config(Vec::new(), ApprovalMode::Ask, false);
+        let inner = Arc::new(MockTool::new(name, "ran", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let (governance, _, _events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&[name]),
+            governance,
+            &temp.path,
+            &config,
+            PolicyTool {
+                name: name.to_owned(),
+                source: ToolSource::Mcp,
+                capabilities: Capabilities::for_tool(ToolSource::Mcp, "wipe"),
+                path_field: None,
+                legacy_sensitive: false,
+            },
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-mcp",
+                name,
+                serde_json::json!({"target": "everything"}),
+            ))
+            .await;
+
+        assert!(
+            !result.is_error,
+            "without an explicit approval section MCP tools keep the 9.1 behavior: {result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            gate.calls().is_empty(),
+            "legacy MCP tools are not sent to the native permission gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_task_is_destructive_and_requires_approval_under_explicit_ask_mode() {
+        let temp = PolicyTempDir::new("delegate");
+        let name = jessica_runtime::DELEGATE_TASK_TOOL_NAME;
+        let capabilities = Capabilities::for_tool(ToolSource::Delegation, name);
+        assert!(
+            capabilities.destructive,
+            "the delegation descriptor must mark delegate_task destructive"
+        );
+        let config = policy_config(Vec::new(), ApprovalMode::Ask, true);
+        let inner = Arc::new(MockTool::new(name, "must not run", Duration::ZERO));
+        let gate = Arc::new(MockGate::new(
+            ToolPermissionDecision::Reject,
+            Duration::ZERO,
+        ));
+        let (governance, _, _events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&[name]),
+            governance,
+            &temp.path,
+            &config,
+            PolicyTool {
+                name: name.to_owned(),
+                source: ToolSource::Delegation,
+                capabilities,
+                path_field: None,
+                legacy_sensitive: permission_required(name),
+            },
+            Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-delegate",
+                name,
+                serde_json::json!({"task": "delete everything"}),
+            ))
+            .await;
+
+        assert!(result.is_error, "a rejected delegation must not run");
+        assert!(result.content.contains("denied by the user"));
+        assert_eq!(
+            gate.calls().len(),
+            1,
+            "explicit ask mode must send delegate_task to the approval gate"
+        );
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "the delegated child run must not start after a rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escape_is_a_policy_denial_before_execution() {
+        use std::os::unix::fs::symlink;
+
+        let temp = PolicyTempDir::new("escape");
+        let outside = PolicyTempDir::new("escape-outside");
+        std::fs::write(outside.path.join("secret.txt"), "outside").expect("outside file");
+        symlink(&outside.path, temp.path.join("link")).expect("symlink must be created");
+        let mut config = policy_config(Vec::new(), ApprovalMode::Ask, false);
+        config.policy.rules = vec![PolicyRuleConfig {
+            id: "protect-secrets".to_owned(),
+            tool: Some(ToolSelector::One("read_file".to_owned())),
+            path_glob: Some("**/secret.txt".to_owned()),
+            program: None,
+            args_prefix: None,
+            action: RuleAction::Deny,
+            reason: Some("secrets are protected".to_owned()),
+        }];
+        let inner = Arc::new(MockTool::new("read_file", "must not run", Duration::ZERO));
+        let (governance, _, mut events) = governance();
+        let tool = governed_with_policy(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            harness(&["read_file"]),
+            governance,
+            &temp.path,
+            &config,
+            policy_tool_for("read_file"),
+            None,
+        )
+        .await;
+
+        let result = tool
+            .execute_with_call(&ToolCall::new(
+                "call-read",
+                "read_file",
+                serde_json::json!({"path": "link/secret.txt"}),
+            ))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("escapes the workspace root"),
+            "the structured path error must be visible: {}",
+            result.content
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        match events.try_recv() {
+            Ok(AgentEvent::PolicyDenied { reason, .. }) => {
+                assert!(reason.contains("escapes the workspace root"));
+            }
+            other => panic!("expected PolicyDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_without_explicit_approval_uses_only_the_ask_gate() {
+        let temp = PolicyTempDir::new("ask-gate-only");
+        let config = policy_config(
+            vec![policy_rule("ask-read", RuleAction::Ask, "read_file")],
+            ApprovalMode::Ask,
+            false,
+        );
+        let gate = Arc::new(MockGate::new(ToolPermissionDecision::Allow, Duration::ZERO));
+
+        // The ask rule prompts through the ask gate even though the legacy
+        // approval flow was not explicitly configured.
+        let read_inner = Arc::new(MockTool::new("read_file", "contents", Duration::ZERO));
+        let (read_governance, _, _) = governance();
+        let read_tool = governed_with_policy(
+            Arc::clone(&read_inner) as Arc<dyn Tool>,
+            harness(&["read_file"]),
+            read_governance,
+            &temp.path,
+            &config,
+            policy_tool_for("read_file"),
+            None,
+        )
+        .await
+        .with_ask_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+        let result = read_tool
+            .execute_with_call(&ToolCall::new(
+                "read-1",
+                "read_file",
+                serde_json::json!({"path": "a.txt"}),
+            ))
+            .await;
+        assert!(
+            !result.is_error,
+            "the approved ask rule must run: {result:?}"
+        );
+        assert_eq!(read_inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.calls().len(), 1);
+
+        // A legacy-sensitive tool that no rule mentions keeps the pre-v2 CLI
+        // behavior: the ask-only gate is not consulted.
+        let bash_inner = Arc::new(MockTool::new("bash", "ran", Duration::ZERO));
+        let (bash_governance, _, _) = governance();
+        let bash_tool = governed_with_policy(
+            Arc::clone(&bash_inner) as Arc<dyn Tool>,
+            harness(&["bash"]),
+            bash_governance,
+            &temp.path,
+            &config,
+            policy_tool_for("bash"),
+            None,
+        )
+        .await
+        .with_ask_gate(Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>));
+        let result = bash_tool
+            .execute_with_call(&ToolCall::new(
+                "bash-1",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            ))
+            .await;
+        assert!(!result.is_error);
+        assert_eq!(bash_inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gate.calls().len(),
+            1,
+            "the legacy-sensitive tool must not consult the ask-only gate"
         );
     }
 }

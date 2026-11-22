@@ -878,8 +878,10 @@ pub struct HarnessConfig {
     pub profile: ProfileConfig,
     /// Session budgets enforced by the runtime and harness guards.
     pub budget: BudgetConfig,
-    /// Tool allowlist.
+    /// Tool allowlist and parameter-level policy rules.
     pub policy: PolicyConfig,
+    /// Approval mode for sensitive tools.
+    pub approval: ApprovalConfig,
     /// Tool catalog profile, exposure budgets, and per-tool limits.
     pub tools: ToolsConfig,
     /// Optional child-agent delegation.
@@ -934,10 +936,12 @@ impl HarnessConfig {
             .get("events")
             .and_then(toml::Value::as_table)
             .is_some_and(|events| events.contains_key("path"));
+        let explicit_approval = table.contains_key("approval");
 
         let mut config: Self = toml::Value::Table(table)
             .try_into()
             .map_err(|source| ConfigError::Toml { source })?;
+        config.approval.explicit = explicit_approval;
         if !config.profile.trace_enabled() {
             if !explicit_events_path {
                 config.events.path = None;
@@ -984,6 +988,7 @@ impl HarnessConfig {
         }
         self.tools
             .validate(self.budget.tool_timeout_ms, self.budget.max_result_bytes)?;
+        self.policy.validate()?;
         self.delegation.validate()?;
         self.reliability.validate()?;
         if self.delegation.enabled {
@@ -1203,17 +1208,209 @@ impl BudgetConfig {
 }
 
 /// Tool policy settings.
+///
+/// `allowed_tools` remains the top-level exposure allowlist. Rules only make
+/// parameter-level decisions for tools that are already exposed, so a hidden
+/// tool is still reported as unknown to the model.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Tool names the model may execute. An empty list denies every call.
     pub allowed_tools: Vec<String>,
+    /// Ordered parameter-level rules evaluated as deny, ask, then allow.
+    ///
+    /// Rules are additive. An empty list preserves the pre-v2 behavior.
+    pub rules: Vec<PolicyRuleConfig>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             allowed_tools: NATIVE_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl PolicyConfig {
+    /// Validates rule identifiers, conditions, and action/tool combinations.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            let prefix = format!("policy.rules[{index}]");
+            if rule.id.trim().is_empty() {
+                return Err(invalid(format!("{prefix}.id must not be empty")));
+            }
+            if !ids.insert(rule.id.clone()) {
+                return Err(invalid(format!(
+                    "{prefix}.id `{}` is declared more than once",
+                    rule.id
+                )));
+            }
+            let tools: Vec<&str> = match &rule.tool {
+                None => Vec::new(),
+                Some(ToolSelector::One(tool)) => vec![tool.as_str()],
+                Some(ToolSelector::Many(tools)) => tools.iter().map(String::as_str).collect(),
+            };
+            if let Some(ToolSelector::Many(tools)) = &rule.tool
+                && tools.is_empty()
+            {
+                return Err(invalid(format!("{prefix}.tool must not be an empty array")));
+            }
+            for tool in &tools {
+                if tool.trim().is_empty() {
+                    return Err(invalid(format!("{prefix}.tool entries must not be empty")));
+                }
+            }
+            let has_condition = rule.tool.is_some()
+                || rule.path_glob.is_some()
+                || rule.program.is_some()
+                || rule.args_prefix.is_some();
+            if !has_condition {
+                return Err(invalid(format!(
+                    "{prefix} must declare at least one of tool, path_glob, program, or args_prefix"
+                )));
+            }
+            if let Some(glob) = &rule.path_glob
+                && glob.trim().is_empty()
+            {
+                return Err(invalid(format!("{prefix}.path_glob must not be empty")));
+            }
+            if let Some(program) = &rule.program
+                && program.trim().is_empty()
+            {
+                return Err(invalid(format!("{prefix}.program must not be empty")));
+            }
+            if let Some(args) = &rule.args_prefix
+                && args.is_empty()
+            {
+                return Err(invalid(format!(
+                    "{prefix}.args_prefix must not be empty when present"
+                )));
+            }
+            if rule.program.is_some() || rule.args_prefix.is_some() {
+                for tool in &tools {
+                    if !matches!(*tool, "exec" | "bash") {
+                        return Err(invalid(format!(
+                            "{prefix}.program and args_prefix are only meaningful for `exec` and `bash`; `{tool}` is invalid"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Action selected by a parameter-level policy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Deny the call. Deny rules are evaluated first.
+    Deny,
+    /// Require one-time approval. Ask rules are evaluated after all denies.
+    Ask,
+    /// Allow the call. Allow rules are evaluated after all asks.
+    Allow,
+}
+
+/// Tool selector accepted by a policy rule.
+///
+/// A rule may name one tool or an array of tools. The selector is a matching
+/// condition; omitting it lets the other conditions match across tools.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolSelector {
+    /// One tool name.
+    One(String),
+    /// Multiple tool names.
+    Many(Vec<String>),
+}
+
+impl ToolSelector {
+    /// Returns whether `name` is selected.
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::One(tool) => tool == name,
+            Self::Many(tools) => tools.iter().any(|tool| tool == name),
+        }
+    }
+}
+
+/// One ordered parameter-level policy rule.
+///
+/// All present conditions must match (logical AND). `path_glob` matches the
+/// canonical workspace-relative path for file tools and the canonical `cwd`
+/// for `exec`; `bash` command strings are never parsed. `program` and
+/// `args_prefix` match `exec` arguments only because `bash` accepts one opaque
+/// command string.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRuleConfig {
+    /// Stable non-empty identifier reported by `policy simulate` and traces.
+    pub id: String,
+    /// Tool name or names this rule applies to.
+    #[serde(default)]
+    pub tool: Option<ToolSelector>,
+    /// Minimal glob matched against the canonical workspace-relative path.
+    ///
+    /// Supported subset: `*` within one path segment, `**` as a complete
+    /// segment matching zero or more segments, and `?` for one character
+    /// within a segment. Character classes, brace expansion, and backslash
+    /// escapes are not implemented and are treated literally.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Exact `exec` program name or path.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Required prefix of the `exec` argument array.
+    #[serde(default)]
+    pub args_prefix: Option<Vec<String>>,
+    /// Decision when every condition matches.
+    pub action: RuleAction,
+    /// Optional human-readable explanation surfaced in errors and simulate.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Approval mode for sensitive tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Ask the host for one-time approval when a gate is available.
+    ///
+    /// This is the default. Without an explicit `[approval]` section it keeps
+    /// the pre-v2 behavior: ACP asks, while a CLI turn without a terminal gate
+    /// runs policy-allowed sensitive tools.
+    #[default]
+    Ask,
+    /// Deny sensitive tools that no explicit `allow` rule permits.
+    Deny,
+    /// Auto-approve sensitive tools permitted by policy and record the
+    /// approval event before execution.
+    Allow,
+}
+
+/// Approval settings for sensitive tools.
+///
+/// The `explicit` flag is set when the document contains an `[approval]`
+/// section. It is deliberately not serialized: it distinguishes the legacy
+/// default from an operator who explicitly chose `mode = "ask"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// Mode applied to sensitive tools and `ask` rules.
+    pub mode: ApprovalMode,
+    /// Whether the document contained an `[approval]` section.
+    #[serde(skip)]
+    pub(crate) explicit: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::Ask,
+            explicit: false,
         }
     }
 }
@@ -3092,5 +3289,113 @@ mod tests {
         )
         .expect_err("blank working directory must fail");
         assert!(blank_dir.to_string().contains("working_dir"));
+    }
+
+    #[test]
+    fn policy_rules_accept_single_and_multiple_tool_selectors() {
+        let config = HarnessConfig::from_toml_str(
+            "[policy]\nallowed_tools = [\"exec\", \"read_file\"]\n\
+             [[policy.rules]]\nid = \"no-secret-reads\"\ntool = \"read_file\"\n\
+             path_glob = \"secrets/**\"\naction = \"deny\"\nreason = \"protected\"\n\
+             [[policy.rules]]\nid = \"safe-exec\"\ntool = [\"exec\"]\n\
+             program = \"git\"\nargs_prefix = [\"status\"]\naction = \"allow\"\n",
+        )
+        .expect("valid policy rules must parse");
+
+        assert_eq!(config.policy.rules.len(), 2);
+        assert_eq!(config.policy.rules[0].id, "no-secret-reads");
+        assert_eq!(
+            config.policy.rules[0].tool,
+            Some(ToolSelector::One("read_file".to_owned()))
+        );
+        assert_eq!(config.policy.rules[0].action, RuleAction::Deny);
+        assert_eq!(
+            config.policy.rules[1].tool,
+            Some(ToolSelector::Many(vec!["exec".to_owned()]))
+        );
+        assert_eq!(
+            config.policy.rules[1].args_prefix,
+            Some(vec!["status".to_owned()])
+        );
+        assert_eq!(config.policy.rules[1].action, RuleAction::Allow);
+    }
+
+    #[test]
+    fn policy_rule_validation_rejects_ambiguous_or_unreachable_rules() {
+        for (rule, expected) in [
+            (
+                "id = \"\"\ntool = \"read_file\"\naction = \"allow\"\n",
+                "id",
+            ),
+            (
+                "id = \"a\"\ntool = \"read_file\"\naction = \"allow\"\n\
+                 [[policy.rules]]\nid = \"a\"\ntool = \"write_file\"\naction = \"deny\"\n",
+                "more than once",
+            ),
+            ("id = \"a\"\naction = \"deny\"\n", "at least one"),
+            (
+                "id = \"a\"\ntool = \"read_file\"\npath_glob = \"  \"\naction = \"deny\"\n",
+                "path_glob",
+            ),
+            (
+                "id = \"a\"\ntool = [\"read_file\"]\nprogram = \"cat\"\naction = \"deny\"\n",
+                "only meaningful",
+            ),
+            (
+                "id = \"a\"\ntool = \"exec\"\nargs_prefix = []\naction = \"deny\"\n",
+                "args_prefix",
+            ),
+        ] {
+            let document =
+                format!("[policy]\nallowed_tools = [\"read_file\"]\n[[policy.rules]]\n{rule}");
+            let error = HarnessConfig::from_toml_str(&document)
+                .expect_err("invalid policy rule must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rule_unknown_actions_and_fields_are_rejected() {
+        let bad_action = HarnessConfig::from_toml_str(
+            "[[policy.rules]]\nid = \"a\"\ntool = \"read_file\"\naction = \"permit\"\n",
+        )
+        .expect_err("unknown action must fail");
+        assert!(bad_action.to_string().contains("permit"));
+
+        let bad_field = HarnessConfig::from_toml_str(
+            "[[policy.rules]]\nid = \"a\"\ntool = \"read_file\"\naction = \"deny\"\n\
+             command_glob = \"rm *\"\n",
+        )
+        .expect_err("unknown rule fields must fail");
+        assert!(bad_field.to_string().contains("command_glob"));
+    }
+
+    #[test]
+    fn approval_defaults_are_legacy_and_an_explicit_section_is_recorded() {
+        let default = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(default.approval.mode, ApprovalMode::Ask);
+        assert!(!default.approval.explicit);
+
+        let ask =
+            HarnessConfig::from_toml_str("[approval]\nmode = \"ask\"\n").expect("ask must parse");
+        assert_eq!(ask.approval.mode, ApprovalMode::Ask);
+        assert!(ask.approval.explicit);
+
+        let deny =
+            HarnessConfig::from_toml_str("[approval]\nmode = \"deny\"\n").expect("deny must parse");
+        assert_eq!(deny.approval.mode, ApprovalMode::Deny);
+        assert!(deny.approval.explicit);
+
+        let allow = HarnessConfig::from_toml_str("[approval]\nmode = \"allow\"\n")
+            .expect("allow must parse");
+        assert_eq!(allow.approval.mode, ApprovalMode::Allow);
+        assert!(allow.approval.explicit);
+
+        let unknown = HarnessConfig::from_toml_str("[approval]\nmode = \"sometimes\"\n")
+            .expect_err("unknown approval mode must fail");
+        assert!(unknown.to_string().contains("sometimes"));
     }
 }
