@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2 已完成，9.3–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a 已完成，9.3b 待依赖审批，9.4–9.8 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2041,7 +2041,8 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.0** | Profile preset、effective config、默认 trace | 否 | 无 | 无 | ☑ |
 | **9.1** | Tool Catalog、descriptor、per-tool limits、schema 过滤、`tools list/inspect` | 否 | 无 | 无 | ☑ |
 | **9.2** | Supervisor A：env allowlist、per-tool timeout 落地、输出上限、acceptance/sensor 超时 | 否 | 无 | 9.1 | ☑ |
-| **9.3** | Supervisor B：进程组 kill、rlimits、bash 启用条件 | 否 | `libc`/`nix` 审批 | 9.2 | ☐ |
+| **9.3a** | Supervisor B（无依赖子集）：bash 启用门、`sandbox = "process"`、迁移说明 | 否 | 无 | 9.2 | ☑ |
+| **9.3b** | Supervisor B（依赖门）：进程组 kill、SIGTERM→SIGKILL、rlimits | 否 | `libc`/`nix` 审批 | 9.3a | ☐ |
 | **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☐ |
 | **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☐ |
 | **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☐ |
@@ -2113,7 +2114,7 @@ Task 9.2（2026-11-22）：Execution Supervisor A — env allowlist、输出上�
 
 ---
 
-Task 9.3（待确认；依赖审批）：Execution Supervisor B — 进程组 kill、rlimits、bash 启用条件
+Task 9.3（9.3a 已完成；9.3b 待依赖审批）：Execution Supervisor B — 进程组 kill、rlimits、bash 启用条件
 
 范围与约束：
 
@@ -2128,6 +2129,12 @@ Task 9.3（待确认；依赖审批）：Execution Supervisor B — 进程组 ki
 - 测试：bash 未启用时 provider schema 不含 bash 且幻觉调用得到 `unknown tool`；显式启用后可用；超时后进程组无孤儿（通过 `/proc`、`ps` 或子进程标记文件验证）；SIGTERM 宽限后 SIGKILL；rlimit 触发返回结构化失败；取消路径清理；9.3b 未批准时不得出现依赖相关代码。
 
 完成标准：9.3a 在无新依赖下 fmt/clippy/test 全绿并完成迁移说明；9.3b 在依赖批准后完成进程组/rlimit 行为测试。README 更新 bash 默认关闭、启用条件与安全边界；未改 core。
+
+实施记录（2026-11-22，实际耗时约 10 分钟，20:22–20:32，仅 9.3a）：
+
+- 完成情况：`[tools.bash]` 升级为 `BashToolConfig`（`enabled` 默认 false、`sandbox` 仅接受 `process`，保留 `timeout_ms`/`max_args_bytes` 并复用既有校验）；`ToolCatalog::build` 增加 native bash 启用门，未显式启用时即使 policy/profile 允许也隐藏，并记录 `HiddenReason::BashDisabled`（显示为 `disabled; set [tools.bash].enabled = true`），`tools list --all` 与 `inspect` 可解释原因；system prompt 过滤未启用的 bash，避免向模型宣传不可用工具；`[tools.bash]` 随 `[tools]` 热加载。新增行为测试覆盖：默认 provider schema 无 bash、幻觉调用得到 `unknown tool` 且无文件副作用、显式启用后可执行、CLI 默认 list/`--all`/inspect 的隐藏与启用行为、REPL 与 ACP 热加载启用、`sandbox = "container"`/`rlimits`/非布尔 `enabled` 在加载期结构化拒绝。README、`examples/harness.toml`、`install.sh` 增加默认关闭、显式 opt-in 与迁移说明，并明确当前仅保证直接子进程。
+- 偏离/说明：1) 按用户决定仅交付 9.3a，未引入 `libc`/`nix`，未实现进程组 `SIGTERM`→`SIGKILL`、rlimits、unsafe syscall 或任何 9.3b 代码；2) `rlimits` 字段未加入配置，当前由 `deny_unknown_fields` 在加载期整体拒绝，避免暴露未实现的安全能力；9.3b 获批后再添加并校验 rlimit > 0；3) `sandbox = "container"` 由 serde 枚举拒绝，错误信息包含 `container`；4) 系统提示不再静态提及 bash，仅当 bash 已启用且被 allowlist 允许时通过 allowlist 行体现；5) 启用门位于 CLI Catalog 装配层，`BashTool` 本身不持门，保持 `jessica-tools` 可独立使用/测试；6) 既有依赖 bash 的单元测试与 E2E 配置均显式加入 `[tools.bash] enabled = true`；7) 未改 `jessica-core`，未新增第三方 crate，`DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 999 passed, 0 failed, 2 ignored。
 
 ---
 

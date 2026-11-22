@@ -37,6 +37,9 @@ pub(crate) enum ToolsCommand {
 /// The tools are bound to the turn's canonical workspace root and to the
 /// supervisor settings in `config`. Constructing them has no side effects;
 /// `tools list` uses the same candidates as a turn.
+///
+/// The bash candidate is always constructed so inspection can explain its
+/// state, but the catalog hides it unless `tools.bash.enabled` is true.
 pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<CatalogCandidate> {
     let supervisor = config.resolved_supervisor();
     let bash_timeout = config

@@ -59,6 +59,7 @@ fn bash_receives_only_the_supervisor_environment_and_truncated_output() {
         &config,
         "[profile]\ntrace = \"off\"\n\
          [policy]\nallowed_tools = [\"bash\"]\n\
+         [tools.bash]\nenabled = true\n\
          [tools.supervisor]\n\
          env_allowlist = [\"E2E_MARKER\"]\n\
          command_timeout_ms = 2000\n\

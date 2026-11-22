@@ -109,7 +109,8 @@ fn enabled_config(settings: &Settings<'_>) -> String {
          [budget]\nmax_tokens = {}\ntool_timeout_ms = {}\nmax_rounds = 16\n\n\
          [policy]\nallowed_tools = [{allowed}]\n\n\
          [delegation]\nenabled = true\nmax_rounds = {}\ntimeout_ms = {}\n\
-         max_task_bytes = 8192\nmax_result_bytes = {}\nmax_child_tool_calls = {}\n",
+         max_task_bytes = 8192\nmax_result_bytes = {}\nmax_child_tool_calls = {}\n\n\
+         [tools.bash]\nenabled = true\n",
         settings.max_tokens,
         settings.tool_timeout_ms,
         settings.max_rounds,
@@ -122,7 +123,8 @@ fn enabled_config(settings: &Settings<'_>) -> String {
 /// Renders a configuration with delegation disabled.
 fn disabled_config() -> String {
     "[events]\npath = \"events.sqlite\"\n\n\
-     [policy]\nallowed_tools = [\"bash\", \"read_file\", \"write_file\"]\n"
+     [policy]\nallowed_tools = [\"bash\", \"read_file\", \"write_file\"]\n\n\
+     [tools.bash]\nenabled = true\n"
         .to_owned()
 }
 

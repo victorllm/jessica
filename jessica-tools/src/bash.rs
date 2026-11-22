@@ -62,6 +62,9 @@ const SENSITIVE_ENV_NAMES: &[&str] = &["BASH_ENV", "ENV", "PROMPT_COMMAND"];
 
 /// Runs bash commands with a hard timeout and bounded stdout/stderr capture.
 ///
+/// The tool has no enable gate of its own: the host decides whether to expose
+/// it. The CLI hides it unless `tools.bash.enabled` is explicitly true.
+///
 /// Commands start with an empty environment containing only the built-in
 /// allowlist plus explicitly configured extensions; credential-bearing names
 /// are always filtered. A command that exits non-zero is reported as a failed

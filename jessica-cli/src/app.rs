@@ -1420,19 +1420,26 @@ fn stable_turn_index(messages: &[Message]) -> u64 {
 }
 
 fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
-    let allowed = if config.policy.allowed_tools.is_empty() {
+    let allowed = config
+        .policy
+        .allowed_tools
+        .iter()
+        .filter(|name| config.tools.bash.enabled || *name != "bash")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let allowed = if allowed.is_empty() {
         "none".to_owned()
     } else {
-        config.policy.allowed_tools.join(", ")
+        allowed.join(", ")
     };
     format!(
         "You are Jessica, a deterministic coding agent. The workspace root is {}. \
-         Use read_file and write_file with paths relative to the workspace root; bash is also \
-         available when allowed. Tool calls are subject to this allowlist: {allowed}. A denied \
-         call returns an error result, so adapt instead of repeating it. A command sensor runs \
-         after every tool result. If an acceptance check fails, its feedback is injected as a \
-         user message: fix the underlying problem and retry. Verify your work with tools instead \
-         of claiming success. When the task is complete, reply with a concise summary.",
+         Use read_file and write_file with paths relative to the workspace root. Tool calls \
+         are subject to this allowlist: {allowed}. A denied call returns an error result, so \
+         adapt instead of repeating it. A command sensor runs after every tool result. If an \
+         acceptance check fails, its feedback is injected as a user message: fix the underlying \
+         problem and retry. Verify your work with tools instead of claiming success. When the \
+         task is complete, reply with a concise summary.",
         root.display()
     )
 }
@@ -2079,7 +2086,8 @@ mod tests {
         HarnessConfig::from_toml_str(
             "[delegation]\nenabled = true\n\
              [policy]\n\
-             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n",
+             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n\
+             [tools.bash]\nenabled = true\n",
         )
         .expect("enabled delegation config must parse")
     }
@@ -2241,7 +2249,11 @@ mod tests {
 
         let disabled_calls = disabled_provider.calls();
         let disabled_names = schema_names(&disabled_calls[0].tools);
-        assert_eq!(disabled_names, vec!["bash", "read_file", "write_file"]);
+        assert_eq!(
+            disabled_names,
+            vec!["read_file", "write_file"],
+            "bash is disabled by default even though the default allowlist names it"
+        );
 
         let resume_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
@@ -2322,14 +2334,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_is_hidden_until_enabled_and_unknown_calls_do_not_execute() {
+        let workspace = TempDir::new("bash-disabled");
+        let disabled_provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call-disabled-bash", "printf ran > disabled-marker.txt"),
+            done_text("adapted", 1),
+        ]));
+        let disabled_runtime = runtime_at(
+            Arc::clone(&disabled_provider),
+            HarnessConfig::default(),
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            disabled_runtime
+                .run_turn("run bash".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let disabled_calls = disabled_provider.calls();
+        assert_eq!(
+            schema_names(&disabled_calls[0].tools),
+            vec!["read_file", "write_file"],
+            "disabled bash must not appear in the provider schema"
+        );
+        let rejection = disabled_calls[1]
+            .messages
+            .last()
+            .expect("the unknown bash call must produce a result")
+            .content
+            .clone();
+        assert!(
+            rejection.contains("unknown tool `bash`"),
+            "a hallucinated call to disabled bash must be unknown: {rejection}"
+        );
+        assert!(
+            !workspace.path().join("disabled-marker.txt").exists(),
+            "a disabled bash call must have no filesystem effect"
+        );
+
+        let enabled_provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call-enabled-bash", "printf ran > enabled-marker.txt"),
+            done_text("done", 1),
+        ]));
+        let enabled_config = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\n")
+            .expect("an explicit bash enable must parse");
+        let enabled_runtime = runtime_at(
+            Arc::clone(&enabled_provider),
+            enabled_config,
+            workspace.path().to_path_buf(),
+        );
+        assert_eq!(
+            enabled_runtime
+                .run_turn("run bash".to_owned())
+                .await
+                .expect("the enabled turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let enabled_calls = enabled_provider.calls();
+        assert!(
+            schema_names(&enabled_calls[0].tools).contains(&"bash"),
+            "explicitly enabled bash must be exposed"
+        );
+        assert!(
+            workspace.path().join("enabled-marker.txt").exists(),
+            "an enabled bash call must execute"
+        );
+    }
+
+    #[tokio::test]
     async fn exposure_budgets_fail_turn_startup_before_the_model_is_called() {
         for (toml, expected) in [
             (
-                "[tools]\nmax_exposed_tools = 2\n",
+                "[tools]\nmax_exposed_tools = 2\n[tools.bash]\nenabled = true\n",
                 "tools.max_exposed_tools",
             ),
             (
-                "[tools]\nmax_tool_schema_bytes = 1\n",
+                "[tools]\nmax_tool_schema_bytes = 1\n[tools.bash]\nenabled = true\n",
                 "tools.max_tool_schema_bytes",
             ),
         ] {
@@ -2399,7 +2483,7 @@ mod tests {
             "slow-command",
             "sleep 2",
         )]));
-        let config = HarnessConfig::from_toml_str("[tools.bash]\ntimeout_ms = 1\n")
+        let config = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\ntimeout_ms = 1\n")
             .expect("per-tool timeout must parse");
         let runtime = runtime_with(Arc::clone(&provider), config);
 
@@ -2591,7 +2675,11 @@ mod tests {
         );
         assert_eq!(
             schema_names(&calls[0].tools),
-            vec!["bash", "read_file", "write_file"]
+            vec!["read_file", "write_file"]
+        );
+        assert!(
+            !system_prompt_of(&calls[0]).contains("bash"),
+            "the first prompt must not advertise disabled bash"
         );
         assert!(
             system_prompt_of(&calls[1]).contains("delegate_task"),
@@ -2612,6 +2700,42 @@ mod tests {
             "hot reload must not add or reorder messages"
         );
         assert_eq!(calls[1].messages[1].content, "second question");
+    }
+
+    #[tokio::test]
+    async fn enabling_bash_is_reloadable_for_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+
+        runtime
+            .run_turn("first question".to_owned())
+            .await
+            .expect("first turn should complete");
+        let enabled = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\n")
+            .expect("the enable gate must parse");
+        sender
+            .send(Arc::new(enabled))
+            .expect("runtime must keep the receiver open");
+        runtime
+            .run_turn("second question".to_owned())
+            .await
+            .expect("second turn should complete");
+
+        let calls = provider.calls();
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["read_file", "write_file"],
+            "the first turn must keep bash disabled"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash", "read_file", "write_file"],
+            "the next turn must expose the reloaded bash gate"
+        );
     }
 
     #[tokio::test]
@@ -2641,7 +2765,11 @@ mod tests {
         );
         assert_eq!(
             schema_names(&calls[0].tools),
-            vec!["bash", "read_file", "write_file"]
+            vec!["read_file", "write_file"]
+        );
+        assert!(
+            !system_prompt_of(&calls[0]).contains("bash"),
+            "the in-flight prompt must not advertise disabled bash"
         );
         assert!(
             system_prompt_of(&calls[1]).contains("delegate_task"),
@@ -2710,8 +2838,10 @@ mod tests {
                 .expect("first turn should run"),
             SessionEndReason::Completed
         );
-        let reloaded = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 1\n")
-            .expect("budget should parse");
+        let reloaded = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 1\n[tools.bash]\nenabled = true\n",
+        )
+        .expect("budget should parse");
         sender
             .send(Arc::new(reloaded))
             .expect("runtime must keep the receiver open");

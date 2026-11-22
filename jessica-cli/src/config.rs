@@ -218,6 +218,71 @@ pub struct ToolLimitConfig {
     pub max_args_bytes: Option<usize>,
 }
 
+/// Sandbox used to run the native `bash` tool.
+///
+/// Only [`BashSandbox::Process`] is implemented. An unsupported value is
+/// rejected while loading, so a configuration cannot silently request
+/// isolation that the runtime does not provide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashSandbox {
+    /// Run bash as a direct child process under the execution supervisor.
+    ///
+    /// The supervisor enforces a deadline and environment isolation. Process
+    /// groups and rlimits are not applied in this mode.
+    #[default]
+    Process,
+}
+
+/// Configuration for the native `bash` tool.
+///
+/// Bash is disabled by default. It enters the catalog only when `enabled` is
+/// explicitly true, even if `policy.allowed_tools` and `tools.profile` include
+/// it. The `sandbox` field currently accepts only `"process"`; process-group
+/// cleanup and rlimits are a later task.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BashToolConfig {
+    /// Whether bash may enter this turn's catalog.
+    ///
+    /// Defaults to false. Enabling bash requires `sandbox = "process"`, which
+    /// is also the default.
+    pub enabled: bool,
+    /// Sandbox mode. Only `"process"` is implemented.
+    pub sandbox: BashSandbox,
+    /// Wall-clock timeout for this tool, in milliseconds.
+    ///
+    /// Must be at least 1 and must not exceed `budget.tool_timeout_ms` or the
+    /// bash tool's internal 10-second deadline.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    ///
+    /// Must be at least 1 when present. The check runs before policy,
+    /// permission, and execution.
+    pub max_args_bytes: Option<usize>,
+}
+
+impl Default for BashToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sandbox: BashSandbox::Process,
+            timeout_ms: None,
+            max_args_bytes: None,
+        }
+    }
+}
+
+impl BashToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
 /// Execution supervisor settings shared by command-backed components.
 ///
 /// The supervisor starts every command with an empty environment, passes only
@@ -355,8 +420,8 @@ pub struct ToolsConfig {
     pub read_file: ToolLimitConfig,
     /// Optional limits for the native `write_file` tool.
     pub write_file: ToolLimitConfig,
-    /// Optional limits for the native `bash` tool.
-    pub bash: ToolLimitConfig,
+    /// Enable gate and optional limits for the native `bash` tool.
+    pub bash: BashToolConfig,
     /// Execution supervisor settings.
     pub supervisor: SupervisorConfig,
 }
@@ -369,23 +434,13 @@ impl Default for ToolsConfig {
             max_tool_schema_bytes: DEFAULT_MAX_TOOL_SCHEMA_BYTES,
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
-            bash: ToolLimitConfig::default(),
+            bash: BashToolConfig::default(),
             supervisor: SupervisorConfig::default(),
         }
     }
 }
 
 impl ToolsConfig {
-    /// Returns the configured limits for a native tool, if any.
-    pub fn limits(&self, name: &str) -> Option<&ToolLimitConfig> {
-        match name {
-            "read_file" => Some(&self.read_file),
-            "write_file" => Some(&self.write_file),
-            "bash" => Some(&self.bash),
-            _ => None,
-        }
-    }
-
     /// Returns the effective command deadline before the bash-specific cap.
     ///
     /// The default is the smaller of `fallback` and the bash tool's original
@@ -406,11 +461,14 @@ impl ToolsConfig {
     /// deadline so the descriptor never advertises a longer run than the tool
     /// can honor.
     pub fn timeout_for(&self, name: &str, fallback: Duration) -> Duration {
-        let configured = self
-            .limits(name)
-            .and_then(|limits| limits.timeout_ms)
-            .map(Duration::from_millis)
-            .unwrap_or(fallback);
+        let configured = match name {
+            "read_file" => self.read_file.timeout_ms,
+            "write_file" => self.write_file.timeout_ms,
+            "bash" => self.bash.timeout_ms,
+            _ => None,
+        }
+        .map(Duration::from_millis)
+        .unwrap_or(fallback);
         if name == "bash" {
             configured
                 .min(DEFAULT_BASH_TIMEOUT)
@@ -445,7 +503,12 @@ impl ToolsConfig {
 
     /// Returns the argument-size limit for one tool, if configured.
     pub fn max_args_bytes(&self, name: &str) -> Option<usize> {
-        self.limits(name).and_then(|limits| limits.max_args_bytes)
+        match name {
+            "read_file" => self.read_file.max_args_bytes,
+            "write_file" => self.write_file.max_args_bytes,
+            "bash" => self.bash.max_args_bytes,
+            _ => None,
+        }
     }
 
     /// Rejects unusable exposure budgets, supervisor settings, and per-tool
@@ -485,7 +548,7 @@ impl ToolsConfig {
             .min(bash_internal_ms);
         validate_tool_limits(
             "tools.bash",
-            &self.bash,
+            &self.bash.limits(),
             global_timeout_ms,
             Some(bash_cap_ms),
         )?;
@@ -1476,7 +1539,12 @@ mod tests {
         assert_eq!(config.tools.max_tool_schema_bytes, 128 * 1024);
         assert_eq!(config.tools.read_file, ToolLimitConfig::default());
         assert_eq!(config.tools.write_file, ToolLimitConfig::default());
-        assert_eq!(config.tools.bash, ToolLimitConfig::default());
+        assert_eq!(config.tools.bash, BashToolConfig::default());
+        assert!(
+            !config.tools.bash.enabled,
+            "bash must be opt-in even when the default allowlist names it"
+        );
+        assert_eq!(config.tools.bash.sandbox, BashSandbox::Process);
         assert_eq!(config.tools.supervisor, SupervisorConfig::default());
 
         let supervisor = config.resolved_supervisor();
@@ -1691,11 +1759,41 @@ mod tests {
     }
 
     #[test]
+    fn bash_requires_an_explicit_enable_and_a_supported_sandbox() {
+        let disabled = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert!(!disabled.tools.bash.enabled);
+        assert_eq!(disabled.tools.bash.sandbox, BashSandbox::Process);
+
+        let enabled =
+            HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\nsandbox = \"process\"\n")
+                .expect("an explicit process sandbox must be accepted");
+        assert!(enabled.tools.bash.enabled);
+        assert_eq!(enabled.tools.bash.sandbox, BashSandbox::Process);
+
+        for (toml, expected) in [
+            (
+                "[tools.bash]\nenabled = true\nsandbox = \"container\"\n",
+                "container",
+            ),
+            ("[tools.bash]\nrlimits = { cpu_seconds = 1 }\n", "rlimits"),
+            ("[tools.bash]\nenabled = \"yes\"\n", "boolean"),
+        ] {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("unsupported bash gates must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn tools_changes_are_hot_reloadable() {
         let current = HarnessConfig::from_toml_str("[tools]\nprofile = \"full\"\n")
             .expect("current config must parse");
         let next = HarnessConfig::from_toml_str(
             "[tools]\nprofile = \"readonly\"\n\
+             [tools.bash]\nenabled = true\n\
              [tools.read_file]\ntimeout_ms = 2000\n\
              [tools.supervisor]\nsensor_timeout_ms = 500\nmax_output_bytes = 1024\n",
         )
@@ -1703,7 +1801,7 @@ mod tests {
         assert_eq!(
             changed_immutable_section(&current, &next),
             None,
-            "the catalog is rebuilt per turn, so [tools] must reload"
+            "the bash enable gate is nested in [tools], so it must reload"
         );
     }
 
@@ -1965,6 +2063,8 @@ mod tests {
         );
         assert_eq!(json["memory"]["enabled"], false);
         assert_eq!(json["skills"]["enabled"], false);
+        assert_eq!(json["tools"]["bash"]["enabled"], false);
+        assert_eq!(json["tools"]["bash"]["sandbox"], "process");
     }
 
     #[test]

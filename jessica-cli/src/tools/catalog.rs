@@ -83,6 +83,8 @@ pub(crate) enum HiddenReason {
     NotInPolicy,
     /// The source/name pair is excluded by `tools.profile`.
     NotInProfile,
+    /// The native bash tool is disabled by `tools.bash.enabled`.
+    BashDisabled,
 }
 
 impl HiddenReason {
@@ -91,6 +93,7 @@ impl HiddenReason {
         match self {
             Self::NotInPolicy => "not in policy.allowed_tools",
             Self::NotInProfile => "not in tools.profile",
+            Self::BashDisabled => "disabled; set [tools.bash].enabled = true",
         }
     }
 }
@@ -227,6 +230,12 @@ impl ToolCatalog {
             }
             if !profile_allows(config.tools.profile, candidate.source, &candidate.name) {
                 hidden_reasons.push(HiddenReason::NotInProfile);
+            }
+            if candidate.source == ToolSource::Native
+                && candidate.name == "bash"
+                && !config.tools.bash.enabled
+            {
+                hidden_reasons.push(HiddenReason::BashDisabled);
             }
 
             entries.insert(
@@ -398,7 +407,8 @@ mod tests {
         let config = parse_config(
             "[profile]\ntrace = \"off\"\n\
              [policy]\nallowed_tools = [\"read_file\", \"bash\", \"mcp__s__tool\"]\n\
-             [tools]\nprofile = \"full\"\n",
+             [tools]\nprofile = \"full\"\n\
+             [tools.bash]\nenabled = true\n",
         );
         let catalog = ToolCatalog::build(
             vec![
@@ -422,7 +432,8 @@ mod tests {
         let config = parse_config(
             "[profile]\ntrace = \"off\"\n\
              [policy]\nallowed_tools = [\"read_file\", \"bash\"]\n\
-             [tools]\nprofile = \"readonly\"\n",
+             [tools]\nprofile = \"readonly\"\n\
+             [tools.bash]\nenabled = true\n",
         );
         let catalog = ToolCatalog::build(
             vec![
@@ -453,6 +464,43 @@ mod tests {
             write.hidden_reason_text(),
             "not in policy.allowed_tools, not in tools.profile"
         );
+    }
+
+    #[test]
+    fn disabled_bash_is_hidden_even_when_policy_and_profile_allow_it() {
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\", \"bash\"]\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                candidate("read_file", ToolSource::Native),
+                candidate("bash", ToolSource::Native),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        assert_eq!(catalog.exposed_names(), ["read_file"]);
+        let bash = catalog.find("bash").expect("bash must stay inspectable");
+        assert_eq!(
+            bash.hidden_reasons,
+            vec![HiddenReason::BashDisabled],
+            "the enable gate must hide bash even when policy allows it"
+        );
+        assert_eq!(
+            bash.hidden_reason_text(),
+            "disabled; set [tools.bash].enabled = true"
+        );
+
+        let enabled = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"bash\"]\n\
+             [tools.bash]\nenabled = true\n",
+        );
+        let catalog = ToolCatalog::build(vec![candidate("bash", ToolSource::Native)], &enabled)
+            .expect("catalog must build");
+        assert_eq!(catalog.exposed_names(), ["bash"]);
     }
 
     #[test]
@@ -525,7 +573,8 @@ mod tests {
         let config = parse_config(
             "[profile]\ntrace = \"off\"\n\
              [policy]\nallowed_tools = [\"read_file\", \"bash\"]\n\
-             [tools]\nprofile = \"full\"\nmax_exposed_tools = 1\n",
+             [tools]\nprofile = \"full\"\nmax_exposed_tools = 1\n\
+             [tools.bash]\nenabled = true\n",
         );
         let catalog = ToolCatalog::build(
             vec![
@@ -564,7 +613,7 @@ mod tests {
              [policy]\nallowed_tools = [\"read_file\", \"bash\", \"delegate_task\"]\n\
              [delegation]\nenabled = true\n\
              [tools.read_file]\ntimeout_ms = 500\nmax_args_bytes = 2048\n\
-             [tools.bash]\ntimeout_ms = 3000\n",
+             [tools.bash]\nenabled = true\ntimeout_ms = 3000\n",
         );
         let catalog = ToolCatalog::build(
             vec![

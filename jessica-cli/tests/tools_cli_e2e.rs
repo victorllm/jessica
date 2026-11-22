@@ -146,7 +146,8 @@ fn tools_list_all_and_inspect_explain_every_hidden_reason() {
     std::fs::write(
         &config,
         "[policy]\nallowed_tools = [\"read_file\", \"bash\"]\n\
-         [tools]\nprofile = \"readonly\"\n",
+         [tools]\nprofile = \"readonly\"\n\
+         [tools.bash]\nenabled = true\n",
     )
     .expect("configuration should be written");
 
@@ -232,8 +233,8 @@ fn an_over_budget_catalog_is_still_inspectable() {
     let stdout = String::from_utf8_lossy(&listed.stdout);
     let stderr = String::from_utf8_lossy(&listed.stderr);
     assert!(
-        stdout.starts_with("NAME") && stdout.contains("exposed 3/3 tools;"),
-        "every configured tool must still be shown: {stdout}"
+        stdout.starts_with("NAME") && stdout.contains("exposed 2/3 tools;"),
+        "every enabled configured tool must still be shown: {stdout}"
     );
     assert!(
         stderr.contains("warning") && stderr.contains("tools.max_exposed_tools"),
@@ -245,5 +246,86 @@ fn an_over_budget_catalog_is_still_inspectable() {
         inspected.status.success(),
         "inspect must not be blocked by the budget: {}",
         String::from_utf8_lossy(&inspected.stderr)
+    );
+}
+
+#[test]
+fn disabled_bash_is_omitted_from_listing_and_explained_on_demand() {
+    const HIDDEN_REASON: &str = "disabled; set [tools.bash].enabled = true";
+
+    let temp = TempDir::new("bash-disabled");
+    let config = temp.path().join("harness.toml");
+    std::fs::write(
+        &config,
+        "[policy]\nallowed_tools = [\"bash\", \"read_file\"]\n",
+    )
+    .expect("configuration should be written");
+
+    let listed = run_tools(temp.path(), &config, &["list"]);
+    assert!(
+        listed.status.success(),
+        "tools list must succeed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("read_file")),
+        "the allowed read_file tool must be listed: {stdout}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("bash")),
+        "allowlisting bash is not enough while it is disabled: {stdout}"
+    );
+    assert!(
+        stdout.contains("exposed 1/3 tools;"),
+        "the summary must count the hidden bash tool: {stdout}"
+    );
+
+    let all = run_tools(temp.path(), &config, &["list", "--all"]);
+    assert!(all.status.success());
+    let all_stdout = String::from_utf8_lossy(&all.stdout);
+    let bash_line = tool_line(&all_stdout, "bash");
+    assert!(
+        bash_line.contains("no") && bash_line.contains(HIDDEN_REASON),
+        "list --all must explain how to enable bash: {bash_line}"
+    );
+    assert!(
+        !bash_line.contains("not in policy.allowed_tools"),
+        "the allowlist did admit bash; only the enable gate hid it: {bash_line}"
+    );
+
+    let inspected = run_tools(temp.path(), &config, &["inspect", "bash"]);
+    assert!(
+        inspected.status.success(),
+        "a hidden bash tool must remain inspectable: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected = String::from_utf8_lossy(&inspected.stdout);
+    assert!(inspected.contains("exposed: no"));
+    assert!(inspected.contains(&format!("hidden: {HIDDEN_REASON}")));
+
+    let enabled_config = temp.path().join("enabled.toml");
+    std::fs::write(
+        &enabled_config,
+        "[policy]\nallowed_tools = [\"bash\", \"read_file\"]\n\
+         [tools.bash]\nenabled = true\n",
+    )
+    .expect("enabled configuration should be written");
+    let enabled = run_tools(temp.path(), &enabled_config, &["list"]);
+    assert!(
+        enabled.status.success(),
+        "tools list must succeed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let enabled_stdout = String::from_utf8_lossy(&enabled.stdout);
+    assert!(
+        enabled_stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("bash")),
+        "explicitly enabling bash must expose it: {enabled_stdout}"
     );
 }

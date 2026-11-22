@@ -142,6 +142,17 @@ reliability. `safe` narrows the default allowlist to `read_file`; `dev`, `ci`,
 and `lab` use `bash`, `read_file`, and `write_file`. Side-effecting subsystems
 therefore stay opt-in.
 
+Presets and allowlists do not enable the native `bash` tool by themselves. It
+also requires `[tools.bash] enabled = true`; without that explicit opt-in bash
+stays hidden even when the profile and `policy.allowed_tools` include it.
+Configurations written before this gate existed must add the opt-in to keep
+their previous tool surface:
+
+```toml
+[tools.bash]
+enabled = true
+```
+
 Trace persistence is strict by default. A relative path resolves against the
 startup workspace, and the event store plus any missing parent directories are
 created on first run:
@@ -165,12 +176,15 @@ jessica --config ~/.jessica/harness.toml config
 ## Tool catalog and exposure
 
 Every turn rebuilds a host-side tool catalog. A tool is exposed to the model
-only when all three host decisions agree:
+only when all of these host decisions agree:
 
 1. its source is available this turn (native, configured WASM, session MCP, or
    enabled delegation);
 2. its name is in `policy.allowed_tools`;
-3. `tools.profile` permits that source/name pair.
+3. `tools.profile` permits that source/name pair;
+4. for the native `bash` tool, `[tools.bash] enabled = true` is set.
+
+Being in the allowlist is necessary but never sufficient.
 
 ```toml
 [tools]
@@ -183,6 +197,8 @@ timeout_ms = 5000         # defaults to budget.tool_timeout_ms
 max_args_bytes = 65536    # optional pre-execution argument limit
 
 [tools.bash]
+enabled = false           # explicit opt-in; bash stays hidden when false
+sandbox = "process"       # only supported value in this build
 timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
 ```
 
@@ -194,16 +210,21 @@ timeout_ms = 10000        # cannot exceed bash's internal 10 s deadline
 | `full` | every allowlisted tool, including WASM, MCP, and `delegate_task` |
 
 Narrow profiles never expose WASM, MCP, or delegation tools. The default is
-`full` so existing configurations keep their tool surface; choose a narrower
-profile to enforce least privilege.
+`full`; choose a narrower profile to enforce least privilege. `ops` and `full`
+still need the `[tools.bash] enabled = true` opt-in before bash is exposed, and
+the system prompt does not advertise a disabled bash tool.
 
 Hidden tools are not registered, so they never appear in the provider tool
 schema and cannot execute. A model that hallucinates a hidden name receives an
-`unknown tool` error result. Exceeding either exposure budget fails turn
+`unknown tool` error result. `jessica tools list --all` and
+`jessica tools inspect <name>` explain every hidden reason, including
+`disabled; set [tools.bash].enabled = true` for a bash tool that the policy and
+profile would otherwise permit. Exceeding either exposure budget fails turn
 startup with an actionable error instead of silently dropping tools. Per-tool
 `max_args_bytes` is checked before policy, approval, and execution; `timeout_ms`
-overrides the global tool timeout for that tool. The whole `[tools]` section is
-hot-reloadable and applies to the next turn.
+overrides the global tool timeout for that tool. The whole `[tools]` section,
+including `[tools.bash]` and `[tools.supervisor]`, is hot-reloadable and applies
+to the next turn.
 
 ### Execution supervisor
 
@@ -227,10 +248,20 @@ time and filtered again at execution time. Provider keys and Jessica host
 credentials therefore never reach a command, sensor, or acceptance process.
 
 The deadline covers spawning, reading both pipes, and waiting for exit. A
-timeout fails the tool or check instead of hanging the turn; the direct child is
-killed on drop. Process-group cleanup and rlimits are a later task. Output
-beyond `max_output_bytes` per stream is truncated with a notice that records the
-original byte count. The rendered `bash` result is also capped at the same
+timeout fails the tool or check instead of hanging the turn; only the direct
+child is killed on drop. This build provides no process-group guarantee, so a
+grandchild started by a command can survive a timeout or cancellation, and it
+applies no resource limits. Process-group `SIGTERM`→`SIGKILL` cleanup and
+rlimits belong to Task 9.3b and are not enabled here; adding `enabled = true`
+does not change that boundary.
+
+Policy is not a complete security boundary for bash. Jessica does not parse
+command strings, so `policy.allowed_tools` can only permit or block the tool as
+a whole. Real isolation depends on the execution sandbox; until process-group
+handling and rlimits land, run bash only in trusted workspaces.
+
+Output beyond `max_output_bytes` per stream is truncated with a notice that
+records the original byte count. The rendered `bash` result is also capped at the same
 value, so a large command output cannot trip `ResultSizeGuard` or turn into
 `BudgetExceeded`. A non-zero exit still means “the command ran and failed” and
 keeps its exit code; only spawn, timeout, read, and wait failures are supervisor
