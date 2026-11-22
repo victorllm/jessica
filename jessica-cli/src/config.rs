@@ -5,7 +5,7 @@
 //! layered memory. Missing optional sections disable that component; the policy
 //! default is the same allowlist the CLI has always exposed natively.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
@@ -33,6 +33,18 @@ const DEFAULT_EVENTS_PATH: &str = ".jessica/events.db";
 const DEFAULT_MAX_EXPOSED_TOOLS: usize = 64;
 /// Default maximum total schema bytes sent to the model in one turn.
 const DEFAULT_MAX_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
+/// Default tool-result size below which the original content is returned.
+const DEFAULT_INLINE_THRESHOLD_BYTES: usize = 32 * 1024;
+/// Default hard cap on a managed tool result entering the model context.
+const DEFAULT_MAX_INLINE_BYTES: usize = 64 * 1024;
+/// Default maximum bytes stored in one artifact.
+const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Default artifact directory, relative to the workspace root.
+const DEFAULT_ARTIFACT_DIR: &str = ".jessica/artifacts";
+/// Default number of days an artifact is retained.
+const DEFAULT_ARTIFACT_RETENTION_DAYS: u64 = 7;
+/// Default total byte budget for retained artifacts.
+const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default token budget for a session (prompt plus completion tokens).
 const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
@@ -416,6 +428,18 @@ pub struct ToolsConfig {
     pub max_exposed_tools: usize,
     /// Maximum total serialized schema bytes exposed in one turn.
     pub max_tool_schema_bytes: usize,
+    /// Results at or below this byte length are returned unchanged.
+    pub inline_threshold_bytes: usize,
+    /// Hard cap on a managed result entering the model context.
+    pub max_inline_bytes: usize,
+    /// Maximum bytes stored in one artifact.
+    pub max_artifact_bytes: usize,
+    /// Directory for content-addressed artifacts, relative to the workspace.
+    pub artifact_dir: PathBuf,
+    /// Number of days an artifact is retained.
+    pub artifact_retention_days: u64,
+    /// Total byte budget for retained artifacts.
+    pub artifact_max_bytes: u64,
     /// Optional limits for the native `read_file` tool.
     pub read_file: ToolLimitConfig,
     /// Optional limits for the native `write_file` tool.
@@ -432,6 +456,12 @@ impl Default for ToolsConfig {
             profile: ToolProfile::Full,
             max_exposed_tools: DEFAULT_MAX_EXPOSED_TOOLS,
             max_tool_schema_bytes: DEFAULT_MAX_TOOL_SCHEMA_BYTES,
+            inline_threshold_bytes: DEFAULT_INLINE_THRESHOLD_BYTES,
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+            artifact_dir: PathBuf::from(DEFAULT_ARTIFACT_DIR),
+            artifact_retention_days: DEFAULT_ARTIFACT_RETENTION_DAYS,
+            artifact_max_bytes: DEFAULT_ARTIFACT_MAX_BYTES,
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
             bash: BashToolConfig::default(),
@@ -511,6 +541,25 @@ impl ToolsConfig {
         }
     }
 
+    /// Returns the effective hard cap for one managed tool result.
+    ///
+    /// The configured `max_inline_bytes` is additionally bounded by
+    /// `budget.max_result_bytes`. Existing configurations with a small result
+    /// guard therefore keep working: a managed preview can never trip the
+    /// guard, which remains the final internal invariant.
+    pub fn effective_max_inline_bytes(&self, max_result_bytes: usize) -> usize {
+        self.max_inline_bytes.min(max_result_bytes)
+    }
+
+    /// Returns the effective threshold below which results stay inline.
+    ///
+    /// The configured threshold is clamped to the effective inline cap so an
+    /// unusual budget cannot make the manager return an oversized result.
+    pub fn effective_inline_threshold(&self, max_result_bytes: usize) -> usize {
+        self.inline_threshold_bytes
+            .min(self.effective_max_inline_bytes(max_result_bytes))
+    }
+
     /// Rejects unusable exposure budgets, supervisor settings, and per-tool
     /// limits.
     ///
@@ -531,6 +580,32 @@ impl ToolsConfig {
         if self.max_tool_schema_bytes == 0 {
             return Err(invalid("tools.max_tool_schema_bytes must be at least 1"));
         }
+        if self.inline_threshold_bytes == 0 {
+            return Err(invalid("tools.inline_threshold_bytes must be at least 1"));
+        }
+        if self.max_inline_bytes == 0 {
+            return Err(invalid("tools.max_inline_bytes must be at least 1"));
+        }
+        if self.max_artifact_bytes == 0 {
+            return Err(invalid("tools.max_artifact_bytes must be at least 1"));
+        }
+        if self.inline_threshold_bytes > self.max_inline_bytes {
+            return Err(invalid(
+                "tools.inline_threshold_bytes must not exceed tools.max_inline_bytes",
+            ));
+        }
+        if self.max_inline_bytes > self.max_artifact_bytes {
+            return Err(invalid(
+                "tools.max_inline_bytes must not exceed tools.max_artifact_bytes",
+            ));
+        }
+        if self.artifact_retention_days == 0 {
+            return Err(invalid("tools.artifact_retention_days must be at least 1"));
+        }
+        if self.artifact_max_bytes == 0 {
+            return Err(invalid("tools.artifact_max_bytes must be at least 1"));
+        }
+        validate_artifact_dir(&self.artifact_dir)?;
         self.supervisor
             .validate(global_timeout_ms, max_result_bytes)?;
         validate_tool_limits("tools.read_file", &self.read_file, global_timeout_ms, None)?;
@@ -1432,6 +1507,32 @@ fn validate_working_dir(field: &str, working_dir: Option<&Path>) -> Result<(), C
     Ok(())
 }
 
+/// Validates the artifact directory lexically.
+///
+/// The path must be relative and consist only of normal components. Absolute
+/// paths, `..`, `.`, and platform prefixes are rejected before any filesystem
+/// access; the artifact store additionally rejects symlinked directories and
+/// checks the canonical location against the workspace root.
+fn validate_artifact_dir(artifact_dir: &Path) -> Result<(), ConfigError> {
+    if artifact_dir.as_os_str().is_empty() {
+        return Err(invalid("tools.artifact_dir must not be empty"));
+    }
+    if artifact_dir.is_absolute() {
+        return Err(invalid(
+            "tools.artifact_dir must be relative to the workspace",
+        ));
+    }
+    if artifact_dir
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid(
+            "tools.artifact_dir must contain only normal path components (no `.`, `..`, or prefixes)",
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid {
         message: message.into(),
@@ -1489,8 +1590,21 @@ mod tests {
         assert_eq!(config.budget.tool_timeout(), Duration::from_secs(10));
         assert_eq!(
             config.policy.allowed_tools,
-            vec!["read_file".to_owned(), "write_file".to_owned()]
+            vec![
+                "read_file".to_owned(),
+                "read_artifact".to_owned(),
+                "write_file".to_owned()
+            ]
         );
+        assert_eq!(config.tools.inline_threshold_bytes, 32_768);
+        assert_eq!(config.tools.max_inline_bytes, 65_536);
+        assert_eq!(config.tools.max_artifact_bytes, 16_777_216);
+        assert_eq!(
+            config.tools.artifact_dir,
+            PathBuf::from(".jessica/artifacts")
+        );
+        assert_eq!(config.tools.artifact_retention_days, 7);
+        assert_eq!(config.tools.artifact_max_bytes, 268_435_456);
 
         let sensor = config.sensor.expect("example must configure a sensor");
         assert_eq!(sensor.name, "diff-check");
@@ -1537,6 +1651,15 @@ mod tests {
         assert_eq!(config.tools.profile, ToolProfile::Full);
         assert_eq!(config.tools.max_exposed_tools, 64);
         assert_eq!(config.tools.max_tool_schema_bytes, 128 * 1024);
+        assert_eq!(config.tools.inline_threshold_bytes, 32 * 1024);
+        assert_eq!(config.tools.max_inline_bytes, 64 * 1024);
+        assert_eq!(config.tools.max_artifact_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            config.tools.artifact_dir,
+            PathBuf::from(".jessica/artifacts")
+        );
+        assert_eq!(config.tools.artifact_retention_days, 7);
+        assert_eq!(config.tools.artifact_max_bytes, 256 * 1024 * 1024);
         assert_eq!(config.tools.read_file, ToolLimitConfig::default());
         assert_eq!(config.tools.write_file, ToolLimitConfig::default());
         assert_eq!(config.tools.bash, BashToolConfig::default());
@@ -1681,6 +1804,89 @@ mod tests {
             accepted.tools.timeout_for("bash", Duration::from_secs(20)),
             Duration::from_secs(10),
             "bash remains capped by its internal deadline"
+        );
+    }
+
+    #[test]
+    fn artifact_limits_are_ordered_and_cannot_escape_lexically() {
+        let cases = [
+            (
+                "[tools]\ninline_threshold_bytes = 0\n",
+                "tools.inline_threshold_bytes",
+            ),
+            ("[tools]\nmax_inline_bytes = 0\n", "tools.max_inline_bytes"),
+            (
+                "[tools]\nmax_artifact_bytes = 0\n",
+                "tools.max_artifact_bytes",
+            ),
+            (
+                "[tools]\ninline_threshold_bytes = 1025\nmax_inline_bytes = 1024\nmax_artifact_bytes = 2048\n",
+                "tools.inline_threshold_bytes must not exceed tools.max_inline_bytes",
+            ),
+            (
+                "[tools]\ninline_threshold_bytes = 1024\nmax_inline_bytes = 2049\nmax_artifact_bytes = 2048\n",
+                "tools.max_inline_bytes must not exceed tools.max_artifact_bytes",
+            ),
+            (
+                "[tools]\nartifact_retention_days = 0\n",
+                "tools.artifact_retention_days",
+            ),
+            (
+                "[tools]\nartifact_max_bytes = 0\n",
+                "tools.artifact_max_bytes",
+            ),
+            (
+                "[tools]\nartifact_dir = \"\"\n",
+                "tools.artifact_dir must not be empty",
+            ),
+            (
+                "[tools]\nartifact_dir = \"/tmp/artifacts\"\n",
+                "tools.artifact_dir must be relative",
+            ),
+            (
+                "[tools]\nartifact_dir = \"../artifacts\"\n",
+                "tools.artifact_dir must contain only normal path components",
+            ),
+            (
+                "[tools]\nartifact_dir = \"./artifacts\"\n",
+                "tools.artifact_dir must contain only normal path components",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("unsafe artifact limits must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+
+        let accepted = HarnessConfig::from_toml_str(
+            "[budget]\nmax_result_bytes = 1024\n\
+             [tools]\n\
+             inline_threshold_bytes = 512\n\
+             max_inline_bytes = 2048\n\
+             max_artifact_bytes = 4096\n\
+             artifact_dir = \"state/results\"\n\
+             artifact_retention_days = 1\n\
+             artifact_max_bytes = 1\n",
+        )
+        .expect("ordered artifact limits must be accepted");
+        assert_eq!(accepted.tools.artifact_dir, PathBuf::from("state/results"));
+        assert_eq!(
+            accepted.tools.effective_max_inline_bytes(1024),
+            1024,
+            "the result guard remains the final hard cap"
+        );
+        assert_eq!(
+            accepted.tools.effective_inline_threshold(1024),
+            512,
+            "a threshold below the effective cap is preserved"
+        );
+        assert_eq!(
+            accepted.tools.effective_max_inline_bytes(8192),
+            2048,
+            "without a tighter guard the configured cap applies"
         );
     }
 

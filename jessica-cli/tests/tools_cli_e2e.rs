@@ -122,7 +122,7 @@ fn tools_list_is_sorted_reproducible_and_creates_no_runtime_state() {
         "the source column must identify the native tool: {stdout}"
     );
     assert!(
-        lines[3].starts_with("exposed 2/4 tools;"),
+        lines[3].starts_with("exposed 2/5 tools;"),
         "the summary must count hidden tools: {stdout}"
     );
 
@@ -233,7 +233,7 @@ fn an_over_budget_catalog_is_still_inspectable() {
     let stdout = String::from_utf8_lossy(&listed.stdout);
     let stderr = String::from_utf8_lossy(&listed.stderr);
     assert!(
-        stdout.starts_with("NAME") && stdout.contains("exposed 2/3 tools;"),
+        stdout.starts_with("NAME") && stdout.contains("exposed 2/4 tools;"),
         "every enabled configured tool must still be shown: {stdout}"
     );
     assert!(
@@ -281,7 +281,7 @@ fn disabled_bash_is_omitted_from_listing_and_explained_on_demand() {
         "allowlisting bash is not enough while it is disabled: {stdout}"
     );
     assert!(
-        stdout.contains("exposed 1/3 tools;"),
+        stdout.contains("exposed 1/4 tools;"),
         "the summary must count the hidden bash tool: {stdout}"
     );
 

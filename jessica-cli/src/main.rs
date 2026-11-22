@@ -6,6 +6,7 @@ mod acp_events;
 mod acp_session;
 mod acp_store;
 mod app;
+mod artifacts;
 mod config;
 mod delegation;
 mod events;

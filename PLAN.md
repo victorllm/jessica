@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a 已完成，9.3b 待依赖审批，9.4–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4 已完成，9.3b 待依赖审批，9.5–9.8 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2043,7 +2043,7 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.2** | Supervisor A：env allowlist、per-tool timeout 落地、输出上限、acceptance/sensor 超时 | 否 | 无 | 9.1 | ☑ |
 | **9.3a** | Supervisor B（无依赖子集）：bash 启用门、`sandbox = "process"`、迁移说明 | 否 | 无 | 9.2 | ☑ |
 | **9.3b** | Supervisor B（依赖门）：进程组 kill、SIGTERM→SIGKILL、rlimits | 否 | `libc`/`nix` 审批 | 9.3a | ☐ |
-| **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☐ |
+| **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☑ |
 | **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☐ |
 | **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☐ |
 | **9.7** | 原生工具 B：glob、regex grep、`apply_patch`、`edit_file` | 否 | `globset`/`regex` 审批 | 9.5/9.6 | ☐ |
@@ -2138,7 +2138,7 @@ Task 9.3（9.3a 已完成；9.3b 待依赖审批）：Execution Supervisor B —
 
 ---
 
-Task 9.4（待确认）：Result Manager、artifact store、`read_artifact`
+Task 9.4（已完成）：Result Manager、artifact store、`read_artifact`
 
 范围与约束：
 
@@ -2153,6 +2153,18 @@ Task 9.4（待确认）：Result Manager、artifact store、`read_artifact`
 - 测试：100 KiB `read_file` 返回 preview+artifact 且 turn 正常完成；200 KiB bash 输出截断落 artifact 且不触发 `BudgetExceeded`；artifact digest 可校验；分页边界；路径逃逸/未知 artifact/损坏 artifact；文件权限 0600；清理边界与失败降级；`read_artifact` 不执行真实工具。
 
 完成标准：fmt/clippy/test 全绿；真实 CLI E2E 至少一个大输出场景与一个分页读取场景；README 更新阈值、artifact 目录、权限与隐私说明；未改 core、未新增第三方 crate。
+
+实施记录（2026-11-22，实际耗时约 20 分钟）：
+
+- 完成情况：新增 `jessica-cli/src/artifacts.rs`，实现 `ArtifactStore`、`ResultManager` 与 `ReadArtifactTool`。`[tools]` 新增 `inline_threshold_bytes`（默认 32768）、`max_inline_bytes`（默认 65536）、`max_artifact_bytes`（默认 16777216）、`artifact_dir`（默认 `.jessica/artifacts`）、`artifact_retention_days`（默认 7）、`artifact_max_bytes`（默认 256 MiB），加载期校验所有数值 ≥1、阈值有序、artifact 目录为 workspace 内相对路径且只含 normal component。`effective_max_inline_bytes`/`effective_inline_threshold` 再把有效上限钳制到 `budget.max_result_bytes`。
+- Result Manager 接入 `GovernedTool`：工具返回后、`ResultSizeGuard` 前统一处理。文本工具收到文本 envelope，JSON 工具收到 JSON envelope；超大结果写入内容寻址 artifact，并向模型返回 digest、原始字节数、stored bytes、`truncated`、next cursor 与不超过 `max_inline_bytes` 的 preview。写入或清理失败时降级为有界 fallback，不使 turn 失败；`ResultSizeGuard` 仍为最后防线。Catalog 暴露的原生、WASM、MCP 与委派工具都经过该 wrapper。
+- Artifact 存储：路径为 `<artifact_dir>/<sha256 前两位>/<64 hex sha256>`；同目录临时文件 + `write_all` + `sync_all` + rename；目录 0700、数据与 sidecar 文件 0600；超 `max_artifact_bytes` 时按 UTF-8 边界截断，`size`/digest 描述实际存储字节，`original_bytes` 保留源长度，sidecar 额外记录版本、tool、created_at 与 `truncated`。sidecar 不写 provider key、环境变量、tool 参数或命令文本。读取时校验 digest、sidecar 一致性、文件类型与大小，并拒绝 shard、数据文件或 sidecar 的 symlink 逃逸；分页按 UTF-8 边界返回。
+- 清理：每个 turn 在第一次需要写 artifact 前最多执行一次有界清理（最多扫描 4096 个条目）；先删除超过 `artifact_retention_days` 的 artifact，再按最旧优先删除至总量不超过 `artifact_max_bytes`。目录不存在时视为 no-op；符号链接、损坏 sidecar 与无关文件跳过；删除失败只 `tracing::warn!`。
+- `read_artifact`：native、只读，参数 `digest` 必填，`offset`/`limit` 可选；只按 digest 在 artifact 目录内定位，不接受路径。单页长度以 `max_inline_bytes - 512` 的 header 预留为上限，返回 digest、实际 offset、page bytes、total_bytes、next_offset 与内容；未知/非法 digest、越界 offset、损坏 sidecar、symlink 逃逸均返回结构化错误。其自身结果绕过 Result Manager，分页不会递归产生新 artifact。
+- 文档与示例：README 新增 result manager/artifact 章节、profile 表补 `read_artifact`、阈值/有效钳制/目录布局/0700·0600/原子写/清理语义/结构化错误与 artifact 可能含敏感内容的隐私警告；`examples/harness.toml` 增加 `[tools]` 结果阈值并将 `read_artifact` 加入示例 allowlist；相关 `config`、`tools list` 计数与 E2E 期望同步更新。
+- 测试：新增 8 个 artifact 行为测试（小结果旁路、100 KiB 落盘与 digest/权限/sidecar、UTF-8 截断、JSON envelope、分页不递归、未知/损坏/逃逸、保留与总量边界、写入失败降级），2 个 app 行为测试（100 KiB `read_file` preview+artifact、200 KiB bash 输出不触发 `BudgetExceeded`），1 个真实 CLI E2E `result_manager_e2e`（大输出 + `read_artifact` 分页 + 0600 + 不递归），以及配置边界/示例解析测试。
+- 偏离/说明：1) 为兼容既有小 `budget.max_result_bytes` 配置，没有在加载期强制 `max_inline_bytes <= budget.max_result_bytes`，而是在运行期把 inline 上限与阈值钳制到预算内，避免正常大输出触发 `BudgetExceeded`；2) 默认 allowlist 保持 `bash`/`read_file`/`write_file` 不变，`read_artifact` 虽在 `readonly`/`coding`/`ops`/`full` profile 中允许，仍必须显式加入 `policy.allowed_tools` 才会暴露；3) 清理只在 turn 内首次超限写入前执行一次且扫描有界，不做常驻定时清理；4) sidecar 在任务要求的最小字段外增加 `version`/`original_bytes`/`truncated` 以支持完整性与截断校验，仍不包含参数或环境信息；5) trace bundle 可选 artifact manifest 未实现，现有 bundle 不打包 artifact 内容；6) 超 `max_artifact_bytes` 时 digest 针对截断后的存储内容，源长度由 `original_bytes` 表达；7) 时间路径（超时、policy/permission 拒绝、guard 拒绝）不产生工具输出，行为保持不变；8) 未修改 `jessica-core`、SQLite schema 或 trace schema，未新增第三方 crate，`DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1011 passed, 0 failed, 2 ignored（含 `result_manager_e2e`）。
 
 ---
 
