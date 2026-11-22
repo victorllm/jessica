@@ -29,6 +29,7 @@ mod skill_distiller;
 mod skill_guide;
 mod skill_source;
 mod skill_worker;
+mod supervisor;
 
 pub use acceptance::{AcceptanceOutcome, AcceptanceRunner, SessionAttempt};
 pub use guards::{ResultSizeGuard, StuckDetectionGuard, TokenBudgetGuard, ToolTimeoutGuard};
@@ -53,4 +54,10 @@ pub use skill_worker::{
     DEFAULT_DRAIN_TIMEOUT, DEFAULT_IDLE_INTERVAL, DEFAULT_MAX_ATTEMPTS, SkillJob, SkillJobId,
     SkillJobQueue, SkillQueueError, SkillSink, SkillSinkError, SkillWorker, SkillWorkerConfig,
     SkillWorkerError, WorkerClock, WorkerOutcome, WorkerTimestamp,
+};
+pub use supervisor::{
+    CapturedStream, CommandSpec, DEFAULT_COMMAND_TIMEOUT, DEFAULT_ENV_ALLOWLIST,
+    DEFAULT_OUTPUT_LIMIT, SupervisedOutput, SupervisorError, cap_rendered_output,
+    cap_rendered_output_with_total, effective_env_allowlist, is_sensitive_env_name,
+    is_valid_env_name, run_supervised,
 };

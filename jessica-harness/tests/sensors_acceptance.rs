@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jessica_core::acceptance::{AcceptanceCheck, AcceptanceContext, AcceptanceResult};
@@ -157,6 +158,125 @@ async fn command_sensor_reports_spawn_failure_without_panicking() {
         observed
             .output
             .contains("/definitely/not/a/jessica-command")
+    );
+}
+
+#[tokio::test]
+async fn a_hung_command_sensor_times_out_instead_of_blocking_the_pipeline() {
+    let sensor = CommandSensor::new("slow", "sh")
+        .args(["-c", "exec sleep 30"])
+        .with_timeout(Duration::from_millis(100));
+    let call = ToolCall::new("call-1", "bash", json!({"command": "true"}));
+    let result = ToolResult::success("call-1", "ok");
+    let started = Instant::now();
+
+    let observed = sensor
+        .observe(&SensorContext {
+            tool_call: &call,
+            tool_result: &result,
+        })
+        .await;
+
+    assert!(!observed.passed);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the sensor must return instead of hanging the turn"
+    );
+    assert!(
+        observed.output.contains("timed out"),
+        "the failure must name the timeout: {}",
+        observed.output
+    );
+}
+
+#[tokio::test]
+async fn command_sensor_passes_only_the_environment_allowlist() {
+    let extension = std::env::vars_os().find_map(|(name, _)| {
+        let name = name.to_str()?.to_owned();
+        let is_default = jessica_harness::DEFAULT_ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| *allowed == name);
+        (!is_default
+            && jessica_harness::is_valid_env_name(&name)
+            && !jessica_harness::is_sensitive_env_name(&name))
+        .then_some(name)
+    });
+    let mut sensor = CommandSensor::new("environment", "env");
+    if let Some(name) = &extension {
+        sensor = sensor.with_env_allowlist([name.clone()]);
+    }
+    let call = ToolCall::new("call-1", "bash", json!({"command": "true"}));
+    let result = ToolResult::success("call-1", "ok");
+
+    let observed = sensor
+        .observe(&SensorContext {
+            tool_call: &call,
+            tool_result: &result,
+        })
+        .await;
+
+    assert!(observed.passed, "env must run: {}", observed.output);
+    assert!(
+        observed.output.contains("PATH="),
+        "PATH is a default allowlist entry and must be present: {}",
+        observed.output
+    );
+    if let Some(name) = extension {
+        assert!(
+            observed.output.contains(&format!("{name}=")),
+            "configured extension `{name}` must be present: {}",
+            observed.output
+        );
+    }
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if jessica_harness::is_sensitive_env_name(name) {
+            assert!(
+                !observed
+                    .output
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "sensitive variable `{name}` must never be inherited"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn command_sensor_output_is_capped_and_marked_truncated() {
+    let sensor = CommandSensor::new("noisy", "sh")
+        .args([
+            "-c",
+            "i=0; while [ $i -lt 200 ]; do printf 'abcdefghij'; i=$((i+1)); done",
+        ])
+        .with_output_limit(128);
+    let call = ToolCall::new("call-1", "bash", json!({"command": "true"}));
+    let result = ToolResult::success("call-1", "ok");
+
+    let observed = sensor
+        .observe(&SensorContext {
+            tool_call: &call,
+            tool_result: &result,
+        })
+        .await;
+
+    assert!(observed.passed);
+    assert!(
+        observed.output.len() <= 128,
+        "the rendered output must respect the cap: {} bytes",
+        observed.output.len()
+    );
+    assert!(
+        observed.output.contains("truncated"),
+        "truncation must be observable: {}",
+        observed.output
+    );
+    assert!(
+        observed.output.contains("of "),
+        "the notice must record the original size: {}",
+        observed.output
     );
 }
 

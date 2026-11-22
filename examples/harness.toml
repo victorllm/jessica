@@ -27,6 +27,17 @@ max_result_bytes = 65_536
 [policy]
 allowed_tools = ["read_file", "write_file"]
 
+# Command-backed tools, the sensor, and the acceptance check run with a cleared
+# environment. Only these names are passed through in addition to the built-in
+# defaults (PATH, HOME, LANG, TERM, TMPDIR). Provider keys and JESSICA_*
+# variables are never inherited.
+[tools.supervisor]
+env_allowlist = []
+command_timeout_ms = 10_000
+max_output_bytes = 65_536
+sensor_timeout_ms = 10_000
+acceptance_timeout_ms = 10_000
+
 [sensor]
 name = "diff-check"
 command = "git"

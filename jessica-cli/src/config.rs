@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
+use jessica_harness::{
+    DEFAULT_OUTPUT_LIMIT, effective_env_allowlist, is_sensitive_env_name, is_valid_env_name,
+};
 use jessica_providers::{
     MAX_BURST, MAX_CONCURRENT, MAX_REQUESTS_PER_MINUTE, MAX_TIMEOUT_MS,
     ReliabilityConfig as ProviderReliabilityConfig,
@@ -215,6 +218,124 @@ pub struct ToolLimitConfig {
     pub max_args_bytes: Option<usize>,
 }
 
+/// Execution supervisor settings shared by command-backed components.
+///
+/// The supervisor starts every command with an empty environment, passes only
+/// allowlisted variables, bounds the complete spawn/read/wait lifecycle, and
+/// caps captured output. Numeric fields are optional so an omitted value can
+/// inherit the session budget; every present value must be at least 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SupervisorConfig {
+    /// Additional environment variable names on top of the built-in defaults.
+    ///
+    /// The defaults (`PATH`, `HOME`, `LANG`, `TERM`, `TMPDIR`) cannot be
+    /// removed. Entries must be concrete names: empty names, wildcards, and
+    /// credential-bearing names are rejected.
+    pub env_allowlist: Vec<String>,
+    /// Wall-clock deadline for command-backed tools, in milliseconds.
+    ///
+    /// Defaults to the smaller of `budget.tool_timeout_ms` and the bash tool's
+    /// 10-second internal deadline. The bash tool never exceeds that internal
+    /// deadline even when this value is larger.
+    pub command_timeout_ms: Option<u64>,
+    /// Maximum captured bytes per output stream for bash, sensors, and
+    /// acceptance checks.
+    ///
+    /// Defaults to the smaller of 64 KiB and `budget.max_result_bytes`. The
+    /// rendered bash result is capped at this value after truncation notices
+    /// are added, so a capped result never exceeds `budget.max_result_bytes`.
+    pub max_output_bytes: Option<usize>,
+    /// Wall-clock deadline for one command sensor run, in milliseconds.
+    ///
+    /// Defaults to the resolved command deadline.
+    pub sensor_timeout_ms: Option<u64>,
+    /// Wall-clock deadline for one acceptance check attempt, in milliseconds.
+    ///
+    /// Defaults to the resolved command deadline.
+    pub acceptance_timeout_ms: Option<u64>,
+}
+
+impl SupervisorConfig {
+    /// Rejects unusable names, non-positive values, and limits that could
+    /// exceed the session budgets.
+    fn validate(&self, global_timeout_ms: u64, max_result_bytes: usize) -> Result<(), ConfigError> {
+        for name in &self.env_allowlist {
+            if !is_valid_env_name(name) {
+                return Err(invalid(format!(
+                    "tools.supervisor.env_allowlist contains invalid name `{name}`: empty names, whitespace, `=`, NUL, `*`, and `?` are not allowed"
+                )));
+            }
+            if is_sensitive_env_name(name) {
+                return Err(invalid(format!(
+                    "tools.supervisor.env_allowlist must not include credential-bearing variable `{name}`"
+                )));
+            }
+        }
+        validate_supervisor_timeout(
+            "tools.supervisor.command_timeout_ms",
+            self.command_timeout_ms,
+            global_timeout_ms,
+        )?;
+        validate_supervisor_timeout(
+            "tools.supervisor.sensor_timeout_ms",
+            self.sensor_timeout_ms,
+            global_timeout_ms,
+        )?;
+        validate_supervisor_timeout(
+            "tools.supervisor.acceptance_timeout_ms",
+            self.acceptance_timeout_ms,
+            global_timeout_ms,
+        )?;
+        if let Some(bytes) = self.max_output_bytes {
+            if bytes == 0 {
+                return Err(invalid(
+                    "tools.supervisor.max_output_bytes must be at least 1",
+                ));
+            }
+            if bytes > max_result_bytes {
+                return Err(invalid(
+                    "tools.supervisor.max_output_bytes must not exceed budget.max_result_bytes",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_supervisor_timeout(
+    field: &str,
+    value: Option<u64>,
+    global_timeout_ms: u64,
+) -> Result<(), ConfigError> {
+    if let Some(timeout_ms) = value {
+        if timeout_ms == 0 {
+            return Err(invalid(format!("{field} must be at least 1")));
+        }
+        if timeout_ms > global_timeout_ms {
+            return Err(invalid(format!(
+                "{field} must not exceed budget.tool_timeout_ms"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Supervisor settings after defaults and session budgets are applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSupervisor {
+    /// Effective allowlist, including the built-in defaults.
+    pub env_allowlist: Vec<String>,
+    /// Effective deadline for command-backed tools.
+    pub command_timeout: Duration,
+    /// Effective per-stream captured-byte limit.
+    pub max_output_bytes: usize,
+    /// Effective deadline for one command sensor run.
+    pub sensor_timeout: Duration,
+    /// Effective deadline for one acceptance check attempt.
+    pub acceptance_timeout: Duration,
+}
+
 /// Tool catalog and exposure settings.
 ///
 /// The catalog is rebuilt for every turn from the configured policy, this
@@ -236,6 +357,8 @@ pub struct ToolsConfig {
     pub write_file: ToolLimitConfig,
     /// Optional limits for the native `bash` tool.
     pub bash: ToolLimitConfig,
+    /// Execution supervisor settings.
+    pub supervisor: SupervisorConfig,
 }
 
 impl Default for ToolsConfig {
@@ -247,6 +370,7 @@ impl Default for ToolsConfig {
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
             bash: ToolLimitConfig::default(),
+            supervisor: SupervisorConfig::default(),
         }
     }
 }
@@ -262,15 +386,61 @@ impl ToolsConfig {
         }
     }
 
+    /// Returns the effective command deadline before the bash-specific cap.
+    ///
+    /// The default is the smaller of `fallback` and the bash tool's original
+    /// 10-second deadline, so adding the supervisor cannot silently widen
+    /// existing configurations.
+    pub fn command_timeout(&self, fallback: Duration) -> Duration {
+        self.supervisor
+            .command_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| fallback.min(DEFAULT_BASH_TIMEOUT))
+    }
+
     /// Returns the effective timeout for one tool.
     ///
     /// A per-tool override replaces `fallback`. Validation has already ensured
-    /// it is positive and no larger than the global timeout.
+    /// it is positive and no larger than the global timeout. The `bash` tool is
+    /// additionally capped by its internal deadline and the supervisor command
+    /// deadline so the descriptor never advertises a longer run than the tool
+    /// can honor.
     pub fn timeout_for(&self, name: &str, fallback: Duration) -> Duration {
-        self.limits(name)
+        let configured = self
+            .limits(name)
             .and_then(|limits| limits.timeout_ms)
             .map(Duration::from_millis)
-            .unwrap_or(fallback)
+            .unwrap_or(fallback);
+        if name == "bash" {
+            configured
+                .min(DEFAULT_BASH_TIMEOUT)
+                .min(self.command_timeout(fallback))
+        } else {
+            configured
+        }
+    }
+
+    /// Resolves supervisor defaults against the session budgets.
+    pub fn resolved_supervisor(&self, budget: &BudgetConfig) -> ResolvedSupervisor {
+        let command_timeout = self.command_timeout(budget.tool_timeout());
+        ResolvedSupervisor {
+            env_allowlist: effective_env_allowlist(&self.supervisor.env_allowlist),
+            command_timeout,
+            max_output_bytes: self
+                .supervisor
+                .max_output_bytes
+                .unwrap_or_else(|| DEFAULT_OUTPUT_LIMIT.min(budget.max_result_bytes)),
+            sensor_timeout: self
+                .supervisor
+                .sensor_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(command_timeout),
+            acceptance_timeout: self
+                .supervisor
+                .acceptance_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(command_timeout),
+        }
     }
 
     /// Returns the argument-size limit for one tool, if configured.
@@ -278,18 +448,28 @@ impl ToolsConfig {
         self.limits(name).and_then(|limits| limits.max_args_bytes)
     }
 
-    /// Rejects unusable exposure budgets and per-tool limits.
+    /// Rejects unusable exposure budgets, supervisor settings, and per-tool
+    /// limits.
     ///
     /// `global_timeout_ms` is `budget.tool_timeout_ms`; per-tool overrides must
-    /// not exceed it. The bash override is also capped by the tool's internal
-    /// timeout so the descriptor cannot advertise a deadline the tool ignores.
-    pub fn validate(&self, global_timeout_ms: u64) -> Result<(), ConfigError> {
+    /// not exceed it. The bash override is additionally capped by the smaller
+    /// of the tool's internal deadline and the supervisor command deadline so
+    /// the descriptor cannot advertise a deadline the tool ignores.
+    /// `max_result_bytes` bounds the supervisor output cap so truncated bash
+    /// results cannot trip the result-size guard.
+    pub fn validate(
+        &self,
+        global_timeout_ms: u64,
+        max_result_bytes: usize,
+    ) -> Result<(), ConfigError> {
         if self.max_exposed_tools == 0 {
             return Err(invalid("tools.max_exposed_tools must be at least 1"));
         }
         if self.max_tool_schema_bytes == 0 {
             return Err(invalid("tools.max_tool_schema_bytes must be at least 1"));
         }
+        self.supervisor
+            .validate(global_timeout_ms, max_result_bytes)?;
         validate_tool_limits("tools.read_file", &self.read_file, global_timeout_ms, None)?;
         validate_tool_limits(
             "tools.write_file",
@@ -297,11 +477,17 @@ impl ToolsConfig {
             global_timeout_ms,
             None,
         )?;
+        let bash_internal_ms = DEFAULT_BASH_TIMEOUT.as_millis() as u64;
+        let bash_cap_ms = self
+            .supervisor
+            .command_timeout_ms
+            .unwrap_or(bash_internal_ms)
+            .min(bash_internal_ms);
         validate_tool_limits(
             "tools.bash",
             &self.bash,
             global_timeout_ms,
-            Some(DEFAULT_BASH_TIMEOUT.as_millis() as u64),
+            Some(bash_cap_ms),
         )?;
         Ok(())
     }
@@ -426,6 +612,15 @@ impl HarnessConfig {
         serde_json::to_string_pretty(self)
     }
 
+    /// Resolves the supervisor settings that apply to the next turn.
+    ///
+    /// The result combines `[tools.supervisor]`, `budget.tool_timeout_ms`, and
+    /// `budget.max_result_bytes`. Because it is derived per turn, a hot-reloaded
+    /// `[tools]` section affects only turns started afterwards.
+    pub fn resolved_supervisor(&self) -> ResolvedSupervisor {
+        self.tools.resolved_supervisor(&self.budget)
+    }
+
     /// Rejects values that would make the assembly ambiguous or unusable.
     ///
     /// A zero token budget and a zero result-size limit are accepted: they are
@@ -441,7 +636,8 @@ impl HarnessConfig {
         if self.budget.max_stuck_rounds == 0 {
             return Err(invalid("budget.max_stuck_rounds must be at least 1"));
         }
-        self.tools.validate(self.budget.tool_timeout_ms)?;
+        self.tools
+            .validate(self.budget.tool_timeout_ms, self.budget.max_result_bytes)?;
         self.delegation.validate()?;
         self.reliability.validate()?;
         if self.delegation.enabled {
@@ -1281,6 +1477,143 @@ mod tests {
         assert_eq!(config.tools.read_file, ToolLimitConfig::default());
         assert_eq!(config.tools.write_file, ToolLimitConfig::default());
         assert_eq!(config.tools.bash, ToolLimitConfig::default());
+        assert_eq!(config.tools.supervisor, SupervisorConfig::default());
+
+        let supervisor = config.resolved_supervisor();
+        assert_eq!(
+            supervisor.env_allowlist,
+            vec!["PATH", "HOME", "LANG", "TERM", "TMPDIR"]
+        );
+        assert_eq!(supervisor.command_timeout, Duration::from_secs(10));
+        assert_eq!(supervisor.max_output_bytes, 64 * 1024);
+        assert_eq!(supervisor.sensor_timeout, Duration::from_secs(10));
+        assert_eq!(supervisor.acceptance_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn supervisor_defaults_never_widen_existing_command_boundaries() {
+        let config = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 20000\n")
+            .expect("a longer global timeout is valid");
+        let supervisor = config.resolved_supervisor();
+
+        assert_eq!(
+            supervisor.command_timeout,
+            Duration::from_secs(10),
+            "an omitted supervisor deadline must not raise the bash 10 s boundary"
+        );
+        assert_eq!(
+            config.tools.timeout_for("bash", Duration::from_secs(20)),
+            Duration::from_secs(10),
+            "the bash descriptor must not advertise a deadline the tool ignores"
+        );
+        assert_eq!(
+            config
+                .tools
+                .timeout_for("read_file", Duration::from_secs(20)),
+            Duration::from_secs(20),
+            "other tools keep the global deadline"
+        );
+    }
+
+    #[test]
+    fn supervisor_config_is_validated_and_resolved() {
+        let rejected = [
+            (
+                "[tools.supervisor]\ncommand_timeout_ms = 0\n",
+                "tools.supervisor.command_timeout_ms",
+            ),
+            (
+                "[tools.supervisor]\nsensor_timeout_ms = 0\n",
+                "tools.supervisor.sensor_timeout_ms",
+            ),
+            (
+                "[tools.supervisor]\nacceptance_timeout_ms = 0\n",
+                "tools.supervisor.acceptance_timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n\
+                 [tools.supervisor]\ncommand_timeout_ms = 5001\n",
+                "tools.supervisor.command_timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n\
+                 [tools.supervisor]\nsensor_timeout_ms = 5001\n",
+                "tools.supervisor.sensor_timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n\
+                 [tools.supervisor]\nacceptance_timeout_ms = 5001\n",
+                "tools.supervisor.acceptance_timeout_ms",
+            ),
+            (
+                "[tools.supervisor]\nmax_output_bytes = 0\n",
+                "tools.supervisor.max_output_bytes",
+            ),
+            (
+                "[budget]\nmax_result_bytes = 1024\n\
+                 [tools.supervisor]\nmax_output_bytes = 1025\n",
+                "tools.supervisor.max_output_bytes",
+            ),
+            (
+                "[tools.supervisor]\nenv_allowlist = [\"\"]\n",
+                "tools.supervisor.env_allowlist",
+            ),
+            (
+                "[tools.supervisor]\nenv_allowlist = [\"OPENAI_*\"]\n",
+                "tools.supervisor.env_allowlist",
+            ),
+            (
+                "[tools.supervisor]\nenv_allowlist = [\"OPENAI_API_KEY\"]\n",
+                "credential-bearing",
+            ),
+            (
+                "[tools.supervisor]\nenv_allowlist = [\"JESSICA_PROVIDER\"]\n",
+                "credential-bearing",
+            ),
+            (
+                "[tools.supervisor]\nenv_allowlist = [\"A=B\"]\n",
+                "tools.supervisor.env_allowlist",
+            ),
+            (
+                "[tools.supervisor]\ncommand_timeout_ms = 3000\n\
+                 [tools.bash]\ntimeout_ms = 4000\n",
+                "tools.bash.timeout_ms",
+            ),
+        ];
+        for (toml, expected) in rejected {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("invalid supervisor settings must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+
+        let accepted = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 20000\nmax_result_bytes = 4096\n\
+             [tools.supervisor]\n\
+             env_allowlist = [\"CARGO_HOME\", \"PATH\"]\n\
+             command_timeout_ms = 15000\n\
+             max_output_bytes = 2048\n\
+             sensor_timeout_ms = 3000\n\
+             acceptance_timeout_ms = 4000\n",
+        )
+        .expect("valid supervisor settings must be accepted");
+        let supervisor = accepted.resolved_supervisor();
+        assert_eq!(
+            supervisor.env_allowlist,
+            vec!["PATH", "HOME", "LANG", "TERM", "TMPDIR", "CARGO_HOME"],
+            "configuration extends defaults without duplicates"
+        );
+        assert_eq!(supervisor.command_timeout, Duration::from_millis(15000));
+        assert_eq!(supervisor.max_output_bytes, 2048);
+        assert_eq!(supervisor.sensor_timeout, Duration::from_millis(3000));
+        assert_eq!(supervisor.acceptance_timeout, Duration::from_millis(4000));
+        assert_eq!(
+            accepted.tools.timeout_for("bash", Duration::from_secs(20)),
+            Duration::from_secs(10),
+            "bash remains capped by its internal deadline"
+        );
     }
 
     #[test]
@@ -1363,7 +1696,8 @@ mod tests {
             .expect("current config must parse");
         let next = HarnessConfig::from_toml_str(
             "[tools]\nprofile = \"readonly\"\n\
-             [tools.read_file]\ntimeout_ms = 2000\n",
+             [tools.read_file]\ntimeout_ms = 2000\n\
+             [tools.supervisor]\nsensor_timeout_ms = 500\nmax_output_bytes = 1024\n",
         )
         .expect("next config must parse");
         assert_eq!(

@@ -1,27 +1,35 @@
 //! Command-backed acceptance check used by the example CLI configuration.
 
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use jessica_core::acceptance::{AcceptanceCheck, AcceptanceContext, AcceptanceResult};
-use tokio::process::Command;
+use jessica_harness::{
+    CapturedStream, CommandSpec, DEFAULT_COMMAND_TIMEOUT, DEFAULT_OUTPUT_LIMIT, SupervisedOutput,
+    SupervisorError, cap_rendered_output_with_total, run_supervised,
+};
 
-/// Maximum captured bytes per output stream in acceptance feedback.
-const OUTPUT_LIMIT: usize = 8 * 1024;
+use crate::config::ResolvedSupervisor;
 
 /// Runs one external command in a fixed working directory.
 ///
 /// The command runs directly, without a shell; callers that need shell syntax
-/// can invoke `sh -c`. A zero exit status passes. Non-zero status, a signal, a
-/// spawn failure, or a missing executable fails with diagnostics that are fed
-/// back to the model on retry.
+/// can invoke `sh -c`. It starts with an empty environment containing only the
+/// supervisor allowlist, and the complete spawn/read/wait sequence is bounded
+/// by a deadline. A zero exit status passes. Non-zero status, a signal, a
+/// timeout, a spawn failure, or a missing executable fails with diagnostics
+/// that are fed back to the model on retry. Captured output is capped with an
+/// explicit truncation notice.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandAcceptanceCheck {
     name: String,
     program: String,
     args: Vec<String>,
     current_dir: PathBuf,
+    env_allowlist: Vec<String>,
+    timeout: Duration,
+    output_limit: usize,
 }
 
 impl CommandAcceptanceCheck {
@@ -37,7 +45,18 @@ impl CommandAcceptanceCheck {
             program: program.into(),
             args,
             current_dir,
+            env_allowlist: Vec::new(),
+            timeout: DEFAULT_COMMAND_TIMEOUT,
+            output_limit: DEFAULT_OUTPUT_LIMIT,
         }
+    }
+
+    /// Applies the resolved supervisor limits to this check.
+    pub(crate) fn with_supervisor(mut self, supervisor: &ResolvedSupervisor) -> Self {
+        self.env_allowlist = supervisor.env_allowlist.clone();
+        self.timeout = supervisor.acceptance_timeout;
+        self.output_limit = supervisor.max_output_bytes;
+        self
     }
 }
 
@@ -48,36 +67,39 @@ impl AcceptanceCheck for CommandAcceptanceCheck {
     }
 
     async fn check(&self, _context: &AcceptanceContext<'_>) -> AcceptanceResult {
-        let output = Command::new(&self.program)
-            .args(&self.args)
-            .current_dir(&self.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await;
+        let spec = CommandSpec {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            current_dir: Some(self.current_dir.clone()),
+            env_allowlist: self.env_allowlist.clone(),
+            output_limit: self.output_limit,
+        };
 
-        match output {
+        match run_supervised(&spec, self.timeout).await {
             Ok(output) if output.status.success() => {
                 AcceptanceResult::pass(format!("command `{}` exited successfully", self.program))
             }
             Ok(output) => {
-                let mut feedback = format!(
-                    "acceptance command `{}` failed with {}.{}",
-                    self.program,
-                    output.status,
-                    render_output(&output.stdout, &output.stderr)
+                let source_total = output
+                    .stdout
+                    .total_bytes
+                    .saturating_add(output.stderr.total_bytes);
+                let rendered = cap_rendered_output_with_total(
+                    &render_output(&output),
+                    self.output_limit,
+                    source_total,
                 );
-                if feedback.chars().count() > OUTPUT_LIMIT * 2 {
-                    let mut truncated: String = feedback.chars().take(OUTPUT_LIMIT * 2).collect();
-                    truncated.push('…');
-                    feedback = truncated;
-                }
-                AcceptanceResult::fail(feedback)
+                AcceptanceResult::fail(format!(
+                    "acceptance command `{}` failed with {}.{rendered}",
+                    self.program, output.status
+                ))
             }
+            Err(SupervisorError::Timeout { timeout_ms, .. }) => AcceptanceResult::fail(format!(
+                "acceptance command `{}` timed out after {timeout_ms} ms and was terminated",
+                self.program
+            )),
             Err(error) => AcceptanceResult::fail(format!(
-                "could not start acceptance command `{}` in `{}`: {error}",
+                "could not run acceptance command `{}` in `{}`: {error}",
                 self.program,
                 self.current_dir.display()
             )),
@@ -87,13 +109,13 @@ impl AcceptanceCheck for CommandAcceptanceCheck {
 
 /// Renders captured output, preferring stderr because failures usually explain
 /// themselves there.
-fn render_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = capped(stderr);
+fn render_output(output: &SupervisedOutput) -> String {
+    let stderr = render_stream(&output.stderr);
     if !stderr.is_empty() {
         return format!("\nstderr: {stderr}");
     }
 
-    let stdout = capped(stdout);
+    let stdout = render_stream(&output.stdout);
     if stdout.is_empty() {
         String::new()
     } else {
@@ -101,21 +123,27 @@ fn render_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-fn capped(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    if text.len() <= OUTPUT_LIMIT {
-        text.into_owned()
-    } else {
-        let mut truncated = String::from_utf8_lossy(&bytes[..OUTPUT_LIMIT]).into_owned();
-        truncated.push_str("\n…(output truncated)");
-        truncated
+/// Renders one stream, appending its truncation state.
+fn render_stream(stream: &CapturedStream) -> String {
+    if stream.bytes.is_empty() && !stream.truncated {
+        return String::new();
     }
+    let mut rendered = String::from_utf8_lossy(&stream.bytes).into_owned();
+    if stream.truncated {
+        rendered.push_str(&format!(
+            "\n…(stream truncated at {} bytes: {} bytes total)",
+            stream.bytes.len(),
+            stream.total_bytes
+        ));
+    }
+    rendered
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use jessica_core::types::Message;
+    use std::time::Instant;
 
     fn check(command: &str) -> CommandAcceptanceCheck {
         CommandAcceptanceCheck::new(
@@ -164,5 +192,52 @@ mod tests {
         assert!(!result.passed);
         assert!(result.feedback.contains("could not start"));
         assert!(result.feedback.contains("/definitely/not/a/jessica-check"));
+    }
+
+    #[tokio::test]
+    async fn a_hung_acceptance_command_times_out_and_fails_the_check() {
+        let mut check = check("exec sleep 30");
+        check.timeout = Duration::from_millis(100);
+        let started = Instant::now();
+
+        let result = run(&check).await;
+
+        assert!(!result.passed);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the check must return instead of hanging the turn"
+        );
+        assert!(
+            result.feedback.contains("timed out"),
+            "the feedback must name the timeout: {}",
+            result.feedback
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_feedback_is_truncated_at_the_configured_limit() {
+        let mut check = check(
+            "i=0; while [ $i -lt 20 ]; do printf 'abcdefghijklmnopqrstuvwxyz' >&2; i=$((i+1)); done; exit 9",
+        );
+        check.output_limit = 64;
+
+        let result = run(&check).await;
+
+        assert!(!result.passed);
+        assert!(
+            result.feedback.contains("truncated"),
+            "truncation must be observable: {}",
+            result.feedback
+        );
+        assert!(
+            result.feedback.contains("of "),
+            "the notice must record the original size: {}",
+            result.feedback
+        );
+        assert!(
+            result.feedback.contains('9'),
+            "the exit code must survive truncation: {}",
+            result.feedback
+        );
     }
 }
