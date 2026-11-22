@@ -1548,6 +1548,15 @@ pub(crate) enum CliError {
     /// `--config` was given more than once.
     #[error("`--config` may be given only once")]
     DuplicateConfig,
+    /// `config` was given an unexpected argument.
+    #[error("unexpected config argument `{argument}`")]
+    InvalidConfigCommand {
+        /// Unrecognized argument.
+        argument: String,
+    },
+    /// The effective configuration could not be serialized.
+    #[error("failed to serialize the effective configuration: {0}")]
+    ConfigSerialization(#[source] serde_json::Error),
     /// `--resume` was given without a session id.
     #[error("`--resume` requires a session id")]
     MissingResumeSessionId,
@@ -1557,11 +1566,11 @@ pub(crate) enum CliError {
     /// A prompt and `--resume` cannot be used together.
     #[error("`--resume` cannot be combined with a prompt")]
     ResumeWithPrompt,
-    /// `--resume` was requested without a configured event store.
-    #[error("`--resume` requires an `[events]` path in the configuration")]
+    /// `--resume` was requested while trace persistence was disabled.
+    #[error("`--resume` requires trace persistence (`profile.trace = \"strict\"`)")]
     ResumeRequiresEventStore,
-    /// `replay` was requested without a configured event store.
-    #[error("`replay` requires an `[events]` path in the configuration")]
+    /// `replay` was requested while trace persistence was disabled.
+    #[error("`replay` requires trace persistence (`profile.trace = \"strict\"`)")]
     ReplayRequiresEventStore,
     /// A `replay` argument was not recognized.
     #[error("unexpected replay argument `{argument}`")]
@@ -1584,8 +1593,8 @@ pub(crate) enum CliError {
     /// Offline replay failed.
     #[error("replay failed: {0}")]
     Replay(#[from] ReplayError),
-    /// `trace` was requested without a configured event store.
-    #[error("`trace` requires an `[events]` path in the configuration")]
+    /// `trace` was requested while trace persistence was disabled.
+    #[error("`trace` requires trace persistence (`profile.trace = \"strict\"`)")]
     TraceRequiresEventStore,
     /// A `trace` argument was missing, unknown, or malformed.
     #[error("invalid trace command: {message}")]
@@ -1756,8 +1765,9 @@ pub(crate) enum CliError {
         /// Failure that prevented completion.
         cause: String,
     },
-    /// ACP session recovery was configured without an event-store path.
-    #[error("ACP session recovery requires an [events] path")]
+    /// ACP session recovery was configured while trace persistence was
+    /// disabled.
+    #[error("ACP session recovery requires trace persistence (`profile.trace = \"strict\"`)")]
     AcpPersistenceWithoutEvents,
     /// The ACP session index could not be opened.
     #[error("ACP session store failure: {0}")]

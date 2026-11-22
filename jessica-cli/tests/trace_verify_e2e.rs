@@ -842,13 +842,13 @@ fn a_database_without_the_trace_schema_is_rejected_untouched() {
 fn trace_requires_an_event_store_path() {
     let temp = TempDir::new("no-events");
     let config = temp.path.join("harness.toml");
-    std::fs::write(&config, "").expect("config should be written");
+    std::fs::write(&config, "[profile]\ntrace = \"off\"\n").expect("config should be written");
 
     let output = run_verify(&config, &["--all"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("requires an `[events]` path"),
+        stderr.contains("requires trace persistence"),
         "expected a configuration error:\n{stderr}"
     );
 }

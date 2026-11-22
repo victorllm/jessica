@@ -125,11 +125,49 @@ cargo run -p jessica-cli --bin jessica -- --config examples/harness.toml "修改
 `OPENAI_API_KEY` is required. `OPENAI_BASE_URL` and `OPENAI_MODEL` select an
 OpenAI-compatible endpoint and model.
 
+## Profiles and effective configuration
+
+Jessica resolves configuration in this order: built-in defaults, the selected
+`profile.preset`, then explicit fields in the TOML document. Explicit values
+always win, including an explicit empty `policy.allowed_tools`.
+
+```toml
+[profile]
+preset = "dev"   # default; also accepts "safe", "ci", or "lab"
+trace = "strict" # default; use "off" to disable persistence
+```
+
+Presets only supply safe defaults; they never enable memory, skills, or
+reliability. `safe` narrows the default allowlist to `read_file`; `dev`, `ci`,
+and `lab` use `bash`, `read_file`, and `write_file`. Side-effecting subsystems
+therefore stay opt-in.
+
+Trace persistence is strict by default. A relative path resolves against the
+startup workspace, and the event store plus any missing parent directories are
+created on first run:
+
+```toml
+[events]
+path = ".jessica/events.db" # the default when omitted
+```
+
+Set `trace = "off"` to disable persistence. Combining it with an explicit
+`events.path` is rejected instead of silently overriding one side. `--resume`,
+`replay`, and ACP session recovery require trace persistence.
+
+`jessica config` prints the fully resolved configuration as JSON without
+opening a provider, event store, memory or skills database, or wasm module:
+
+```bash
+jessica --config ~/.jessica/harness.toml config
+```
+
 ## Trace verification and digests
 
 `jessica trace verify` audits recorded turn traces without creating or
-migrating the `[events]` database. It does not execute a replay unless
-`--replay` is requested:
+migrating the configured event store (default `.jessica/events.db` relative to
+the startup workspace). It does not execute a replay unless `--replay` is
+requested:
 
 ```bash
 jessica --config ~/.jessica/harness.toml trace verify --turn <turn_id>
@@ -328,8 +366,9 @@ prompt returns `-32602` with a stable, actionable message.
 The `[acp]` section is startup-only. ACP reuses the REPL configuration watcher:
 changes to reloadable sections such as `[budget]`, `[policy]`, `[sensor]`,
 `[acceptance]`, and `[delegation]` apply to the next prompt, while changes to
-`events`, `memory`, `skills`, `wasm`, `reliability`, or `acp` reject the whole
-reload and keep the startup value. WASM tools are loaded once at startup.
+`profile`, `events`, `memory`, `skills`, `wasm`, `reliability`, or `acp` reject
+the whole reload and keep the startup value. WASM tools are loaded once at
+startup.
 
 ### Stdio MCP servers
 
@@ -382,19 +421,22 @@ content-free `-32603` with `{"reason":"mcp_server_startup_failed"}`. Only
 
 ### Session recovery and lifecycle
 
-Enable the persisted session lifecycle by configuring both the event store and
-the ACP state directory:
+Enable the persisted session lifecycle with the ACP state directory. The
+default strict trace supplies the event store, so no `[events]` section is
+required:
 
 ```toml
-[events]
-path = "events.db"
-
 [acp]
 state_dir = "acp-state"
+
+# Optional: override the default .jessica/events.db store.
+[events]
+path = "events.db"
 ```
 
 Relative paths resolve against the startup workspace. `state_dir` requires
-`events.path`; startup fails if only one is configured. The state directory
+trace persistence; startup fails when `profile.trace = "off"` disables the
+event store. The state directory
 contains one small index per ACP session: the session id, canonical cwd,
 timestamps, and committed turn ids. It never stores prompt text, tool
 arguments, model output, environment values, or credentials. Conversation
@@ -502,10 +544,10 @@ directory passed to `paseo --home`):
 `-32602`; use stdio servers. MCP servers are rejected on `session/load` and
 `session/resume`, so a client that persists MCP configuration should start a new
 session rather than resuming one with `mcpServers`. Sessions are recoverable
-only when the harness file passed with `--config` configures `[events].path`
-and `[acp].state_dir`. With persistence, clients that check `loadSession` use
-`session/load`; clients that prefer the non-replaying lifecycle can use
-`session/resume`.
+only when the harness file passed with `--config` configures `[acp].state_dir`
+and trace persistence is enabled (the default, or an explicit `[events].path`).
+With persistence, clients that check `loadSession` use `session/load`; clients
+that prefer the non-replaying lifecycle can use `session/resume`.
 
 Paseo 0.15.x performs a **global** provider catalog probe with
 `cwd = $HOME`. Jessica's startup workspace root is the directory in which its

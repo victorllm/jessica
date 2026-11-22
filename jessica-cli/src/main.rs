@@ -162,6 +162,22 @@ async fn run() -> RunOutcome {
                 signal: None,
             }
         }
+        Mode::Config => {
+            // Configuration inspection has no side effects: it never opens a
+            // provider, event store, memory database, skill database, or wasm
+            // module.
+            let result = match config.to_effective_json() {
+                Ok(json) => {
+                    println!("{json}");
+                    Ok(None)
+                }
+                Err(error) => Err(CliError::ConfigSerialization(error)),
+            };
+            RunOutcome {
+                result,
+                signal: None,
+            }
+        }
         Mode::Turn { resume, prompt } => {
             // The listener is installed once at startup, before the event
             // store is opened. Turns never install their own listener.
@@ -359,6 +375,7 @@ where
 }
 
 /// Parsed command line.
+#[derive(Debug)]
 struct Options {
     /// Optional TOML configuration path.
     config: Option<PathBuf>,
@@ -367,6 +384,7 @@ struct Options {
 }
 
 /// Command selected by the arguments.
+#[derive(Debug)]
 enum Mode {
     /// Runs one governed turn, resumes a session, or starts the REPL.
     Turn {
@@ -392,6 +410,8 @@ enum Mode {
         /// Parsed trace command.
         command: TraceCommand,
     },
+    /// Prints the effective resolved configuration as JSON.
+    Config,
     /// Serves stable ACP v1 over stdin/stdout.
     Acp,
 }
@@ -401,8 +421,8 @@ enum Mode {
 /// An interactive REPL (a `Turn` with neither `--resume` nor a prompt) and
 /// the long-lived ACP server own a config watcher. The ACP watcher starts when
 /// the lazy runtime is assembled, so every later prompt reads the newest
-/// reloadable snapshot. One-shot, resume, replay, and skills return `None`, so
-/// they load the startup configuration exactly once.
+/// reloadable snapshot. One-shot, resume, replay, skills, trace, and config
+/// return `None`, so they load the startup configuration exactly once.
 fn watched_config_path(mode: &Mode, config_path: &Option<PathBuf>) -> Option<PathBuf> {
     match mode {
         Mode::Turn {
@@ -414,12 +434,16 @@ fn watched_config_path(mode: &Mode, config_path: &Option<PathBuf>) -> Option<Pat
     }
 }
 
-/// Parses arguments, returning `None` after printing help.
+/// Parses process arguments, returning `None` after printing help.
 fn parse_args() -> Result<Option<Options>, CliError> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Parses arguments from an iterator, returning `None` after printing help.
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Option<Options>, CliError> {
     let mut config = None;
     let mut resume = None;
     let mut prompt_parts = Vec::new();
-    let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -469,6 +493,15 @@ fn parse_args() -> Result<Option<Options>, CliError> {
                 return Ok(Some(Options {
                     config,
                     mode: Mode::Trace { command },
+                }));
+            }
+            "config" if resume.is_none() && prompt_parts.is_empty() => {
+                if let Some(argument) = args.next() {
+                    return Err(CliError::InvalidConfigCommand { argument });
+                }
+                return Ok(Some(Options {
+                    config,
+                    mode: Mode::Config,
                 }));
             }
             "acp" if resume.is_none() && prompt_parts.is_empty() => {
@@ -1171,15 +1204,20 @@ fn print_usage() {
          OPENAI_* or ANTHROPIC_* variables configure it.\n\
          \n\
          --resume <session_id> continues an interrupted session recorded in the\n\
-         [events] database. It cannot be combined with a prompt and requires an\n\
-         [events] path in the configuration.\n\
+         trace event store (default .jessica/events.db). It cannot be combined\n\
+         with a prompt and requires trace persistence (profile.trace = \"strict\").\n\
+         \n\
+         Usage: jessica [--config <path>] config\n\
+         \n\
+         Prints the effective configuration, including profile preset defaults and\n\
+         the resolved trace path, as pretty JSON. It has no runtime side effects.\n\
          \n\
          Usage: jessica [--config <path>] replay --session <session_id> --out <path>\n\
          \n\
          Replays a recorded session offline: the recorded model responses and tool\n\
          results drive the loop, and the resulting events are written as JSONL. It\n\
-         requires an [events] path, never calls the model or a tool, and never reads\n\
-         the clock or the network.\n\
+         requires trace persistence, never calls the model or a tool, and never\n\
+         reads the clock or the network.\n\
          \n\
          Usage: jessica [--config <path>] trace verify --turn <turn_id> [--json] [--replay] [--expect <digest>]\n\
          \x20      jessica [--config <path>] trace verify --all [--json] [--allow-open] [--replay]\n\
@@ -1189,9 +1227,10 @@ fn print_usage() {
          \x20      jessica [--config <path>] trace export --all --out <path> [--allow-open]\n\
          \x20      jessica trace verify-bundle --bundle <path> [--json] [--allow-open] [--expect <digest>]\n\
          \n\
-         Verifies, digests, or exports recorded turn traces against an existing\n\
-         [events] database. The store is opened read-only: the command never\n\
-         creates or migrates it. `trace verify-bundle` audits a portable bundle\n\
+         Verifies, digests, or exports recorded turn traces against a recorded\n\
+         trace store (default .jessica/events.db). The store is opened read-only:\n\
+         the command never creates or migrates it. `trace verify-bundle` audits a\n\
+         portable bundle\n\
          entirely offline. See `jessica trace --help` for problem kinds and exit\n\
          codes.\n\
          \n\
@@ -1397,6 +1436,7 @@ mod tests {
             },
         };
         assert_eq!(watched_config_path(&trace, &config), None);
+        assert_eq!(watched_config_path(&Mode::Config, &config), None);
 
         assert_eq!(
             watched_config_path(&Mode::Acp, &config),
@@ -1404,6 +1444,19 @@ mod tests {
             "ACP serves long-lived prompts and must observe reloadable config"
         );
         assert_eq!(watched_config_path(&Mode::Acp, &None), None);
+    }
+
+    #[test]
+    fn config_mode_parses_a_config_path_and_rejects_extra_arguments() {
+        let options = parse_args_from(skill_args(&["--config", "harness.toml", "config"]))
+            .expect("config arguments must parse")
+            .expect("not a help request");
+        assert_eq!(options.config, Some(PathBuf::from("harness.toml")));
+        assert!(matches!(options.mode, Mode::Config));
+
+        let error = parse_args_from(skill_args(&["config", "--json"]))
+            .expect_err("config has no extra arguments");
+        assert!(error.to_string().contains("--json"), "{error}");
     }
 
     #[test]
@@ -1794,18 +1847,15 @@ mod tests {
     #[test]
     fn acp_rejects_prompts_and_malformed_flags() {
         let error = parse_acp_args(None, skill_args(&["hello"]))
-            .err()
-            .expect("a prompt must not be accepted in ACP mode");
+            .expect_err("a prompt must not be accepted in ACP mode");
         assert!(error.to_string().contains("hello"));
 
         let error = parse_acp_args(None, skill_args(&["--unknown"]))
-            .err()
-            .expect("unknown flags must be rejected");
+            .expect_err("unknown flags must be rejected");
         assert!(error.to_string().contains("--unknown"));
 
         let error = parse_acp_args(None, skill_args(&["--config"]))
-            .err()
-            .expect("a missing config path must be rejected");
+            .expect_err("a missing path is rejected");
         assert!(error.to_string().contains("path"));
     }
 

@@ -16,11 +16,15 @@ use jessica_providers::{
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Tools registered by the CLI and allowed when no policy section is given.
 const NATIVE_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
+/// Read-only tool set supplied by the `safe` profile preset.
+const SAFE_TOOLS: &[&str] = &["read_file"];
+/// Default event-store path, relative to the workspace root.
+const DEFAULT_EVENTS_PATH: &str = ".jessica/events.db";
 /// Native tools a delegated child may be granted.
 pub(crate) const NATIVE_CHILD_TOOLS: &[&str] = &["bash", "read_file", "write_file"];
 
@@ -101,10 +105,79 @@ const DEFAULT_ACP_MAX_HISTORY_MESSAGES: usize = 200;
 /// Default maximum serialized byte length of ACP session history.
 const DEFAULT_ACP_MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Built-in configuration preset.
+///
+/// A preset supplies defaults for fields the document does not set explicitly.
+/// It never overrides an explicit value. Presets deliberately do not enable
+/// memory, skills, or reliability: those subsystems write data or spend tokens,
+/// so opting in stays an explicit decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePreset {
+    /// Read-only tools with trace persistence.
+    Safe,
+    /// Native tools with trace persistence.
+    #[default]
+    Dev,
+    /// Non-interactive work with native tools and trace persistence.
+    Ci,
+    /// Native tools with trace persistence for experimentation.
+    Lab,
+}
+
+impl ProfilePreset {
+    /// Returns the tool allowlist supplied when the document does not set
+    /// `policy.allowed_tools`.
+    fn allowed_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Safe => SAFE_TOOLS,
+            Self::Dev | Self::Ci | Self::Lab => NATIVE_TOOLS,
+        }
+    }
+}
+
+/// Controls whether turns are recorded to the event store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceMode {
+    /// Every turn is written to the event store. This is the default.
+    #[default]
+    Strict,
+    /// No trace is written. An explicit `events.path` is rejected because it
+    /// would silently contradict this mode.
+    Off,
+}
+
+impl TraceMode {
+    /// Returns whether traces are persisted in this mode.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+/// Profile preset and trace policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Preset supplying defaults for unset fields.
+    pub preset: ProfilePreset,
+    /// Whether trace persistence is enabled.
+    pub trace: TraceMode,
+}
+
+impl ProfileConfig {
+    /// Returns whether trace persistence is enabled.
+    pub fn trace_enabled(&self) -> bool {
+        self.trace.is_enabled()
+    }
+}
+
 /// Complete harness configuration loaded from a TOML file.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HarnessConfig {
+    /// Profile preset and trace policy applied before validation.
+    pub profile: ProfileConfig,
     /// Session budgets enforced by the runtime and harness guards.
     pub budget: BudgetConfig,
     /// Tool allowlist.
@@ -146,10 +219,43 @@ impl HarnessConfig {
     }
 
     /// Parses and validates configuration from an in-memory TOML document.
+    ///
+    /// Resolution is explicit-value-first: built-in defaults, then the
+    /// selected profile preset for keys the document omits, then the document
+    /// itself. A [`TraceMode::Off`] profile clears the implicit event-store
+    /// path; an explicit `events.path` with `trace = "off"` is rejected by
+    /// [`Self::validate`].
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|source| ConfigError::Toml { source })?;
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|source| ConfigError::Toml { source })?;
+        let profile = profile_from_table(&table)?;
+        apply_profile_defaults(&mut table, profile)?;
+        let explicit_events_path = table
+            .get("events")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|events| events.contains_key("path"));
+
+        let mut config: Self = toml::Value::Table(table)
+            .try_into()
+            .map_err(|source| ConfigError::Toml { source })?;
+        if !config.profile.trace_enabled() {
+            if !explicit_events_path {
+                config.events.path = None;
+            }
+        } else if config.events.path.is_none() {
+            config.events.path = Some(PathBuf::from(DEFAULT_EVENTS_PATH));
+        }
         config.validate()?;
         Ok(config)
+    }
+
+    /// Serializes the effective configuration as pretty JSON.
+    ///
+    /// Presets and defaults have already been resolved, so this output is the
+    /// configuration used to assemble the runtime. It is intended for audit and
+    /// debugging, not for round-tripping back into TOML.
+    pub fn to_effective_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
     }
 
     /// Rejects values that would make the assembly ambiguous or unusable.
@@ -218,6 +324,16 @@ impl HarnessConfig {
         {
             return Err(invalid("events.path must not be empty when present"));
         }
+        if self.profile.trace_enabled() && self.events.path.is_none() {
+            return Err(invalid(
+                "profile.trace = \"strict\" requires an events path",
+            ));
+        }
+        if !self.profile.trace_enabled() && self.events.path.is_some() {
+            return Err(invalid(
+                "profile.trace = \"off\" cannot be combined with events.path",
+            ));
+        }
         if self.memory.path.as_os_str().is_empty() {
             return Err(invalid("memory.path must not be empty"));
         }
@@ -225,7 +341,7 @@ impl HarnessConfig {
         self.acp.validate()?;
         if self.acp.state_dir.is_some() && self.events.path.is_none() {
             return Err(invalid(
-                "acp.state_dir requires an [events] path for ACP session recovery",
+                "acp.state_dir requires trace persistence and an events.path",
             ));
         }
         Ok(())
@@ -236,16 +352,18 @@ impl HarnessConfig {
 ///
 /// The REPL may hot-reload `budget`, `policy`, `delegation`, `sensor`, and
 /// `acceptance` because each turn rebuilds those components from its snapshot.
-/// The remaining sections own long-lived resources or limits created once at
-/// startup (the event recorder, memory and skill databases, wasm modules, the
-/// provider reliability wrapper, and ACP session limits), so any change to
-/// them rejects the whole reload. The returned name is used verbatim in the
-/// rejection log.
+/// The remaining sections own long-lived resources, limits, or startup
+/// resolution created once at startup (the profile, event recorder, memory and
+/// skill databases, wasm modules, the provider reliability wrapper, and ACP
+/// session limits), so any change to them rejects the whole reload. The
+/// returned name is used verbatim in the rejection log.
 pub(crate) fn changed_immutable_section(
     current: &HarnessConfig,
     next: &HarnessConfig,
 ) -> Option<&'static str> {
-    if current.events != next.events {
+    if current.profile != next.profile {
+        Some("profile")
+    } else if current.events != next.events {
         Some("events")
     } else if current.memory != next.memory {
         Some("memory")
@@ -267,7 +385,7 @@ pub(crate) fn changed_immutable_section(
 /// Every field must be positive. The ACP server applies the session limit when
 /// creating sessions and the remaining limits to each prompt and to the
 /// history retained for later prompts.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AcpConfig {
     /// Maximum number of sessions created in one ACP process.
@@ -330,7 +448,7 @@ impl AcpConfig {
 }
 
 /// Session budget settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     /// Maximum prompt plus completion tokens across the session.
@@ -374,7 +492,7 @@ impl BudgetConfig {
 }
 
 /// Tool policy settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Tool names the model may execute. An empty list denies every call.
@@ -396,7 +514,7 @@ impl Default for PolicyConfig {
 /// allowlist does not need to mention the tool. When enabled, the parent
 /// allowlist must contain `delegate_task` and the child timeout is fixed at
 /// [`CHILD_TOOL_TIMEOUT`]; there is no per-child timeout setting.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DelegationConfig {
     /// Whether `delegate_task` is registered and child agents may run.
@@ -479,7 +597,7 @@ impl DelegationConfig {
 /// selected base provider without a retry wrapper. The section is still
 /// validated so a malformed configuration cannot be enabled accidentally by
 /// flipping only `enabled`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReliabilityConfig {
     /// Whether the CLI wraps the base provider with retries and timeouts.
@@ -614,20 +732,29 @@ impl ReliabilityConfig {
 }
 
 /// Persistent event log settings.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
     /// SQLite database path. Relative paths resolve against the workspace root.
     ///
-    /// When omitted, events are not persisted and `--resume` is unavailable.
+    /// Defaults to `.jessica/events.db` when trace persistence is enabled.
+    /// `profile.trace = "off"` removes the path and disables `--resume`.
     pub path: Option<PathBuf>,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            path: Some(PathBuf::from(DEFAULT_EVENTS_PATH)),
+        }
+    }
 }
 
 /// Layered memory settings.
 ///
 /// Memory is disabled by default. When disabled, the CLI neither creates nor
 /// opens the configured database file, and no memory is injected or written.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Whether layered memory is enabled for this run.
@@ -658,7 +785,7 @@ impl Default for MemoryConfig {
 }
 
 /// Embedder selected for long-term memory recall.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryEmbedderKind {
     /// Reproducible, non-semantic byte n-gram embeddings.
@@ -669,7 +796,7 @@ pub enum MemoryEmbedderKind {
 }
 
 /// Policy for automatic memory writes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryWritePolicy {
     /// Write one `kind=turn` entry after a turn finishes with `Completed`.
@@ -683,7 +810,7 @@ pub enum MemoryWritePolicy {
 ///
 /// Skills are disabled by default. When disabled, the CLI neither creates nor
 /// opens the configured database, and no skill job is enqueued or injected.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Whether skill triggering, distillation, retrieval, and review are enabled.
@@ -769,7 +896,7 @@ impl SkillsConfig {
 }
 
 /// WebAssembly tool plugin settings.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
     /// Manifest paths. Relative paths resolve against the workspace root.
@@ -781,7 +908,7 @@ pub struct WasmConfig {
 }
 
 /// One command sensor run after a tool result.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SensorConfig {
     /// Name shown in sensor diagnostics.
@@ -797,7 +924,7 @@ pub struct SensorConfig {
 }
 
 /// External acceptance check with retry orchestration.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceConfig {
     /// Name shown in acceptance diagnostics.
@@ -817,6 +944,47 @@ pub struct AcceptanceConfig {
 
 fn default_max_retries() -> u32 {
     DEFAULT_MAX_RETRIES
+}
+
+fn profile_from_table(table: &toml::Table) -> Result<ProfileConfig, ConfigError> {
+    let Some(value) = table.get("profile") else {
+        return Ok(ProfileConfig::default());
+    };
+    value
+        .clone()
+        .try_into()
+        .map_err(|source| ConfigError::Toml { source })
+}
+
+fn apply_profile_defaults(
+    table: &mut toml::Table,
+    profile: ProfileConfig,
+) -> Result<(), ConfigError> {
+    let allowed_tools = toml::Value::Array(
+        profile
+            .preset
+            .allowed_tools()
+            .iter()
+            .map(|name| toml::Value::String((*name).to_owned()))
+            .collect(),
+    );
+    insert_nested_if_absent(table, "policy", "allowed_tools", allowed_tools)
+}
+
+fn insert_nested_if_absent(
+    table: &mut toml::Table,
+    section: &str,
+    key: &str,
+    value: toml::Value,
+) -> Result<(), ConfigError> {
+    let section_value = table
+        .entry(section.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let section_table = section_value
+        .as_table_mut()
+        .ok_or_else(|| invalid(format!("`{section}` must be a table")))?;
+    section_table.entry(key.to_owned()).or_insert(value);
+    Ok(())
 }
 
 fn validate_command(section: &str, name: &str, command: &str) -> Result<(), ConfigError> {
@@ -978,12 +1146,21 @@ mod tests {
     }
 
     #[test]
-    fn acp_state_dir_requires_the_event_store_and_rejects_blank_paths() {
-        let without_events = HarnessConfig::from_toml_str("[acp]\nstate_dir = \"acp-state\"\n")
-            .expect_err("ACP recovery needs the event store");
+    fn acp_state_dir_requires_trace_persistence_and_rejects_blank_paths() {
+        let implicit = HarnessConfig::from_toml_str("[acp]\nstate_dir = \"acp-state\"\n")
+            .expect("the default trace supplies an event store");
+        assert_eq!(
+            implicit.events.path,
+            Some(PathBuf::from(".jessica/events.db"))
+        );
+
+        let without_trace = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n[acp]\nstate_dir = \"acp-state\"\n",
+        )
+        .expect_err("ACP recovery needs a recorded turn stream");
         assert!(
-            without_events.to_string().contains("events"),
-            "the error must explain the dependency: {without_events}"
+            without_trace.to_string().contains("events"),
+            "the error must explain the dependency: {without_trace}"
         );
 
         let blank = HarnessConfig::from_toml_str(
@@ -1054,16 +1231,136 @@ mod tests {
     }
 
     #[test]
-    fn event_store_path_is_optional_and_parsed() {
-        let config = HarnessConfig::from_toml_str("[events]\npath = \"state/events.sqlite\"\n")
-            .expect("events section must parse");
+    fn default_profile_enables_strict_trace_with_a_workspace_scoped_store() {
+        let parsed = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(parsed.profile.preset, ProfilePreset::Dev);
+        assert_eq!(parsed.profile.trace, TraceMode::Strict);
+        assert!(parsed.profile.trace_enabled());
+        assert_eq!(
+            parsed.events.path,
+            Some(PathBuf::from(".jessica/events.db"))
+        );
+
+        let default = HarnessConfig::default();
+        assert_eq!(default.profile, parsed.profile);
+        assert_eq!(default.events, parsed.events);
+        assert_eq!(
+            default.policy.allowed_tools,
+            vec!["bash", "read_file", "write_file"]
+        );
+    }
+
+    #[test]
+    fn profile_presets_supply_tool_defaults_without_enabling_side_effects() {
+        let safe = HarnessConfig::from_toml_str("[profile]\npreset = \"safe\"\n")
+            .expect("safe preset must parse");
+        assert_eq!(safe.profile.preset, ProfilePreset::Safe);
+        assert_eq!(safe.policy.allowed_tools, vec!["read_file"]);
+        assert_eq!(safe.profile.trace, TraceMode::Strict);
+        assert_eq!(safe.events.path, Some(PathBuf::from(".jessica/events.db")));
+        assert!(!safe.memory.enabled);
+        assert!(!safe.skills.enabled);
+        assert!(!safe.skills.auto_activate);
+        assert!(!safe.reliability.enabled);
+
+        for (document, preset) in [
+            ("[profile]\npreset = \"dev\"\n", ProfilePreset::Dev),
+            ("[profile]\npreset = \"ci\"\n", ProfilePreset::Ci),
+            ("[profile]\npreset = \"lab\"\n", ProfilePreset::Lab),
+        ] {
+            let config = HarnessConfig::from_toml_str(document).expect("preset must parse");
+            assert_eq!(config.profile.preset, preset);
+            assert_eq!(
+                config.policy.allowed_tools,
+                vec!["bash", "read_file", "write_file"]
+            );
+            assert!(!config.memory.enabled);
+            assert!(!config.skills.enabled);
+            assert!(!config.skills.auto_activate);
+            assert!(!config.reliability.enabled);
+        }
+    }
+
+    #[test]
+    fn explicit_policy_and_events_values_override_preset_defaults() {
+        let config = HarnessConfig::from_toml_str(
+            "[profile]\npreset = \"safe\"\n\
+             [policy]\nallowed_tools = [\"bash\"]\n\
+             [events]\npath = \"state/events.sqlite\"\n",
+        )
+        .expect("explicit values must parse");
+
+        assert_eq!(config.policy.allowed_tools, vec!["bash"]);
         assert_eq!(
             config.events.path,
             Some(PathBuf::from("state/events.sqlite"))
         );
 
-        let default = HarnessConfig::from_toml_str("").expect("empty config must parse");
-        assert_eq!(default.events.path, None);
+        let empty = HarnessConfig::from_toml_str(
+            "[profile]\npreset = \"dev\"\n[policy]\nallowed_tools = []\n",
+        )
+        .expect("an explicit empty allowlist must survive preset resolution");
+        assert!(empty.policy.allowed_tools.is_empty());
+    }
+
+    #[test]
+    fn trace_off_disables_persistence_and_rejects_an_explicit_path() {
+        let off = HarnessConfig::from_toml_str("[profile]\ntrace = \"off\"\n")
+            .expect("trace off must parse");
+        assert_eq!(off.profile.preset, ProfilePreset::Dev);
+        assert!(!off.profile.trace_enabled());
+        assert_eq!(off.events.path, None);
+
+        let conflict = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n[events]\npath = \"events.db\"\n",
+        )
+        .expect_err("trace off with an event store must fail");
+        assert!(
+            conflict.to_string().contains("profile.trace"),
+            "the error must identify the trace mode: {conflict}"
+        );
+        assert!(
+            conflict.to_string().contains("events.path"),
+            "the error must identify the conflicting path: {conflict}"
+        );
+    }
+
+    #[test]
+    fn invalid_profile_values_are_rejected() {
+        for (document, needle) in [
+            ("[profile]\npreset = \"staging\"\n", "staging"),
+            ("[profile]\ntrace = \"best_effort\"\n", "best_effort"),
+            ("[profile]\nmode = \"dev\"\n", "mode"),
+        ] {
+            let error = HarnessConfig::from_toml_str(document)
+                .expect_err("invalid profile values must fail");
+            assert!(
+                error.to_string().contains(needle),
+                "the error must mention {needle}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_config_serializes_the_resolved_profile_and_trace_path() {
+        let config = HarnessConfig::from_toml_str("[profile]\npreset = \"safe\"\n")
+            .expect("safe preset must parse");
+        let json: serde_json::Value = serde_json::from_str(
+            &config
+                .to_effective_json()
+                .expect("effective config must serialize"),
+        )
+        .expect("effective config must be valid JSON");
+
+        assert_eq!(json["profile"]["preset"], "safe");
+        assert_eq!(json["profile"]["trace"], "strict");
+        assert_eq!(json["events"]["path"], ".jessica/events.db");
+        assert_eq!(
+            json["policy"]["allowed_tools"],
+            serde_json::json!(["read_file"])
+        );
+        assert_eq!(json["memory"]["enabled"], false);
+        assert_eq!(json["skills"]["enabled"], false);
     }
 
     #[test]

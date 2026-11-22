@@ -284,7 +284,7 @@ tool_timeout_ms = 9000
 allowed_tools = [\"bash\", \"read_file\"]
 
 [events]
-path = \".jessica/events.db\"
+path = \"events.sqlite\"
 ";
         write_atomic(&path, with_events)
             .await
@@ -405,11 +405,8 @@ enabled = true
     fn every_immutable_section_is_named_in_rejection_order() {
         let current = HarnessConfig::default();
         let cases = [
-            (
-                "events",
-                "[events]\npath = \".jessica/events.db\"\n",
-                "events",
-            ),
+            ("profile", "[profile]\npreset = \"ci\"\n", "profile"),
+            ("events", "[events]\npath = \"events.sqlite\"\n", "events"),
             (
                 "memory",
                 "[memory]\nenabled = true\npath = \".jessica/memory.db\"\n",
@@ -443,10 +440,21 @@ enabled = true
     fn the_first_changed_immutable_section_wins() {
         let current = HarnessConfig::default();
         let next = HarnessConfig::from_toml_str(
-            "[events]\npath = \".jessica/events.db\"\n\
+            "[profile]\npreset = \"safe\"\n\
+             [events]\npath = \"events.sqlite\"\n\
              [memory]\nenabled = true\npath = \".jessica/memory.db\"\n",
         )
         .expect("config should parse");
-        assert_eq!(changed_immutable_section(&current, &next), Some("events"));
+        assert_eq!(changed_immutable_section(&current, &next), Some("profile"));
+
+        let events_before_memory = HarnessConfig::from_toml_str(
+            "[events]\npath = \"events.sqlite\"\n\
+             [memory]\nenabled = true\npath = \".jessica/memory.db\"\n",
+        )
+        .expect("config should parse");
+        assert_eq!(
+            changed_immutable_section(&current, &events_before_memory),
+            Some("events")
+        );
     }
 }
