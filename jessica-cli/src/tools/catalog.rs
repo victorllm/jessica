@@ -200,7 +200,7 @@ impl ToolCatalog {
                 max_args_bytes: config.tools.max_args_bytes(&candidate.name),
                 max_inline_bytes: max_inline_bytes(candidate.source, config),
                 max_artifact_bytes: Some(config.tools.max_artifact_bytes),
-                max_output_lines: None,
+                max_output_lines: max_output_lines(&candidate.name, config),
             };
             let approval = if permission_required(&candidate.name) {
                 ApprovalPolicy::Interactive
@@ -327,18 +327,37 @@ impl ToolCatalog {
 /// phases must be added here explicitly so a new capability is never exposed by
 /// accident under a narrow profile.
 fn profile_allows(profile: ToolProfile, source: ToolSource, name: &str) -> bool {
+    if source != ToolSource::Native {
+        return profile == ToolProfile::Full;
+    }
     match profile {
         ToolProfile::Full => true,
-        ToolProfile::Readonly => {
-            source == ToolSource::Native && matches!(name, "read_file" | "read_artifact")
+        ToolProfile::Readonly => is_read_only_native(name),
+        ToolProfile::Coding => is_read_only_native(name) || matches!(name, "write_file" | "exec"),
+        ToolProfile::Ops => is_read_only_native(name) || matches!(name, "bash" | "exec"),
+    }
+}
+
+/// Returns whether a native tool has no host side effects.
+///
+/// The list is explicit so a newly added native tool is never exposed by a
+/// narrow profile until its capabilities have been reviewed here.
+fn is_read_only_native(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_artifact" | "list_dir" | "grep" | "git_status" | "git_diff"
+    )
+}
+
+/// Returns the descriptor's output-line cap for tools that bound rendered lines.
+fn max_output_lines(name: &str, config: &HarnessConfig) -> Option<usize> {
+    match name {
+        "read_file" => {
+            Some(usize::try_from(jessica_tools::MAX_READ_FILE_LINES).unwrap_or(usize::MAX))
         }
-        ToolProfile::Coding => {
-            source == ToolSource::Native
-                && matches!(name, "read_file" | "read_artifact" | "write_file")
-        }
-        ToolProfile::Ops => {
-            source == ToolSource::Native && matches!(name, "read_file" | "read_artifact" | "bash")
-        }
+        "list_dir" => Some(config.tools.list_dir.max_entries),
+        "grep" => Some(config.tools.grep.max_matches),
+        _ => None,
     }
 }
 
@@ -535,6 +554,186 @@ mod tests {
                 "{profile} must not expose third-party tools"
             );
         }
+    }
+
+    #[test]
+    fn readonly_profile_exposes_read_only_native_tools_but_never_exec() {
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\", \"read_artifact\", \"list_dir\", \"grep\", \"git_status\", \"git_diff\", \"exec\", \"bash\"]\n\
+             [tools]\nprofile = \"readonly\"\n\
+             [tools.bash]\nenabled = true\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                candidate("read_file", ToolSource::Native),
+                candidate("read_artifact", ToolSource::Native),
+                candidate("list_dir", ToolSource::Native),
+                candidate("grep", ToolSource::Native),
+                candidate("git_status", ToolSource::Native),
+                candidate("git_diff", ToolSource::Native),
+                candidate("exec", ToolSource::Native),
+                candidate("bash", ToolSource::Native),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        assert_eq!(
+            catalog.exposed_names(),
+            [
+                "git_diff",
+                "git_status",
+                "grep",
+                "list_dir",
+                "read_artifact",
+                "read_file"
+            ]
+        );
+        assert_eq!(
+            catalog
+                .find("exec")
+                .expect("exec must be configured")
+                .hidden_reasons,
+            vec![HiddenReason::NotInProfile],
+            "readonly must hide the command tool"
+        );
+    }
+
+    #[test]
+    fn exec_is_exposed_only_by_command_profiles_and_still_needs_the_allowlist() {
+        for (profile, expected) in [
+            ("readonly", Vec::new()),
+            ("coding", vec!["exec"]),
+            ("ops", vec!["exec"]),
+            ("full", vec!["exec"]),
+        ] {
+            let config = parse_config(&format!(
+                "[profile]\ntrace = \"off\"\n\
+                 [policy]\nallowed_tools = [\"exec\", \"bash\"]\n\
+                 [tools]\nprofile = \"{profile}\"\n\
+                 [tools.bash]\nenabled = false\n"
+            ));
+            let catalog = ToolCatalog::build(
+                vec![
+                    candidate("exec", ToolSource::Native),
+                    candidate("bash", ToolSource::Native),
+                ],
+                &config,
+            )
+            .expect("catalog must build");
+            assert_eq!(catalog.exposed_names(), expected, "profile {profile}");
+
+            let not_allowlisted = parse_config(&format!(
+                "[profile]\ntrace = \"off\"\n\
+                 [policy]\nallowed_tools = [\"read_file\"]\n\
+                 [tools]\nprofile = \"{profile}\"\n"
+            ));
+            let catalog = ToolCatalog::build(
+                vec![candidate("exec", ToolSource::Native)],
+                &not_allowlisted,
+            )
+            .expect("catalog must build");
+            assert!(
+                catalog
+                    .find("exec")
+                    .expect("exec must exist")
+                    .hidden_reasons
+                    .contains(&HiddenReason::NotInPolicy),
+                "{profile} must still require an allowlist entry for exec"
+            );
+        }
+    }
+
+    #[test]
+    fn new_native_tools_are_hidden_unless_the_allowlist_names_them() {
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\"]\n\
+             [tools]\nprofile = \"readonly\"\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                candidate("read_file", ToolSource::Native),
+                candidate("list_dir", ToolSource::Native),
+                candidate("grep", ToolSource::Native),
+                candidate("git_status", ToolSource::Native),
+                candidate("git_diff", ToolSource::Native),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        assert_eq!(catalog.exposed_names(), ["read_file"]);
+        for name in ["list_dir", "grep", "git_status", "git_diff"] {
+            assert_eq!(
+                catalog
+                    .find(name)
+                    .expect("tool must be configured")
+                    .hidden_reasons,
+                vec![HiddenReason::NotInPolicy],
+                "`{name}` must be hidden without an allowlist entry"
+            );
+        }
+    }
+
+    #[test]
+    fn output_line_caps_report_the_configured_or_schema_limits() {
+        let config = parse_config(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\", \"list_dir\", \"grep\", \"exec\"]\n\
+             [tools]\nprofile = \"readonly\"\n\
+             [tools.list_dir]\nmax_entries = 7\n\
+             [tools.grep]\nmax_matches = 9\n",
+        );
+        let catalog = ToolCatalog::build(
+            vec![
+                candidate("read_file", ToolSource::Native),
+                candidate("list_dir", ToolSource::Native),
+                candidate("grep", ToolSource::Native),
+                candidate("exec", ToolSource::Native),
+            ],
+            &config,
+        )
+        .expect("catalog must build");
+
+        assert_eq!(
+            catalog
+                .find("read_file")
+                .expect("read_file must exist")
+                .descriptor
+                .limits
+                .max_output_lines,
+            Some(10_000)
+        );
+        assert_eq!(
+            catalog
+                .find("list_dir")
+                .expect("list_dir must exist")
+                .descriptor
+                .limits
+                .max_output_lines,
+            Some(7)
+        );
+        assert_eq!(
+            catalog
+                .find("grep")
+                .expect("grep must exist")
+                .descriptor
+                .limits
+                .max_output_lines,
+            Some(9)
+        );
+        assert_eq!(
+            catalog
+                .find("exec")
+                .expect("exec must exist")
+                .descriptor
+                .limits
+                .max_output_lines,
+            None,
+            "exec output is byte-capped, not line-capped"
+        );
     }
 
     #[test]

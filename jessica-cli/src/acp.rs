@@ -29,7 +29,7 @@
 //! servers on `session/load` or `session/resume` remain unsupported and are
 //! rejected with `-32602`.
 //!
-//! Sensitive native tools (`bash`, `write_file`, `delegate_task`) ask through
+//! Sensitive native tools (`bash`, `exec`, `write_file`, `delegate_task`) ask through
 //! `session/request_permission` before they run. The pending `tool_call` update
 //! is queued first on the same FIFO writer, so the client always sees the call
 //! it is being asked about. Only one-shot `allow_once`/`reject_once` options

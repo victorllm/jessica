@@ -238,7 +238,7 @@ pub(crate) struct TurnRequest {
     ///
     /// ACP supplies a gate that asks the client through
     /// `session/request_permission`. The CLI and resume paths pass `None`,
-    /// leaving `bash`, `write_file`, and `delegate_task` governed by policy
+    /// leaving `bash`, `exec`, `write_file`, and `delegate_task` governed by policy
     /// alone. The fixed sensitive set is evaluated inside [`GovernedTool`];
     /// configured WASM and MCP tools never request permission.
     pub(crate) permission_gate: Option<Arc<dyn ToolPermissionGate>>,
@@ -1453,12 +1453,14 @@ fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
     };
     format!(
         "You are Jessica, a deterministic coding agent. The workspace root is {}. \
-         Use read_file and write_file with paths relative to the workspace root. Tool calls \
-         are subject to this allowlist: {allowed}. A denied call returns an error result, so \
-         adapt instead of repeating it. A command sensor runs after every tool result. If an \
-         acceptance check fails, its feedback is injected as a user message: fix the underlying \
-         problem and retry. Verify your work with tools instead of claiming success. When the \
-         task is complete, reply with a concise summary.",
+         Use read_file, list_dir, grep, git_status, git_diff, and write_file with paths \
+         relative to the workspace root. exec runs one program with an explicit argument \
+         array and never goes through a shell. Tool calls are subject to this allowlist: \
+         {allowed}. A denied call returns an error result, so adapt instead of repeating it. \
+         A command sensor runs after every tool result. If an acceptance check fails, its \
+         feedback is injected as a user message: fix the underlying problem and retry. \
+         Verify your work with tools instead of claiming success. When the task is complete, \
+         reply with a concise summary.",
         root.display()
     )
 }
@@ -2547,6 +2549,7 @@ mod tests {
     async fn a_large_read_file_result_becomes_a_preview_and_artifact() {
         let workspace = TempDir::new("large-read");
         let content = "r".repeat(100 * 1024);
+        let read_output = format!("1\t{content}\n");
         std::fs::write(workspace.path().join("big.txt"), &content)
             .expect("large file must be written");
         let provider = Arc::new(ScriptedProvider::new(vec![
@@ -2581,20 +2584,23 @@ mod tests {
             .content
             .clone();
         assert!(tool_result.starts_with("[result artifact]"));
-        assert!(tool_result.contains("original_bytes: 102400"));
+        assert!(tool_result.contains(&format!("original_bytes: {}", read_output.len())));
         assert!(tool_result.contains("truncated: false"));
         assert!(
             tool_result.len() <= 64 * 1024,
             "only a bounded preview may enter the model context: {}",
             tool_result.len()
         );
-        assert_ne!(tool_result, content, "the full result must not be inline");
+        assert_ne!(
+            tool_result, read_output,
+            "the full result must not be inline"
+        );
 
         let digest = managed_digest(&tool_result);
         let artifact = artifact_path(workspace.path(), &digest);
         assert_eq!(
             std::fs::read(&artifact).expect("artifact must exist"),
-            content.as_bytes()
+            read_output.as_bytes()
         );
     }
 
@@ -3283,7 +3289,7 @@ mod tests {
         );
         assert_eq!(
             calls[1].messages.last().expect("tool result").content,
-            "alpha",
+            "1\talpha\n",
             "the first turn must read from its own root"
         );
         assert!(
@@ -3293,7 +3299,7 @@ mod tests {
         );
         assert_eq!(
             calls[4].messages.last().expect("tool result").content,
-            "beta",
+            "1\tbeta\n",
             "the second turn must read from its own root"
         );
         assert!(
@@ -3543,7 +3549,7 @@ mod tests {
         assert_eq!(outcome.messages[2].tool_calls[0].name, "read_file");
         assert_eq!(
             outcome.messages[3],
-            Message::tool("read-1", "contents"),
+            Message::tool("read-1", "1\tcontents\n"),
             "the transcript must contain the same tool result the event stream carried"
         );
         assert_eq!(outcome.messages[4], Message::assistant("finished"));

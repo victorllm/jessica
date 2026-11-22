@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4 已完成，9.3b 待依赖审批，9.5–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5 已完成，9.3b 待依赖审批，9.6–9.8 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2044,7 +2044,7 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.3a** | Supervisor B（无依赖子集）：bash 启用门、`sandbox = "process"`、迁移说明 | 否 | 无 | 9.2 | ☑ |
 | **9.3b** | Supervisor B（依赖门）：进程组 kill、SIGTERM→SIGKILL、rlimits | 否 | `libc`/`nix` 审批 | 9.3a | ☐ |
 | **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☑ |
-| **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☐ |
+| **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☑ |
 | **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☐ |
 | **9.7** | 原生工具 B：glob、regex grep、`apply_patch`、`edit_file` | 否 | `globset`/`regex` 审批 | 9.5/9.6 | ☐ |
 | **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☐ |
@@ -2168,7 +2168,7 @@ Task 9.4（已完成）：Result Manager、artifact store、`read_artifact`
 
 ---
 
-Task 9.5（待确认）：原生工具 A — read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec`
+Task 9.5（已完成）：原生工具 A — read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec`
 
 范围与约束：
 
@@ -2184,6 +2184,17 @@ Task 9.5（待确认）：原生工具 A — read ranges、`list_dir`、literal 
 - 测试：read offset/limit/行号/二进制/越界；list_dir 排序/上限/忽略目录/symlink；grep 字面量特殊字符/大小写/二进制跳过/输出上限；git status/diff 真实临时仓库；exec env 清理/超时/非零退出/无 shell/参数数组；readonly profile 不暴露 exec；allowlist 拒绝；`tools list/inspect` 覆盖新工具。
 
 完成标准：fmt/clippy/test 全绿；真实 CLI E2E 至少一个 `exec` 与一个 `read_file` offset 场景；README 工具表、profile 与安全说明更新；未改 core、未新增第三方 crate。
+
+实施记录（2026-11-22，实际耗时约 90 分钟，含一次上下文压缩后继续）：
+
+- 完成情况：`jessica-tools` 新增 `workspace`、`command`、`exec`、`git`、`grep`、`list_dir` 与测试辅助模块。`read_file` 增强为 1-based 行 offset、行 limit（默认 2000、上限 10000）、始终带 `行号\t内容` 输出、NUL/非法 UTF-8 二进制拒绝、16 MiB 扫描上限、超出 EOF 的结构化错误与 next-offset footer；路径仍经 canonicalize 并拒绝 workspace 外与 symlink 逃逸。
+- 命令执行分层：`jessica-tools` 定义 `CommandRunner`/`CommandRequest`/`CommandOutput`/`CommandError`，避免反向依赖 `jessica-harness`；CLI 新增 `HarnessCommandRunner`，把请求映射到 9.2 `run_supervised`，因此生产路径实际复用 env 清理、凭据过滤、统一 deadline、双流输出上限与 drop kill。`git_status`/`git_diff` 使用固定只读参数数组且不接受用户参数；`exec` 使用 `{program,args,cwd?,timeout_ms?}` 数组，不经过 shell。
+- 结果语义：`exec` 非零退出返回 `is_error=false` 的 JSON（`status`/`exit_code`/`duration_ms`/stdout/stderr 的字节数与 truncated 标志）；spawn、timeout、I/O 失败返回 `is_error=true` 的结构化 JSON。`git` 在非仓库时返回可操作提示，超时/非零按 supervisor 处理。`list_dir`/`grep` 有界遍历、稳定排序、可配置忽略目录与条目/文件/字节/匹配/输出上限，跳过 symlink、二进制、超大与不可读条目并汇总；grep 仅做字面量匹配。
+- CLI 装配：Catalog 新增 9 个 native candidate；descriptor 为只读工具与 `exec` 分配 capabilities、Text/JSON result format、path/command policy hints，并为 `read_file`/`list_dir`/`grep` 报告 `max_output_lines`；profile 表扩展为 readonly/coding/ops 的只读集合，`exec` 仅 coding/ops/full；`permission_required` 加入 `exec`；ACP 的 kind/title/location 与系统提示同步覆盖新工具。新工具默认仍不在 `policy.allowed_tools` 中，必须显式 opt-in。
+- 配置：新增 `[tools.list_dir]`、`[tools.grep]`、`[tools.git_status]`、`[tools.git_diff]`、`[tools.exec]`；校验忽略目录必须是单一 normal component，条目/文件/字节/匹配/输出上限必须 ≥1，per-tool timeout 不得超过全局预算。`timeout_ms` 默认继承 `budget.tool_timeout_ms`，`max_args_bytes` 默认不设上限、可按工具覆盖。
+- 测试：`jessica-tools` 新增/扩展 read、list_dir、grep、git、exec 行为测试（含真实临时 git 仓库、参数注入拒绝、env 清理、超时、非零退出、symlink 逃逸、二进制/超大跳过、输出上限）；CLI 增加 catalog profile/隐藏原因/输出行数、permission 集合、ACP 映射、config 边界、runner 真实进程测试，以及真实 CLI E2E `native_tools_e2e`（exec 字面量参数、env 清理、非零退出、read_file offset/行号）与更新后的 `result_manager_e2e`/`tools_cli_e2e`/`acp_stdio`/`delegation_e2e`。
+- 偏离/说明：1) `read_file` 的 offset 明确定义为行号而非字节偏移，避免多字节字符边界问题；2) `read_file` 保持纯文本输出，超阈值时由 9.4 Result Manager 转 artifact，未改成 rich JSON；3) `exec` 成功/失败统一返回 JSON 字符串，便于模型与 trace 读取 `exit_code`；4) `git_status`/`git_diff` 刻意不接受任何参数，牺牲灵活性换取注入面最小化；5) 新增原生工具默认不在 allowlist，且 `exec` 没有类似 bash 的独立 enable 门，安全边界由 profile、allowlist 与 ACP approval 共同承担；6) `examples/harness.toml` 未启用新工具，保持既有示例行为；7) 进程组/rlimits 仍属 9.3b，本次未实现。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1061 passed, 0 failed, 2 ignored（含 `native_tools_e2e`、`result_manager_e2e`、`tools_cli_e2e`、`acp_stdio`）。
 
 ---
 

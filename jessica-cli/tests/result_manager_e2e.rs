@@ -66,6 +66,9 @@ fn a_large_read_file_is_managed_and_paginated_through_read_artifact() {
     let content = pattern.repeat(FILE_BYTES / pattern.len());
     assert_eq!(content.len(), FILE_BYTES);
     std::fs::write(temp.path().join("big.txt"), &content).expect("large file should be written");
+    // read_file renders one-based line numbers, so the managed result is the
+    // `1\t` prefix, the 100 KiB line, and its trailing newline.
+    let read_output = format!("1\t{content}\n");
 
     std::fs::write(
         temp.path().join("harness.toml"),
@@ -133,8 +136,8 @@ fn a_large_read_file_is_managed_and_paginated_through_read_artifact() {
         "the model must receive a managed preview: {preview}"
     );
     assert!(
-        preview.contains("original_bytes: 102400"),
-        "the preview must report the original size: {preview}"
+        preview.contains(&format!("original_bytes: {}", read_output.len())),
+        "the preview must report the line-numbered result size: {preview}"
     );
     assert!(
         preview.contains("truncated: false"),
@@ -152,7 +155,7 @@ fn a_large_read_file_is_managed_and_paginated_through_read_artifact() {
     let digest = digest_line(&preview);
 
     let page = tool_content(&requests[2]);
-    let expected = &content[PAGE_OFFSET..PAGE_OFFSET + PAGE_LIMIT];
+    let expected = &read_output[PAGE_OFFSET..PAGE_OFFSET + PAGE_LIMIT];
     assert!(
         page.contains(&format!("digest: {digest}")),
         "the page must identify its artifact: {page}"
@@ -187,7 +190,7 @@ fn a_large_read_file_is_managed_and_paginated_through_read_artifact() {
     );
     assert_eq!(
         std::fs::read(&artifacts[0]).expect("artifact must read"),
-        content.as_bytes()
+        read_output.as_bytes()
     );
     assert_eq!(
         std::fs::metadata(&artifacts[0])
