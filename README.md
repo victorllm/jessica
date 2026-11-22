@@ -205,6 +205,42 @@ startup with an actionable error instead of silently dropping tools. Per-tool
 overrides the global tool timeout for that tool. The whole `[tools]` section is
 hot-reloadable and applies to the next turn.
 
+### Execution supervisor
+
+`bash`, the command sensor, and the acceptance check run under one supervisor:
+
+```toml
+[tools.supervisor]
+env_allowlist = ["CARGO_HOME", "RUSTUP_HOME"]  # additions to the defaults
+command_timeout_ms = 10000    # defaults to min(budget.tool_timeout_ms, 10 s)
+max_output_bytes = 65536      # defaults to min(64 KiB, budget.max_result_bytes)
+sensor_timeout_ms = 10000     # defaults to command_timeout_ms
+acceptance_timeout_ms = 10000 # defaults to command_timeout_ms
+```
+
+Every child starts from an empty environment. The defaults `PATH`, `HOME`,
+`LANG`, `TERM`, and `TMPDIR` are always present; `env_allowlist` adds names and
+cannot remove them. Empty names, wildcards, and credential-bearing names
+(`OPENAI_*`, `ANTHROPIC_*`, `JESSICA_*`, `*_KEY`, `*_TOKEN`, `*_SECRET`,
+`*_PASSWORD`, SSH/dynamic-linker variables, and similar) are rejected at load
+time and filtered again at execution time. Provider keys and Jessica host
+credentials therefore never reach a command, sensor, or acceptance process.
+
+The deadline covers spawning, reading both pipes, and waiting for exit. A
+timeout fails the tool or check instead of hanging the turn; the direct child is
+killed on drop. Process-group cleanup and rlimits are a later task. Output
+beyond `max_output_bytes` per stream is truncated with a notice that records the
+original byte count. The rendered `bash` result is also capped at the same
+value, so a large command output cannot trip `ResultSizeGuard` or turn into
+`BudgetExceeded`. A non-zero exit still means “the command ran and failed” and
+keeps its exit code; only spawn, timeout, read, and wait failures are supervisor
+errors.
+
+`[tools.supervisor]` is rebuilt for each turn, so changes apply to the next turn
+and never to an already running child. Child-agent commands are aligned with the
+same supervisor in a later task; the current delegation path keeps its existing
+fixed limits.
+
 ```bash
 jessica --config ~/.jessica/harness.toml tools list
 jessica --config ~/.jessica/harness.toml tools list --all

@@ -29,10 +29,11 @@
 //!   treats as terminal: `--resume` reports the session as already ended.
 //!   Recoverable shutdown (a checkpoint instead of a terminal cancellation)
 //!   requires a separate task.
-//! - `CommandSensor` and `CommandAcceptanceCheck` have no timeout. If one hangs,
-//!   the first signal cannot finish the terminal-event wait or the skill drain;
-//!   only a second signal can force the process down. Command timeouts require
-//!   a separate task.
+//! - `CommandSensor` and `CommandAcceptanceCheck` are bounded by
+//!   `[tools.supervisor]`, but the first signal still waits for an in-flight
+//!   command to reach its deadline before the terminal-event wait and skill
+//!   drain can finish. Process-group cleanup and cancellation-aware command
+//!   teardown require a separate task.
 //! - Only SIGINT and SIGTERM are handled. SIGHUP and other signals keep their
 //!   default disposition.
 

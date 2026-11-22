@@ -1,12 +1,16 @@
 //! Sensor pipelines and command-backed sensors.
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use jessica_core::sensor::{Sensor, SensorContext, SensorResult};
-use tokio::process::Command;
+
+use crate::supervisor::{
+    CapturedStream, CommandSpec, DEFAULT_COMMAND_TIMEOUT, DEFAULT_OUTPUT_LIMIT, SupervisedOutput,
+    cap_rendered_output, cap_rendered_output_with_total, run_supervised,
+};
 
 /// One sensor's named result within a [`SensorReport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,26 +91,37 @@ impl SensorPipeline {
 /// Runs a fixed command after tool execution and uses its exit status as the
 /// pass/fail verdict.
 ///
-/// Exit status zero is a pass; a nonzero exit, a signal termination, or a spawn
-/// failure is a failure. The command receives no stdin and runs without a shell
-/// unless the caller explicitly configures a shell program. Both stdout and
-/// stderr are included in the returned output.
+/// Exit status zero is a pass; a nonzero exit, a signal termination, a timeout,
+/// or a spawn failure is a failure. The command receives no stdin, runs without
+/// a shell unless the caller explicitly configures a shell program, and starts
+/// with an empty environment containing only the supervisor allowlist. Both
+/// stdout and stderr are included in the returned output, capped at the
+/// configured output limit with an explicit truncation notice.
 #[derive(Debug, Clone)]
 pub struct CommandSensor {
     name: String,
     program: String,
     args: Vec<String>,
     current_dir: Option<PathBuf>,
+    env_allowlist: Vec<String>,
+    timeout: Duration,
+    output_limit: usize,
 }
 
 impl CommandSensor {
     /// Creates a sensor named `name` that runs `program`.
+    ///
+    /// The default deadline is [`DEFAULT_COMMAND_TIMEOUT`] and each captured
+    /// stream is capped at [`DEFAULT_OUTPUT_LIMIT`] bytes.
     pub fn new(name: impl Into<String>, program: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             program: program.into(),
             args: Vec::new(),
             current_dir: None,
+            env_allowlist: Vec::new(),
+            timeout: DEFAULT_COMMAND_TIMEOUT,
+            output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
 
@@ -131,6 +146,32 @@ impl CommandSensor {
         self.current_dir = Some(directory.into());
         self
     }
+
+    /// Sets the wall-clock deadline for the complete spawn, read, and wait
+    /// sequence.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Sets the retained byte limit for each captured stream and for the
+    /// rendered sensor output.
+    pub fn with_output_limit(mut self, limit: usize) -> Self {
+        self.output_limit = limit;
+        self
+    }
+
+    /// Adds environment variable names on top of the supervisor defaults.
+    ///
+    /// Credential-bearing names are always filtered, even when listed here.
+    pub fn with_env_allowlist<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_allowlist.extend(names.into_iter().map(Into::into));
+        self
+    }
 }
 
 #[async_trait]
@@ -140,58 +181,74 @@ impl Sensor for CommandSensor {
     }
 
     async fn observe(&self, _context: &SensorContext<'_>) -> SensorResult {
-        let mut command = Command::new(&self.program);
-        command
-            .args(&self.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(directory) = &self.current_dir {
-            command.current_dir(directory);
-        }
+        let spec = CommandSpec {
+            program: self.program.clone(),
+            args: self.args.clone(),
+            current_dir: self.current_dir.clone(),
+            env_allowlist: self.env_allowlist.clone(),
+            output_limit: self.output_limit,
+        };
 
-        let output = match command.output().await {
+        let output = match run_supervised(&spec, self.timeout).await {
             Ok(output) => output,
             Err(error) => {
-                return SensorResult::fail(format!(
-                    "command sensor `{}` could not start `{}`: {error}",
-                    self.name, self.program
-                ));
+                let message = format!("command sensor `{}` failed: {error}", self.name);
+                return SensorResult::fail(cap_rendered_output(&message, self.output_limit));
             }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let rendered = render_output(&stdout, &stderr);
-
+        let rendered = render_output(&output);
+        let source_total = output
+            .stdout
+            .total_bytes
+            .saturating_add(output.stderr.total_bytes);
         if output.status.success() {
-            SensorResult::pass(rendered)
+            SensorResult::pass(cap_rendered_output_with_total(
+                &rendered,
+                self.output_limit,
+                source_total,
+            ))
         } else {
-            SensorResult::fail(format!(
+            let message = format!(
                 "command sensor `{}` failed with {}: {rendered}",
                 self.name, output.status
+            );
+            SensorResult::fail(cap_rendered_output_with_total(
+                &message,
+                self.output_limit,
+                source_total,
             ))
         }
     }
 }
 
-/// Renders captured streams with stable labels.
-fn render_output(stdout: &str, stderr: &str) -> String {
+/// Renders captured streams with stable labels and truncation notices.
+fn render_output(output: &SupervisedOutput) -> String {
     let mut rendered = String::new();
-    if !stdout.is_empty() {
-        rendered.push_str("stdout:\n");
-        rendered.push_str(stdout);
-    }
-    if !stderr.is_empty() {
-        if !rendered.is_empty() {
-            rendered.push('\n');
-        }
-        rendered.push_str("stderr:\n");
-        rendered.push_str(stderr);
-    }
+    append_stream(&mut rendered, "stdout", &output.stdout);
+    append_stream(&mut rendered, "stderr", &output.stderr);
     if rendered.is_empty() {
         rendered.push_str("(no output)");
     }
     rendered
+}
+
+/// Appends one non-empty stream with its truncation state.
+fn append_stream(rendered: &mut String, label: &str, stream: &CapturedStream) {
+    if stream.bytes.is_empty() && !stream.truncated {
+        return;
+    }
+    if !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    rendered.push_str(label);
+    rendered.push_str(":\n");
+    rendered.push_str(&String::from_utf8_lossy(&stream.bytes));
+    if stream.truncated {
+        rendered.push_str(&format!(
+            "\n[{label} truncated at {} bytes: {} bytes total]",
+            stream.bytes.len(),
+            stream.total_bytes
+        ));
+    }
 }

@@ -34,12 +34,22 @@ pub(crate) enum ToolsCommand {
 
 /// Builds executable candidates for the native tools.
 ///
-/// The tools are bound to the turn's canonical workspace root. Constructing
-/// them has no side effects; `tools list` uses the same candidates as a turn.
-pub(crate) fn native_candidates(root: &Path) -> Vec<CatalogCandidate> {
+/// The tools are bound to the turn's canonical workspace root and to the
+/// supervisor settings in `config`. Constructing them has no side effects;
+/// `tools list` uses the same candidates as a turn.
+pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<CatalogCandidate> {
+    let supervisor = config.resolved_supervisor();
+    let bash_timeout = config
+        .tools
+        .timeout_for("bash", config.budget.tool_timeout());
     let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(root.to_path_buf()));
     let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(root.to_path_buf()));
-    let bash: Arc<dyn Tool> = Arc::new(BashTool::new().with_current_dir(root.to_path_buf()));
+    let bash: Arc<dyn Tool> = Arc::new(
+        BashTool::with_limits(bash_timeout, supervisor.max_output_bytes)
+            .with_content_limit(supervisor.max_output_bytes)
+            .with_env_allowlist(supervisor.env_allowlist)
+            .with_current_dir(root.to_path_buf()),
+    );
     vec![
         CatalogCandidate::from_tool(read, ToolSource::Native),
         CatalogCandidate::from_tool(write, ToolSource::Native),
@@ -66,7 +76,7 @@ pub(crate) fn delegation_candidate() -> CatalogCandidate {
 /// catalog, but it never constructs a provider, event store, memory database,
 /// skill database, or MCP connection.
 async fn inspection_catalog(config: &HarnessConfig, root: &Path) -> Result<ToolCatalog, CliError> {
-    let mut candidates = native_candidates(root);
+    let mut candidates = native_candidates(root, config);
     for tool in load_wasm_tools(config, root).await? {
         candidates.push(CatalogCandidate::from_tool(tool, ToolSource::Wasm));
     }
@@ -242,7 +252,8 @@ mod tests {
 
     #[test]
     fn native_candidates_are_the_three_native_tools_in_any_order() {
-        let candidates = native_candidates(Path::new("."));
+        let config = HarnessConfig::default();
+        let candidates = native_candidates(Path::new("."), &config);
         let mut names: Vec<&str> = candidates
             .iter()
             .map(|candidate| candidate.name.as_str())

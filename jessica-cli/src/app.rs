@@ -465,7 +465,8 @@ impl CliRuntime {
                 acceptance.command.clone(),
                 acceptance.args.clone(),
                 resolve_dir(scope.root(), acceptance.working_dir.as_deref()),
-            );
+            )
+            .with_supervisor(&config.resolved_supervisor());
             let runner = AcceptanceRunner::new(
                 Arc::new(check) as Arc<dyn AcceptanceCheck>,
                 retries,
@@ -914,7 +915,7 @@ impl CliRuntime {
         // only tools the parent profile actually exposes. The final catalog is
         // rebuilt with the executable delegate tool and then checked against
         // the exposure budgets.
-        let mut candidates = self.turn_candidates(scope, extra_tools);
+        let mut candidates = self.turn_candidates(scope, config, extra_tools);
         let base = ToolCatalog::build(candidates.clone(), config).map_err(CliError::ToolCatalog)?;
 
         // The child executor receives the same counting provider, so every
@@ -993,9 +994,13 @@ impl CliRuntime {
         let Some(sensor) = &config.sensor else {
             return Vec::new();
         };
+        let supervisor = config.resolved_supervisor();
         let command = CommandSensor::new(&sensor.name, &sensor.command)
             .args(sensor.args.clone())
-            .with_current_dir(resolve_dir(scope.root(), sensor.working_dir.as_deref()));
+            .with_current_dir(resolve_dir(scope.root(), sensor.working_dir.as_deref()))
+            .with_timeout(supervisor.sensor_timeout)
+            .with_output_limit(supervisor.max_output_bytes)
+            .with_env_allowlist(supervisor.env_allowlist);
         vec![Arc::new(command) as Arc<dyn Sensor>]
     }
 
@@ -1045,9 +1050,10 @@ impl CliRuntime {
     fn turn_candidates(
         &self,
         scope: &TurnScope,
+        config: &HarnessConfig,
         extra_tools: &[Arc<dyn Tool>],
     ) -> Vec<CatalogCandidate> {
-        let mut candidates = native_candidates(scope.root());
+        let mut candidates = native_candidates(scope.root(), config);
         candidates.extend(
             self.wasm_tools
                 .iter()
