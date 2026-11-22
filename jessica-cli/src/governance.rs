@@ -421,6 +421,15 @@ impl GovernedTool {
                 self.timeout_result(call, elapsed.max(crossed)).await
             }
             Ok(result) => {
+                // A tool may enforce the same deadline internally and return a
+                // regular error just before the outer `tokio::time::timeout`
+                // fires. Treat that result as a timeout too, so the session is
+                // tripped deterministically instead of depending on which
+                // timer wins the race.
+                if elapsed >= self.timeout {
+                    let crossed = self.timeout + Duration::from_nanos(1);
+                    return self.timeout_result(call, elapsed.max(crossed)).await;
+                }
                 let result = match &self.result_manager {
                     Some(manager) => {
                         manager
