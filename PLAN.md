@@ -2030,6 +2030,29 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0 已完成，9.1+ 待逐项确认）
+
+背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
+
+Task 9.0（2026-11-22）：Profile preset、effective config、默认 trace
+
+范围与约束：
+
+- 不修改 `jessica-core`；不新增第三方 crate；不实现 9.1 的 Tool Catalog、每工具限额、执行监督、策略 v2、结果管理、额外原生工具、MCP/WASM descriptor 或多 Agent 嵌套。
+- 配置解析采用 raw `toml::Table` 合并，确保“显式字段 > preset > 内建默认”可区分；不能依赖反序列化后的 `HarnessConfig` 推断用户是否显式设置。
+- 默认 `profile.preset = "dev"`、`profile.trace = "strict"`、`events.path = ".jessica/events.db"`（相对启动 workspace root）。
+- preset 只提供安全默认值，不自动启用 memory、skills 或 reliability；`safe` 把默认 allowlist 收窄为 `read_file`，`dev`/`ci`/`lab` 使用原生工具集。显式字段（包括显式空 allowlist）始终优先。
+- `trace = "off"` 清除隐式事件库路径并禁用 `--resume`/`replay`/ACP recovery；与显式 `events.path` 同时出现时启动失败，不静默覆盖。
+- `EventRecorder::open` 在打开 SQLite 前创建缺失父目录，使默认 `.jessica/events.db` 与显式嵌套路径都可落盘；目录创建失败 fail-closed。
+- `profile` 为不可热更新 section，变更整份拒绝。
+- `jessica config` 输出 resolved effective config 的 pretty JSON，且不得打开 provider、event store、memory/skills DB 或 wasm 模块；`Serialize` 仅用于配置输出。
+- 计划文本中“effective config 和 preset 名写入 trace”不在本 Task 实现：冻结的 `jessica-core` trace payload 没有承载配置的变体，复用 `TurnStarted.messages`/`AgentEvent`/`Gap` 会污染审计语义。记录到 Deferred，待单独批准 core schema change。
+- 默认 trace 会改变所有未配置 `[events]` 的运行；README、热加载不可变 section 列表与受影响测试必须同步更新；`.jessica/` 加入 `.gitignore`。`install.sh` 已显式生成绝对 `[events].path`，本 Task 不改其行为。
+
+完成标准：fmt/clippy/test 全绿；新增行为测试覆盖默认值、preset 覆盖、safe allowlist、trace off/冲突、非法 preset、effective JSON、`jessica config` 无副作用、父目录创建与热加载拒绝；README 与进度追踪更新。
+
+---
+
 Claude Code 执行纪律（写入 CLAUDE.md 末尾）
 
 1. 一次会话只做一个 Task，完成后主动运行该 Task 的所有验收命令，把结果贴出来。
@@ -2124,9 +2147,19 @@ Task 8.5 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实�
 
 Task 8.6 ☑ 耗时未精确计时（跨上下文执行；含方案确认、实现、格式化与全量验收） — 交付子 Agent 轨迹证据。`jessica-core`（经批准）：`TRACE_SCHEMA_VERSION` 2→3，新增 `TracePayload::ChildAgent { call_id, event }`，支持 1..=3，v2 reader 拒绝 v3，payload 永远 trace-only。`jessica-runtime`：新增 `ChildEventSink` 与 `with_child_event_sink`，子事件先入 child sink，始终包装 `CountingChildSink`，timeout 父终态使用已观测计数，sink 失败按 Cancelled 中止。`jessica-cli`：journal 实现 child sink，强制父 start → 子 start → 子轨迹 → 子 end（timeout 可缺）→ 父 end，拒绝无括号/重复/越界/parent-only/缺失终态/过期 attempt；verifier 在 turn 含 `ChildAgent` 时严格校验 bootstrap、delegate 链接、轮次与工具状态机、终态和计数（timeout 前缀、工具限额 +1），生命周期-only trace 保持 v2 规则；replay 接受 v1–v3 并忽略子证据；README 记录 v3、replay 不执行子 Agent、digest/bundle 覆盖与隐私留存提示。`jessica-memory`：`payload_kind=child_agent`、`event_type` 存内部 tag，拒绝缺 attempt/session、空 call_id、嵌套 lifecycle 与 legacy mirror，链/离线导出同步。测试新增/更新 27 个（core 1、runtime 3、journal 11、memory 2、verifier 8、replay 1、真实 delegation E2E 1，含 export/verify-bundle 与子轨迹篡改）。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 945 passed, 0 failed, 2 ignored（58 suites）。偏离/说明：1) child sink 拒绝后 transcript 计数可大于已接受证据，journal 失败且不定义部分证据验证；2) 严格校验以含 `ChildAgent` 为开关；3) replay 不执行子 Agent，不验证子 provider/工具可复现性；4) 不支持递归委派；5) 保留/隐私删除留给 8.7；6) 未改 SQLite schema/bundle 格式，未新增第三方 crate，未提交/未推送，`DESIGN.md` 保持未跟踪。
 
+Task 9.0 ☑ 耗时未精确计时（含方案确认、实现、测试与全量验收） — 交付 profile preset、effective config 与默认 trace。`jessica-cli`：新增 `ProfilePreset`（`safe`/`dev`/`ci`/`lab`）、`TraceMode`（`strict`/`off`）与 `ProfileConfig`；`HarnessConfig.profile` 默认 `dev`+`strict`；`from_toml_str` 改用 raw `toml::Table` 合并，显式字段 > preset > 内建默认，preset 只补 `policy.allowed_tools`，不自动启用 memory/skills/reliability；`EventsConfig::default().path = ".jessica/events.db"`，`trace = "off"` 清除隐式路径但拒绝显式 `events.path`；`validate` 强制 strict 需要路径、off 禁止路径、ACP `state_dir` 需要 trace；`profile` 加入不可热更新 section；配置类型派生 `Serialize` 并新增 `to_effective_json`；新增无副作用 `jessica config` 命令与 `parse_args_from`；`EventRecorder::open` 创建缺失父目录并以 `CreateParent` fail-closed。测试覆盖默认值、preset/显式覆盖、safe allowlist、trace off/冲突、非法 preset、effective JSON、真实 CLI config 输出与无副作用、父目录创建、热加载拒绝。README、`.gitignore`（`/.jessica/`）与 PLAN 同步；未改 `install.sh`，因为它已显式生成 `[events].path`。测试净增 10 个（945→955）：配置默认/preset/覆盖/trace off/非法值/effective JSON、`jessica config` 真实 E2E 2 个、EventRecorder 父目录创建与路径阻塞 2 个、`config` 参数解析 1 个；另更新 ACP 依赖默认 trace、热加载不可变 section 与受影响 E2E。验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 955 passed, 0 failed, 2 ignored。偏离/说明：1) 计划中的“effective config 和 preset 名写入 trace”未实现，冻结的 core trace payload 无配置承载变体，复用既有 payload 会污染审计语义，已记入 Deferred 待单独批准；2) preset 当前只影响工具 allowlist，memory/skills/reliability 始终 opt-in；3) 默认事件库位于 workspace root 的 `.jessica/events.db`，`install.sh` 仍显式写入 `$JESSICA_HOME/events.db`；4) 未修改 `jessica-core`、未新增第三方 crate、未改 SQLite schema、未提交/未推送，`DESIGN.md` 保持未跟踪。
+
 ---
 
 Deferred（待办，由用户决定是否单开 Task）
+
+· Task 9.0 未把 effective config 或 preset 名写入 trace。冻结的 `jessica-core` `TracePayload` 没有承载配置快照的变体；用 `TurnStarted.messages`、普通 `AgentEvent`、`Gap` 或 `ChildAgent` 夹带配置会破坏审计语义、replay parity 与 bundle/digest 契约。若需要，须单开 Task 并明确批准 core 公共 API/schema 变更：新增配置 payload 或包络字段、版本号、旧 reader 拒绝规则、verifier/digest/export/bundle 兼容性、敏感配置脱敏与保留策略；不得在 CLI 侧静默编码。
+
+· Task 9.0 的默认 trace 把事件库放在 workspace root 的 `.jessica/events.db`；仓库根运行示例时会把完整会话写入仓库内目录（已加入 `.gitignore`，但不等于隐私保护）。该库、ACP 索引与导出 bundle 仍无保留期、字段脱敏、文件权限收紧或物理删除。若需要生产级默认安全，须单开 Task 定义 0600/0700 权限、umask 行为、保留期/GC、隐私删除与 append-only 审计契约的取舍；不得在 9.x 顺手修改 schema/删除路径。
+
+· Task 9.0 的 `jessica config` 输出未带 schema/version，字段集合由 `Serialize` 派生，适合人工审计而非稳定机器契约；preset 目前只补 `policy.allowed_tools`，`ci`/`lab` 与 `dev` 的工具集相同。若需要 CI 消费该 JSON 或让 preset 覆盖更多默认（预算、超时、memory/skills 安全上限），须单开 Task 定义版本化 schema、兼容策略、preset 变更影响面与“preset 不自动启用副作用子系统”的边界。
+
+· Task 9.0 的默认事件库路径相对启动 workspace root；`install.sh` 生成配置时仍显式写 `$JESSICA_HOME/events.db`，Paseo 启动的 ACP 因此不受默认路径影响。其他调用方若依赖“未配置 `[events]` 即无持久化”，必须显式设置 `profile.trace = "off"`；后续若改变默认路径或迁移到平台数据目录，须单开 Task 处理兼容与数据搬迁。
 
 · Trace Integrity v2（2026-11-17 规划）的包络与存储部分已由 Task 7.1（2026-11-18）交付，生产者侧无损记录由 Task 7.2（2026-11-18）交付：新增 additive `TraceEvent` 包络、`trace_events`/`trace_heads`、事务内 legacy+trace 双写、fail-closed、acceptance 事件归属与 `Resumed` 轨迹，未修改 `AgentEvent`；`EventSink` + `TurnJournal` 保证成功 turn 的全部生产事件与 `TurnEnded` 在返回前提交，pump 不再写 trace，`Gap` 变体保留但 CLI 不再产生。事件模型 v2 已由 Task 7.3（2026-11-19）交付：`SessionStarted.messages`、`RoundStarted`/`RoundFinished`（含 usage）、`PermissionDecided`、`ChildSessionStarted`/`ChildSessionEnded`，`TRACE_SCHEMA_VERSION=2` 且 v1 可读；permission/child 生命周期仅写 trace（不镜像 legacy），子会话内部轨迹当时未持久化，后由 Task 8.6 以 v3 嵌套证据补齐。trace verify CLI 已由 Task 7.4（2026-11-19）交付：`jessica trace verify --turn/--all` 以只读方式打开事件库，校验结构、v2 语义和 trace↔legacy 镜像，支持稳定 JSON 报告与 `--allow-open`；默认不执行 replay。单 turn 执行一致性已由 Task 7.5（2026-11-19）交付：`trace verify --turn ... --replay` 用 trace 自身的 `SessionStarted.messages` 与录制事件重建每个 fresh attempt，驱动真实 `AgentLoop` 并逐事件比较；仅覆盖 closed v2 fresh、Completed/Error/MaxRounds，trace-only 与 CLI governance 事件排除，其他轨迹显式 unsupported。子 Agent 内部轨迹已由 Task 8.6（2026-11-19）交付为 v3 嵌套证据。仍暂缓/未实现：trace 保留/GC 与隐私删除（8.7 候选）、fsync/掉电级持久性、v1→v2 混合 legacy 流 replay（见下方 replay 条目）、子 Agent replay 与子 provider 调用/工具结果可复现性（8.6 只记录并验证嵌套证据，不重放子执行）、跨 turn 聚合摘要之外的签名/TSA；replay/resume 仍只读 legacy 事件流，trace 不是 recovery 的唯一来源。上述各项须单开 Task。
 · Task 8.6 的子轨迹严格校验只在 turn 含 `ChildAgent` 时启用；纯生命周期 v3 trace（旧生产者或手工证据）仍按 v2 规则通过。若要强制所有 v3 生产者必须携带子轨迹，需升级版本策略或新增显式模式，不能把缺失证据当作合规。

@@ -69,8 +69,23 @@ pub(crate) struct EventRecorder {
 }
 
 impl EventRecorder {
-    /// Opens or creates the database at `path`.
+    /// Opens or creates the database at `path`, creating missing parent
+    /// directories first.
+    ///
+    /// The event store itself intentionally does not create directories, so the
+    /// CLI does it here for both default trace persistence and explicit paths.
     pub(crate) async fn open(path: PathBuf) -> Result<Self, RecorderError> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await.map_err(|source| {
+                RecorderError::CreateParent {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
         let store = tokio::task::spawn_blocking(move || EventStore::open(path))
             .await
             .map_err(RecorderError::Task)?
@@ -271,6 +286,15 @@ fn now() -> Timestamp {
 /// Errors raised while recording or loading events.
 #[derive(Debug, Error)]
 pub(crate) enum RecorderError {
+    /// The event store's parent directory could not be created.
+    #[error("failed to create event store directory `{path}`: {source}")]
+    CreateParent {
+        /// Directory that could not be created.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
     /// The underlying event store failed.
     #[error("event store error: {0}")]
     Store(#[from] EventStoreError),
@@ -321,6 +345,72 @@ mod tests {
                 let _ = std::fs::remove_file(PathBuf::from(sidecar));
             }
         }
+    }
+
+    /// Temporary directory removed recursively.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "jessica-events-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("temporary directory must be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_a_recorder_creates_a_missing_parent_directory() {
+        let root = TempDir::new("parent-creation");
+        let database = root.0.join(".jessica/nested/events.db");
+        assert!(
+            !database.parent().expect("parent exists").exists(),
+            "the test must start without the nested directory"
+        );
+
+        let recorder = EventRecorder::open(database.clone())
+            .await
+            .expect("opening must create the parent directory");
+        recorder
+            .record_session_start(
+                &SessionId::new("parent-creation"),
+                &[Message::user("hello")],
+            )
+            .await
+            .expect("the created directory must be writable");
+        drop(recorder);
+
+        assert!(database.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_parent_path_that_is_a_file_fails_without_touching_it() {
+        let root = TempDir::new("parent-blocked");
+        let blocker = root.0.join(".jessica");
+        std::fs::write(&blocker, b"not a directory").expect("blocking file must be written");
+
+        let error = match EventRecorder::open(blocker.join("events.db")).await {
+            Ok(_) => panic!("a file cannot be used as the event store directory"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, RecorderError::CreateParent { .. }),
+            "the failure must name directory creation: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&blocker).expect("blocking file stays readable"),
+            b"not a directory"
+        );
     }
 
     #[tokio::test]

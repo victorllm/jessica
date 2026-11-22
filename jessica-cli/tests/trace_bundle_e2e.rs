@@ -607,8 +607,8 @@ fn export_requires_an_event_store_and_never_creates_it() {
     let output = run_export(&empty_config, &["--all", "--out", path(&bundle)]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("requires an `[events]` path"),
-        "export must require [events]"
+        String::from_utf8_lossy(&output.stderr).contains("requires trace persistence"),
+        "export must require trace persistence"
     );
 }
 
@@ -682,7 +682,8 @@ fn write_config(temp: &TempDir, database: &Path) -> PathBuf {
 
 fn write_empty_config(temp: &TempDir) -> PathBuf {
     let config = temp.path.join("empty.toml");
-    std::fs::write(&config, "").expect("empty config should be written");
+    std::fs::write(&config, "[profile]\ntrace = \"off\"\n")
+        .expect("empty config should be written");
     config
 }
 

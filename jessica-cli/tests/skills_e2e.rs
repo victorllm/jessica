@@ -322,8 +322,8 @@ fn manual_review_commands_and_activation_inject_memory_then_skills() {
     assert_eq!(messages[3]["role"], "user");
     assert_eq!(messages[3]["content"], "ORANGE MAGENTA");
     assert!(
-        !temp.path.join(".jessica/events.sqlite").exists(),
-        "review and turn paths must not create an event store without one"
+        temp.path.join(".jessica/events.db").is_file(),
+        "the default trace must record the turn in the workspace"
     );
 
     let delete = run_skill_command(&temp.path, &config, &["delete", &id.to_string()]);
@@ -576,7 +576,8 @@ fn skill_open_failure_degrades_without_changing_the_turn() {
     let config = temp.path.join("harness.toml");
     write_config(
         &config,
-        "[skills]\nenabled = true\npath = \".jessica/skills.db\"\n\
+        "[profile]\ntrace = \"off\"\n\
+         [skills]\nenabled = true\npath = \".jessica/skills.db\"\n\
          min_tool_calls = 0\nmin_rounds = 0\n",
     );
 

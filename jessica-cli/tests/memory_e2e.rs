@@ -254,7 +254,8 @@ fn disabled_memory_does_not_inject_or_create_a_database() {
     let config = temp.path.join("harness.toml");
     write_config(
         &config,
-        "[memory]\nenabled = false\npath = \".jessica/memory.db\"\n",
+        "[profile]\ntrace = \"off\"\n\
+         [memory]\nenabled = false\npath = \".jessica/memory.db\"\n",
     );
 
     let (output, requests) = run_turn(&temp.path, &config, "hello", "plain answer");
@@ -283,7 +284,8 @@ fn memory_open_failure_degrades_without_changing_the_exit_code() {
     let config = temp.path.join("harness.toml");
     write_config(
         &config,
-        "[memory]\nenabled = true\npath = \".jessica/memory.db\"\n",
+        "[profile]\ntrace = \"off\"\n\
+         [memory]\nenabled = true\npath = \".jessica/memory.db\"\n",
     );
 
     let (output, requests) = run_turn(&temp.path, &config, "hello", "still works");
