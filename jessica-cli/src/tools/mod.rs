@@ -2,20 +2,29 @@
 
 mod catalog;
 mod descriptor;
+mod runner;
 
 use std::path::Path;
 
 use jessica_core::tool::Tool;
 use jessica_runtime::{DELEGATE_TASK_TOOL_NAME, delegate_task_schema};
-use jessica_tools::{BashTool, ReadFileTool, WriteFileTool};
+use jessica_tools::{
+    BashTool, CommandRunner, ExecTool, GitOperation, GitTool, GrepOptions, GrepTool,
+    ListDirOptions, ListDirTool, ReadFileTool, WriteFileTool,
+};
 
 use crate::app::{CliError, load_wasm_tools};
+use crate::artifacts::ReadArtifactTool;
 use crate::config::HarnessConfig;
 
 pub(crate) use catalog::{CatalogCandidate, CatalogEntry, CatalogError, ToolCatalog};
-pub(crate) use descriptor::{ApprovalPolicy, ToolSource};
+pub(crate) use descriptor::{
+    ApprovalPolicy, Capabilities, ResultFormat, ToolDescriptor, ToolSource,
+};
 
 use std::sync::Arc;
+
+use runner::HarnessCommandRunner;
 
 /// Subcommand requested under `jessica tools`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,13 +46,73 @@ pub(crate) enum ToolsCommand {
 /// The tools are bound to the turn's canonical workspace root and to the
 /// supervisor settings in `config`. Constructing them has no side effects;
 /// `tools list` uses the same candidates as a turn.
+///
+/// The bash candidate is always constructed so inspection can explain its
+/// state, but the catalog hides it unless `tools.bash.enabled` is true.
 pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<CatalogCandidate> {
     let supervisor = config.resolved_supervisor();
+    let runner: Arc<dyn CommandRunner> = Arc::new(HarnessCommandRunner);
     let bash_timeout = config
         .tools
         .timeout_for("bash", config.budget.tool_timeout());
+    let exec_timeout = config
+        .tools
+        .timeout_for("exec", config.budget.tool_timeout());
+    let git_status_timeout = config
+        .tools
+        .timeout_for("git_status", config.budget.tool_timeout());
+    let git_diff_timeout = config
+        .tools
+        .timeout_for("git_diff", config.budget.tool_timeout());
     let read: Arc<dyn Tool> = Arc::new(ReadFileTool::new(root.to_path_buf()));
     let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(root.to_path_buf()));
+    let read_artifact: Arc<dyn Tool> = Arc::new(ReadArtifactTool::from_config(root, config));
+    let list_dir: Arc<dyn Tool> = Arc::new(ListDirTool::new(
+        root.to_path_buf(),
+        ListDirOptions {
+            ignore_dirs: config.tools.list_dir.ignore_dirs.clone(),
+            max_entries: config.tools.list_dir.max_entries,
+        },
+    ));
+    let grep: Arc<dyn Tool> = Arc::new(GrepTool::new(
+        root.to_path_buf(),
+        GrepOptions {
+            ignore_dirs: config.tools.grep.ignore_dirs.clone(),
+            max_files: config.tools.grep.max_files,
+            max_file_bytes: config.tools.grep.max_file_bytes,
+            max_matches: config.tools.grep.max_matches,
+            max_output_bytes: config.tools.grep.max_output_bytes,
+        },
+    ));
+    let git_status: Arc<dyn Tool> = Arc::new(
+        GitTool::new(
+            root.to_path_buf(),
+            GitOperation::Status,
+            Arc::clone(&runner),
+            git_status_timeout,
+            supervisor.max_output_bytes,
+        )
+        .with_env_allowlist(supervisor.env_allowlist.clone()),
+    );
+    let git_diff: Arc<dyn Tool> = Arc::new(
+        GitTool::new(
+            root.to_path_buf(),
+            GitOperation::Diff,
+            Arc::clone(&runner),
+            git_diff_timeout,
+            supervisor.max_output_bytes,
+        )
+        .with_env_allowlist(supervisor.env_allowlist.clone()),
+    );
+    let exec: Arc<dyn Tool> = Arc::new(
+        ExecTool::new(
+            root.to_path_buf(),
+            Arc::clone(&runner),
+            exec_timeout,
+            supervisor.max_output_bytes,
+        )
+        .with_env_allowlist(supervisor.env_allowlist.clone()),
+    );
     let bash: Arc<dyn Tool> = Arc::new(
         BashTool::with_limits(bash_timeout, supervisor.max_output_bytes)
             .with_content_limit(supervisor.max_output_bytes)
@@ -53,6 +122,12 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
     vec![
         CatalogCandidate::from_tool(read, ToolSource::Native),
         CatalogCandidate::from_tool(write, ToolSource::Native),
+        CatalogCandidate::from_tool(read_artifact, ToolSource::Native),
+        CatalogCandidate::from_tool(list_dir, ToolSource::Native),
+        CatalogCandidate::from_tool(grep, ToolSource::Native),
+        CatalogCandidate::from_tool(git_status, ToolSource::Native),
+        CatalogCandidate::from_tool(git_diff, ToolSource::Native),
+        CatalogCandidate::from_tool(exec, ToolSource::Native),
         CatalogCandidate::from_tool(bash, ToolSource::Native),
     ]
 }
@@ -75,7 +150,10 @@ pub(crate) fn delegation_candidate() -> CatalogCandidate {
 /// The command loads WASM manifests because they are part of the configured
 /// catalog, but it never constructs a provider, event store, memory database,
 /// skill database, or MCP connection.
-async fn inspection_catalog(config: &HarnessConfig, root: &Path) -> Result<ToolCatalog, CliError> {
+pub(crate) async fn inspection_catalog(
+    config: &HarnessConfig,
+    root: &Path,
+) -> Result<ToolCatalog, CliError> {
     let mut candidates = native_candidates(root, config);
     for tool in load_wasm_tools(config, root).await? {
         candidates.push(CatalogCandidate::from_tool(tool, ToolSource::Wasm));
@@ -251,7 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_candidates_are_the_three_native_tools_in_any_order() {
+    fn native_candidates_are_the_configured_native_tools_in_any_order() {
         let config = HarnessConfig::default();
         let candidates = native_candidates(Path::new("."), &config);
         let mut names: Vec<&str> = candidates
@@ -259,7 +337,20 @@ mod tests {
             .map(|candidate| candidate.name.as_str())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, ["bash", "read_file", "write_file"]);
+        assert_eq!(
+            names,
+            [
+                "bash",
+                "exec",
+                "git_diff",
+                "git_status",
+                "grep",
+                "list_dir",
+                "read_artifact",
+                "read_file",
+                "write_file"
+            ]
+        );
         assert!(
             candidates.iter().all(|candidate| candidate.tool.is_some()),
             "native candidates must be executable"

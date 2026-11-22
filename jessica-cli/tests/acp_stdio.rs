@@ -1338,10 +1338,13 @@ async fn acp_streams_updates_before_the_response_and_replays_history() {
     let finished = &second_updates[1];
     assert_eq!(finished["toolCallId"], "call_read");
     assert_eq!(finished["status"], "completed");
-    assert_eq!(finished["rawOutput"], "note contents");
+    assert_eq!(finished["rawOutput"], "1\tnote contents\n");
     assert_eq!(finished["content"][0]["type"], "content");
     assert_eq!(finished["content"][0]["content"]["type"], "text");
-    assert_eq!(finished["content"][0]["content"]["text"], "note contents");
+    assert_eq!(
+        finished["content"][0]["content"]["text"],
+        "1\tnote contents\n"
+    );
     assert_eq!(second_updates[2]["content"]["text"], "second answer");
     assert!(
         acp.permission_requests().is_empty(),
@@ -1496,7 +1499,7 @@ async fn acp_session_load_after_restart_replays_history_and_continues_context() 
     assert_eq!(replayed[1]["status"], "in_progress");
     assert_eq!(replayed[2]["toolCallId"], "call_read");
     assert_eq!(replayed[2]["status"], "completed");
-    assert_eq!(replayed[2]["rawOutput"], "note contents");
+    assert_eq!(replayed[2]["rawOutput"], "1\tnote contents\n");
     assert_eq!(replayed[3]["content"]["text"], "read result answer");
     assert_ne!(
         replayed[0]["messageId"], replayed[3]["messageId"],
@@ -1548,7 +1551,7 @@ async fn acp_session_load_after_restart_replays_history_and_continues_context() 
     assert!(
         messages
             .iter()
-            .any(|message| message["role"] == "tool" && message["content"] == "note contents"),
+            .any(|message| message["role"] == "tool" && message["content"] == "1\tnote contents\n"),
         "the restored tool result must reach the provider: {messages:?}"
     );
     assert!(
@@ -1935,6 +1938,7 @@ async fn acp_session_close_cancels_active_work_and_acknowledges_after_it_stops()
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
          [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n\n\
          [events]\npath = \"events.db\"\n\n\
          [acp]\nstate_dir = \"acp-state\"\n",
     )
@@ -2314,6 +2318,7 @@ async fn acp_session_delete_cancels_active_work_without_reindexing() {
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
          [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n\n\
          [events]\npath = \"events.db\"\n\n\
          [acp]\nstate_dir = \"acp-state\"\n",
     )
@@ -2526,7 +2531,8 @@ async fn acp_cancel_is_scoped_closes_in_flight_tools_and_keeps_the_session_usabl
     std::fs::write(
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
-         [policy]\nallowed_tools = [\"bash\"]\n",
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n",
     )
     .expect("harness configuration must be written");
     let provider = MockProvider::start(vec![
@@ -2712,7 +2718,8 @@ async fn spawn_permission_harness(
         &config,
         format!(
             "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
-             [policy]\nallowed_tools = [{allowed_tools}]\n"
+             [policy]\nallowed_tools = [{allowed_tools}]\n\n\
+             [tools.bash]\nenabled = true\n"
         ),
     )
     .expect("harness configuration must be written");
@@ -3080,6 +3087,7 @@ async fn acp_delegation_asks_only_for_the_parent_call() {
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
          [policy]\nallowed_tools = [\"bash\", \"delegate_task\"]\n\n\
+         [tools.bash]\nenabled = true\n\n\
          [delegation]\nenabled = true\n",
     )
     .expect("harness configuration must be written");
@@ -3171,6 +3179,7 @@ async fn acp_sigterm_cancels_two_active_sessions_and_exits_within_the_bound() {
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
          [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n\n\
          [skills]\nenabled = true\npath = \"skills.db\"\ndrain_timeout_ms = 500\n",
     )
     .expect("harness configuration must be written");
@@ -3266,7 +3275,8 @@ async fn acp_stdin_eof_cancels_two_active_sessions_and_exits_within_the_bound() 
     std::fs::write(
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
-         [policy]\nallowed_tools = [\"bash\"]\n",
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n",
     )
     .expect("harness configuration must be written");
     let provider = MockProvider::start(vec![
@@ -3331,7 +3341,8 @@ async fn acp_stdout_failure_cancels_work_without_panicking_or_hanging() {
     std::fs::write(
         &config,
         "[budget]\nmax_rounds = 8\nmax_tokens = 100000\n\n\
-         [policy]\nallowed_tools = [\"bash\"]\n",
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n",
     )
     .expect("harness configuration must be written");
     let provider = MockProvider::start(vec![tool_calls_response(&[(
@@ -3525,7 +3536,8 @@ async fn acp_error_paths_are_stable_and_keep_sensitive_content_out_of_stderr() {
     std::fs::write(
         &config,
         "[budget]\nmax_rounds = 4\nmax_tokens = 100000\n\n\
-         [policy]\nallowed_tools = [\"bash\"]\n",
+         [policy]\nallowed_tools = [\"bash\"]\n\n\
+         [tools.bash]\nenabled = true\n",
     )
     .expect("harness configuration must be written");
     let provider = MockProvider::start(vec![
@@ -3677,6 +3689,9 @@ max_tokens = 100000
 [policy]
 allowed_tools = [\"bash\"]
 
+[tools.bash]
+enabled = true
+
 [acp]
 max_prompt_bytes = 8
 ",
@@ -3706,6 +3721,9 @@ max_tokens = 100000
 
 [policy]
 allowed_tools = [\"bash\"]
+
+[tools.bash]
+enabled = true
 
 [acp]
 max_prompt_bytes = 64

@@ -31,19 +31,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::acp_store::AcpStoreError;
+use crate::artifacts::ResultManager;
 use crate::config::{ConfigError, HarnessConfig};
 use crate::delegation::NativeChildToolFactory;
 use crate::events::{EventJournal, EventRecorder, RecorderError};
-use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate};
+use crate::governance::{
+    GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate, cli_permission_gate,
+};
 use crate::journal::TurnJournal;
 use crate::memory::MemoryAssembly;
+use crate::policy_v2::{PolicyError, PolicyTool, PolicyV2};
 use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
-use crate::tools::{
-    ApprovalPolicy, CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates,
-};
+use crate::tools::{CatalogCandidate, CatalogError, ToolCatalog, ToolSource, native_candidates};
 
 /// Maximum time to wait for the event pump to observe a terminal event.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -62,6 +64,30 @@ enum AttemptStart {
         /// Checkpoint rebuilt from the recorded events.
         checkpoint: SessionCheckpoint,
     },
+}
+
+/// Shared governance objects wrapped around every exposed tool in one turn.
+struct ToolWiring {
+    /// Harness owning policy, guards, and sensors.
+    harness: Arc<Harness>,
+    /// Turn budget and cancellation state.
+    governance: Arc<GovernanceState>,
+    /// Timeout guard shared with the harness.
+    timeout_guard: Arc<ToolTimeoutGuard>,
+    /// Result-size guard shared with the harness.
+    result_guard: Arc<ResultSizeGuard>,
+    /// Result manager applied before the result-size guard.
+    result_manager: Arc<ResultManager>,
+    /// Optional protocol gate preserving the legacy sensitive-tool flow.
+    permission_gate: Option<Arc<dyn ToolPermissionGate>>,
+    /// Optional gate used by policy `ask` verdicts.
+    ///
+    /// ACP reuses its permission gate here. A terminal CLI turn supplies a
+    /// one-shot prompt when an `ask` rule exists, without changing the legacy
+    /// behavior of sensitive tools that no rule mentions.
+    ask_gate: Option<Arc<dyn ToolPermissionGate>>,
+    /// Policy v2 evaluator shared by every governed tool in the turn.
+    policy_v2: Arc<PolicyV2>,
 }
 
 /// Per-turn middleware, agent, and pump wiring.
@@ -221,7 +247,7 @@ pub(crate) struct TurnRequest {
     ///
     /// ACP supplies a gate that asks the client through
     /// `session/request_permission`. The CLI and resume paths pass `None`,
-    /// leaving `bash`, `write_file`, and `delegate_task` governed by policy
+    /// leaving `bash`, `exec`, `write_file`, and `delegate_task` governed by policy
     /// alone. The fixed sensitive set is evaluated inside [`GovernedTool`];
     /// configured WASM and MCP tools never request permission.
     pub(crate) permission_gate: Option<Arc<dyn ToolPermissionGate>>,
@@ -388,14 +414,16 @@ impl CliRuntime {
         // `initial_messages` must never mix a newer published config with an
         // older one, even if the watcher fires mid-turn.
         let config = self.config_snapshot();
-        let setup = self.build_turn(
-            &scope,
-            true,
-            &config,
-            update_sink,
-            &extra_tools,
-            permission_gate,
-        )?;
+        let setup = self
+            .build_turn(
+                &scope,
+                true,
+                &config,
+                update_sink,
+                &extra_tools,
+                permission_gate,
+            )
+            .await?;
         let first_session = session_id.unwrap_or_else(next_session_id);
         // A signal may arrive between the REPL's last check and this point.
         // The child token is already cancelled in that case: skip memory and
@@ -750,7 +778,9 @@ impl CliRuntime {
 
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
-        let setup = self.build_turn(&scope, false, &config, None, &[], None)?;
+        let setup = self
+            .build_turn(&scope, false, &config, None, &[], None)
+            .await?;
         let trace_messages = checkpoint.messages().to_vec();
         if setup.cancel.is_cancelled() {
             let turn_id = next_turn_id();
@@ -865,9 +895,10 @@ impl CliRuntime {
     /// sink the pump keeps rendering to the terminal. `extra_tools` contains
     /// session-scoped tools such as MCP discoveries; each is still wrapped in
     /// [`GovernedTool`] by [`CliRuntime::build_tool_registry`].
-    /// `permission_gate` is attached to the sensitive native tools only; it is
-    /// `None` outside the ACP path.
-    fn build_turn(
+    /// `permission_gate` is the ACP protocol gate. A terminal CLI turn also
+    /// installs an ask-only prompt for policy v2 `ask` verdicts; neither gate
+    /// changes the legacy sensitive-tool flow when no approval is configured.
+    async fn build_turn(
         &self,
         scope: &TurnScope,
         allow_delegation: bool,
@@ -881,6 +912,7 @@ impl CliRuntime {
         let timeout_guard = Arc::new(ToolTimeoutGuard::new(timeout));
         let stuck_guard = Arc::new(StuckDetectionGuard::new(config.budget.max_stuck_rounds));
         let result_guard = Arc::new(ResultSizeGuard::new(config.budget.max_result_bytes));
+        let result_manager = Arc::new(ResultManager::new(scope.root(), config));
 
         let guards: Vec<Arc<dyn Guard>> = vec![
             Arc::clone(&token_guard) as Arc<dyn Guard>,
@@ -890,6 +922,18 @@ impl CliRuntime {
         ];
         let policy: Arc<dyn Policy> =
             Arc::new(AllowlistPolicy::new(config.policy.allowed_tools.clone()));
+        let policy_v2 = Arc::new(
+            PolicyV2::new(scope.root(), config)
+                .await
+                .map_err(CliError::PolicyV2)?,
+        );
+        // ACP supplies its protocol gate. A CLI turn installs a terminal
+        // prompt for `ask` verdicts (an explicit `ask` mode or an `ask` rule);
+        // without any gate an ask outcome fails closed. The CLI prompt is not
+        // used as the legacy sensitive-tool gate, so adding one `ask` rule
+        // does not start prompting for unrelated sensitive tools.
+        let cli_ask_gate = cli_permission_gate(scope.root(), config);
+        let ask_gate = permission_gate.clone().or(cli_ask_gate);
         let sensors = self.build_sensors(scope, config);
         let harness = Arc::new(
             Harness::with_event_capacity(Vec::new(), DEFAULT_EVENT_CAPACITY)
@@ -944,14 +988,17 @@ impl CliRuntime {
             .enforce_budget(config)
             .map_err(CliError::ToolCatalog)?;
 
-        let registry = self.build_tool_registry(
-            &catalog,
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            Arc::clone(&timeout_guard),
-            Arc::clone(&result_guard),
+        let wiring = ToolWiring {
+            harness: Arc::clone(&harness),
+            governance: Arc::clone(&governance),
+            timeout_guard: Arc::clone(&timeout_guard),
+            result_guard: Arc::clone(&result_guard),
+            result_manager,
             permission_gate,
-        )?;
+            ask_gate,
+            policy_v2,
+        };
+        let registry = self.build_tool_registry(&catalog, &wiring)?;
         let agent = AgentLoop::new(
             provider,
             Arc::new(registry),
@@ -1077,11 +1124,7 @@ impl CliRuntime {
     fn build_tool_registry(
         &self,
         catalog: &ToolCatalog,
-        harness: Arc<Harness>,
-        governance: Arc<GovernanceState>,
-        timeout_guard: Arc<ToolTimeoutGuard>,
-        result_guard: Arc<ResultSizeGuard>,
-        permission_gate: Option<Arc<dyn ToolPermissionGate>>,
+        wiring: &ToolWiring,
     ) -> Result<ToolRegistry, CliError> {
         let mut registry = ToolRegistry::new();
         for entry in catalog.exposed() {
@@ -1092,15 +1135,29 @@ impl CliRuntime {
                 .ok_or_else(|| CatalogError::MissingImplementation { name: name.clone() })?;
             let mut governed = GovernedTool::new(
                 Arc::clone(tool),
-                Arc::clone(&harness),
-                Arc::clone(&governance),
+                Arc::clone(&wiring.harness),
+                Arc::clone(&wiring.governance),
                 Duration::from_millis(entry.descriptor.limits.timeout_ms),
-                Arc::clone(&timeout_guard),
-                Arc::clone(&result_guard),
+                Arc::clone(&wiring.timeout_guard),
+                Arc::clone(&wiring.result_guard),
             )
-            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes);
-            if entry.descriptor.approval == ApprovalPolicy::Interactive {
-                governed = governed.with_permission_gate(permission_gate.clone());
+            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes)
+            .with_result_manager(
+                Some(Arc::clone(&wiring.result_manager)),
+                entry.descriptor.result_format,
+            )
+            .with_policy_v2(
+                Arc::clone(&wiring.policy_v2),
+                PolicyTool::from_descriptor(&entry.descriptor),
+            );
+            // A policy `ask` rule can target a tool that the legacy approval
+            // set never covered, so the ask gate is attached to every exposed
+            // tool. The evaluator decides which gate is consulted.
+            if wiring.permission_gate.is_some() {
+                governed = governed.with_permission_gate(wiring.permission_gate.clone());
+            }
+            if wiring.ask_gate.is_some() {
+                governed = governed.with_ask_gate(wiring.ask_gate.clone());
             }
             registry
                 .register(Arc::new(governed))
@@ -1420,19 +1477,28 @@ fn stable_turn_index(messages: &[Message]) -> u64 {
 }
 
 fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
-    let allowed = if config.policy.allowed_tools.is_empty() {
+    let allowed = config
+        .policy
+        .allowed_tools
+        .iter()
+        .filter(|name| config.tools.bash.enabled || *name != "bash")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let allowed = if allowed.is_empty() {
         "none".to_owned()
     } else {
-        config.policy.allowed_tools.join(", ")
+        allowed.join(", ")
     };
     format!(
         "You are Jessica, a deterministic coding agent. The workspace root is {}. \
-         Use read_file and write_file with paths relative to the workspace root; bash is also \
-         available when allowed. Tool calls are subject to this allowlist: {allowed}. A denied \
-         call returns an error result, so adapt instead of repeating it. A command sensor runs \
-         after every tool result. If an acceptance check fails, its feedback is injected as a \
-         user message: fix the underlying problem and retry. Verify your work with tools instead \
-         of claiming success. When the task is complete, reply with a concise summary.",
+         Use read_file, list_dir, grep, git_status, git_diff, and write_file with paths \
+         relative to the workspace root. exec runs one program with an explicit argument \
+         array and never goes through a shell. Tool calls are subject to this allowlist: \
+         {allowed}. A denied call returns an error result, so adapt instead of repeating it. \
+         A command sensor runs after every tool result. If an acceptance check fails, its \
+         feedback is injected as a user message: fix the underlying problem and retry. \
+         Verify your work with tools instead of claiming success. When the task is complete, \
+         reply with a concise summary.",
         root.display()
     )
 }
@@ -1502,10 +1568,25 @@ pub(crate) enum CliError {
     /// The tool catalog could not be built or queried.
     #[error("tool catalog error: {0}")]
     ToolCatalog(#[from] CatalogError),
+    /// Policy v2 could not be initialized or evaluated.
+    #[error("policy error: {0}")]
+    PolicyV2(#[from] PolicyError),
     /// A `tools` subcommand argument was missing, unknown, or malformed.
     #[error("invalid tools command: {message}")]
     InvalidToolsCommand {
         /// Human-readable parse failure.
+        message: String,
+    },
+    /// A `policy` subcommand argument was missing, unknown, or malformed.
+    #[error("invalid policy command: {message}")]
+    InvalidPolicyCommand {
+        /// Human-readable parse failure.
+        message: String,
+    },
+    /// `policy simulate` could not evaluate the requested call.
+    #[error("policy simulation failed: {message}")]
+    PolicySimulation {
+        /// Structured reason such as hidden tool, invalid JSON, or path error.
         message: String,
     },
     /// A tool could not be registered.
@@ -2079,7 +2160,8 @@ mod tests {
         HarnessConfig::from_toml_str(
             "[delegation]\nenabled = true\n\
              [policy]\n\
-             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n",
+             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n\
+             [tools.bash]\nenabled = true\n",
         )
         .expect("enabled delegation config must parse")
     }
@@ -2196,6 +2278,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         let reason = setup
             .agent
@@ -2228,6 +2311,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         setup
             .agent
@@ -2241,7 +2325,11 @@ mod tests {
 
         let disabled_calls = disabled_provider.calls();
         let disabled_names = schema_names(&disabled_calls[0].tools);
-        assert_eq!(disabled_names, vec!["bash", "read_file", "write_file"]);
+        assert_eq!(
+            disabled_names,
+            vec!["read_file", "write_file"],
+            "bash is disabled by default even though the default allowlist names it"
+        );
 
         let resume_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
@@ -2255,6 +2343,7 @@ mod tests {
                 &[],
                 None,
             )
+            .await
             .expect("turn should build");
         setup
             .agent
@@ -2322,14 +2411,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_is_hidden_until_enabled_and_unknown_calls_do_not_execute() {
+        let workspace = TempDir::new("bash-disabled");
+        let disabled_provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call-disabled-bash", "printf ran > disabled-marker.txt"),
+            done_text("adapted", 1),
+        ]));
+        let disabled_runtime = runtime_at(
+            Arc::clone(&disabled_provider),
+            HarnessConfig::default(),
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            disabled_runtime
+                .run_turn("run bash".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let disabled_calls = disabled_provider.calls();
+        assert_eq!(
+            schema_names(&disabled_calls[0].tools),
+            vec!["read_file", "write_file"],
+            "disabled bash must not appear in the provider schema"
+        );
+        let rejection = disabled_calls[1]
+            .messages
+            .last()
+            .expect("the unknown bash call must produce a result")
+            .content
+            .clone();
+        assert!(
+            rejection.contains("unknown tool `bash`"),
+            "a hallucinated call to disabled bash must be unknown: {rejection}"
+        );
+        assert!(
+            !workspace.path().join("disabled-marker.txt").exists(),
+            "a disabled bash call must have no filesystem effect"
+        );
+
+        let enabled_provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call-enabled-bash", "printf ran > enabled-marker.txt"),
+            done_text("done", 1),
+        ]));
+        let enabled_config = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\n")
+            .expect("an explicit bash enable must parse");
+        let enabled_runtime = runtime_at(
+            Arc::clone(&enabled_provider),
+            enabled_config,
+            workspace.path().to_path_buf(),
+        );
+        assert_eq!(
+            enabled_runtime
+                .run_turn("run bash".to_owned())
+                .await
+                .expect("the enabled turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let enabled_calls = enabled_provider.calls();
+        assert!(
+            schema_names(&enabled_calls[0].tools).contains(&"bash"),
+            "explicitly enabled bash must be exposed"
+        );
+        assert!(
+            workspace.path().join("enabled-marker.txt").exists(),
+            "an enabled bash call must execute"
+        );
+    }
+
+    #[tokio::test]
     async fn exposure_budgets_fail_turn_startup_before_the_model_is_called() {
         for (toml, expected) in [
             (
-                "[tools]\nmax_exposed_tools = 2\n",
+                "[tools]\nmax_exposed_tools = 2\n[tools.bash]\nenabled = true\n",
                 "tools.max_exposed_tools",
             ),
             (
-                "[tools]\nmax_tool_schema_bytes = 1\n",
+                "[tools]\nmax_tool_schema_bytes = 1\n[tools.bash]\nenabled = true\n",
                 "tools.max_tool_schema_bytes",
             ),
         ] {
@@ -2399,7 +2560,7 @@ mod tests {
             "slow-command",
             "sleep 2",
         )]));
-        let config = HarnessConfig::from_toml_str("[tools.bash]\ntimeout_ms = 1\n")
+        let config = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\ntimeout_ms = 1\n")
             .expect("per-tool timeout must parse");
         let runtime = runtime_with(Arc::clone(&provider), config);
 
@@ -2420,6 +2581,145 @@ mod tests {
             provider.calls().len(),
             1,
             "a timed-out tool must cancel the turn before another model request"
+        );
+    }
+
+    /// Extracts the digest header from a managed result.
+    fn managed_digest(content: &str) -> String {
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("digest: "))
+            .expect("a managed result must carry a digest")
+            .to_owned()
+    }
+
+    /// Resolves the content-addressed artifact path under `root`.
+    fn artifact_path(root: &Path, digest: &str) -> PathBuf {
+        let hex = digest
+            .strip_prefix("sha256:")
+            .expect("digest must be namespaced");
+        root.join(".jessica/artifacts").join(&hex[..2]).join(hex)
+    }
+
+    #[tokio::test]
+    async fn a_large_read_file_result_becomes_a_preview_and_artifact() {
+        let workspace = TempDir::new("large-read");
+        let content = "r".repeat(100 * 1024);
+        let read_output = format!("1\t{content}\n");
+        std::fs::write(workspace.path().join("big.txt"), &content)
+            .expect("large file must be written");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            read_request("call_read", "big.txt"),
+            done_text("read complete", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n\
+             [policy]\nallowed_tools = [\"read_file\"]\n",
+        )
+        .expect("read config must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("read the large file".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed
+        );
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        let tool_result = calls[1]
+            .messages
+            .last()
+            .expect("the read result must reach the model")
+            .content
+            .clone();
+        assert!(tool_result.starts_with("[result artifact]"));
+        assert!(tool_result.contains(&format!("original_bytes: {}", read_output.len())));
+        assert!(tool_result.contains("truncated: false"));
+        assert!(
+            tool_result.len() <= 64 * 1024,
+            "only a bounded preview may enter the model context: {}",
+            tool_result.len()
+        );
+        assert_ne!(
+            tool_result, read_output,
+            "the full result must not be inline"
+        );
+
+        let digest = managed_digest(&tool_result);
+        let artifact = artifact_path(workspace.path(), &digest);
+        assert_eq!(
+            std::fs::read(&artifact).expect("artifact must exist"),
+            read_output.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_bash_result_does_not_trip_the_result_size_guard() {
+        let workspace = TempDir::new("large-bash");
+        let command = "i=0; while [ $i -lt 20000 ]; do printf 'abcdefghij'; i=$((i+1)); done";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            bash_request("call_bash", command),
+            done_text("bash complete", 1),
+        ]));
+        let config = HarnessConfig::from_toml_str(
+            "[profile]\ntrace = \"off\"\n\
+             [budget]\nmax_result_bytes = 300000\n\
+             [policy]\nallowed_tools = [\"bash\"]\n\
+             [tools.bash]\nenabled = true\n\
+             [tools.supervisor]\n\
+             command_timeout_ms = 5000\n\
+             max_output_bytes = 250000\n",
+        )
+        .expect("bash config must parse");
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            runtime
+                .run_turn("produce a large command result".to_owned())
+                .await
+                .expect("the turn must finish"),
+            SessionEndReason::Completed,
+            "a managed large result must not trip the result-size guard"
+        );
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2);
+        let tool_result = calls[1]
+            .messages
+            .last()
+            .expect("the bash result must reach the model")
+            .content
+            .clone();
+        assert!(tool_result.starts_with("[result artifact]"));
+        assert!(tool_result.contains("digest: sha256:"));
+        assert!(tool_result.contains("next_offset: 32768"));
+        assert!(
+            tool_result.len() <= 64 * 1024,
+            "the managed preview must stay within the inline cap: {}",
+            tool_result.len()
+        );
+        assert!(
+            tool_result.matches("abcdefghij").count() < 20_000,
+            "the full 200 KiB command output must not enter the model context"
+        );
+
+        let digest = managed_digest(&tool_result);
+        let artifact = artifact_path(workspace.path(), &digest);
+        let stored = std::fs::read_to_string(&artifact).expect("artifact must exist");
+        assert!(
+            stored.matches("abcdefghij").count() >= 20_000,
+            "the artifact must retain the full command output"
         );
     }
 
@@ -2498,6 +2798,7 @@ mod tests {
         let config = runtime.config_snapshot();
         let setup = runtime
             .build_turn(&test_scope().await, true, &config, None, &[], None)
+            .await
             .expect("turn should build");
 
         let reason = setup
@@ -2591,7 +2892,11 @@ mod tests {
         );
         assert_eq!(
             schema_names(&calls[0].tools),
-            vec!["bash", "read_file", "write_file"]
+            vec!["read_file", "write_file"]
+        );
+        assert!(
+            !system_prompt_of(&calls[0]).contains("bash"),
+            "the first prompt must not advertise disabled bash"
         );
         assert!(
             system_prompt_of(&calls[1]).contains("delegate_task"),
@@ -2612,6 +2917,42 @@ mod tests {
             "hot reload must not add or reorder messages"
         );
         assert_eq!(calls[1].messages[1].content, "second question");
+    }
+
+    #[tokio::test]
+    async fn enabling_bash_is_reloadable_for_the_next_turn() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let (runtime, sender) =
+            runtime_with_reload(Arc::clone(&provider), HarnessConfig::default());
+
+        runtime
+            .run_turn("first question".to_owned())
+            .await
+            .expect("first turn should complete");
+        let enabled = HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\n")
+            .expect("the enable gate must parse");
+        sender
+            .send(Arc::new(enabled))
+            .expect("runtime must keep the receiver open");
+        runtime
+            .run_turn("second question".to_owned())
+            .await
+            .expect("second turn should complete");
+
+        let calls = provider.calls();
+        assert_eq!(
+            schema_names(&calls[0].tools),
+            vec!["read_file", "write_file"],
+            "the first turn must keep bash disabled"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash", "read_file", "write_file"],
+            "the next turn must expose the reloaded bash gate"
+        );
     }
 
     #[tokio::test]
@@ -2641,7 +2982,11 @@ mod tests {
         );
         assert_eq!(
             schema_names(&calls[0].tools),
-            vec!["bash", "read_file", "write_file"]
+            vec!["read_file", "write_file"]
+        );
+        assert!(
+            !system_prompt_of(&calls[0]).contains("bash"),
+            "the in-flight prompt must not advertise disabled bash"
         );
         assert!(
             system_prompt_of(&calls[1]).contains("delegate_task"),
@@ -2710,8 +3055,10 @@ mod tests {
                 .expect("first turn should run"),
             SessionEndReason::Completed
         );
-        let reloaded = HarnessConfig::from_toml_str("[budget]\ntool_timeout_ms = 1\n")
-            .expect("budget should parse");
+        let reloaded = HarnessConfig::from_toml_str(
+            "[budget]\ntool_timeout_ms = 1\n[tools.bash]\nenabled = true\n",
+        )
+        .expect("budget should parse");
         sender
             .send(Arc::new(reloaded))
             .expect("runtime must keep the receiver open");
@@ -2999,7 +3346,7 @@ mod tests {
         );
         assert_eq!(
             calls[1].messages.last().expect("tool result").content,
-            "alpha",
+            "1\talpha\n",
             "the first turn must read from its own root"
         );
         assert!(
@@ -3009,7 +3356,7 @@ mod tests {
         );
         assert_eq!(
             calls[4].messages.last().expect("tool result").content,
-            "beta",
+            "1\tbeta\n",
             "the second turn must read from its own root"
         );
         assert!(
@@ -3061,9 +3408,11 @@ mod tests {
             .expect("scope b must build");
         let setup_a = runtime
             .build_turn(&scope_a, false, &config, None, &[], None)
+            .await
             .expect("turn a must build");
         let setup_b = runtime
             .build_turn(&scope_b, false, &config, None, &[], None)
+            .await
             .expect("turn b must build");
 
         parent_a.cancel();
@@ -3259,7 +3608,7 @@ mod tests {
         assert_eq!(outcome.messages[2].tool_calls[0].name, "read_file");
         assert_eq!(
             outcome.messages[3],
-            Message::tool("read-1", "contents"),
+            Message::tool("read-1", "1\tcontents\n"),
             "the transcript must contain the same tool result the event stream carried"
         );
         assert_eq!(outcome.messages[4], Message::assistant("finished"));

@@ -109,7 +109,8 @@ fn enabled_config(settings: &Settings<'_>) -> String {
          [budget]\nmax_tokens = {}\ntool_timeout_ms = {}\nmax_rounds = 16\n\n\
          [policy]\nallowed_tools = [{allowed}]\n\n\
          [delegation]\nenabled = true\nmax_rounds = {}\ntimeout_ms = {}\n\
-         max_task_bytes = 8192\nmax_result_bytes = {}\nmax_child_tool_calls = {}\n",
+         max_task_bytes = 8192\nmax_result_bytes = {}\nmax_child_tool_calls = {}\n\n\
+         [tools.bash]\nenabled = true\n",
         settings.max_tokens,
         settings.tool_timeout_ms,
         settings.max_rounds,
@@ -122,7 +123,8 @@ fn enabled_config(settings: &Settings<'_>) -> String {
 /// Renders a configuration with delegation disabled.
 fn disabled_config() -> String {
     "[events]\npath = \"events.sqlite\"\n\n\
-     [policy]\nallowed_tools = [\"bash\", \"read_file\", \"write_file\"]\n"
+     [policy]\nallowed_tools = [\"bash\", \"read_file\", \"write_file\"]\n\n\
+     [tools.bash]\nenabled = true\n"
         .to_owned()
 }
 
@@ -605,7 +607,7 @@ fn normal_delegation_keeps_child_events_out_of_the_parent_store() {
     let child_follow_up = request_messages(children[1]);
     assert_eq!(child_follow_up.len(), 4);
     assert_eq!(child_follow_up[3]["role"], "tool");
-    assert_eq!(child_follow_up[3]["content"], "ORANGE-NOTE");
+    assert_eq!(child_follow_up[3]["content"], "1\tORANGE-NOTE\n");
 
     let parent = run.parent_requests();
     assert_eq!(parent.len(), 2);
@@ -1334,7 +1336,7 @@ fn two_delegations_in_one_round_keep_their_transcripts_separate() {
 
     let alpha_follow_up = request_messages(children[1]);
     assert_eq!(alpha_follow_up.len(), 4);
-    assert_eq!(alpha_follow_up[3]["content"], "ALPHA-ONLY");
+    assert_eq!(alpha_follow_up[3]["content"], "1\tALPHA-ONLY\n");
     assert!(
         !children[1].contains("BETA-ONLY"),
         "alpha must not see beta state"
@@ -1342,7 +1344,7 @@ fn two_delegations_in_one_round_keep_their_transcripts_separate() {
 
     let beta_follow_up = request_messages(children[3]);
     assert_eq!(beta_follow_up.len(), 4);
-    assert_eq!(beta_follow_up[3]["content"], "BETA-ONLY");
+    assert_eq!(beta_follow_up[3]["content"], "1\tBETA-ONLY\n");
     assert!(
         !children[3].contains("ALPHA-ONLY"),
         "beta must not see alpha state"

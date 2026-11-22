@@ -233,8 +233,14 @@ path = "$home_toml/memory.db"
 enabled = false
 path = "$home_toml/skills.db"
 
-# The built-in tool allowlist is bash, read_file, and write_file. To restrict
-# it, uncomment and edit:
+# The built-in tool allowlist is bash, read_file, and write_file. Native bash
+# is hidden until explicitly enabled here; the allowlist alone is not enough:
+#
+# [tools.bash]
+# enabled = true
+# sandbox = "process"
+#
+# To restrict the allowlist, uncomment and edit:
 #
 # [policy]
 # allowed_tools = ["read_file", "write_file"]

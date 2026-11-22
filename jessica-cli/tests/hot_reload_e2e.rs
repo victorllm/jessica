@@ -36,6 +36,9 @@ tool_timeout_ms = 9000
 [policy]
 allowed_tools = [\"bash\", \"read_file\", \"write_file\"]
 
+[tools.bash]
+enabled = true
+
 [memory]
 enabled = true
 path = \".jessica/memory.db\"
@@ -57,6 +60,9 @@ tool_timeout_ms = 9000
 allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]
 
 [delegation]
+enabled = true
+
+[tools.bash]
 enabled = true
 
 [memory]
@@ -557,6 +563,92 @@ fn repl_reload_changes_system_prompt_and_tool_schema_between_turns() {
     assert!(
         stderr.contains("[config] reloaded"),
         "a successful reload must be logged\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn repl_reload_can_enable_bash_for_the_next_turn() {
+    const DISABLED: &str = "\
+[budget]
+max_rounds = 4
+tool_timeout_ms = 9000
+
+[policy]
+allowed_tools = [\"bash\", \"read_file\", \"write_file\"]
+";
+    const ENABLED: &str = "\
+[budget]
+max_rounds = 4
+tool_timeout_ms = 9000
+
+[policy]
+allowed_tools = [\"bash\", \"read_file\", \"write_file\"]
+
+[tools.bash]
+enabled = true
+";
+
+    let temp = TempDir::new("enable-gate");
+    let config = temp.path.join("harness.toml");
+    write_config(&config, DISABLED);
+    let server = ScriptedServer::start(vec![
+        Plan::SseWithMutation {
+            response: text_response("first answer"),
+            path: config.clone(),
+            body: ENABLED.to_owned(),
+            wait: Duration::ZERO,
+        },
+        Plan::Sse(text_response("second answer")),
+    ]);
+    let mut child = spawn_repl(&temp.path, &config, server.address);
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+
+    send_line(&mut stdin, "first question");
+    server.wait_for_mutations(1);
+    thread::sleep(POLL_SETTLE);
+    send_line(&mut stdin, "second question");
+    send_line(&mut stdin, "exit");
+    drop(stdin);
+
+    let status = wait_with_timeout(&mut child);
+    let output = collect_output(child, status);
+    let requests = server.finish();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "CLI failed with {}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert_eq!(
+        requests.len(),
+        2,
+        "each text turn must make exactly one provider request\nstderr:\n{stderr}"
+    );
+
+    let first = request_json(&requests[0]);
+    let second = request_json(&requests[1]);
+    assert_eq!(
+        tool_names(&first),
+        vec!["read_file", "write_file"],
+        "bash must stay hidden until the reload"
+    );
+    assert!(
+        !system_prompt(&first).contains("bash"),
+        "the first prompt must not advertise disabled bash: {}",
+        system_prompt(&first)
+    );
+    assert_eq!(
+        tool_names(&second),
+        vec!["bash", "read_file", "write_file"],
+        "the reloaded enable gate must expose bash"
+    );
+    assert!(
+        system_prompt(&second).contains("bash"),
+        "the next prompt must advertise the enabled bash tool"
+    );
+    assert!(
+        stderr.contains("[config] reloaded"),
+        "the enable gate is nested in [tools] and must reload\nstderr:\n{stderr}"
     );
 }
 

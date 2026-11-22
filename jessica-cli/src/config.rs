@@ -5,7 +5,7 @@
 //! layered memory. Missing optional sections disable that component; the policy
 //! default is the same allowlist the CLI has always exposed natively.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use jessica_core::types::Budget;
@@ -19,7 +19,11 @@ use jessica_providers::{
 use jessica_runtime::{
     CHILD_TOOL_TIMEOUT, DELEGATE_TASK_TOOL_NAME, DelegationLimits, MIN_RESULT_BYTES,
 };
-use jessica_tools::DEFAULT_BASH_TIMEOUT;
+use jessica_tools::{
+    DEFAULT_BASH_TIMEOUT, DEFAULT_GREP_FILE_BYTES, DEFAULT_GREP_FILES, DEFAULT_GREP_IGNORES,
+    DEFAULT_GREP_MATCHES, DEFAULT_GREP_OUTPUT_BYTES, DEFAULT_LIST_DIR_ENTRIES,
+    DEFAULT_LIST_DIR_IGNORES,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -33,6 +37,18 @@ const DEFAULT_EVENTS_PATH: &str = ".jessica/events.db";
 const DEFAULT_MAX_EXPOSED_TOOLS: usize = 64;
 /// Default maximum total schema bytes sent to the model in one turn.
 const DEFAULT_MAX_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
+/// Default tool-result size below which the original content is returned.
+const DEFAULT_INLINE_THRESHOLD_BYTES: usize = 32 * 1024;
+/// Default hard cap on a managed tool result entering the model context.
+const DEFAULT_MAX_INLINE_BYTES: usize = 64 * 1024;
+/// Default maximum bytes stored in one artifact.
+const DEFAULT_MAX_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Default artifact directory, relative to the workspace root.
+const DEFAULT_ARTIFACT_DIR: &str = ".jessica/artifacts";
+/// Default number of days an artifact is retained.
+const DEFAULT_ARTIFACT_RETENTION_DAYS: u64 = 7;
+/// Default total byte budget for retained artifacts.
+const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default token budget for a session (prompt plus completion tokens).
 const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
@@ -218,6 +234,205 @@ pub struct ToolLimitConfig {
     pub max_args_bytes: Option<usize>,
 }
 
+/// Sandbox used to run the native `bash` tool.
+///
+/// Only [`BashSandbox::Process`] is implemented. An unsupported value is
+/// rejected while loading, so a configuration cannot silently request
+/// isolation that the runtime does not provide.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashSandbox {
+    /// Run bash as a direct child process under the execution supervisor.
+    ///
+    /// The supervisor enforces a deadline and environment isolation. Process
+    /// groups and rlimits are not applied in this mode.
+    #[default]
+    Process,
+}
+
+/// Configuration for the native `bash` tool.
+///
+/// Bash is disabled by default. It enters the catalog only when `enabled` is
+/// explicitly true, even if `policy.allowed_tools` and `tools.profile` include
+/// it. The `sandbox` field currently accepts only `"process"`; process-group
+/// cleanup and rlimits are a later task.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BashToolConfig {
+    /// Whether bash may enter this turn's catalog.
+    ///
+    /// Defaults to false. Enabling bash requires `sandbox = "process"`, which
+    /// is also the default.
+    pub enabled: bool,
+    /// Sandbox mode. Only `"process"` is implemented.
+    pub sandbox: BashSandbox,
+    /// Wall-clock timeout for this tool, in milliseconds.
+    ///
+    /// Must be at least 1 and must not exceed `budget.tool_timeout_ms` or the
+    /// bash tool's internal 10-second deadline.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    ///
+    /// Must be at least 1 when present. The check runs before policy,
+    /// permission, and execution.
+    pub max_args_bytes: Option<usize>,
+}
+
+impl Default for BashToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sandbox: BashSandbox::Process,
+            timeout_ms: None,
+            max_args_bytes: None,
+        }
+    }
+}
+
+impl BashToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
+/// Configuration for the native `list_dir` tool.
+///
+/// The ignored names are matched against entries at the listed directory level.
+/// An empty list disables skipping. Every entry must be a single normal path
+/// component such as `.git` or `target`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirToolConfig {
+    /// Wall-clock timeout for this tool, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    pub max_args_bytes: Option<usize>,
+    /// Entry names skipped by `list_dir`.
+    #[serde(default = "default_list_dir_ignores")]
+    pub ignore_dirs: Vec<String>,
+    /// Maximum number of entries rendered.
+    #[serde(default = "default_list_dir_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for ListDirToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            max_args_bytes: None,
+            ignore_dirs: default_list_dir_ignores(),
+            max_entries: default_list_dir_entries(),
+        }
+    }
+}
+
+impl ListDirToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
+/// Returns the default `list_dir` ignored entry names.
+fn default_list_dir_ignores() -> Vec<String> {
+    DEFAULT_LIST_DIR_IGNORES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Returns the default `list_dir` entry cap.
+fn default_list_dir_entries() -> usize {
+    DEFAULT_LIST_DIR_ENTRIES
+}
+
+/// Configuration for the native literal `grep` tool.
+///
+/// The ignored names apply to traversed directories. All numeric limits must be
+/// at least 1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrepToolConfig {
+    /// Wall-clock timeout for this tool, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum serialized JSON argument size for this tool, in bytes.
+    pub max_args_bytes: Option<usize>,
+    /// Directory names skipped during the walk.
+    #[serde(default = "default_grep_ignores")]
+    pub ignore_dirs: Vec<String>,
+    /// Maximum number of regular files read.
+    #[serde(default = "default_grep_files")]
+    pub max_files: usize,
+    /// Maximum file size in bytes; larger files are skipped.
+    #[serde(default = "default_grep_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Maximum number of matching lines returned.
+    #[serde(default = "default_grep_matches")]
+    pub max_matches: usize,
+    /// Maximum bytes of rendered match output.
+    #[serde(default = "default_grep_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+impl Default for GrepToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            max_args_bytes: None,
+            ignore_dirs: default_grep_ignores(),
+            max_files: default_grep_files(),
+            max_file_bytes: default_grep_file_bytes(),
+            max_matches: default_grep_matches(),
+            max_output_bytes: default_grep_output_bytes(),
+        }
+    }
+}
+
+impl GrepToolConfig {
+    /// Returns the generic limits view used by shared validation.
+    fn limits(&self) -> ToolLimitConfig {
+        ToolLimitConfig {
+            timeout_ms: self.timeout_ms,
+            max_args_bytes: self.max_args_bytes,
+        }
+    }
+}
+
+/// Returns the default `grep` ignored directory names.
+fn default_grep_ignores() -> Vec<String> {
+    DEFAULT_GREP_IGNORES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Returns the default `grep` file cap.
+fn default_grep_files() -> usize {
+    DEFAULT_GREP_FILES
+}
+
+/// Returns the default `grep` per-file byte cap.
+fn default_grep_file_bytes() -> usize {
+    DEFAULT_GREP_FILE_BYTES
+}
+
+/// Returns the default `grep` match cap.
+fn default_grep_matches() -> usize {
+    DEFAULT_GREP_MATCHES
+}
+
+/// Returns the default `grep` rendered-output cap.
+fn default_grep_output_bytes() -> usize {
+    DEFAULT_GREP_OUTPUT_BYTES
+}
+
 /// Execution supervisor settings shared by command-backed components.
 ///
 /// The supervisor starts every command with an empty environment, passes only
@@ -351,12 +566,34 @@ pub struct ToolsConfig {
     pub max_exposed_tools: usize,
     /// Maximum total serialized schema bytes exposed in one turn.
     pub max_tool_schema_bytes: usize,
+    /// Results at or below this byte length are returned unchanged.
+    pub inline_threshold_bytes: usize,
+    /// Hard cap on a managed result entering the model context.
+    pub max_inline_bytes: usize,
+    /// Maximum bytes stored in one artifact.
+    pub max_artifact_bytes: usize,
+    /// Directory for content-addressed artifacts, relative to the workspace.
+    pub artifact_dir: PathBuf,
+    /// Number of days an artifact is retained.
+    pub artifact_retention_days: u64,
+    /// Total byte budget for retained artifacts.
+    pub artifact_max_bytes: u64,
     /// Optional limits for the native `read_file` tool.
     pub read_file: ToolLimitConfig,
     /// Optional limits for the native `write_file` tool.
     pub write_file: ToolLimitConfig,
-    /// Optional limits for the native `bash` tool.
-    pub bash: ToolLimitConfig,
+    /// Enable gate and optional limits for the native `bash` tool.
+    pub bash: BashToolConfig,
+    /// Ignore list and limits for the native `list_dir` tool.
+    pub list_dir: ListDirToolConfig,
+    /// Ignore list, search bounds, and limits for the native `grep` tool.
+    pub grep: GrepToolConfig,
+    /// Optional limits for the native `git_status` tool.
+    pub git_status: ToolLimitConfig,
+    /// Optional limits for the native `git_diff` tool.
+    pub git_diff: ToolLimitConfig,
+    /// Optional limits for the native `exec` tool.
+    pub exec: ToolLimitConfig,
     /// Execution supervisor settings.
     pub supervisor: SupervisorConfig,
 }
@@ -367,25 +604,26 @@ impl Default for ToolsConfig {
             profile: ToolProfile::Full,
             max_exposed_tools: DEFAULT_MAX_EXPOSED_TOOLS,
             max_tool_schema_bytes: DEFAULT_MAX_TOOL_SCHEMA_BYTES,
+            inline_threshold_bytes: DEFAULT_INLINE_THRESHOLD_BYTES,
+            max_inline_bytes: DEFAULT_MAX_INLINE_BYTES,
+            max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES,
+            artifact_dir: PathBuf::from(DEFAULT_ARTIFACT_DIR),
+            artifact_retention_days: DEFAULT_ARTIFACT_RETENTION_DAYS,
+            artifact_max_bytes: DEFAULT_ARTIFACT_MAX_BYTES,
             read_file: ToolLimitConfig::default(),
             write_file: ToolLimitConfig::default(),
-            bash: ToolLimitConfig::default(),
+            bash: BashToolConfig::default(),
+            list_dir: ListDirToolConfig::default(),
+            grep: GrepToolConfig::default(),
+            git_status: ToolLimitConfig::default(),
+            git_diff: ToolLimitConfig::default(),
+            exec: ToolLimitConfig::default(),
             supervisor: SupervisorConfig::default(),
         }
     }
 }
 
 impl ToolsConfig {
-    /// Returns the configured limits for a native tool, if any.
-    pub fn limits(&self, name: &str) -> Option<&ToolLimitConfig> {
-        match name {
-            "read_file" => Some(&self.read_file),
-            "write_file" => Some(&self.write_file),
-            "bash" => Some(&self.bash),
-            _ => None,
-        }
-    }
-
     /// Returns the effective command deadline before the bash-specific cap.
     ///
     /// The default is the smaller of `fallback` and the bash tool's original
@@ -406,11 +644,19 @@ impl ToolsConfig {
     /// deadline so the descriptor never advertises a longer run than the tool
     /// can honor.
     pub fn timeout_for(&self, name: &str, fallback: Duration) -> Duration {
-        let configured = self
-            .limits(name)
-            .and_then(|limits| limits.timeout_ms)
-            .map(Duration::from_millis)
-            .unwrap_or(fallback);
+        let configured = match name {
+            "read_file" => self.read_file.timeout_ms,
+            "write_file" => self.write_file.timeout_ms,
+            "bash" => self.bash.timeout_ms,
+            "list_dir" => self.list_dir.timeout_ms,
+            "grep" => self.grep.timeout_ms,
+            "git_status" => self.git_status.timeout_ms,
+            "git_diff" => self.git_diff.timeout_ms,
+            "exec" => self.exec.timeout_ms,
+            _ => None,
+        }
+        .map(Duration::from_millis)
+        .unwrap_or(fallback);
         if name == "bash" {
             configured
                 .min(DEFAULT_BASH_TIMEOUT)
@@ -445,7 +691,36 @@ impl ToolsConfig {
 
     /// Returns the argument-size limit for one tool, if configured.
     pub fn max_args_bytes(&self, name: &str) -> Option<usize> {
-        self.limits(name).and_then(|limits| limits.max_args_bytes)
+        match name {
+            "read_file" => self.read_file.max_args_bytes,
+            "write_file" => self.write_file.max_args_bytes,
+            "bash" => self.bash.max_args_bytes,
+            "list_dir" => self.list_dir.max_args_bytes,
+            "grep" => self.grep.max_args_bytes,
+            "git_status" => self.git_status.max_args_bytes,
+            "git_diff" => self.git_diff.max_args_bytes,
+            "exec" => self.exec.max_args_bytes,
+            _ => None,
+        }
+    }
+
+    /// Returns the effective hard cap for one managed tool result.
+    ///
+    /// The configured `max_inline_bytes` is additionally bounded by
+    /// `budget.max_result_bytes`. Existing configurations with a small result
+    /// guard therefore keep working: a managed preview can never trip the
+    /// guard, which remains the final internal invariant.
+    pub fn effective_max_inline_bytes(&self, max_result_bytes: usize) -> usize {
+        self.max_inline_bytes.min(max_result_bytes)
+    }
+
+    /// Returns the effective threshold below which results stay inline.
+    ///
+    /// The configured threshold is clamped to the effective inline cap so an
+    /// unusual budget cannot make the manager return an oversized result.
+    pub fn effective_inline_threshold(&self, max_result_bytes: usize) -> usize {
+        self.inline_threshold_bytes
+            .min(self.effective_max_inline_bytes(max_result_bytes))
     }
 
     /// Rejects unusable exposure budgets, supervisor settings, and per-tool
@@ -468,6 +743,32 @@ impl ToolsConfig {
         if self.max_tool_schema_bytes == 0 {
             return Err(invalid("tools.max_tool_schema_bytes must be at least 1"));
         }
+        if self.inline_threshold_bytes == 0 {
+            return Err(invalid("tools.inline_threshold_bytes must be at least 1"));
+        }
+        if self.max_inline_bytes == 0 {
+            return Err(invalid("tools.max_inline_bytes must be at least 1"));
+        }
+        if self.max_artifact_bytes == 0 {
+            return Err(invalid("tools.max_artifact_bytes must be at least 1"));
+        }
+        if self.inline_threshold_bytes > self.max_inline_bytes {
+            return Err(invalid(
+                "tools.inline_threshold_bytes must not exceed tools.max_inline_bytes",
+            ));
+        }
+        if self.max_inline_bytes > self.max_artifact_bytes {
+            return Err(invalid(
+                "tools.max_inline_bytes must not exceed tools.max_artifact_bytes",
+            ));
+        }
+        if self.artifact_retention_days == 0 {
+            return Err(invalid("tools.artifact_retention_days must be at least 1"));
+        }
+        if self.artifact_max_bytes == 0 {
+            return Err(invalid("tools.artifact_max_bytes must be at least 1"));
+        }
+        validate_artifact_dir(&self.artifact_dir)?;
         self.supervisor
             .validate(global_timeout_ms, max_result_bytes)?;
         validate_tool_limits("tools.read_file", &self.read_file, global_timeout_ms, None)?;
@@ -485,12 +786,57 @@ impl ToolsConfig {
             .min(bash_internal_ms);
         validate_tool_limits(
             "tools.bash",
-            &self.bash,
+            &self.bash.limits(),
             global_timeout_ms,
             Some(bash_cap_ms),
         )?;
+        validate_tool_limits(
+            "tools.list_dir",
+            &self.list_dir.limits(),
+            global_timeout_ms,
+            None,
+        )?;
+        validate_ignore_dirs("tools.list_dir.ignore_dirs", &self.list_dir.ignore_dirs)?;
+        if self.list_dir.max_entries == 0 {
+            return Err(invalid("tools.list_dir.max_entries must be at least 1"));
+        }
+        validate_tool_limits("tools.grep", &self.grep.limits(), global_timeout_ms, None)?;
+        validate_ignore_dirs("tools.grep.ignore_dirs", &self.grep.ignore_dirs)?;
+        for (field, value) in [
+            ("tools.grep.max_files", self.grep.max_files),
+            ("tools.grep.max_file_bytes", self.grep.max_file_bytes),
+            ("tools.grep.max_matches", self.grep.max_matches),
+            ("tools.grep.max_output_bytes", self.grep.max_output_bytes),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("{field} must be at least 1")));
+            }
+        }
+        validate_tool_limits(
+            "tools.git_status",
+            &self.git_status,
+            global_timeout_ms,
+            None,
+        )?;
+        validate_tool_limits("tools.git_diff", &self.git_diff, global_timeout_ms, None)?;
+        validate_tool_limits("tools.exec", &self.exec, global_timeout_ms, None)?;
         Ok(())
     }
+}
+
+/// Rejects ignore-list entries that are not single normal path components.
+fn validate_ignore_dirs(field: &str, names: &[String]) -> Result<(), ConfigError> {
+    for name in names {
+        let mut components = Path::new(name).components();
+        let valid =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if !valid {
+            return Err(invalid(format!(
+                "{field} entry `{name}` must be a single normal path component"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_tool_limits(
@@ -532,8 +878,10 @@ pub struct HarnessConfig {
     pub profile: ProfileConfig,
     /// Session budgets enforced by the runtime and harness guards.
     pub budget: BudgetConfig,
-    /// Tool allowlist.
+    /// Tool allowlist and parameter-level policy rules.
     pub policy: PolicyConfig,
+    /// Approval mode for sensitive tools.
+    pub approval: ApprovalConfig,
     /// Tool catalog profile, exposure budgets, and per-tool limits.
     pub tools: ToolsConfig,
     /// Optional child-agent delegation.
@@ -588,10 +936,12 @@ impl HarnessConfig {
             .get("events")
             .and_then(toml::Value::as_table)
             .is_some_and(|events| events.contains_key("path"));
+        let explicit_approval = table.contains_key("approval");
 
         let mut config: Self = toml::Value::Table(table)
             .try_into()
             .map_err(|source| ConfigError::Toml { source })?;
+        config.approval.explicit = explicit_approval;
         if !config.profile.trace_enabled() {
             if !explicit_events_path {
                 config.events.path = None;
@@ -638,6 +988,7 @@ impl HarnessConfig {
         }
         self.tools
             .validate(self.budget.tool_timeout_ms, self.budget.max_result_bytes)?;
+        self.policy.validate()?;
         self.delegation.validate()?;
         self.reliability.validate()?;
         if self.delegation.enabled {
@@ -857,17 +1208,209 @@ impl BudgetConfig {
 }
 
 /// Tool policy settings.
+///
+/// `allowed_tools` remains the top-level exposure allowlist. Rules only make
+/// parameter-level decisions for tools that are already exposed, so a hidden
+/// tool is still reported as unknown to the model.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Tool names the model may execute. An empty list denies every call.
     pub allowed_tools: Vec<String>,
+    /// Ordered parameter-level rules evaluated as deny, ask, then allow.
+    ///
+    /// Rules are additive. An empty list preserves the pre-v2 behavior.
+    pub rules: Vec<PolicyRuleConfig>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             allowed_tools: NATIVE_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl PolicyConfig {
+    /// Validates rule identifiers, conditions, and action/tool combinations.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            let prefix = format!("policy.rules[{index}]");
+            if rule.id.trim().is_empty() {
+                return Err(invalid(format!("{prefix}.id must not be empty")));
+            }
+            if !ids.insert(rule.id.clone()) {
+                return Err(invalid(format!(
+                    "{prefix}.id `{}` is declared more than once",
+                    rule.id
+                )));
+            }
+            let tools: Vec<&str> = match &rule.tool {
+                None => Vec::new(),
+                Some(ToolSelector::One(tool)) => vec![tool.as_str()],
+                Some(ToolSelector::Many(tools)) => tools.iter().map(String::as_str).collect(),
+            };
+            if let Some(ToolSelector::Many(tools)) = &rule.tool
+                && tools.is_empty()
+            {
+                return Err(invalid(format!("{prefix}.tool must not be an empty array")));
+            }
+            for tool in &tools {
+                if tool.trim().is_empty() {
+                    return Err(invalid(format!("{prefix}.tool entries must not be empty")));
+                }
+            }
+            let has_condition = rule.tool.is_some()
+                || rule.path_glob.is_some()
+                || rule.program.is_some()
+                || rule.args_prefix.is_some();
+            if !has_condition {
+                return Err(invalid(format!(
+                    "{prefix} must declare at least one of tool, path_glob, program, or args_prefix"
+                )));
+            }
+            if let Some(glob) = &rule.path_glob
+                && glob.trim().is_empty()
+            {
+                return Err(invalid(format!("{prefix}.path_glob must not be empty")));
+            }
+            if let Some(program) = &rule.program
+                && program.trim().is_empty()
+            {
+                return Err(invalid(format!("{prefix}.program must not be empty")));
+            }
+            if let Some(args) = &rule.args_prefix
+                && args.is_empty()
+            {
+                return Err(invalid(format!(
+                    "{prefix}.args_prefix must not be empty when present"
+                )));
+            }
+            if rule.program.is_some() || rule.args_prefix.is_some() {
+                for tool in &tools {
+                    if !matches!(*tool, "exec" | "bash") {
+                        return Err(invalid(format!(
+                            "{prefix}.program and args_prefix are only meaningful for `exec` and `bash`; `{tool}` is invalid"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Action selected by a parameter-level policy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Deny the call. Deny rules are evaluated first.
+    Deny,
+    /// Require one-time approval. Ask rules are evaluated after all denies.
+    Ask,
+    /// Allow the call. Allow rules are evaluated after all asks.
+    Allow,
+}
+
+/// Tool selector accepted by a policy rule.
+///
+/// A rule may name one tool or an array of tools. The selector is a matching
+/// condition; omitting it lets the other conditions match across tools.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolSelector {
+    /// One tool name.
+    One(String),
+    /// Multiple tool names.
+    Many(Vec<String>),
+}
+
+impl ToolSelector {
+    /// Returns whether `name` is selected.
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::One(tool) => tool == name,
+            Self::Many(tools) => tools.iter().any(|tool| tool == name),
+        }
+    }
+}
+
+/// One ordered parameter-level policy rule.
+///
+/// All present conditions must match (logical AND). `path_glob` matches the
+/// canonical workspace-relative path for file tools and the canonical `cwd`
+/// for `exec`; `bash` command strings are never parsed. `program` and
+/// `args_prefix` match `exec` arguments only because `bash` accepts one opaque
+/// command string.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRuleConfig {
+    /// Stable non-empty identifier reported by `policy simulate` and traces.
+    pub id: String,
+    /// Tool name or names this rule applies to.
+    #[serde(default)]
+    pub tool: Option<ToolSelector>,
+    /// Minimal glob matched against the canonical workspace-relative path.
+    ///
+    /// Supported subset: `*` within one path segment, `**` as a complete
+    /// segment matching zero or more segments, and `?` for one character
+    /// within a segment. Character classes, brace expansion, and backslash
+    /// escapes are not implemented and are treated literally.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Exact `exec` program name or path.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Required prefix of the `exec` argument array.
+    #[serde(default)]
+    pub args_prefix: Option<Vec<String>>,
+    /// Decision when every condition matches.
+    pub action: RuleAction,
+    /// Optional human-readable explanation surfaced in errors and simulate.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Approval mode for sensitive tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Ask the host for one-time approval when a gate is available.
+    ///
+    /// This is the default. Without an explicit `[approval]` section it keeps
+    /// the pre-v2 behavior: ACP asks, while a CLI turn without a terminal gate
+    /// runs policy-allowed sensitive tools.
+    #[default]
+    Ask,
+    /// Deny sensitive tools that no explicit `allow` rule permits.
+    Deny,
+    /// Auto-approve sensitive tools permitted by policy and record the
+    /// approval event before execution.
+    Allow,
+}
+
+/// Approval settings for sensitive tools.
+///
+/// The `explicit` flag is set when the document contains an `[approval]`
+/// section. It is deliberately not serialized: it distinguishes the legacy
+/// default from an operator who explicitly chose `mode = "ask"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// Mode applied to sensitive tools and `ask` rules.
+    pub mode: ApprovalMode,
+    /// Whether the document contained an `[approval]` section.
+    #[serde(skip)]
+    pub(crate) explicit: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::Ask,
+            explicit: false,
         }
     }
 }
@@ -1369,6 +1912,32 @@ fn validate_working_dir(field: &str, working_dir: Option<&Path>) -> Result<(), C
     Ok(())
 }
 
+/// Validates the artifact directory lexically.
+///
+/// The path must be relative and consist only of normal components. Absolute
+/// paths, `..`, `.`, and platform prefixes are rejected before any filesystem
+/// access; the artifact store additionally rejects symlinked directories and
+/// checks the canonical location against the workspace root.
+fn validate_artifact_dir(artifact_dir: &Path) -> Result<(), ConfigError> {
+    if artifact_dir.as_os_str().is_empty() {
+        return Err(invalid("tools.artifact_dir must not be empty"));
+    }
+    if artifact_dir.is_absolute() {
+        return Err(invalid(
+            "tools.artifact_dir must be relative to the workspace",
+        ));
+    }
+    if artifact_dir
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid(
+            "tools.artifact_dir must contain only normal path components (no `.`, `..`, or prefixes)",
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid {
         message: message.into(),
@@ -1426,8 +1995,21 @@ mod tests {
         assert_eq!(config.budget.tool_timeout(), Duration::from_secs(10));
         assert_eq!(
             config.policy.allowed_tools,
-            vec!["read_file".to_owned(), "write_file".to_owned()]
+            vec![
+                "read_file".to_owned(),
+                "read_artifact".to_owned(),
+                "write_file".to_owned()
+            ]
         );
+        assert_eq!(config.tools.inline_threshold_bytes, 32_768);
+        assert_eq!(config.tools.max_inline_bytes, 65_536);
+        assert_eq!(config.tools.max_artifact_bytes, 16_777_216);
+        assert_eq!(
+            config.tools.artifact_dir,
+            PathBuf::from(".jessica/artifacts")
+        );
+        assert_eq!(config.tools.artifact_retention_days, 7);
+        assert_eq!(config.tools.artifact_max_bytes, 268_435_456);
 
         let sensor = config.sensor.expect("example must configure a sensor");
         assert_eq!(sensor.name, "diff-check");
@@ -1474,9 +2056,23 @@ mod tests {
         assert_eq!(config.tools.profile, ToolProfile::Full);
         assert_eq!(config.tools.max_exposed_tools, 64);
         assert_eq!(config.tools.max_tool_schema_bytes, 128 * 1024);
+        assert_eq!(config.tools.inline_threshold_bytes, 32 * 1024);
+        assert_eq!(config.tools.max_inline_bytes, 64 * 1024);
+        assert_eq!(config.tools.max_artifact_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            config.tools.artifact_dir,
+            PathBuf::from(".jessica/artifacts")
+        );
+        assert_eq!(config.tools.artifact_retention_days, 7);
+        assert_eq!(config.tools.artifact_max_bytes, 256 * 1024 * 1024);
         assert_eq!(config.tools.read_file, ToolLimitConfig::default());
         assert_eq!(config.tools.write_file, ToolLimitConfig::default());
-        assert_eq!(config.tools.bash, ToolLimitConfig::default());
+        assert_eq!(config.tools.bash, BashToolConfig::default());
+        assert!(
+            !config.tools.bash.enabled,
+            "bash must be opt-in even when the default allowlist names it"
+        );
+        assert_eq!(config.tools.bash.sandbox, BashSandbox::Process);
         assert_eq!(config.tools.supervisor, SupervisorConfig::default());
 
         let supervisor = config.resolved_supervisor();
@@ -1617,6 +2213,89 @@ mod tests {
     }
 
     #[test]
+    fn artifact_limits_are_ordered_and_cannot_escape_lexically() {
+        let cases = [
+            (
+                "[tools]\ninline_threshold_bytes = 0\n",
+                "tools.inline_threshold_bytes",
+            ),
+            ("[tools]\nmax_inline_bytes = 0\n", "tools.max_inline_bytes"),
+            (
+                "[tools]\nmax_artifact_bytes = 0\n",
+                "tools.max_artifact_bytes",
+            ),
+            (
+                "[tools]\ninline_threshold_bytes = 1025\nmax_inline_bytes = 1024\nmax_artifact_bytes = 2048\n",
+                "tools.inline_threshold_bytes must not exceed tools.max_inline_bytes",
+            ),
+            (
+                "[tools]\ninline_threshold_bytes = 1024\nmax_inline_bytes = 2049\nmax_artifact_bytes = 2048\n",
+                "tools.max_inline_bytes must not exceed tools.max_artifact_bytes",
+            ),
+            (
+                "[tools]\nartifact_retention_days = 0\n",
+                "tools.artifact_retention_days",
+            ),
+            (
+                "[tools]\nartifact_max_bytes = 0\n",
+                "tools.artifact_max_bytes",
+            ),
+            (
+                "[tools]\nartifact_dir = \"\"\n",
+                "tools.artifact_dir must not be empty",
+            ),
+            (
+                "[tools]\nartifact_dir = \"/tmp/artifacts\"\n",
+                "tools.artifact_dir must be relative",
+            ),
+            (
+                "[tools]\nartifact_dir = \"../artifacts\"\n",
+                "tools.artifact_dir must contain only normal path components",
+            ),
+            (
+                "[tools]\nartifact_dir = \"./artifacts\"\n",
+                "tools.artifact_dir must contain only normal path components",
+            ),
+        ];
+        for (toml, expected) in cases {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("unsafe artifact limits must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+
+        let accepted = HarnessConfig::from_toml_str(
+            "[budget]\nmax_result_bytes = 1024\n\
+             [tools]\n\
+             inline_threshold_bytes = 512\n\
+             max_inline_bytes = 2048\n\
+             max_artifact_bytes = 4096\n\
+             artifact_dir = \"state/results\"\n\
+             artifact_retention_days = 1\n\
+             artifact_max_bytes = 1\n",
+        )
+        .expect("ordered artifact limits must be accepted");
+        assert_eq!(accepted.tools.artifact_dir, PathBuf::from("state/results"));
+        assert_eq!(
+            accepted.tools.effective_max_inline_bytes(1024),
+            1024,
+            "the result guard remains the final hard cap"
+        );
+        assert_eq!(
+            accepted.tools.effective_inline_threshold(1024),
+            512,
+            "a threshold below the effective cap is preserved"
+        );
+        assert_eq!(
+            accepted.tools.effective_max_inline_bytes(8192),
+            2048,
+            "without a tighter guard the configured cap applies"
+        );
+    }
+
+    #[test]
     fn tool_profiles_parse_and_reject_unknown_names() {
         for (name, expected) in [
             ("readonly", ToolProfile::Readonly),
@@ -1660,6 +2339,56 @@ mod tests {
                 "[tools.read_file]\nmax_args_bytes = 0\n",
                 "tools.read_file.max_args_bytes",
             ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.exec]\ntimeout_ms = 5001\n",
+                "tools.exec.timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.git_status]\ntimeout_ms = 5001\n",
+                "tools.git_status.timeout_ms",
+            ),
+            (
+                "[budget]\ntool_timeout_ms = 5000\n[tools.git_diff]\ntimeout_ms = 0\n",
+                "tools.git_diff.timeout_ms",
+            ),
+            (
+                "[tools.exec]\nmax_args_bytes = 0\n",
+                "tools.exec.max_args_bytes",
+            ),
+            (
+                "[tools.git_status]\nmax_args_bytes = 0\n",
+                "tools.git_status.max_args_bytes",
+            ),
+            (
+                "[tools.git_diff]\nmax_args_bytes = 0\n",
+                "tools.git_diff.max_args_bytes",
+            ),
+            (
+                "[tools.list_dir]\nmax_entries = 0\n",
+                "tools.list_dir.max_entries",
+            ),
+            (
+                "[tools.list_dir]\nignore_dirs = [\"../escape\"]\n",
+                "tools.list_dir.ignore_dirs",
+            ),
+            (
+                "[tools.list_dir]\nignore_dirs = [\"nested/name\"]\n",
+                "tools.list_dir.ignore_dirs",
+            ),
+            ("[tools.grep]\nmax_files = 0\n", "tools.grep.max_files"),
+            (
+                "[tools.grep]\nmax_file_bytes = 0\n",
+                "tools.grep.max_file_bytes",
+            ),
+            ("[tools.grep]\nmax_matches = 0\n", "tools.grep.max_matches"),
+            (
+                "[tools.grep]\nmax_output_bytes = 0\n",
+                "tools.grep.max_output_bytes",
+            ),
+            (
+                "[tools.grep]\nignore_dirs = [\"..\"]\n",
+                "tools.grep.ignore_dirs",
+            ),
         ];
         for (toml, expected) in cases {
             let error = HarnessConfig::from_toml_str(toml)
@@ -1691,11 +2420,78 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_sections_default_to_bounded_search_and_directory_limits() {
+        let config = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(config.tools.list_dir.ignore_dirs, [".git", "target"]);
+        assert_eq!(config.tools.list_dir.max_entries, 500);
+        assert_eq!(config.tools.grep.ignore_dirs, [".git", "target"]);
+        assert_eq!(config.tools.grep.max_files, 2_000);
+        assert_eq!(config.tools.grep.max_file_bytes, 1024 * 1024);
+        assert_eq!(config.tools.grep.max_matches, 200);
+        assert_eq!(config.tools.grep.max_output_bytes, 64 * 1024);
+        for key in [
+            "read_file",
+            "write_file",
+            "list_dir",
+            "grep",
+            "git_status",
+            "git_diff",
+            "exec",
+        ] {
+            assert_eq!(
+                config.tools.timeout_for(key, Duration::from_secs(30)),
+                Duration::from_secs(30),
+                "`{key}` must inherit the global timeout"
+            );
+            assert_eq!(
+                config.tools.max_args_bytes(key),
+                None,
+                "`{key}` must not invent an argument limit"
+            );
+        }
+        assert_eq!(
+            config.tools.timeout_for("bash", Duration::from_secs(30)),
+            Duration::from_secs(10),
+            "bash keeps its internal deadline"
+        );
+    }
+
+    #[test]
+    fn bash_requires_an_explicit_enable_and_a_supported_sandbox() {
+        let disabled = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert!(!disabled.tools.bash.enabled);
+        assert_eq!(disabled.tools.bash.sandbox, BashSandbox::Process);
+
+        let enabled =
+            HarnessConfig::from_toml_str("[tools.bash]\nenabled = true\nsandbox = \"process\"\n")
+                .expect("an explicit process sandbox must be accepted");
+        assert!(enabled.tools.bash.enabled);
+        assert_eq!(enabled.tools.bash.sandbox, BashSandbox::Process);
+
+        for (toml, expected) in [
+            (
+                "[tools.bash]\nenabled = true\nsandbox = \"container\"\n",
+                "container",
+            ),
+            ("[tools.bash]\nrlimits = { cpu_seconds = 1 }\n", "rlimits"),
+            ("[tools.bash]\nenabled = \"yes\"\n", "boolean"),
+        ] {
+            let error = HarnessConfig::from_toml_str(toml)
+                .expect_err("unsupported bash gates must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn tools_changes_are_hot_reloadable() {
         let current = HarnessConfig::from_toml_str("[tools]\nprofile = \"full\"\n")
             .expect("current config must parse");
         let next = HarnessConfig::from_toml_str(
             "[tools]\nprofile = \"readonly\"\n\
+             [tools.bash]\nenabled = true\n\
              [tools.read_file]\ntimeout_ms = 2000\n\
              [tools.supervisor]\nsensor_timeout_ms = 500\nmax_output_bytes = 1024\n",
         )
@@ -1703,7 +2499,7 @@ mod tests {
         assert_eq!(
             changed_immutable_section(&current, &next),
             None,
-            "the catalog is rebuilt per turn, so [tools] must reload"
+            "the bash enable gate is nested in [tools], so it must reload"
         );
     }
 
@@ -1965,6 +2761,8 @@ mod tests {
         );
         assert_eq!(json["memory"]["enabled"], false);
         assert_eq!(json["skills"]["enabled"], false);
+        assert_eq!(json["tools"]["bash"]["enabled"], false);
+        assert_eq!(json["tools"]["bash"]["sandbox"], "process");
     }
 
     #[test]
@@ -2491,5 +3289,113 @@ mod tests {
         )
         .expect_err("blank working directory must fail");
         assert!(blank_dir.to_string().contains("working_dir"));
+    }
+
+    #[test]
+    fn policy_rules_accept_single_and_multiple_tool_selectors() {
+        let config = HarnessConfig::from_toml_str(
+            "[policy]\nallowed_tools = [\"exec\", \"read_file\"]\n\
+             [[policy.rules]]\nid = \"no-secret-reads\"\ntool = \"read_file\"\n\
+             path_glob = \"secrets/**\"\naction = \"deny\"\nreason = \"protected\"\n\
+             [[policy.rules]]\nid = \"safe-exec\"\ntool = [\"exec\"]\n\
+             program = \"git\"\nargs_prefix = [\"status\"]\naction = \"allow\"\n",
+        )
+        .expect("valid policy rules must parse");
+
+        assert_eq!(config.policy.rules.len(), 2);
+        assert_eq!(config.policy.rules[0].id, "no-secret-reads");
+        assert_eq!(
+            config.policy.rules[0].tool,
+            Some(ToolSelector::One("read_file".to_owned()))
+        );
+        assert_eq!(config.policy.rules[0].action, RuleAction::Deny);
+        assert_eq!(
+            config.policy.rules[1].tool,
+            Some(ToolSelector::Many(vec!["exec".to_owned()]))
+        );
+        assert_eq!(
+            config.policy.rules[1].args_prefix,
+            Some(vec!["status".to_owned()])
+        );
+        assert_eq!(config.policy.rules[1].action, RuleAction::Allow);
+    }
+
+    #[test]
+    fn policy_rule_validation_rejects_ambiguous_or_unreachable_rules() {
+        for (rule, expected) in [
+            (
+                "id = \"\"\ntool = \"read_file\"\naction = \"allow\"\n",
+                "id",
+            ),
+            (
+                "id = \"a\"\ntool = \"read_file\"\naction = \"allow\"\n\
+                 [[policy.rules]]\nid = \"a\"\ntool = \"write_file\"\naction = \"deny\"\n",
+                "more than once",
+            ),
+            ("id = \"a\"\naction = \"deny\"\n", "at least one"),
+            (
+                "id = \"a\"\ntool = \"read_file\"\npath_glob = \"  \"\naction = \"deny\"\n",
+                "path_glob",
+            ),
+            (
+                "id = \"a\"\ntool = [\"read_file\"]\nprogram = \"cat\"\naction = \"deny\"\n",
+                "only meaningful",
+            ),
+            (
+                "id = \"a\"\ntool = \"exec\"\nargs_prefix = []\naction = \"deny\"\n",
+                "args_prefix",
+            ),
+        ] {
+            let document =
+                format!("[policy]\nallowed_tools = [\"read_file\"]\n[[policy.rules]]\n{rule}");
+            let error = HarnessConfig::from_toml_str(&document)
+                .expect_err("invalid policy rule must be rejected");
+            assert!(
+                error.to_string().contains(expected),
+                "expected `{expected}` in: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rule_unknown_actions_and_fields_are_rejected() {
+        let bad_action = HarnessConfig::from_toml_str(
+            "[[policy.rules]]\nid = \"a\"\ntool = \"read_file\"\naction = \"permit\"\n",
+        )
+        .expect_err("unknown action must fail");
+        assert!(bad_action.to_string().contains("permit"));
+
+        let bad_field = HarnessConfig::from_toml_str(
+            "[[policy.rules]]\nid = \"a\"\ntool = \"read_file\"\naction = \"deny\"\n\
+             command_glob = \"rm *\"\n",
+        )
+        .expect_err("unknown rule fields must fail");
+        assert!(bad_field.to_string().contains("command_glob"));
+    }
+
+    #[test]
+    fn approval_defaults_are_legacy_and_an_explicit_section_is_recorded() {
+        let default = HarnessConfig::from_toml_str("").expect("empty config must parse");
+        assert_eq!(default.approval.mode, ApprovalMode::Ask);
+        assert!(!default.approval.explicit);
+
+        let ask =
+            HarnessConfig::from_toml_str("[approval]\nmode = \"ask\"\n").expect("ask must parse");
+        assert_eq!(ask.approval.mode, ApprovalMode::Ask);
+        assert!(ask.approval.explicit);
+
+        let deny =
+            HarnessConfig::from_toml_str("[approval]\nmode = \"deny\"\n").expect("deny must parse");
+        assert_eq!(deny.approval.mode, ApprovalMode::Deny);
+        assert!(deny.approval.explicit);
+
+        let allow = HarnessConfig::from_toml_str("[approval]\nmode = \"allow\"\n")
+            .expect("allow must parse");
+        assert_eq!(allow.approval.mode, ApprovalMode::Allow);
+        assert!(allow.approval.explicit);
+
+        let unknown = HarnessConfig::from_toml_str("[approval]\nmode = \"sometimes\"\n")
+            .expect_err("unknown approval mode must fail");
+        assert!(unknown.to_string().contains("sometimes"));
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jessica_core::tool::Tool;
-use jessica_tools::{ReadFileTool, WriteFileTool};
+use jessica_tools::{MAX_READ_FILE_BYTES, ReadFileTool, WriteFileTool};
 use serde_json::json;
 
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
@@ -62,7 +62,7 @@ async fn read_file_returns_utf8_content() {
     let result = tool.execute(json!({"path": "hello.txt"})).await;
 
     assert!(!result.is_error, "unexpected error: {}", result.content);
-    assert_eq!(result.content, "hello\nworld");
+    assert_eq!(result.content, "1\thello\n2\tworld\n");
 }
 
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn read_file_rejects_absolute_path_outside_root() {
 #[tokio::test]
 async fn read_file_rejects_invalid_utf8() {
     let workspace = TempWorkspace::new("read-binary");
-    workspace.write("binary.bin", &[0xff, 0xfe, 0x00]);
+    workspace.write("binary.bin", &[0xff, 0xfe, b'a']);
 
     let tool = ReadFileTool::new(workspace.root.clone());
     let result = tool.execute(json!({"path": "binary.bin"})).await;
@@ -110,7 +110,7 @@ async fn read_file_rejects_invalid_utf8() {
 #[tokio::test]
 async fn read_file_rejects_oversized_files() {
     let workspace = TempWorkspace::new("read-large");
-    let content = vec![b'x'; 256 * 1024 + 1];
+    let content = vec![b'x'; MAX_READ_FILE_BYTES as usize + 1];
     workspace.write("large.txt", &content);
 
     let tool = ReadFileTool::new(workspace.root.clone());

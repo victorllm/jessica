@@ -29,7 +29,7 @@
 //! servers on `session/load` or `session/resume` remain unsupported and are
 //! rejected with `-32602`.
 //!
-//! Sensitive native tools (`bash`, `write_file`, `delegate_task`) ask through
+//! Sensitive native tools (`bash`, `exec`, `write_file`, `delegate_task`) ask through
 //! `session/request_permission` before they run. The pending `tool_call` update
 //! is queued first on the same FIFO writer, so the client always sees the call
 //! it is being asked about. Only one-shot `allow_once`/`reject_once` options
@@ -94,6 +94,7 @@ use crate::acp_session::{
 };
 use crate::acp_store::{AcpLoadError, AcpPersistence, AcpSessionIndex};
 use crate::app::{CliError, CliRuntime, TurnOutcome, TurnRequest, TurnScope};
+use crate::approval::approval_request_input;
 use crate::config::HarnessConfig;
 use crate::governance::{ToolPermissionDecision, ToolPermissionGate};
 use crate::hot_reload::ConfigWatcher;
@@ -1282,6 +1283,7 @@ async fn run_prompt_worker(
     let permission_gate: Arc<dyn ToolPermissionGate> = Arc::new(AcpPermissionGate {
         session_id: acp_session_id,
         mapper,
+        root: cwd.clone(),
         updates: updates.clone(),
         cancel: guard.token().clone(),
         timeout: TOOL_PERMISSION_TIMEOUT,
@@ -1671,6 +1673,8 @@ struct AcpPermissionGate {
     session_id: AcpSessionId,
     /// Mapper shared with the update sink so request and update fields agree.
     mapper: AcpEventMapper,
+    /// Session workspace root used for bounded write-file diff summaries.
+    root: PathBuf,
     /// FIFO writer queue shared with session updates.
     updates: mpsc::UnboundedSender<WriterMessage>,
     /// Prompt cancellation token.
@@ -1691,9 +1695,10 @@ impl ToolPermissionGate for AcpPermissionGate {
             return ToolPermissionDecision::Cancelled;
         }
 
+        let raw_input = approval_request_input(&self.root, call).await;
         let request = RequestPermissionRequest::new(
             self.session_id.clone(),
-            self.mapper.permission_request_update(call),
+            self.mapper.permission_request_update(call, raw_input),
             permission_options(),
         );
         // The child token lets the writer drop this one request (and send
@@ -2867,6 +2872,7 @@ mod tests {
         let gate = Arc::new(AcpPermissionGate {
             session_id: AcpSessionId::new("sess-1"),
             mapper: AcpEventMapper::new(PathBuf::from("/workspace"), MessageId::new("turn-1")),
+            root: PathBuf::from("/workspace"),
             updates,
             cancel: cancel.clone(),
             timeout,

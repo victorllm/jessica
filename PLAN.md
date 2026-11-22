@@ -2030,7 +2030,7 @@ Task 8.6（2026-11-19 确认并完成）：子 Agent 轨迹证据
 
 ---
 
-Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2 已完成，9.3–9.8 待逐项确认）
+Phase 9：自动配置与工具能力层（2026-11-22 新增；Task 9.0、9.1、9.2、9.3a、9.4、9.5、9.6 已完成，9.3b 待依赖审批，9.7–9.8 待逐项确认）
 
 背景：用户希望 Jessica 更自动、更简洁，并为后续工具能力扩展与多 Agent 协同打基础。Phase 9 先交付不影响工具执行语义的配置地基，再按依赖顺序逐 Task 确认 Catalog、执行监督、策略、结果管理与协议扩展。
 
@@ -2041,10 +2041,11 @@ Phase 9 任务序列（依赖顺序；每项仍须单独确认后实施）：
 | **9.0** | Profile preset、effective config、默认 trace | 否 | 无 | 无 | ☑ |
 | **9.1** | Tool Catalog、descriptor、per-tool limits、schema 过滤、`tools list/inspect` | 否 | 无 | 无 | ☑ |
 | **9.2** | Supervisor A：env allowlist、per-tool timeout 落地、输出上限、acceptance/sensor 超时 | 否 | 无 | 9.1 | ☑ |
-| **9.3** | Supervisor B：进程组 kill、rlimits、bash 启用条件 | 否 | `libc`/`nix` 审批 | 9.2 | ☐ |
-| **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☐ |
-| **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☐ |
-| **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☐ |
+| **9.3a** | Supervisor B（无依赖子集）：bash 启用门、`sandbox = "process"`、迁移说明 | 否 | 无 | 9.2 | ☑ |
+| **9.3b** | Supervisor B（依赖门）：进程组 kill、SIGTERM→SIGKILL、rlimits | 否 | `libc`/`nix` 审批 | 9.3a | ☐ |
+| **9.4** | Result Manager、artifact store、`read_artifact` | 否 | 无 | 9.1 | ☑ |
+| **9.5** | 原生工具 A：read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec` | 否 | 无 | 9.2/9.4 | ☑ |
+| **9.6** | Policy v2、approval modes、`policy simulate` | 否 | 无 | 9.1/9.5 | ☑ |
 | **9.7** | 原生工具 B：glob、regex grep、`apply_patch`、`edit_file` | 否 | `globset`/`regex` 审批 | 9.5/9.6 | ☐ |
 | **9.8** | MCP/WASM descriptor、子 Agent 工具安全对齐 | 否 | 无 | 9.1/9.4/9.6 | ☐ |
 
@@ -2113,7 +2114,7 @@ Task 9.2（2026-11-22）：Execution Supervisor A — env allowlist、输出上�
 
 ---
 
-Task 9.3（待确认；依赖审批）：Execution Supervisor B — 进程组 kill、rlimits、bash 启用条件
+Task 9.3（9.3a 已完成；9.3b 待依赖审批）：Execution Supervisor B — 进程组 kill、rlimits、bash 启用条件
 
 范围与约束：
 
@@ -2129,9 +2130,15 @@ Task 9.3（待确认；依赖审批）：Execution Supervisor B — 进程组 ki
 
 完成标准：9.3a 在无新依赖下 fmt/clippy/test 全绿并完成迁移说明；9.3b 在依赖批准后完成进程组/rlimit 行为测试。README 更新 bash 默认关闭、启用条件与安全边界；未改 core。
 
+实施记录（2026-11-22，实际耗时约 10 分钟，20:22–20:32，仅 9.3a）：
+
+- 完成情况：`[tools.bash]` 升级为 `BashToolConfig`（`enabled` 默认 false、`sandbox` 仅接受 `process`，保留 `timeout_ms`/`max_args_bytes` 并复用既有校验）；`ToolCatalog::build` 增加 native bash 启用门，未显式启用时即使 policy/profile 允许也隐藏，并记录 `HiddenReason::BashDisabled`（显示为 `disabled; set [tools.bash].enabled = true`），`tools list --all` 与 `inspect` 可解释原因；system prompt 过滤未启用的 bash，避免向模型宣传不可用工具；`[tools.bash]` 随 `[tools]` 热加载。新增行为测试覆盖：默认 provider schema 无 bash、幻觉调用得到 `unknown tool` 且无文件副作用、显式启用后可执行、CLI 默认 list/`--all`/inspect 的隐藏与启用行为、REPL 与 ACP 热加载启用、`sandbox = "container"`/`rlimits`/非布尔 `enabled` 在加载期结构化拒绝。README、`examples/harness.toml`、`install.sh` 增加默认关闭、显式 opt-in 与迁移说明，并明确当前仅保证直接子进程。
+- 偏离/说明：1) 按用户决定仅交付 9.3a，未引入 `libc`/`nix`，未实现进程组 `SIGTERM`→`SIGKILL`、rlimits、unsafe syscall 或任何 9.3b 代码；2) `rlimits` 字段未加入配置，当前由 `deny_unknown_fields` 在加载期整体拒绝，避免暴露未实现的安全能力；9.3b 获批后再添加并校验 rlimit > 0；3) `sandbox = "container"` 由 serde 枚举拒绝，错误信息包含 `container`；4) 系统提示不再静态提及 bash，仅当 bash 已启用且被 allowlist 允许时通过 allowlist 行体现；5) 启用门位于 CLI Catalog 装配层，`BashTool` 本身不持门，保持 `jessica-tools` 可独立使用/测试；6) 既有依赖 bash 的单元测试与 E2E 配置均显式加入 `[tools.bash] enabled = true`；7) 未改 `jessica-core`，未新增第三方 crate，`DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 999 passed, 0 failed, 2 ignored。
+
 ---
 
-Task 9.4（待确认）：Result Manager、artifact store、`read_artifact`
+Task 9.4（已完成）：Result Manager、artifact store、`read_artifact`
 
 范围与约束：
 
@@ -2147,9 +2154,21 @@ Task 9.4（待确认）：Result Manager、artifact store、`read_artifact`
 
 完成标准：fmt/clippy/test 全绿；真实 CLI E2E 至少一个大输出场景与一个分页读取场景；README 更新阈值、artifact 目录、权限与隐私说明；未改 core、未新增第三方 crate。
 
+实施记录（2026-11-22，实际耗时约 20 分钟）：
+
+- 完成情况：新增 `jessica-cli/src/artifacts.rs`，实现 `ArtifactStore`、`ResultManager` 与 `ReadArtifactTool`。`[tools]` 新增 `inline_threshold_bytes`（默认 32768）、`max_inline_bytes`（默认 65536）、`max_artifact_bytes`（默认 16777216）、`artifact_dir`（默认 `.jessica/artifacts`）、`artifact_retention_days`（默认 7）、`artifact_max_bytes`（默认 256 MiB），加载期校验所有数值 ≥1、阈值有序、artifact 目录为 workspace 内相对路径且只含 normal component。`effective_max_inline_bytes`/`effective_inline_threshold` 再把有效上限钳制到 `budget.max_result_bytes`。
+- Result Manager 接入 `GovernedTool`：工具返回后、`ResultSizeGuard` 前统一处理。文本工具收到文本 envelope，JSON 工具收到 JSON envelope；超大结果写入内容寻址 artifact，并向模型返回 digest、原始字节数、stored bytes、`truncated`、next cursor 与不超过 `max_inline_bytes` 的 preview。写入或清理失败时降级为有界 fallback，不使 turn 失败；`ResultSizeGuard` 仍为最后防线。Catalog 暴露的原生、WASM、MCP 与委派工具都经过该 wrapper。
+- Artifact 存储：路径为 `<artifact_dir>/<sha256 前两位>/<64 hex sha256>`；同目录临时文件 + `write_all` + `sync_all` + rename；目录 0700、数据与 sidecar 文件 0600；超 `max_artifact_bytes` 时按 UTF-8 边界截断，`size`/digest 描述实际存储字节，`original_bytes` 保留源长度，sidecar 额外记录版本、tool、created_at 与 `truncated`。sidecar 不写 provider key、环境变量、tool 参数或命令文本。读取时校验 digest、sidecar 一致性、文件类型与大小，并拒绝 shard、数据文件或 sidecar 的 symlink 逃逸；分页按 UTF-8 边界返回。
+- 清理：每个 turn 在第一次需要写 artifact 前最多执行一次有界清理（最多扫描 4096 个条目）；先删除超过 `artifact_retention_days` 的 artifact，再按最旧优先删除至总量不超过 `artifact_max_bytes`。目录不存在时视为 no-op；符号链接、损坏 sidecar 与无关文件跳过；删除失败只 `tracing::warn!`。
+- `read_artifact`：native、只读，参数 `digest` 必填，`offset`/`limit` 可选；只按 digest 在 artifact 目录内定位，不接受路径。单页长度以 `max_inline_bytes - 512` 的 header 预留为上限，返回 digest、实际 offset、page bytes、total_bytes、next_offset 与内容；未知/非法 digest、越界 offset、损坏 sidecar、symlink 逃逸均返回结构化错误。其自身结果绕过 Result Manager，分页不会递归产生新 artifact。
+- 文档与示例：README 新增 result manager/artifact 章节、profile 表补 `read_artifact`、阈值/有效钳制/目录布局/0700·0600/原子写/清理语义/结构化错误与 artifact 可能含敏感内容的隐私警告；`examples/harness.toml` 增加 `[tools]` 结果阈值并将 `read_artifact` 加入示例 allowlist；相关 `config`、`tools list` 计数与 E2E 期望同步更新。
+- 测试：新增 8 个 artifact 行为测试（小结果旁路、100 KiB 落盘与 digest/权限/sidecar、UTF-8 截断、JSON envelope、分页不递归、未知/损坏/逃逸、保留与总量边界、写入失败降级），2 个 app 行为测试（100 KiB `read_file` preview+artifact、200 KiB bash 输出不触发 `BudgetExceeded`），1 个真实 CLI E2E `result_manager_e2e`（大输出 + `read_artifact` 分页 + 0600 + 不递归），以及配置边界/示例解析测试。
+- 偏离/说明：1) 为兼容既有小 `budget.max_result_bytes` 配置，没有在加载期强制 `max_inline_bytes <= budget.max_result_bytes`，而是在运行期把 inline 上限与阈值钳制到预算内，避免正常大输出触发 `BudgetExceeded`；2) 默认 allowlist 保持 `bash`/`read_file`/`write_file` 不变，`read_artifact` 虽在 `readonly`/`coding`/`ops`/`full` profile 中允许，仍必须显式加入 `policy.allowed_tools` 才会暴露；3) 清理只在 turn 内首次超限写入前执行一次且扫描有界，不做常驻定时清理；4) sidecar 在任务要求的最小字段外增加 `version`/`original_bytes`/`truncated` 以支持完整性与截断校验，仍不包含参数或环境信息；5) trace bundle 可选 artifact manifest 未实现，现有 bundle 不打包 artifact 内容；6) 超 `max_artifact_bytes` 时 digest 针对截断后的存储内容，源长度由 `original_bytes` 表达；7) 时间路径（超时、policy/permission 拒绝、guard 拒绝）不产生工具输出，行为保持不变；8) 未修改 `jessica-core`、SQLite schema 或 trace schema，未新增第三方 crate，`DESIGN.md` 保持未跟踪。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1011 passed, 0 failed, 2 ignored（含 `result_manager_e2e`）。
+
 ---
 
-Task 9.5（待确认）：原生工具 A — read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec`
+Task 9.5（已完成）：原生工具 A — read ranges、`list_dir`、literal grep、`git status`/`git diff`、`exec`
 
 范围与约束：
 
@@ -2166,9 +2185,20 @@ Task 9.5（待确认）：原生工具 A — read ranges、`list_dir`、literal 
 
 完成标准：fmt/clippy/test 全绿；真实 CLI E2E 至少一个 `exec` 与一个 `read_file` offset 场景；README 工具表、profile 与安全说明更新；未改 core、未新增第三方 crate。
 
+实施记录（2026-11-22，实际耗时约 90 分钟，含一次上下文压缩后继续）：
+
+- 完成情况：`jessica-tools` 新增 `workspace`、`command`、`exec`、`git`、`grep`、`list_dir` 与测试辅助模块。`read_file` 增强为 1-based 行 offset、行 limit（默认 2000、上限 10000）、始终带 `行号\t内容` 输出、NUL/非法 UTF-8 二进制拒绝、16 MiB 扫描上限、超出 EOF 的结构化错误与 next-offset footer；路径仍经 canonicalize 并拒绝 workspace 外与 symlink 逃逸。
+- 命令执行分层：`jessica-tools` 定义 `CommandRunner`/`CommandRequest`/`CommandOutput`/`CommandError`，避免反向依赖 `jessica-harness`；CLI 新增 `HarnessCommandRunner`，把请求映射到 9.2 `run_supervised`，因此生产路径实际复用 env 清理、凭据过滤、统一 deadline、双流输出上限与 drop kill。`git_status`/`git_diff` 使用固定只读参数数组且不接受用户参数；`exec` 使用 `{program,args,cwd?,timeout_ms?}` 数组，不经过 shell。
+- 结果语义：`exec` 非零退出返回 `is_error=false` 的 JSON（`status`/`exit_code`/`duration_ms`/stdout/stderr 的字节数与 truncated 标志）；spawn、timeout、I/O 失败返回 `is_error=true` 的结构化 JSON。`git` 在非仓库时返回可操作提示，超时/非零按 supervisor 处理。`list_dir`/`grep` 有界遍历、稳定排序、可配置忽略目录与条目/文件/字节/匹配/输出上限，跳过 symlink、二进制、超大与不可读条目并汇总；grep 仅做字面量匹配。
+- CLI 装配：Catalog 新增 9 个 native candidate；descriptor 为只读工具与 `exec` 分配 capabilities、Text/JSON result format、path/command policy hints，并为 `read_file`/`list_dir`/`grep` 报告 `max_output_lines`；profile 表扩展为 readonly/coding/ops 的只读集合，`exec` 仅 coding/ops/full；`permission_required` 加入 `exec`；ACP 的 kind/title/location 与系统提示同步覆盖新工具。新工具默认仍不在 `policy.allowed_tools` 中，必须显式 opt-in。
+- 配置：新增 `[tools.list_dir]`、`[tools.grep]`、`[tools.git_status]`、`[tools.git_diff]`、`[tools.exec]`；校验忽略目录必须是单一 normal component，条目/文件/字节/匹配/输出上限必须 ≥1，per-tool timeout 不得超过全局预算。`timeout_ms` 默认继承 `budget.tool_timeout_ms`，`max_args_bytes` 默认不设上限、可按工具覆盖。
+- 测试：`jessica-tools` 新增/扩展 read、list_dir、grep、git、exec 行为测试（含真实临时 git 仓库、参数注入拒绝、env 清理、超时、非零退出、symlink 逃逸、二进制/超大跳过、输出上限）；CLI 增加 catalog profile/隐藏原因/输出行数、permission 集合、ACP 映射、config 边界、runner 真实进程测试，以及真实 CLI E2E `native_tools_e2e`（exec 字面量参数、env 清理、非零退出、read_file offset/行号）与更新后的 `result_manager_e2e`/`tools_cli_e2e`/`acp_stdio`/`delegation_e2e`。
+- 偏离/说明：1) `read_file` 的 offset 明确定义为行号而非字节偏移，避免多字节字符边界问题；2) `read_file` 保持纯文本输出，超阈值时由 9.4 Result Manager 转 artifact，未改成 rich JSON；3) `exec` 成功/失败统一返回 JSON 字符串，便于模型与 trace 读取 `exit_code`；4) `git_status`/`git_diff` 刻意不接受任何参数，牺牲灵活性换取注入面最小化；5) 新增原生工具默认不在 allowlist，且 `exec` 没有类似 bash 的独立 enable 门，安全边界由 profile、allowlist 与 ACP approval 共同承担；6) `examples/harness.toml` 未启用新工具，保持既有示例行为；7) 进程组/rlimits 仍属 9.3b，本次未实现。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1061 passed, 0 failed, 2 ignored（含 `native_tools_e2e`、`result_manager_e2e`、`tools_cli_e2e`、`acp_stdio`）。
+
 ---
 
-Task 9.6（待确认）：Policy v2、approval modes、`policy simulate`
+Task 9.6（已完成）：Policy v2、approval modes、`policy simulate`
 
 范围与约束：
 
@@ -2182,6 +2212,17 @@ Task 9.6（待确认）：Policy v2、approval modes、`policy simulate`
 - 测试：deny 优先于 ask/allow；ask 优先于 allow；同优先级首条命中；path canonicalize/symlink 逃逸；exec program/args prefix；bash 不做字符串解析；delegate destructive；approval ask/deny/allow 的可观察行为；simulate 不执行工具且输出命中 id；配置重复 id/空条件/未知 action/未知字段拒绝。
 
 完成标准：fmt/clippy/test 全绿；真实 CLI `policy simulate` E2E；README policy v2、approval 与迁移说明；未改 core、未新增第三方 crate。
+
+实施记录（2026-11-22，实际耗时约 100 分钟，含一次上下文压缩后继续）：
+
+- 完成情况：`jessica-cli` 新增 `policy_v2.rs`、`approval.rs`、`policy_command.rs`。`[policy]` 新增 `[[policy.rules]]`，支持 `tool` 字符串/数组、`path_glob`、`program`、`args_prefix`、`action`、`reason`，`deny_unknown_fields`；加载期校验 id 唯一非空、至少一个条件、action 合法、path_glob/program/args_prefix 非空、program/args_prefix 仅用于 exec/bash。`[approval] mode` 支持 ask/deny/allow，默认 ask。
+- 评估：宿主侧 `PolicyV2` 在 harness allowlist 之后、permission gate 与执行之前评估。固定顺序为全部 deny → 全部 ask → 全部 allow → 敏感工具批准模式；同一优先级取配置顺序第一条。路径先做词法归一化，再 canonicalize 最近存在祖先；拒绝 `..`/symlink 逃逸、悬空 symlink、workspace 外路径与非 UTF-8。文件工具按 descriptor 的 `path_field` 匹配，`exec` 按 `program` + `args` 前缀 + canonical `cwd`，`bash` 从不解析命令字符串。最小 glob 仅实现 `*`/`**`/`?`，字符类、花括号与反斜杠按字面量处理并在 README 明示。
+- 批准行为：无 `[approval]` 时保持 9.1 行为（ACP 对固定敏感集请求，CLI 无 gate 时运行已允许工具）；显式 `ask` 或任一 ask 规则在 CLI TTY 上启用专用 ask gate，以 stderr 一次性 `y/yes` 询问（120 s 超时），ACP 的 ask verdict 复用协议 gate，无 gate 时 fail closed。ask gate 与 legacy sensitive gate 分离，因此仅添加一条 ask 规则不会让未被规则提及的敏感工具开始询问。`deny` 拒绝敏感工具与 ask 规则，除非显式 allow；`allow` 自动批准但仍先写入 `PermissionDecided { Allow }`，写入失败则不执行。显式 `[approval]` 下 destructive MCP 也视为敏感；WASM 维持既有只读能力分类；`delegate_task` 保持 legacy 敏感且 destructive。
+- 审批摘要：`exec` 仅 program/args/cwd，`bash` 仅 command，`delegate_task` 仅 task，`write_file` 返回 path、字节/行数与有界公共前后缀 diff（最多读取 256 KiB，且 canonical 后必须在 workspace 内）；未知/MCP 工具递归脱敏 secret/token/password/api_key/credential 等键并截断。ACP `rawInput` 改用该摘要，不再传原始完整参数。
+- `policy simulate`：同一 inspection catalog（含 WASM manifest）评估合成 `ToolCall`，输出 tool/source/decision/rule/approval/reason。未知/隐藏工具、非法 JSON、非对象参数、不可 canonicalize 路径均结构化失败。命令在 `assemble_runtime` 之前处理，不创建 provider、事件库、memory/skills DB、MCP 连接，也不执行工具。
+- 测试：config 规则/批准模式边界；`policy_v2` glob、优先级、首条命中、路径规范化与 symlink 逃逸、exec 匹配、bash 不解析、MCP/approval 组合；`approval` 摘要与脱敏；`governance` 集成测试覆盖 deny 不询问不执行、ask allow/reject、ask 无 gate fail closed、ask-only gate 不改变 legacy 敏感工具、deny/allow 模式、自动批准先记录后执行、allow 规则覆盖 deny 模式、MCP 敏感性与 9.1 兼容、symlink 逃逸、`delegate_task` 的 Delegation capability 为 destructive 且显式 ask 模式下拒绝后不执行；真实 CLI E2E `policy_cli_e2e` 覆盖 deny 命中输出、write_file 不落盘、非法 JSON/未知/隐藏工具、symlink 逃逸、exec program/args、重复 id 配置拒绝，并断言不创建 events/memory/skills/.jessica/artifacts。
+- 偏离/说明：1) `jessica-core` 的冻结 `PolicyDecision` 只有 Allow/Deny，故 `ask` 作为 CLI 宿主内三态判定实现，未改 core，也未替换 harness allowlist；2) 计划中的“默认拒绝”按既有 allowlist/未知工具语义落地：未暴露工具仍拒绝，已暴露的非敏感工具在无规则命中时保持 9.1 的允许行为，避免破坏兼容性；敏感工具由显式批准模式或 legacy gate 决定；计划文字中的“`deny` 为 CI 默认”未做成 preset 的隐式默认，否则会改变未写 `[approval]` 的既有 `ci` 配置行为；当前默认仍为 `ask`，CI 需显式写 `[approval] mode = "deny"`；3) 校验允许 `program`/`args_prefix` 与 `bash` 组合以匹配计划文字，但评估器只在 `exec` 上匹配，bash 规则因不解析命令而永不命中；4) `jessica governance explain` 为可选项，本 Task 未实现；5) `path_glob` 仅对 Native 工具求值，MCP/WASM 的参数不当作 workspace 路径；6) 显式 `ask` 需要 gate，非 TTY CLI 无内置 gate 时 fail closed；7) `build_turn` 改为 async 以 canonicalize workspace root，属 CLI 内部装配变化；8) `DESIGN.md` 保持未跟踪，未修改 `jessica-core`，未新增第三方 crate。
+- 验收：`cargo fmt --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 1098 passed, 0 failed, 2 ignored（含 `policy_cli_e2e` 6 个 E2E 与 `governance` 新增集成测试）。
 
 ---
 

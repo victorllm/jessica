@@ -59,7 +59,10 @@ impl Capabilities {
     /// Assigns capabilities from the tool source and native tool name.
     pub(crate) fn for_tool(source: ToolSource, name: &str) -> Self {
         match (source, name) {
-            (ToolSource::Native, "read_file") => Self {
+            (
+                ToolSource::Native,
+                "read_file" | "read_artifact" | "list_dir" | "grep" | "git_status" | "git_diff",
+            ) => Self {
                 read_only: true,
                 ..Self::none()
             },
@@ -68,7 +71,7 @@ impl Capabilities {
                 destructive: true,
                 ..Self::none()
             },
-            (ToolSource::Native, "bash") => Self {
+            (ToolSource::Native, "bash" | "exec") => Self {
                 executes: true,
                 network: true,
                 destructive: true,
@@ -121,15 +124,18 @@ impl Capabilities {
 /// Limits reported for one tool.
 ///
 /// `timeout_ms` and `max_args_bytes` are enforced by the CLI governance
-/// wrapper. `max_inline_bytes` is the existing result-size guard. Artifact and
-/// line limits are not implemented in this phase and are reported as absent.
+/// wrapper. `max_inline_bytes` is the effective result-manager cap; the
+/// configured cap is additionally bounded by `budget.max_result_bytes`.
+/// `max_artifact_bytes` reports the host artifact limit. Artifact storage is
+/// shared by all tools, so `read_artifact` reports the same limits even though
+/// its own output never creates another artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolLimits {
     /// Effective wall-clock timeout in milliseconds.
     pub timeout_ms: u64,
     /// Maximum serialized argument bytes, or `None` when unlimited.
     pub max_args_bytes: Option<usize>,
-    /// Maximum inline result bytes retained by the result-size guard.
+    /// Maximum inline result bytes entering the model context.
     pub max_inline_bytes: usize,
     /// Maximum artifact bytes, or `None` when artifacts are unsupported.
     pub max_artifact_bytes: Option<usize>,
@@ -235,7 +241,7 @@ impl ToolDescriptor {
             limits,
             approval,
             policy_hints: policy_hints_for(source, &name),
-            result_format: result_format_for(source),
+            result_format: result_format_for(source, &name),
         })
     }
 }
@@ -249,22 +255,31 @@ pub(crate) fn version_for(source: ToolSource) -> &'static str {
     }
 }
 
-/// Returns the result shape for a tool source.
-pub(crate) fn result_format_for(source: ToolSource) -> ResultFormat {
-    match source {
-        ToolSource::Native | ToolSource::Mcp => ResultFormat::Text,
-        ToolSource::Wasm | ToolSource::Delegation => ResultFormat::Json,
+/// Returns the result shape for a tool source and name.
+///
+/// `exec` is the one native tool whose result is a JSON document: callers need
+/// a machine-readable `exit_code` and stream metadata even though a non-zero
+/// exit is a successful call. Other native tools and MCP stay free-form text.
+pub(crate) fn result_format_for(source: ToolSource, name: &str) -> ResultFormat {
+    match (source, name) {
+        (ToolSource::Native, "exec") => ResultFormat::Json,
+        (ToolSource::Native | ToolSource::Mcp, _) => ResultFormat::Text,
+        (ToolSource::Wasm | ToolSource::Delegation, _) => ResultFormat::Json,
     }
 }
 
 fn policy_hints_for(source: ToolSource, name: &str) -> PolicyHints {
     match (source, name) {
-        (ToolSource::Native, "read_file" | "write_file") => PolicyHints {
+        (ToolSource::Native, "read_file" | "write_file" | "list_dir" | "grep") => PolicyHints {
             path_field: Some("path".to_owned()),
             ..PolicyHints::default()
         },
         (ToolSource::Native, "bash") => PolicyHints {
             command_field: Some("command".to_owned()),
+            ..PolicyHints::default()
+        },
+        (ToolSource::Native, "exec") => PolicyHints {
+            command_field: Some("program".to_owned()),
             ..PolicyHints::default()
         },
         _ => PolicyHints::default(),
@@ -379,6 +394,31 @@ mod tests {
         assert!(read.read_only);
         assert!(!read.writes_files && !read.executes && !read.network && !read.destructive);
 
+        let read_artifact = Capabilities::for_tool(ToolSource::Native, "read_artifact");
+        assert!(read_artifact.read_only);
+        assert!(
+            !read_artifact.writes_files
+                && !read_artifact.executes
+                && !read_artifact.network
+                && !read_artifact.destructive
+        );
+
+        for name in ["list_dir", "grep", "git_status", "git_diff"] {
+            let read_only = Capabilities::for_tool(ToolSource::Native, name);
+            assert!(read_only.read_only, "{name} must be read-only");
+            assert!(
+                !read_only.writes_files
+                    && !read_only.executes
+                    && !read_only.network
+                    && !read_only.destructive,
+                "{name} must not claim side effects"
+            );
+        }
+
+        let exec = Capabilities::for_tool(ToolSource::Native, "exec");
+        assert!(exec.executes && exec.network && exec.destructive);
+        assert!(!exec.read_only && !exec.writes_files);
+
         let write = Capabilities::for_tool(ToolSource::Native, "write_file");
         assert!(write.writes_files && write.destructive);
         assert!(!write.read_only && !write.executes);
@@ -390,7 +430,17 @@ mod tests {
         assert!(wasm.read_only);
         assert!(!wasm.writes_files && !wasm.network && !wasm.destructive);
 
-        for capabilities in [read, write, bash, wasm] {
+        let delegation = Capabilities::for_tool(
+            ToolSource::Delegation,
+            jessica_runtime::DELEGATE_TASK_TOOL_NAME,
+        );
+        assert!(
+            delegation.destructive && delegation.writes_files && delegation.executes,
+            "delegation runs a child agent and must be treated as destructive"
+        );
+        assert!(!delegation.read_only);
+
+        for capabilities in [read, read_artifact, exec, write, bash, wasm, delegation] {
             assert!(
                 !capabilities.parallel_safe,
                 "no tool is parallel-safe in this phase"
@@ -423,5 +473,27 @@ mod tests {
         );
         assert_eq!(descriptor.result_format, ResultFormat::Text);
         assert_eq!(descriptor.approval, ApprovalPolicy::Interactive);
+
+        assert_eq!(
+            result_format_for(ToolSource::Native, "exec"),
+            ResultFormat::Json,
+            "exec results carry structured exit metadata"
+        );
+        assert_eq!(
+            result_format_for(ToolSource::Native, "grep"),
+            ResultFormat::Text
+        );
+        assert_eq!(
+            policy_hints_for(ToolSource::Native, "grep")
+                .path_field
+                .as_deref(),
+            Some("path")
+        );
+        assert_eq!(
+            policy_hints_for(ToolSource::Native, "exec")
+                .command_field
+                .as_deref(),
+            Some("program")
+        );
     }
 }

@@ -25,7 +25,29 @@ max_stuck_rounds = 3
 max_result_bytes = 65_536
 
 [policy]
-allowed_tools = ["read_file", "write_file"]
+# `read_artifact` is opt-in like every other tool. It lets the model page large
+# results through their digest instead of receiving the full output inline.
+allowed_tools = ["read_file", "read_artifact", "write_file"]
+
+# Large tool results are stored under `.jessica/artifacts` and the model sees a
+# bounded preview plus a digest. `read_artifact` reads pages back. The numeric
+# limits must satisfy 1 <= inline_threshold_bytes <= max_inline_bytes <=
+# max_artifact_bytes. The effective inline caps are also clamped to
+# budget.max_result_bytes.
+[tools]
+inline_threshold_bytes = 32_768
+max_inline_bytes = 65_536
+max_artifact_bytes = 16_777_216
+artifact_dir = ".jessica/artifacts"
+artifact_retention_days = 7
+artifact_max_bytes = 268_435_456
+
+# Native bash is disabled by default. To opt in, add this table and keep
+# "bash" in policy.allowed_tools; the profile must also permit it.
+#
+# [tools.bash]
+# enabled = true
+# sandbox = "process"
 
 # Command-backed tools, the sensor, and the acceptance check run with a cleared
 # environment. Only these names are passed through in addition to the built-in
