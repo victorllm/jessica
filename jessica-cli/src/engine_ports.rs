@@ -20,10 +20,10 @@ use jessica_core::trace::TurnId;
 use jessica_core::types::{Message, SessionId};
 use jessica_engine::{
     AcceptanceConfig, ApprovalConfig, ApprovalMode, CatalogLimits, ChildToolFactory, Engine,
-    EngineBuilder, EngineConfig, EngineError, EventJournal, IdSource, MemoryPort, PolicyConfig,
-    PolicyRule, PumpConsole, ResultConfig, RuleAction, SessionStore, SkillPort, StoredSession,
-    SystemPromptSource, ToolCatalog as EngineToolCatalog, ToolContext, ToolEntry,
-    ToolExecutionConfig, ToolPermissionDecision, ToolPermissionGate, ToolProvider,
+    EngineBuilder, EngineConfig, EngineError, EventJournal, EventRecorder, IdSource, MemoryPort,
+    PolicyConfig, PolicyRule, PumpConsole, RecorderError, ResultConfig, RuleAction, SessionStore,
+    SkillPort, StoredSession, SystemPromptSource, ToolCatalog as EngineToolCatalog, ToolContext,
+    ToolEntry, ToolExecutionConfig, ToolPermissionDecision, ToolPermissionGate, ToolProvider,
     ToolResultManager, ToolSelector, TracePolicy,
 };
 use jessica_harness::{CommandSensor, TurnSignals};
@@ -38,7 +38,6 @@ use crate::config::{
     ToolSelector as CliToolSelector,
 };
 use crate::delegation::NativeChildToolFactory;
-use crate::events::{EventRecorder, RecorderError};
 use crate::governance::ToolPermissionGate as CliToolPermissionGate;
 use crate::memory::MemoryAssembly;
 use crate::skills::SkillsAssembly;

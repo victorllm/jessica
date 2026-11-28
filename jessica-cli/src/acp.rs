@@ -79,6 +79,7 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId, ToolCall};
+use jessica_engine::UpdateSink;
 use serde_json::json;
 use tokio::sync::{Notify, OnceCell, mpsc, oneshot, watch};
 use tokio::time::timeout;
@@ -98,7 +99,6 @@ use crate::config::HarnessConfig;
 use crate::governance::{ToolPermissionDecision, ToolPermissionGate};
 use crate::hot_reload::ConfigWatcher;
 use crate::mcp::{MAX_MCP_SERVERS_PER_SESSION, McpError, McpSession, StdioServerConfig};
-use crate::pump::UpdateSink;
 use crate::shutdown::ShutdownController;
 use crate::tools::CatalogCandidate;
 

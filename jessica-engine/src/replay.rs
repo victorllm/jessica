@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::events::StoredSession;
+use crate::recorder::StoredSession;
 
 /// Number of events buffered while the replay loop produces its stream.
 const EVENT_BUFFER: usize = 1024;
@@ -46,7 +46,7 @@ const EVENT_BUFFER: usize = 1024;
 /// messages to `SessionStarted`. Version-1 recordings contain neither, so those
 /// synthesized fields are removed before returning to keep the replay output
 /// byte-identical to the stream it reproduces.
-pub(crate) async fn replay_session(
+pub async fn replay_session(
     session_id: &SessionId,
     stored: &StoredSession,
 ) -> Result<Vec<AgentEvent>, ReplayError> {
@@ -61,7 +61,7 @@ pub(crate) async fn replay_session(
 /// original session had already spent before resuming. The replay drives
 /// [`jessica_runtime::AgentLoop::resume`] instead of a fresh run and gives the
 /// loop the same total round budget as the original session.
-pub(crate) async fn replay_resumed_session(
+pub async fn replay_resumed_session(
     session_id: &SessionId,
     stored: &StoredSession,
     rounds_completed: u32,
@@ -209,7 +209,7 @@ fn restore_recorded_vocabulary(
 }
 
 /// Serializes events as JSONL, one compact event object per line.
-pub(crate) fn render_jsonl(events: &[AgentEvent]) -> Result<Vec<u8>, ReplayError> {
+pub fn render_jsonl(events: &[AgentEvent]) -> Result<Vec<u8>, ReplayError> {
     let mut output = Vec::new();
     for event in events {
         let line = serde_json::to_string(event)?;
@@ -220,7 +220,7 @@ pub(crate) fn render_jsonl(events: &[AgentEvent]) -> Result<Vec<u8>, ReplayError
 }
 
 /// Writes the replayed event stream to `path`, truncating any existing file.
-pub(crate) async fn write_jsonl(path: PathBuf, events: Vec<AgentEvent>) -> Result<(), ReplayError> {
+pub async fn write_jsonl(path: PathBuf, events: Vec<AgentEvent>) -> Result<(), ReplayError> {
     tokio::task::spawn_blocking(move || {
         let output = render_jsonl(&events)?;
         std::fs::write(&path, output).map_err(|source| ReplayError::Output { path, source })
@@ -958,7 +958,7 @@ impl<'a> ScriptBuilder<'a> {
 
 /// Errors raised while reconstructing or running a replay.
 #[derive(Debug, Error)]
-pub(crate) enum ReplayError {
+pub enum ReplayError {
     /// The stream is empty or does not start with `SessionStarted`.
     #[error("the recorded stream does not begin with a session_started event")]
     MissingSessionStart,

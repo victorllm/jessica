@@ -5,25 +5,22 @@
 //! of reusable middleware, and this crate is the only assembly layer an
 //! embedder needs in order to run a turn without bypassing governance.
 //!
-//! # E3a status
+//! # Status
 //!
 //! This crate contains the public API, ports, configuration, and the governed
-//! provider-to-tool vertical slice introduced by Tasks E1a and E1b, the
-//! producer-side event sink and host policy/result-manager ports from E1c, the
-//! descriptor/patch/artifact alignment from E1d, and the producer journal,
-//! event pump, and SQLite recorder from E2. [`TracePolicy::Required`] is the
-//! default: a required turn trace is opened before any provider call and only
-//! succeeds after `turn_ended` is durable.
+//! provider-to-tool ordering introduced by Tasks E1–E3, the producer journal,
+//! event pump, SQLite recorder, and offline replay. [`TracePolicy::Required`]
+//! is the default: a required turn trace is opened before any provider call
+//! and only succeeds after `turn_ended` is durable.
 //!
-//! Task E3a added the engine-owned complete-turn entry points
-//! [`Engine::run_turn_request`] and [`Engine::resume_turn`]: fixed initial
-//! message ordering, one memory and one skill recall per turn, acceptance
-//! retries with per-attempt sessions, the outer session recorded on final
-//! failure or a governance trip, budget-reason overrides, fail-open post-turn
-//! memory/skill hooks, and resume from recorded evidence without replaying
-//! completed work. Delegation parent assembly, CLI adoption of these entry
-//! points, and the `HarnessConfig`/`EngineConfig` split remain in E3b; the CLI
-//! still owns its parallel turn assembly until then.
+//! [`Engine::run_turn_request`] and [`Engine::resume_turn`] are the complete
+//! turn entry points: fixed initial message ordering, one memory and one skill
+//! recall per turn, acceptance retries with per-attempt sessions, the outer
+//! session recorded on final failure or a governance trip, budget-reason
+//! overrides, fail-open post-turn memory/skill hooks, delegation parent
+//! assembly, and resume from recorded evidence without replaying completed
+//! work. The CLI is an adapter over these entry points; [`replay`] provides
+//! the deterministic offline replay used by trace verification.
 
 #![deny(missing_docs)]
 
@@ -37,6 +34,7 @@ mod policy;
 mod ports;
 mod pump;
 mod recorder;
+pub mod replay;
 mod tooling;
 
 pub use api::{Engine, EngineBuilder, TurnOutcome, TurnRequest};
