@@ -2675,8 +2675,10 @@ mod tests {
                 Message::user("new"),
                 Message::assistant("new answer"),
             ],
+            last_output: "new answer".to_owned(),
             // The generated messages begin after the new user message.
             turn_start: 4,
+            turn_id: "turn-test".to_owned(),
             lagged: false,
         };
 

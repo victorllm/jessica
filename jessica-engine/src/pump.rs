@@ -256,14 +256,33 @@ impl EventPump {
         output: PumpOutput,
         sink: Option<Arc<dyn UpdateSink>>,
     ) -> Self {
+        Self::new_with_console(harness, governance, integrity, output, None, sink)
+    }
+
+    /// Creates a pump with a host-supplied human-console renderer.
+    ///
+    /// The console is used only when `output` is [`PumpOutput::HumanConsole`];
+    /// silent output never invokes it. A `None` console keeps the built-in
+    /// terminal renderer, so an embedder can override rendering without
+    /// changing the pump's event or guard behavior.
+    pub fn new_with_console(
+        harness: Arc<Harness>,
+        governance: Arc<GovernanceState>,
+        integrity: Arc<dyn PumpIntegrity>,
+        output: PumpOutput,
+        console: Option<Arc<dyn PumpConsole>>,
+        sink: Option<Arc<dyn UpdateSink>>,
+    ) -> Self {
         let console = match output {
-            PumpOutput::HumanConsole => Some(Arc::new(StdoutConsole) as Arc<dyn PumpConsole>),
+            PumpOutput::HumanConsole => {
+                Some(console.unwrap_or_else(|| Arc::new(StdoutConsole) as Arc<dyn PumpConsole>))
+            }
             PumpOutput::Silent => None,
         };
         Self::assemble(harness, governance, integrity, output, console, sink)
     }
 
-    /// Assembles a pump with an explicit console, used by behavior tests.
+    /// Assembles a pump from already-resolved rendering state.
     fn assemble(
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
@@ -692,7 +711,7 @@ mod tests {
         ));
         let console = console.map(|console| console as Arc<dyn PumpConsole>);
         let sink = sink.map(|sink| sink as Arc<dyn UpdateSink>);
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             Arc::clone(&harness),
             governance,
             continue_integrity(),
@@ -923,7 +942,7 @@ mod tests {
             harness.events(),
             CancellationToken::new(),
         ));
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             harness,
             governance,
             Arc::new(FixedIntegrity(LagHandling::FailSession)),
@@ -962,7 +981,7 @@ mod tests {
             CancellationToken::new(),
         ));
         let console = Arc::new(RecordingConsole::default());
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             harness,
             governance,
             Arc::new(FixedIntegrity(LagHandling::Warn)),
@@ -1013,7 +1032,7 @@ mod tests {
             harness.events(),
             CancellationToken::new(),
         ));
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             harness,
             governance,
             continue_integrity(),

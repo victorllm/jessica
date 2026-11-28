@@ -306,15 +306,12 @@ impl GovernedTool {
     /// Managed results replace oversized content with a bounded preview and a
     /// digest before the result-size guard, transcript, or model observes
     /// them.
-    pub fn with_result_manager<M>(
+    pub fn with_result_manager(
         mut self,
-        result_manager: Option<Arc<M>>,
+        result_manager: Option<Arc<dyn ToolResultManager>>,
         result_format: ResultFormat,
-    ) -> Self
-    where
-        M: ToolResultManager + 'static,
-    {
-        self.result_manager = result_manager.map(|manager| manager as Arc<dyn ToolResultManager>);
+    ) -> Self {
+        self.result_manager = result_manager;
         self.result_format = result_format;
         self
     }
@@ -1007,7 +1004,10 @@ mod tests {
             Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
             Arc::new(ResultSizeGuard::new(320)),
         )
-        .with_result_manager(Some(manager), ResultFormat::Text);
+        .with_result_manager(
+            Some(manager as Arc<dyn ToolResultManager>),
+            ResultFormat::Text,
+        );
 
         let result = tool
             .execute_with_call(&ToolCall::new("call-1", "large", json!({})))
@@ -1094,6 +1094,332 @@ mod tests {
         async fn request_permission(&self, _call: &ToolCall) -> ToolPermissionDecision {
             ToolPermissionDecision::Allow
         }
+    }
+
+    /// Host policy double that counts how often it is consulted.
+    struct CountingPolicy {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl ToolPolicy for CountingPolicy {
+        async fn evaluate(&self, _call: &ToolCall) -> Result<PolicyVerdict, PolicyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PolicyVerdict::Allow {
+                reason: "allowed".to_owned(),
+                rule: None,
+            })
+        }
+    }
+
+    /// Gate double that counts requests and returns a fixed decision.
+    struct CountingGate {
+        calls: Arc<AtomicU32>,
+        decision: ToolPermissionDecision,
+    }
+
+    #[async_trait]
+    impl ToolPermissionGate for CountingGate {
+        async fn request_permission(&self, _call: &ToolCall) -> ToolPermissionDecision {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision
+        }
+    }
+
+    /// Gate that allows only after a delay longer than the tool timeout.
+    struct SlowAllowGate {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ToolPermissionGate for SlowAllowGate {
+        async fn request_permission(&self, _call: &ToolCall) -> ToolPermissionDecision {
+            tokio::time::sleep(self.delay).await;
+            ToolPermissionDecision::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_denies_before_host_policy_or_gate() {
+        let inner = Arc::new(MockTool::new("hidden", "should not run", Duration::ZERO));
+        let (state, cancel, mut events) = governance();
+        let policy_calls = Arc::new(AtomicU32::new(0));
+        let gate_calls = Arc::new(AtomicU32::new(0));
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&[]),
+            Arc::clone(&state),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_legacy_sensitive(true)
+        .with_tool_policy(Arc::new(CountingPolicy {
+            calls: Arc::clone(&policy_calls),
+        }))
+        .with_permission_gate(Some(Arc::new(CountingGate {
+            calls: Arc::clone(&gate_calls),
+            decision: ToolPermissionDecision::Allow,
+        })));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "hidden", json!({})))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("was denied by policy"),
+            "{result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            policy_calls.load(Ordering::SeqCst),
+            0,
+            "the host policy must not run for a tool outside the allowlist"
+        );
+        assert_eq!(
+            gate_calls.load(Ordering::SeqCst),
+            0,
+            "the approval gate must not run for a tool outside the allowlist"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::PolicyDenied { .. })
+        ));
+        assert!(!state.tripped());
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn policy_denial_precedes_permission_and_never_asks_the_client() {
+        let inner = Arc::new(MockTool::new("blocked", "should not run", Duration::ZERO));
+        let (state, _cancel, _events) = governance();
+        let gate_calls = Arc::new(AtomicU32::new(0));
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&["blocked"]),
+            Arc::clone(&state),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_legacy_sensitive(true)
+        .with_tool_policy(Arc::new(DenyEverything))
+        .with_permission_gate(Some(Arc::new(CountingGate {
+            calls: Arc::clone(&gate_calls),
+            decision: ToolPermissionDecision::Allow,
+        })));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "blocked", json!({})))
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            gate_calls.load(Ordering::SeqCst),
+            0,
+            "a policy denial must not ask the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_allow_permission_decision_fails_closed_without_running_the_tool() {
+        let cases = [
+            (ToolPermissionDecision::Reject, PermissionDecision::Deny),
+            (
+                ToolPermissionDecision::Cancelled,
+                PermissionDecision::Cancelled,
+            ),
+            (
+                ToolPermissionDecision::TimedOut,
+                PermissionDecision::TimedOut,
+            ),
+            (
+                ToolPermissionDecision::TransportFailed,
+                PermissionDecision::Failed,
+            ),
+        ];
+        for (decision, recorded) in cases {
+            let inner = Arc::new(MockTool::new("sensitive", "should not run", Duration::ZERO));
+            let (state, cancel, mut events) = governance();
+            let tool = GovernedTool::new(
+                Arc::clone(&inner) as Arc<dyn Tool>,
+                allowlist(&["sensitive"]),
+                Arc::clone(&state),
+                Duration::from_secs(1),
+                Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+                Arc::new(ResultSizeGuard::new(1024)),
+            )
+            .with_legacy_sensitive(true)
+            .with_permission_gate(Some(Arc::new(CountingGate {
+                calls: Arc::new(AtomicU32::new(0)),
+                decision,
+            })));
+
+            let result = tool
+                .execute_with_call(&ToolCall::new("call-1", "sensitive", json!({})))
+                .await;
+
+            assert!(result.is_error, "{decision:?}: {result:?}");
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                0,
+                "{decision:?} must never execute the tool"
+            );
+            match events.try_recv() {
+                Ok(AgentEvent::PermissionDecided {
+                    decision: observed, ..
+                }) => assert_eq!(observed, recorded),
+                other => panic!("expected PermissionDecided, got {other:?}"),
+            }
+            assert!(!state.tripped(), "{decision:?} must not trip the budget");
+            assert!(
+                !cancel.is_cancelled(),
+                "{decision:?} must not cancel the turn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_permission_wait_does_not_consume_the_tool_timeout() {
+        let inner = Arc::new(MockTool::new("sensitive", "ran", Duration::ZERO));
+        let (state, cancel, _events) = governance();
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&["sensitive"]),
+            Arc::clone(&state),
+            Duration::from_millis(20),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_millis(20))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_legacy_sensitive(true)
+        .with_permission_gate(Some(Arc::new(SlowAllowGate {
+            delay: Duration::from_millis(80),
+        })));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "sensitive", json!({})))
+            .await;
+
+        assert!(
+            !result.is_error,
+            "approval time must not count as tool time: {result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(!state.tripped());
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn the_tool_timeout_starts_after_approval_and_cancels() {
+        let inner = Arc::new(MockTool::new(
+            "slow",
+            "too late",
+            Duration::from_millis(200),
+        ));
+        let (state, cancel, mut events) = governance();
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&["slow"]),
+            Arc::clone(&state),
+            Duration::from_millis(5),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_millis(5))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_legacy_sensitive(true)
+        .with_permission_gate(Some(Arc::new(AllowGate)));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "slow", json!({})))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("exceeding limit"), "{result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(state.tripped());
+        assert!(cancel.is_cancelled());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::PermissionDecided {
+                decision: PermissionDecision::Allow,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::BudgetExceeded {
+                kind: BudgetKind::ToolTimeout,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_approval_that_cannot_be_recorded_never_executes_the_tool() {
+        let inner = Arc::new(MockTool::new("sensitive", "should not run", Duration::ZERO));
+        let (events, _observer) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let state = Arc::new(
+            GovernanceState::new(events, cancel.clone())
+                .with_event_sink(Some(Arc::new(RejectingSink) as Arc<dyn EventSink>)),
+        );
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&["sensitive"]),
+            Arc::clone(&state),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(1024)),
+        )
+        .with_legacy_sensitive(true)
+        .with_permission_gate(Some(Arc::new(AllowGate)));
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "sensitive", json!({})))
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("could not be recorded"),
+            "{result:?}"
+        );
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            cancel.is_cancelled(),
+            "a rejected approval record must cancel the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmanaged_oversized_result_trips_the_result_size_guard_and_cancels() {
+        let inner = Arc::new(MockTool::new("large", "x".repeat(512), Duration::ZERO));
+        let (state, cancel, mut events) = governance();
+        let tool = GovernedTool::new(
+            Arc::clone(&inner) as Arc<dyn Tool>,
+            allowlist(&["large"]),
+            Arc::clone(&state),
+            Duration::from_secs(1),
+            Arc::new(ToolTimeoutGuard::new(Duration::from_secs(1))),
+            Arc::new(ResultSizeGuard::new(64)),
+        );
+
+        let result = tool
+            .execute_with_call(&ToolCall::new("call-1", "large", json!({})))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("exceeds limit"), "{result:?}");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(state.tripped());
+        assert!(cancel.is_cancelled());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::BudgetExceeded {
+                kind: BudgetKind::ResultSize,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

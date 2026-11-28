@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use jessica_core::types::Budget;
+use jessica_runtime::DelegationLimits;
 
 /// Default wall-clock timeout for one governed tool execution.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -23,6 +24,12 @@ const DEFAULT_MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 const DEFAULT_ARTIFACT_RETENTION_DAYS: u64 = 7;
 /// Default total byte budget for retained artifacts.
 const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Default number of consecutive stalled rounds before the stuck guard trips.
+const DEFAULT_MAX_STUCK_ROUNDS: u32 = 3;
+/// Default maximum number of tools exposed to the model in one turn.
+const DEFAULT_MAX_EXPOSED_TOOLS: usize = 64;
+/// Default maximum total canonical schema bytes exposed in one turn.
+const DEFAULT_MAX_TOOL_SCHEMA_BYTES: usize = 128 * 1024;
 
 /// Durability policy for the turn trace.
 ///
@@ -142,6 +149,37 @@ impl Default for ApprovalConfig {
     }
 }
 
+/// Acceptance-check retry policy for one turn.
+///
+/// The engine only decides when the configured [`AcceptanceCheck`] runs and how
+/// many retries are allowed. The check itself, including its command or
+/// protocol, is supplied by an adapter.
+///
+/// [`AcceptanceCheck`]: jessica_core::acceptance::AcceptanceCheck
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceConfig {
+    max_retries: u32,
+}
+
+impl AcceptanceConfig {
+    /// Creates a policy that retries at most `max_retries` times after the
+    /// first failed check.
+    pub fn new(max_retries: u32) -> Self {
+        Self { max_retries }
+    }
+
+    /// Returns the configured retry budget.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+}
+
+impl Default for AcceptanceConfig {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 /// Configuration for one governed tool execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionConfig {
@@ -159,6 +197,29 @@ impl Default for ToolExecutionConfig {
             timeout: DEFAULT_TOOL_TIMEOUT,
             max_args_bytes: None,
             max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+        }
+    }
+}
+
+/// Exposure budgets for the model-visible tool catalog.
+///
+/// The engine checks the catalog returned by the host's
+/// [`ToolProvider`](crate::ToolProvider) after the allowlist and any
+/// delegation tool have been applied. An over-budget catalog fails turn
+/// startup before the model is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogLimits {
+    /// Maximum number of exposed tools.
+    pub max_exposed_tools: usize,
+    /// Maximum total canonical schema bytes of exposed tools.
+    pub max_tool_schema_bytes: usize,
+}
+
+impl Default for CatalogLimits {
+    fn default() -> Self {
+        Self {
+            max_exposed_tools: DEFAULT_MAX_EXPOSED_TOOLS,
+            max_tool_schema_bytes: DEFAULT_MAX_TOOL_SCHEMA_BYTES,
         }
     }
 }
@@ -202,9 +263,14 @@ impl Default for ResultConfig {
 pub struct EngineConfig {
     budget: Budget,
     max_tool_calls: Option<u32>,
+    max_stuck_rounds: u32,
     policy: PolicyConfig,
     approval: ApprovalConfig,
     tools: ToolExecutionConfig,
+    acceptance: Option<AcceptanceConfig>,
+    result: ResultConfig,
+    catalog_limits: CatalogLimits,
+    delegation: Option<DelegationLimits>,
     trace_policy: TracePolicy,
 }
 
@@ -219,9 +285,14 @@ impl EngineConfig {
         Self {
             budget: Budget::new(0, DEFAULT_TOOL_TIMEOUT, 32),
             max_tool_calls: None,
+            max_stuck_rounds: DEFAULT_MAX_STUCK_ROUNDS,
             policy: PolicyConfig::default(),
             approval: ApprovalConfig::default(),
             tools: ToolExecutionConfig::default(),
+            acceptance: None,
+            result: ResultConfig::default(),
+            catalog_limits: CatalogLimits::default(),
+            delegation: None,
             trace_policy,
         }
     }
@@ -235,6 +306,23 @@ impl EngineConfig {
     /// Replaces the tool-call limit for one turn.
     pub fn with_max_tool_calls(mut self, max_tool_calls: Option<u32>) -> Self {
         self.max_tool_calls = max_tool_calls;
+        self
+    }
+
+    /// Replaces the number of consecutive stalled rounds allowed before the
+    /// stuck guard trips.
+    ///
+    /// Values below one are treated as one by the guard.
+    pub fn with_max_stuck_rounds(mut self, max_stuck_rounds: u32) -> Self {
+        self.max_stuck_rounds = max_stuck_rounds;
+        self
+    }
+
+    /// Replaces the acceptance-check policy.
+    ///
+    /// `None` runs one attempt without an external acceptance check.
+    pub fn with_acceptance(mut self, acceptance: Option<AcceptanceConfig>) -> Self {
+        self.acceptance = acceptance;
         self
     }
 
@@ -256,6 +344,29 @@ impl EngineConfig {
         self
     }
 
+    /// Replaces the result-management and artifact settings.
+    pub fn with_result(mut self, result: ResultConfig) -> Self {
+        self.result = result;
+        self
+    }
+
+    /// Replaces the tool-catalog exposure budgets.
+    pub fn with_catalog_limits(mut self, catalog_limits: CatalogLimits) -> Self {
+        self.catalog_limits = catalog_limits;
+        self
+    }
+
+    /// Enables delegation for fresh turns with `delegation` limits.
+    ///
+    /// `None` disables delegation. The engine requires a
+    /// [`ChildToolFactory`](crate::ChildToolFactory) at build time when limits
+    /// are configured. Resume never exposes `delegate_task`, regardless of
+    /// this setting.
+    pub fn with_delegation(mut self, delegation: Option<DelegationLimits>) -> Self {
+        self.delegation = delegation;
+        self
+    }
+
     /// Returns the session budget.
     pub fn budget(&self) -> &Budget {
         &self.budget
@@ -264,6 +375,16 @@ impl EngineConfig {
     /// Returns the per-turn tool-call limit.
     pub fn max_tool_calls(&self) -> Option<u32> {
         self.max_tool_calls
+    }
+
+    /// Returns the stalled-round limit enforced by the stuck guard.
+    pub fn max_stuck_rounds(&self) -> u32 {
+        self.max_stuck_rounds
+    }
+
+    /// Returns the acceptance-check policy, when configured.
+    pub fn acceptance(&self) -> Option<AcceptanceConfig> {
+        self.acceptance
     }
 
     /// Returns the tool policy.
@@ -279,6 +400,21 @@ impl EngineConfig {
     /// Returns the tool execution settings.
     pub fn tools(&self) -> &ToolExecutionConfig {
         &self.tools
+    }
+
+    /// Returns the result-management and artifact settings.
+    pub fn result(&self) -> &ResultConfig {
+        &self.result
+    }
+
+    /// Returns the tool-catalog exposure budgets.
+    pub fn catalog_limits(&self) -> CatalogLimits {
+        self.catalog_limits
+    }
+
+    /// Returns the delegation limits, or `None` when delegation is disabled.
+    pub fn delegation(&self) -> Option<DelegationLimits> {
+        self.delegation
     }
 
     /// Returns the configured trace policy.

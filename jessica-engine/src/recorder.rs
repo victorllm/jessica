@@ -34,7 +34,7 @@ use tokio::task::JoinError;
 
 use crate::api::TurnOutcome;
 use crate::error::EngineError;
-use crate::ports::{TraceStore, TurnTrace};
+use crate::ports::{SessionStore, TraceStore, TurnTrace};
 
 /// Write-only interface for session metadata and versioned traces.
 ///
@@ -97,6 +97,17 @@ impl EventRecorder {
             })?;
         }
         let store = tokio::task::spawn_blocking(move || EventStore::open(path))
+            .await
+            .map_err(RecorderError::Task)?
+            .map_err(RecorderError::Store)?;
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+        })
+    }
+
+    /// Creates an in-memory recorder, useful for tests and ephemeral embedders.
+    pub async fn in_memory() -> Result<Self, RecorderError> {
+        let store = tokio::task::spawn_blocking(EventStore::open_in_memory)
             .await
             .map_err(RecorderError::Task)?
             .map_err(RecorderError::Store)?;
@@ -270,6 +281,18 @@ impl EventJournal for EventRecorder {
         .await
         .map_err(RecorderError::Task)?
         .map_err(RecorderError::Store)
+    }
+}
+
+#[async_trait]
+impl SessionStore for EventRecorder {
+    async fn load_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, EngineError> {
+        EventRecorder::load(self, session_id)
+            .await
+            .map_err(EngineError::Recorder)
     }
 }
 
