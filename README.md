@@ -11,10 +11,13 @@ event-sourced persistence.
 | --- | --- |
 | `jessica-core` | Frozen public types and trait contracts |
 | `jessica-runtime` | Agent loop and session execution |
+| `jessica-sandbox` | wasmtime/WASI sandbox |
 | `jessica-harness` | Guards, policy, sensors, and acceptance orchestration |
+| `jessica-memory` | Event store, trace chain, memory, and skills |
 | `jessica-providers` | OpenAI-compatible streaming provider |
+| `jessica-engine` | Governed turn runtime: ports, journal, pump, acceptance, resume (frozen public API) |
 | `jessica-tools` | Native file, search, git, and command tools |
-| `jessica-cli` | Governed executable entry point |
+| `jessica-cli` | Adapter and composition root for the executable |
 
 See `CLAUDE.md` for project rules and `PLAN.md` for the delivery plan.
 
@@ -30,6 +33,48 @@ sh -n install.sh
 ```
 
 The workflow is defined in `.github/workflows/ci.yml` and uses no secrets.
+
+## Embedding `jessica-engine`
+
+`jessica-engine` is the assembly layer for governed turns. Its public API was
+frozen by Task E5 (2026-11-28): changes require a separate task. The crate is
+pre-1.0, so minor releases may contain breaking changes; patch releases carry
+fixes and documentation only.
+
+An embedder supplies the provider, tool catalog, and durable journal through
+public ports, then runs a turn:
+
+```rust
+use jessica_engine::{EngineBuilder, EngineConfig, TracePolicy, TurnRequest};
+
+let engine = EngineBuilder::new()
+    .provider(provider)       // Arc<dyn jessica_core::llm::LlmProvider>
+    .tool_provider(tools)     // Arc<dyn jessica_engine::ToolProvider>
+    .config(EngineConfig::new(TracePolicy::Required))
+    .event_journal(journal)   // Arc<dyn jessica_engine::EventJournal>
+    .build()?;
+
+let outcome = engine
+    .run_turn_request(TurnRequest::new("fix the failing test"))
+    .await?;
+```
+
+`Engine::run_turn_request` and `Engine::resume_turn` are the complete turn
+entry points; `Engine::run_turn` is the trace-store-only variant for embedders
+that do not need acceptance, memory/skills, delegation, or resume.
+
+The runnable example drives a tool through an approval gate and verifies the
+durable trace using only public APIs:
+
+```bash
+cargo run -p jessica-engine --example governed_turn
+```
+
+Verify the dependency boundary with:
+
+```bash
+cargo tree -p jessica-engine --edges normal
+```
 
 ## Install
 

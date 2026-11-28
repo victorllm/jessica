@@ -33,14 +33,18 @@ Jessica 是一个确定性 Rust Agent 运行时，核心目标不是让模型“
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────┐
-│ jessica-cli：组合根（composition root）                               │
-│                                                                      │
-│  config ──► provider ──► EventRecorder ──► wasm / memory / skills     │
-│                    │                                                  │
-│                    ├── ToolCatalog（native / wasm / mcp / delegation）│
-│                    ├── GovernedTool 包装链                            │
-│                    ├── TurnJournal（producer-side durable sink）      │
-│                    └── EventPump（渲染 / transcript / sensors）       │
+│ jessica-cli：适配器与进程级组合根                                     │
+│  TOML/config · provider 构造 · native/WASM/MCP 工具 · 终端/ACP 输出   │
+│  sensors · acceptance check · memory/skill 装配 · 信号处理             │
+│  实现 engine ports ──► build_engine 每轮装配一个 Engine               │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────────┐
+│ jessica-engine：唯一受治理 turn 装配层                                │
+│  Engine::run_turn_request / resume_turn · EngineConfig                │
+│  ToolCatalog ──► Allowlist ──► PolicyV2 ──► 审批门 ──► GovernedTool   │
+│  TokenCountingProvider · TurnJournal · EventPump · acceptance         │
+│  memory/skill 调用点 · delegation 父侧装配 · 离线 replay               │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────┐
@@ -65,7 +69,7 @@ Jessica 是一个确定性 Rust Agent 运行时，核心目标不是让模型“
 │ SQLite EventStore / TraceStore / TraceChain / Memory / Skill 存储     │
 └──────────────────────────────────────────────────────────────────────┘
 
-除 `jessica-tools → jessica-sandbox` 和 `jessica-cli → 全部实现层` 外，实现层只依赖 jessica-core；jessica-cli 负责最终装配。
+除 `jessica-tools → jessica-sandbox`、`jessica-engine → runtime/harness/memory` 和 `jessica-cli → 全部实现层` 外，实现层只依赖 jessica-core；engine 拥有唯一受治理 turn 路径，CLI 只做适配与最终装配。
 ```
 
 ---
@@ -83,7 +87,8 @@ Workspace 使用 `resolver = "2"`，版本单一来源为根 `Cargo.toml` 的 `[
 | `jessica-providers` | OpenAI 兼容 / Anthropic Provider 与可靠性层 | `jessica-core` | `reqwest`、`tokio` |
 | `jessica-tools` | 原生工具与 WASM 工具适配 | `jessica-core`、`jessica-sandbox` | `tokio` |
 | `jessica-memory` | 事件溯源、trace 存储、分层记忆、技能库 | `jessica-core` | `rusqlite`、`sha2`、`tokio` |
-| `jessica-cli` | 可执行入口、全部实现装配、ACP | 所有实现层 | `agent-client-protocol`、`toml`、`tokio` |
+| `jessica-engine` | 受治理 turn 装配、ports、journal/pump、acceptance、resume、replay | `jessica-core`、`jessica-runtime`、`jessica-harness`、`jessica-memory` | `tokio`、`tokio-util`、`thiserror`、`sha2`、`async-trait` |
+| `jessica-cli` | 可执行入口、进程级资源装配、ACP 适配 | 所有实现层（含 `jessica-engine`） | `agent-client-protocol`、`toml`、`tokio` |
 
 依赖规则：
 
@@ -91,7 +96,8 @@ Workspace 使用 `resolver = "2"`，版本单一来源为根 `Cargo.toml` 的 `[
 - `jessica-core` 不依赖任何内部 crate，也不引入 wasmtime、SQLite、HTTP 客户端或 ACP。
 - `jessica-runtime`、`jessica-sandbox`、`jessica-harness` 只依赖 `jessica-core`。
 - `jessica-tools` 自 Task 3.3 起可依赖 `jessica-sandbox`。
-- `jessica-cli` 是唯一组合根，拥有 provider、数据库、MCP、ACP 和配置等进程级资源。
+- `jessica-engine` 只依赖 `jessica-core`、`jessica-runtime`、`jessica-harness`、`jessica-memory`；不得依赖 CLI、provider、工具或沙箱实现。
+- `jessica-cli` 是唯一进程级组合根，拥有 provider、数据库、MCP、ACP 和配置等资源；但受治理 turn 只能经 `jessica-engine` 装配。
 
 这条依赖线不是形式要求，而是为了保证：
 
@@ -116,9 +122,10 @@ graph TD
         MEM["jessica-memory<br/>EventStore / Trace / Memory / Skills"]
         SANDBOX["jessica-sandbox<br/>wasmtime / WASI"]
         TOOLS["jessica-tools<br/>native tools / WASM adapter"]
+        ENGINE["jessica-engine<br/>governed turn / ports / journal / pump"]
     end
 
-    CLI["jessica-cli<br/>唯一组合根<br/>CLI / ACP / MCP / policy v2 / replay"]
+    CLI["jessica-cli<br/>进程级组合根 + 适配器<br/>CLI / ACP / MCP / policy simulate"]
 
     RT --> CORE
     HARNESS --> CORE
@@ -127,6 +134,10 @@ graph TD
     SANDBOX --> CORE
     TOOLS --> CORE
     TOOLS --> SANDBOX
+    ENGINE --> CORE
+    ENGINE --> RT
+    ENGINE --> HARNESS
+    ENGINE --> MEM
 
     CLI --> CORE
     CLI --> RT
@@ -135,6 +146,7 @@ graph TD
     CLI --> MEM
     CLI --> SANDBOX
     CLI --> TOOLS
+    CLI --> ENGINE
 
     EXT0["serde / serde_json<br/>thiserror / async-trait / futures"]:::ext
     EXT1["tokio / tokio-util"]:::ext
@@ -151,6 +163,9 @@ graph TD
     MEM -.-> EXT3
     SANDBOX -.-> EXT4
     TOOLS -.-> EXT1
+    ENGINE -.-> EXT0
+    ENGINE -.-> EXT1
+    ENGINE -.-> EXT3
     CLI -.-> EXT1
     CLI -.-> EXT5
 
@@ -160,8 +175,8 @@ graph TD
 图中三条关键性质：
 
 - `jessica-core` 只依赖轻量契约与序列化库，不接触 wasmtime、SQLite、HTTP 或 ACP。
-- 实现层之间只有一条合法内部边：`jessica-tools → jessica-sandbox`。
-- `jessica-cli` 是唯一汇合点，拥有全部实现层和进程级资源。
+- 实现层内部边只有 `jessica-tools → jessica-sandbox`，以及 `jessica-engine` 对 runtime/harness/memory 的受控依赖。
+- `jessica-engine` 是唯一受治理 turn 装配点；`jessica-cli` 是唯一进程级资源汇合点，通过 engine 运行 turn。
 
 ---
 
@@ -188,7 +203,7 @@ graph TD
 - `LlmProvider::stream_chat` 返回 `BoxStream<LlmEvent>`；实现负责网络和流式解析，运行时只消费文本增量、工具调用请求、用量和错误。
 - `Tool` 同时支持按参数执行和 `execute_with_call`；AgentLoop 负责给结果盖上原始 tool call id，避免工具实现伪造关联。
 - `Guard` 是纯判定函数：不调用模型、不做 I/O、不读墙钟。有状态 Guard（如 stuck detection）由宿主按会话/轮次构造。
-- `Policy` 只有 allow/deny 两态；三态策略（deny/ask/allow）属于 CLI 宿主层的 `PolicyV2`，不进入冻结契约。
+- `Policy` 只有 allow/deny 两态；三态策略（deny/ask/allow）由 engine 的 `PolicyV2` 在工具执行前执行，CLI 只为 `policy simulate` 保留只读 dry-run 评估器；两者都不进入冻结契约。
 - `Sensor` 在工具结果产生后运行；`Hook` 在生命周期节点运行。两者都是扩展点，不决定内核循环结构。
 - `EventSink` 位于广播之前：生产者必须先 `emit` 成功，再广播事件；sink 失败必须终止本轮，而不是静默丢事件。
 
@@ -297,7 +312,7 @@ Harness 不接管 AgentLoop，而是在同一事件流旁边提供确定性检�
 - `run_sensors`：工具结果后按顺序运行全部 Sensor；
 - `run`：在 AgentLoop 运行期间按顺序调用 Hook；Guard、Policy 和 Sensor 是调用方在明确检查点触发的，不由 `run` 隐式轮询。
 
-CLI 当前以空 hooks 构造 Harness；Hook 是保留的扩展点，不是现有治理链的必需环节。
+engine 与 CLI 当前都以空 hooks 构造 Harness；Hook 是保留的扩展点，不是现有治理链的必需环节。
 
 ### 6.2 四类 Guard
 
@@ -323,7 +338,7 @@ Guard 的顺序是确定性的；多个条件同时满足时，第一个注册�
 - 每轮尝试复用累计对话；
 - 验收失败时注入 `AcceptanceFailed` 反馈；
 - 重试次数由配置限定；
-- CLI 每次尝试创建新的 session id，但共享同一个 `TurnId`；
+- engine 每次尝试创建新的 session id，但共享同一个 `TurnId`；
 - 最终终止原因由验收编排决定，预算 trip 可以覆盖运行时的 `Completed`。
 
 `CommandAcceptanceCheck` 通过 supervisor 执行验收命令，不继承凭据环境。
@@ -343,40 +358,39 @@ Guard 的顺序是确定性的；多个条件同时满足时，第一个注册�
 
 ---
 
-## 7. `jessica-cli`：组合根与一轮执行
+## 7. `jessica-engine`：受治理 turn 运行时与 CLI/ACP 适配器
 
-### 7.1 CLI 模式
+`jessica-engine` 是唯一拥有完整受治理 turn 的层。它只依赖 `jessica-core`、`jessica-runtime`、`jessica-harness` 与 `jessica-memory`，通过 ports 接收宿主资源；CLI 与 ACP 都是它的适配器。Task E5（2026-11-28）冻结了它的公共 API。
 
-| 模式 | 入口 | 是否装配运行时 | 说明 |
-| --- | --- | --- | --- |
-| 默认 / `--resume` | `Mode::Turn` | 是 | one-shot 或 REPL；`--resume` 继续中断会话 |
-| `replay` | `Mode::Replay` | 否 | 离线确定性回放，输出 JSONL |
-| `skills` | `Mode::Skills` | 仅技能库 | 列表、激活、停用、查看等 |
-| `tools` | `Mode::Tools` | 否 | catalog 检查，不创建 `.jessica` |
-| `policy` | `Mode::Policy` | 否 | 对合成调用模拟策略判定，不执行工具 |
-| `trace` | `Mode::Trace` | 否 | 只读验证、摘要、导出、离线验证 bundle |
-| `config` | `Mode::Config` | 否 | 输出 effective config JSON |
-| `acp` | `Mode::Acp` | 是（惰性） | 稳定 ACP v1 stdio 服务 |
+### 7.1 角色与入口
 
-只读子命令刻意不初始化 provider、事件库、记忆库、技能库、WASM 或 MCP，避免审计动作改变证据或产生副作用。
+| 入口 | 边界 |
+| --- | --- |
+| `Engine::run_turn_request` | 完整 turn：固定初始消息顺序、memory/skill 各 recall 一次、acceptance 重试、每 attempt 独立 session、外层 session、budget reason 覆盖、fail-open 完成后处理 |
+| `Engine::resume_turn` | 从持久事件重建 checkpoint；不重放已完成工作；已有终止事件直接返回记录原因 |
+| `Engine::run_turn` | 只绑定 `TraceStore` 的简化入口，不包含 acceptance/memory/skills/delegation/resume |
 
-### 7.2 启动装配
+`TurnRequest` 字段私有，只能经 `with_*` 构造；`EngineBuilder` 只接受命名端口，没有预装配 `Harness`/`ToolRegistry` 的后门。`EngineConfig` 承载预算、policy、approval、acceptance、delegation、result、catalog 与 trace 决策；engine 不解析 TOML、不构造 provider/WASM/MCP。
 
-`assemble_runtime` 按固定顺序构造进程级资源：
+### 7.2 公共端口
 
-1. `EventRecorder`（若配置了 `events.path`）；
-2. Provider（由 `JESSICA_PROVIDER` 选择 OpenAI 兼容或 Anthropic，可选包一层可靠性层）；
-3. WASM 工具（编译一次，跨轮共享）；
-4. 分层记忆（fail-open）；
-5. 技能库与后台蒸馏 worker（fail-open）；
-6. `watch` 配置通道；
-7. `CliRuntime`。
+| 端口 | 宿主职责 |
+| --- | --- |
+| `ToolProvider` | 返回本轮初始 `ToolCatalog`（native / WASM / MCP） |
+| `ToolPermissionGate` | 审批（终端、ACP 或自动允许） |
+| `MemoryPort` / `SkillPort` | recall 与完成后钩子 |
+| `EventJournal` / `SessionStore` | 生产者侧持久化与 resume 加载 |
+| `TraceStore` | `run_turn` 简化路径的 trace sink |
+| `SystemPromptSource` / `IdSource` | system prompt 与 turn/session 标识 |
+| `PumpConsole` / `TurnObserver` | 终端渲染与协议事件 |
+| `ToolResultManager` / `AcceptanceCheck` | 大结果管理与外部验收 |
+| `ChildToolFactory` | 委派子工具实现 |
 
-`CliRuntime` 持有进程级资源和启动根目录。每轮会从 `watch` 通道克隆一个 `Arc<HarnessConfig>` 快照，保证 prompt、schema、guards、policy、delegation、sensors、acceptance 看到的是同一份配置。
+engine 不依赖终端、ACP、TOML、HTTP 或 wasmtime；这些留在适配器。
 
 ### 7.3 一轮的组装顺序
 
-`build_turn` 的顺序体现治理结构：
+engine 的 `build_turn_setup` 按以下顺序装配（CLI 不再保有这些步骤）：
 
 1. **Guards**：token、tool timeout、stuck、result size。
 2. **Policy**：`AllowlistPolicy` + 宿主侧 `PolicyV2`。
@@ -407,7 +421,7 @@ user input
 
 #### 7.3.1 单轮对象装配依赖图
 
-箭头方向表示构造期持有/依赖；虚线表示运行期交互。`CliRuntime` 负责装配：进程级资源由它持有，单轮对象由 `TurnSetup` 持有。
+箭头方向表示构造期持有/依赖；虚线表示运行期交互。`Engine` 持有端口与不可变配置，`build_turn_setup` 组装单轮对象；CLI 只持有进程级资源并实现端口。
 
 ```mermaid
 graph LR
@@ -450,13 +464,13 @@ graph LR
     LOOP -.->|"broadcast"| PUMP
     GS -.->|"trip → cancel"| LOOP
 
-    CLI["CliRuntime"] --> LOOP
-    CLI --> PUMP
-    CLI --> J
-    CLI --> TCP
-    CLI --> GOV
-    CLI --> H
-    CLI --> GS
+    ENG["Engine / build_turn_setup"] --> LOOP
+    ENG --> PUMP
+    ENG --> J
+    ENG --> TCP
+    ENG --> GOV
+    ENG --> H
+    ENG --> GS
 
     style ProviderChain fill:#fafafa,stroke:#bbb
     style ToolChain fill:#fafafa,stroke:#bbb
@@ -477,7 +491,7 @@ graph LR
 sequenceDiagram
     autonumber
     actor U as 用户 / ACP Client
-    participant CLI as CliRuntime 组合根
+    participant E as Engine
     participant MS as Memory / Skills
     participant J as TurnJournal
     participant DB as SQLite
@@ -489,27 +503,27 @@ sequenceDiagram
     participant G as GovernedTool
     participant AR as AcceptanceRunner
 
-    U->>CLI: run_turn_request(input)
-    CLI->>CLI: config_snapshot() 整轮唯一快照
-    CLI->>CLI: build_turn(...)
-    Note over CLI,L: guards → policy/v2 → approval → sensors<br/>cancel token → journal → counting provider<br/>catalog → registry → agent → pump
-    CLI->>MS: recall memory / skills 各一次
-    MS-->>CLI: 可选 guide，失败则省略
+    U->>E: run_turn_request(input)
+    E->>E: config_snapshot() 整轮唯一快照
+    E->>E: build_turn_setup(...)
+    Note over E,L: guards → policy/v2 → approval → sensors<br/>cancel token → journal → counting provider<br/>catalog → registry → agent → pump
+    E->>MS: recall memory / skills 各一次
+    MS-->>E: 可选 guide，失败则省略
 
-    CLI->>J: begin_turn(turn_id, initial, first_session)
+    E->>J: begin_turn(turn_id, initial, first_session)
     J->>DB: turn_started
-    J-->>CLI: ack
+    J-->>E: ack
     alt cancel 已触发
-        CLI->>J: close_empty_turn
-        CLI-->>U: Cancelled
+        E->>J: close_empty_turn
+        E-->>U: Cancelled
     end
 
     loop acceptance attempts（同一 turn_id，每次新 session_id）
-        CLI->>J: record_session_start + begin_attempt
+        E->>J: record_session_start + begin_attempt
         J->>DB: bootstrap messages
-        J-->>CLI: ack
-        CLI->>EP: register(session_id, messages)
-        CLI->>H: run(agent.run(...))
+        J-->>E: ack
+        E->>EP: register(session_id, messages)
+        E->>H: run(agent.run(...))
         H->>L: 驱动循环
 
         L->>J: SessionStarted
@@ -570,37 +584,37 @@ sequenceDiagram
         end
 
         L->>J: SessionEnded
-        L-->>CLI: SessionEndReason
-        CLI->>EP: wait_for(session_id) 与 journal failure 竞速
-        EP-->>CLI: transcript snapshot
-        Note over CLI,J: sink/队列失败时 AgentLoop 不广播 SessionEnded<br/>run_attempt 通过 failure_signal 提前失败
+        L-->>E: SessionEndReason
+        E->>EP: wait_for(session_id) 与 journal failure 竞速
+        EP-->>E: transcript snapshot
+        Note over E,J: sink/队列失败时 AgentLoop 不广播 SessionEnded<br/>engine 通过 failure_signal 提前失败
 
         opt 配置了 acceptance
-            CLI->>AR: supervisor 执行验收命令（空环境）
-            AR-->>CLI: pass / fail
+            E->>AR: supervisor 执行验收命令（空环境）
+            AR-->>E: pass / fail
             alt fail 且仍有重试
                 AR->>J: AcceptanceFailed，下一 attempt
             else pass 或重试耗尽
-                AR-->>CLI: AcceptanceOutcome
+                AR-->>E: AcceptanceOutcome
             end
         end
     end
 
     opt 验收编排或预算 trip
-        CLI->>J: record_outer_session(final_reason)
-        CLI->>EP: outer SessionStarted + SessionEnded
+        E->>J: record_outer_session(final_reason)
+        E->>EP: outer SessionStarted + SessionEnded
     end
 
-    CLI->>J: finish_turn(reason)
+    E->>J: finish_turn(reason)
     J->>DB: 排空队列并提交 turn_ended（此前每条事件 legacy + trace 同事务）
-    J-->>CLI: ack —— 轮次成功边界
+    J-->>E: ack —— 轮次成功边界
 
     alt 持久化或广播完整性失败
-        CLI->>J: flush()（不写 turn_ended）
-        CLI-->>U: TraceIncomplete
+        E->>J: flush()（不写 turn_ended）
+        E-->>U: TraceIncomplete
     else Completed 且未 trip
-        CLI->>MS: record memory + enqueue skill job（fail-open）
-        CLI-->>U: TurnOutcome(reason, messages, lagged)
+        E->>MS: record memory + enqueue skill job（fail-open）
+        E-->>U: TurnOutcome(reason, messages, lagged)
     end
 ```
 
@@ -673,6 +687,52 @@ EventPump 负责：
 
 两者都是 fail-open，不改变轮次的终止原因和退出码。
 
+### 7.7 CLI/ACP 适配器
+
+CLI 仍是进程级组合根，但一轮生命周期全部委托 engine。
+
+#### 7.7.1 CLI 模式
+
+| 模式 | 入口 | 是否装配运行时 | 说明 |
+| --- | --- | --- | --- |
+| 默认 / `--resume` | `Mode::Turn` | 是 | one-shot 或 REPL；`--resume` 继续中断会话 |
+| `replay` | `Mode::Replay` | 否 | 调用 `jessica_engine::replay` 离线回放，输出 JSONL |
+| `skills` | `Mode::Skills` | 仅技能库 | 列表、激活、停用、查看等 |
+| `tools` | `Mode::Tools` | 否 | catalog 检查，不创建 `.jessica` |
+| `policy` | `Mode::Policy` | 否 | 对合成调用模拟策略判定，不执行工具 |
+| `trace` | `Mode::Trace` | 否 | 只读验证、摘要、导出、离线验证 bundle |
+| `config` | `Mode::Config` | 否 | 输出 effective config JSON |
+| `acp` | `Mode::Acp` | 是（惰性） | 稳定 ACP v1 stdio 服务 |
+
+只读子命令刻意不初始化 provider、事件库、记忆库、技能库、WASM 或 MCP，避免审计动作改变证据或产生副作用。
+
+#### 7.7.2 启动装配与端口适配
+
+`assemble_runtime` 按固定顺序构造进程级资源：
+
+1. `EventRecorder`（若配置了 `events.path`）；
+2. Provider（由 `JESSICA_PROVIDER` 选择 OpenAI 兼容或 Anthropic，可选包一层可靠性层）；
+3. WASM 工具（编译一次，跨轮共享）；
+4. 分层记忆（fail-open）；
+5. 技能库与后台蒸馏 worker（fail-open）；
+6. `watch` 配置通道；
+7. `CliRuntime`。
+
+`CliRuntime` 持有进程级资源和启动根目录。每轮从 `watch` 通道克隆一个 `Arc<HarnessConfig>` 快照，由 `engine_ports::build_engine` 映射为不可变 `EngineConfig` 并装配一个 `Engine`。REPL、one-shot 与 ACP 都落到 `Engine::run_turn_request`；`--resume` 落到 `Engine::resume_turn`。
+
+适配器实现 `ToolProvider`、`ToolPermissionGate`、`MemoryPort`、`SkillPort`、`SessionStore`、`SystemPromptSource`、`IdSource`、`PumpConsole`、`TurnObserver`、`ToolResultManager`、`ChildToolFactory` 与 `AcceptanceCheck`；终端渲染、ACP 协议、TOML、provider/WASM/MCP 构造都留在 CLI。离线 replay 位于 `jessica_engine::replay`，CLI 子命令只负责加载与输出。
+
+### 7.8 API 冻结与版本策略
+
+`jessica-engine` 的公共 API 于 Task E5（2026-11-28）冻结：任何公共类型、Trait、方法、变体或字段的变更都需要单开 Task。crate 保持 `#![deny(missing_docs)]`，公共错误用 `thiserror` 结构化，`TracePolicy` 必须显式。冻结不等于不可扩展：`EngineError` 为 `#[non_exhaustive]`，调用方必须保留通配分支。
+
+版本遵循 semver：1.0 之前 minor 版本可含破坏性变更，patch 只含修复与文档；1.0 起按标准 semver。依赖边界与公开示例的检查命令：
+
+```bash
+cargo tree -p jessica-engine --edges normal
+cargo run -p jessica-engine --example governed_turn
+```
+
 ---
 
 ## 8. 工具系统与策略治理
@@ -730,7 +790,7 @@ Catalog 还会检查：
 
 ### 8.4 Policy v2 的判定顺序
 
-`PolicyV2` 位于 CLI 宿主层，不进入 `jessica-core`。固定顺序：
+`PolicyV2` 位于 engine 的治理层（CLI 的 `policy simulate` 有自己的只读评估器），不进入 `jessica-core`。固定顺序：
 
 1. 匹配的 `deny` 规则（按配置顺序）；
 2. 编辑器工具的受保护路径默认拒绝（除非匹配 `allow` 规则）；
@@ -849,7 +909,7 @@ Artifact 存储：
 - 表级 trigger 拒绝 `UPDATE` 和 `DELETE`，append-only。
 - `sessions` 表保存 bootstrap messages，因为 `AgentEvent` 没有 user-message 变体；恢复必须能拿到最初的 system/user 消息。
 - 文件数据库使用 WAL + `synchronous = FULL`；内存数据库使用 memory journal。
-- API 是同步的；Tokio 调用方必须通过 `spawn_blocking`，CLI 的 `EventRecorder` 正是这样做的。
+- API 是同步的；Tokio 调用方必须通过 `spawn_blocking`，CLI 打开 `EventRecorder` 时正是这样做的。
 - 存储不读取宿主时钟，时间戳由调用方提供，便于确定性回放。
 
 ### 9.2 Trace schema
@@ -924,7 +984,7 @@ prev_hash  = 上一条 entry_hash；第一条为全零 genesis
 
 - `--resume` 依赖 legacy 事件流 + bootstrap metadata；
 - trace 是审计证据，带有更完整的 turn 归属和哈希链；
-- ACP 恢复另有自己的会话索引（见第 13 节）；
+- ACP 恢复另有自己的会话索引（见第 14 节）；
 - 当前没有 trace 保留期和隐私删除机制；事件库和导出的 bundle 应视为包含完整对话与工具输出。
 
 ---
@@ -957,7 +1017,7 @@ Provider 在启动时只包一次可靠性层；不会在轮次或子 Agent 中�
 
 ### 10.2 预算计数
 
-`TokenCountingProvider` 位于 CLI 治理层：
+`TokenCountingProvider` 位于 engine 治理层：
 
 - 观察 `LlmEvent::Done` 的 usage；
 - 以原子计数累计 prompt + completion；
@@ -1242,7 +1302,7 @@ Preset 不会自动启用 memory、skills 或 reliability；这些子系统写�
 - **委派单层**：子 Agent 永远拿不到 `delegate_task`。
 - **MCP 仅 stdio**：HTTP/SSE 不支持；`session/load` / `session/resume` 不接受 MCP server。
 - **ACP 仅稳定 v1**：v2、fork、archive、title、client fs/terminal 等不支持。
-- **Hook 未内置**：Harness 支持 Hook，但 CLI 当前用空 hooks 装配；它是扩展点。
+- **Hook 未内置**：Harness 支持 Hook，但 engine 与 CLI 当前用空 hooks 装配；它是扩展点。
 - **记忆向量非语义**：`DeterministicEmbedder` 只保证可复现，不提供语义嵌入能力。
 - **技能默认 draft**：不会自动激活。
 - **Trace 保留/删除未实现**：事件库和 bundle 需按敏感证据管理。
@@ -1301,16 +1361,20 @@ cargo clippy -p <crate> -- -D warnings
 | 事件库与 trace | `jessica-memory/src/{lib,trace_store,trace_chain}.rs` |
 | 分层记忆 | `jessica-memory/src/{memory_log,memory_store,embedding}.rs` |
 | 技能库 | `jessica-memory/src/{skill_jobs,skill_log}.rs` |
-| CLI 组合根 | `jessica-cli/src/app.rs` |
+| Engine 公共 API / turn 编排 | `jessica-engine/src/{lib,api,config,ports,error}.rs` |
+| Engine 治理链 / 工具装配 | `jessica-engine/src/{governance,policy,tooling,journal,pump}.rs` |
+| Engine 事件存储与离线回放 | `jessica-engine/src/{recorder,replay}.rs` |
+| Engine artifact / result | `jessica-engine/src/artifacts.rs` |
+| Embedder 示例 | `jessica-engine/examples/governed_turn.rs` |
+| CLI 组合根与端口适配 | `jessica-cli/src/{app,engine_ports}.rs` |
 | 配置 | `jessica-cli/src/config.rs` |
 | 工具目录与 descriptor | `jessica-cli/src/tools/{mod,catalog,descriptor}.rs` |
-| 治理包装 | `jessica-cli/src/{governance,policy_v2}.rs` |
-| 事件生产与持久化 | `jessica-cli/src/{journal,events,pump}.rs` |
-| Result Manager | `jessica-cli/src/artifacts.rs` |
-| 子 Agent 装配 | `jessica-cli/src/delegation.rs` |
+| CLI 审批门与 `policy simulate` | `jessica-cli/src/{governance,policy_v2}.rs` |
+| CLI Result Manager 适配 | `jessica-cli/src/artifacts.rs` |
+| 子 Agent 工厂 | `jessica-cli/src/delegation.rs` |
 | ACP | `jessica-cli/src/{acp,acp_events,acp_session,acp_store}.rs` |
 | MCP | `jessica-cli/src/mcp.rs` |
-| 回放 | `jessica-cli/src/replay.rs` |
+| 回放子命令 | `jessica-cli/src/trace_replay.rs` |
 | Trace 验证/摘要/bundle | `jessica-cli/src/{trace_verify,trace_digest,trace_bundle}.rs` |
 | 热重载 | `jessica-cli/src/hot_reload.rs` |
 | 记忆/技能装配 | `jessica-cli/src/{memory,skills}.rs` |
@@ -1319,12 +1383,12 @@ cargo clippy -p <crate> -- -D warnings
 
 ## 20. 结论
 
-Jessica 的架构可以概括为四个同心边界：
+Jessica 的架构可以概括为五层同心边界：
 
 ```text
 外层：CLI / ACP / 子命令
-  └─ 组合根：配置、provider、存储、目录、审批、结果管理
-      └─ 治理：Harness + PolicyV2 + GovernedTool + Journal
+  └─ 组合根：配置、provider、存储、终端/协议输出
+      └─ 受治理 turn：jessica-engine（ports + 治理顺序 + journal/pump）
           └─ 内核：AgentLoop 只做确定性循环并产生结构化事件
               └─ 契约：jessica-core 冻结
 ```

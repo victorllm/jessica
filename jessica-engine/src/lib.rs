@@ -7,11 +7,12 @@
 //!
 //! # Status
 //!
-//! This crate contains the public API, ports, configuration, and the governed
-//! provider-to-tool ordering introduced by Tasks E1–E3, the producer journal,
-//! event pump, SQLite recorder, and offline replay. [`TracePolicy::Required`]
-//! is the default: a required turn trace is opened before any provider call
-//! and only succeeds after `turn_ended` is durable.
+//! Tasks E1–E5 built this crate. It contains the public API, ports,
+//! configuration, the governed provider-to-tool ordering, the producer
+//! journal, event pump, SQLite recorder, offline replay, acceptance retries,
+//! memory/skill post-processing, delegation parent assembly, and resume.
+//! [`TracePolicy::Required`] is the default: a required turn trace is opened
+//! before any provider call and only succeeds after `turn_ended` is durable.
 //!
 //! [`Engine::run_turn_request`] and [`Engine::resume_turn`] are the complete
 //! turn entry points: fixed initial message ordering, one memory and one skill
@@ -19,8 +20,27 @@
 //! session recorded on final failure or a governance trip, budget-reason
 //! overrides, fail-open post-turn memory/skill hooks, delegation parent
 //! assembly, and resume from recorded evidence without replaying completed
-//! work. The CLI is an adapter over these entry points; [`replay`] provides
-//! the deterministic offline replay used by trace verification.
+//! work. The CLI and ACP are adapters over these entry points; [`replay`]
+//! provides the deterministic offline replay used by trace verification.
+//!
+//! # API stability
+//!
+//! The public API was frozen by Task E5 on 2026-11-28. Changing any public
+//! type, trait, method, variant, or field requires a separate Task. While the
+//! crate is pre-1.0, minor releases may include breaking changes and patch
+//! releases carry fixes and documentation only; from 1.0 the crate follows
+//! standard semantic versioning.
+//!
+//! Governed entry points are never hidden behind a feature or `doc(hidden)`.
+//! [`Engine::run_turn`] is the trace-store variant for embedders that do not
+//! need the full lifecycle; [`Engine::run_turn_request`] and
+//! [`Engine::resume_turn`] are the complete paths used by the CLI and ACP.
+//!
+//! Verify the dependency boundary with:
+//!
+//! ```text
+//! cargo tree -p jessica-engine --edges normal
+//! ```
 
 #![deny(missing_docs)]
 
