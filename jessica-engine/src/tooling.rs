@@ -44,6 +44,59 @@ impl ToolSource {
     }
 }
 
+/// Host-selected tool exposure profile for one turn.
+///
+/// A profile narrows the tools the engine may expose; it never widens the
+/// allowlist. Third-party tools (WASM, MCP) and delegation are exposed only by
+/// [`CatalogProfile::Full`]. Native tools follow explicit name lists so a newly
+/// added native tool is never exposed by a narrow profile until its
+/// capabilities have been reviewed here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CatalogProfile {
+    /// Only read-only native tools.
+    Readonly,
+    /// Read-only native tools plus the file-editing tools and `exec`.
+    Coding,
+    /// Read-only native tools plus `bash` and `exec`.
+    Ops,
+    /// Every native tool and every allowlisted third-party or delegation tool.
+    #[default]
+    Full,
+}
+
+impl CatalogProfile {
+    /// Returns whether this profile exposes `name` from `source`.
+    ///
+    /// Non-native sources are exposed only by [`Self::Full`]. A narrow profile
+    /// never exposes WASM, MCP, or delegation tools, and it never exposes a
+    /// native tool absent from its explicit read-only or capability list.
+    pub fn allows(self, source: ToolSource, name: &str) -> bool {
+        if source != ToolSource::Native {
+            return self == Self::Full;
+        }
+        match self {
+            Self::Full => true,
+            Self::Readonly => is_read_only_native(name),
+            Self::Coding => {
+                is_read_only_native(name)
+                    || matches!(name, "write_file" | "apply_patch" | "edit_file" | "exec")
+            }
+            Self::Ops => is_read_only_native(name) || matches!(name, "bash" | "exec"),
+        }
+    }
+}
+
+/// Returns whether a native tool has no host side effects.
+///
+/// The list is explicit so a newly added native tool is never exposed by a
+/// narrow profile until its capabilities have been reviewed here.
+fn is_read_only_native(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "read_artifact" | "list_dir" | "grep" | "git_status" | "git_diff"
+    )
+}
+
 /// Advisory metadata supplied by a tool provider.
 ///
 /// MCP annotations and WASM manifest annotations are untrusted
@@ -539,6 +592,19 @@ impl ToolCatalog {
         self.entries.get(name)
     }
 
+    /// Keeps only entries accepted by `predicate`.
+    ///
+    /// The engine applies the configured [`CatalogProfile`] through this
+    /// method immediately after the host provider returns. Exposure budgets,
+    /// delegation parent capabilities, and registry assembly therefore all
+    /// observe the same filtered catalog.
+    pub(crate) fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&ToolEntry) -> bool,
+    {
+        self.entries.retain(|_, entry| predicate(entry));
+    }
+
     /// Iterates over entries in sorted tool-name order.
     pub fn iter(&self) -> impl Iterator<Item = &ToolEntry> {
         self.entries.values()
@@ -923,5 +989,90 @@ mod tests {
         assert_eq!(descriptor.limits.timeout_ms(), Some(1_000));
         assert_eq!(descriptor.limits.max_args_bytes, Some(4_096));
         assert_eq!(descriptor.result_format, ResultFormat::Json);
+    }
+
+    #[test]
+    fn catalog_profile_matrix_is_exhaustive_across_sources_and_native_tools() {
+        // Expected exposure for each native name in profile order:
+        // readonly, coding, ops, full. The table is independent of the
+        // implementation so a rule change must update this test explicitly.
+        let native = [
+            ("read_file", [true, true, true, true]),
+            ("read_artifact", [true, true, true, true]),
+            ("list_dir", [true, true, true, true]),
+            ("grep", [true, true, true, true]),
+            ("git_status", [true, true, true, true]),
+            ("git_diff", [true, true, true, true]),
+            ("write_file", [false, true, false, true]),
+            ("apply_patch", [false, true, false, true]),
+            ("edit_file", [false, true, false, true]),
+            ("bash", [false, false, true, true]),
+            ("exec", [false, true, true, true]),
+            ("future_native_tool", [false, false, false, true]),
+        ];
+        let profiles = [
+            CatalogProfile::Readonly,
+            CatalogProfile::Coding,
+            CatalogProfile::Ops,
+            CatalogProfile::Full,
+        ];
+        for (name, expected) in native {
+            for (profile, allowed) in profiles.into_iter().zip(expected) {
+                assert_eq!(
+                    profile.allows(ToolSource::Native, name),
+                    allowed,
+                    "native `{name}` under {profile:?}"
+                );
+            }
+        }
+
+        for source in [ToolSource::Wasm, ToolSource::Mcp, ToolSource::Delegation] {
+            for name in [
+                "read_file",
+                "write_file",
+                "bash",
+                "echo_json",
+                "mcp__srv__search",
+                "delegate_task",
+                "future_native_tool",
+            ] {
+                assert!(
+                    !CatalogProfile::Readonly.allows(source, name),
+                    "{source:?} `{name}` must be hidden by readonly"
+                );
+                assert!(
+                    !CatalogProfile::Coding.allows(source, name),
+                    "{source:?} `{name}` must be hidden by coding"
+                );
+                assert!(
+                    !CatalogProfile::Ops.allows(source, name),
+                    "{source:?} `{name}` must be hidden by ops"
+                );
+                assert!(
+                    CatalogProfile::Full.allows(source, name),
+                    "{source:?} `{name}` must be exposed by full"
+                );
+            }
+        }
+
+        assert_eq!(CatalogProfile::default(), CatalogProfile::Full);
+    }
+
+    #[test]
+    fn retain_removes_only_entries_the_predicate_rejects() {
+        let mut catalog = ToolCatalog::new();
+        catalog
+            .insert(entry("read_file"))
+            .expect("read_file insert");
+        catalog
+            .insert(entry("write_file"))
+            .expect("write_file insert");
+        catalog.insert(entry("bash")).expect("bash insert");
+
+        catalog.retain(|entry| {
+            CatalogProfile::Readonly.allows(entry.descriptor.source, &entry.descriptor.name)
+        });
+
+        assert_eq!(catalog.names().collect::<Vec<_>>(), vec!["read_file"]);
     }
 }

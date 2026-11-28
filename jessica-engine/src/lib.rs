@@ -13,6 +13,15 @@
 //! memory/skill post-processing, delegation parent assembly, and resume.
 //! [`TracePolicy::Required`] is the default: a required turn trace is opened
 //! before any provider call and only succeeds after `turn_ended` is durable.
+//! The configured [`CatalogProfile`] is applied to the host catalog before
+//! exposure budgets, delegation parent capabilities, and the model-visible
+//! registry are computed.
+//!
+//! Artifact storage, bounded result management, and the [`ReadArtifactTool`]
+//! are owned here. [`ArtifactStore`] writes the CLI-compatible v1 sidecar and
+//! validates it on every read; [`ResultManager`] runs cleanup at most once per
+//! turn and lets `read_artifact` results bypass management. The CLI supplies
+//! [`ResultConfig`] and uses the same manager and tool.
 //!
 //! [`Engine::run_turn_request`] and [`Engine::resume_turn`] are the complete
 //! turn entry points: fixed initial message ordering, one memory and one skill
@@ -59,7 +68,8 @@ mod tooling;
 
 pub use api::{Engine, EngineBuilder, TurnOutcome, TurnRequest};
 pub use artifacts::{
-    ArtifactError, ArtifactPage, ArtifactStore, CleanupReport, ResultManager, StoredArtifact,
+    ArtifactError, ArtifactPage, ArtifactStore, CleanupReport, READ_ARTIFACT_TOOL,
+    ReadArtifactTool, ResultManager, StoredArtifact,
 };
 pub use config::{
     AcceptanceConfig, ApprovalConfig, ApprovalMode, CatalogLimits, EngineConfig, PolicyConfig,
@@ -77,8 +87,8 @@ pub use ports::{
 pub use pump::{EventPump, LagHandling, PumpIntegrity, PumpOutput, SessionSnapshot};
 pub use recorder::{EventJournal, EventRecorder, RecorderError, SqliteTraceStore, StoredSession};
 pub use tooling::{
-    ApprovalPolicy, Capabilities, PolicyHints, ResultFormat, ToolAnnotations, ToolCatalog,
-    ToolDescriptor, ToolEntry, ToolLimits, ToolMetadata, ToolSource, digest_schema,
+    ApprovalPolicy, Capabilities, CatalogProfile, PolicyHints, ResultFormat, ToolAnnotations,
+    ToolCatalog, ToolDescriptor, ToolEntry, ToolLimits, ToolMetadata, ToolSource, digest_schema,
     policy_hints_for, result_format_for,
 };
 

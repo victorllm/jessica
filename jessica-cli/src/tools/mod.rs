@@ -7,6 +7,7 @@ mod runner;
 use std::path::Path;
 
 use jessica_core::tool::Tool;
+use jessica_engine::{ArtifactStore, ReadArtifactTool};
 use jessica_runtime::{DELEGATE_TASK_TOOL_NAME, delegate_task_schema};
 use jessica_tools::{
     ApplyPatchTool, BashTool, CommandRunner, EditFileTool, ExecTool, GitOperation, GitTool,
@@ -14,13 +15,11 @@ use jessica_tools::{
 };
 
 use crate::app::{CliError, load_wasm_tools};
-use crate::artifacts::ReadArtifactTool;
 use crate::config::HarnessConfig;
 
 pub(crate) use catalog::{CatalogCandidate, CatalogEntry, CatalogError, ToolCatalog};
 pub(crate) use descriptor::{
-    ApprovalPolicy, Capabilities, ResultFormat, ToolAnnotations, ToolDescriptor, ToolMetadata,
-    ToolSource, result_format_for,
+    ResultFormat, ToolAnnotations, ToolMetadata, ToolSource, result_format_for,
 };
 
 use std::sync::Arc;
@@ -69,7 +68,13 @@ pub(crate) fn native_candidates(root: &Path, config: &HarnessConfig) -> Vec<Cata
     let write: Arc<dyn Tool> = Arc::new(WriteFileTool::new(root.to_path_buf()));
     let apply_patch: Arc<dyn Tool> = Arc::new(ApplyPatchTool::new(root.to_path_buf()));
     let edit_file: Arc<dyn Tool> = Arc::new(EditFileTool::new(root.to_path_buf()));
-    let read_artifact: Arc<dyn Tool> = Arc::new(ReadArtifactTool::from_config(root, config));
+    let result_config = config
+        .tools
+        .to_result_config(config.budget.max_result_bytes);
+    let read_artifact: Arc<dyn Tool> = Arc::new(ReadArtifactTool::new(
+        Arc::new(ArtifactStore::from_result_config(root, &result_config)),
+        result_config.max_inline_bytes,
+    ));
     let list_dir: Arc<dyn Tool> = Arc::new(ListDirTool::new(
         root.to_path_buf(),
         ListDirOptions {

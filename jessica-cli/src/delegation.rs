@@ -30,11 +30,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use jessica_core::tool::{Tool, ToolSchema};
 use jessica_core::types::ToolResult;
+use jessica_engine::ToolResultManager;
 use jessica_runtime::{ChildToolFactory, DelegationError};
 use jessica_tools::{BashTool, CommandRunner, ExecTool, ReadFileTool, WriteFileTool};
 use serde_json::Value;
 
-use crate::artifacts::ResultManager;
 use crate::config::{HarnessConfig, ResolvedSupervisor};
 use crate::tools::{HarnessCommandRunner, ResultFormat, ToolSource, result_format_for};
 
@@ -49,7 +49,7 @@ pub(crate) struct NativeChildToolFactory {
     /// Effective child `exec` deadline.
     exec_timeout: Duration,
     /// Parent turn result manager.
-    result_manager: Arc<ResultManager>,
+    result_manager: Arc<dyn ToolResultManager>,
 }
 
 impl NativeChildToolFactory {
@@ -57,7 +57,7 @@ impl NativeChildToolFactory {
     pub(crate) fn new(
         root: PathBuf,
         config: &HarnessConfig,
-        result_manager: Arc<ResultManager>,
+        result_manager: Arc<dyn ToolResultManager>,
     ) -> Self {
         Self {
             supervisor: config.resolved_supervisor(),
@@ -122,7 +122,7 @@ struct ManagedChildTool {
     /// Executable child tool.
     inner: Arc<dyn Tool>,
     /// Parent turn result manager.
-    manager: Arc<ResultManager>,
+    manager: Arc<dyn ToolResultManager>,
     /// Result shape used when rendering an artifact envelope.
     format: ResultFormat,
 }
@@ -177,9 +177,21 @@ mod tests {
         }
     }
 
+    /// Builds the engine result manager for one test configuration.
+    fn result_manager(root: &Path, config: &HarnessConfig) -> Arc<dyn ToolResultManager> {
+        let result_config = config
+            .tools
+            .to_result_config(config.budget.max_result_bytes);
+        Arc::new(jessica_engine::ResultManager::new(
+            root,
+            &result_config,
+            config.budget.max_result_bytes,
+        ))
+    }
+
     fn factory(root: &Path) -> NativeChildToolFactory {
         let config = HarnessConfig::default();
-        let manager = Arc::new(ResultManager::new(root, &config));
+        let manager = result_manager(root, &config);
         NativeChildToolFactory::new(root.to_path_buf(), &config, manager)
     }
 
@@ -253,7 +265,7 @@ mod tests {
              [tools.supervisor]\nmax_output_bytes = 128\n",
         )
         .expect("test config must parse");
-        let manager = Arc::new(ResultManager::new(&temp.path, &config));
+        let manager = result_manager(&temp.path, &config);
         let factory = NativeChildToolFactory::new(temp.path.clone(), &config, manager);
         let tools = build(&factory, &["bash"]).expect("bash must build");
 
@@ -290,7 +302,7 @@ mod tests {
              [tools.bash]\nenabled = true\n",
         )
         .expect("test config must parse");
-        let manager = Arc::new(ResultManager::new(&temp.path, &config));
+        let manager = result_manager(&temp.path, &config);
         let factory = NativeChildToolFactory::new(temp.path.clone(), &config, manager);
         let tools = build(&factory, &["bash"]).expect("bash must build");
 
@@ -317,7 +329,7 @@ mod tests {
     async fn child_exec_runs_through_the_supervisor_with_a_cleared_environment() {
         let temp = TempDir::new("exec");
         let config = HarnessConfig::default();
-        let manager = Arc::new(ResultManager::new(&temp.path, &config));
+        let manager = result_manager(&temp.path, &config);
         let factory = NativeChildToolFactory::new(temp.path.clone(), &config, manager);
         let tools = build(&factory, &["exec"]).expect("exec must build");
 

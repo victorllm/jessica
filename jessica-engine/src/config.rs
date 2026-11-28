@@ -10,6 +10,8 @@ use std::time::Duration;
 use jessica_core::types::Budget;
 use jessica_runtime::DelegationLimits;
 
+use crate::tooling::CatalogProfile;
+
 /// Default wall-clock timeout for one governed tool execution.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default hard cap on a tool result entering the model context.
@@ -270,6 +272,7 @@ pub struct EngineConfig {
     acceptance: Option<AcceptanceConfig>,
     result: ResultConfig,
     catalog_limits: CatalogLimits,
+    catalog_profile: CatalogProfile,
     delegation: Option<DelegationLimits>,
     trace_policy: TracePolicy,
 }
@@ -292,6 +295,7 @@ impl EngineConfig {
             acceptance: None,
             result: ResultConfig::default(),
             catalog_limits: CatalogLimits::default(),
+            catalog_profile: CatalogProfile::Full,
             delegation: None,
             trace_policy,
         }
@@ -356,6 +360,17 @@ impl EngineConfig {
         self
     }
 
+    /// Replaces the tool-catalog profile.
+    ///
+    /// The profile is applied to every host-provided catalog before exposure
+    /// budgets, delegation parent capabilities, and the model-visible registry
+    /// are computed. [`CatalogProfile::Full`] preserves the full catalog and is
+    /// the default.
+    pub fn with_catalog_profile(mut self, catalog_profile: CatalogProfile) -> Self {
+        self.catalog_profile = catalog_profile;
+        self
+    }
+
     /// Enables delegation for fresh turns with `delegation` limits.
     ///
     /// `None` disables delegation. The engine requires a
@@ -412,6 +427,11 @@ impl EngineConfig {
         self.catalog_limits
     }
 
+    /// Returns the tool-catalog profile.
+    pub fn catalog_profile(&self) -> CatalogProfile {
+        self.catalog_profile
+    }
+
     /// Returns the delegation limits, or `None` when delegation is disabled.
     pub fn delegation(&self) -> Option<DelegationLimits> {
         self.delegation
@@ -461,6 +481,15 @@ mod tests {
 
         assert_eq!(config.budget().max_tokens, 0);
         assert_eq!(config.trace_policy(), TracePolicy::Disabled);
+    }
+
+    #[test]
+    fn the_catalog_profile_defaults_to_full_and_is_snapshotted() {
+        let default = EngineConfig::new(TracePolicy::Disabled);
+        assert_eq!(default.catalog_profile(), CatalogProfile::Full);
+
+        let readonly = default.with_catalog_profile(CatalogProfile::Readonly);
+        assert_eq!(readonly.catalog_profile(), CatalogProfile::Readonly);
     }
 
     #[test]

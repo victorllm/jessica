@@ -8,7 +8,7 @@ use jessica_core::llm::{LlmError, LlmProvider};
 use jessica_core::tool::Tool;
 use jessica_core::types::{Message, SessionEndReason, SessionId};
 use jessica_engine::replay::ReplayError;
-use jessica_engine::{EventRecorder, RecorderError, UpdateSink};
+use jessica_engine::{EventRecorder, PolicyError, RecorderError, UpdateSink};
 use jessica_runtime::{DelegationError, recover_session};
 use jessica_tools::WasmTool;
 use thiserror::Error;
@@ -20,7 +20,6 @@ use crate::config::{ConfigError, HarnessConfig};
 use crate::engine_ports::build_engine;
 use crate::governance::ToolPermissionGate;
 use crate::memory::MemoryAssembly;
-use crate::policy_v2::PolicyError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
 use crate::tools::{CatalogCandidate, CatalogError, ToolAnnotations, ToolMetadata};
@@ -743,7 +742,7 @@ impl From<jessica_engine::EngineError> for CliError {
             Engine::Recorder(error) => Self::Events(error),
             Engine::Recovery(error) => Self::Recovery(error),
             Engine::Delegation(error) => Self::Delegation(error),
-            Engine::Policy(error) => Self::PolicyV2(cli_policy_error(error)),
+            Engine::Policy(error) => Self::PolicyV2(error),
             Engine::Workspace { root, source } => Self::CanonicalizeRoot { path: root, source },
             Engine::CatalogTooLarge { exposed, limit } => {
                 Self::ToolCatalog(CatalogError::TooManyTools { exposed, limit })
@@ -757,21 +756,6 @@ impl From<jessica_engine::EngineError> for CliError {
             }
             other => Self::Engine(Box::new(other)),
         }
-    }
-}
-
-/// Maps an engine policy error back to the CLI's structural policy error.
-fn cli_policy_error(error: jessica_engine::PolicyError) -> PolicyError {
-    use jessica_engine::PolicyError as Engine;
-    match error {
-        Engine::Root { root, source } => PolicyError::Root { root, source },
-        Engine::EmptyPath => PolicyError::EmptyPath,
-        Engine::Escape { path } => PolicyError::Escape { path },
-        Engine::NotFound { path } => PolicyError::NotFound { path },
-        Engine::Io { path, source } => PolicyError::Io { path, source },
-        Engine::NonUtf8 { path } => PolicyError::NonUtf8 { path },
-        Engine::InvalidGlob { glob, reason } => PolicyError::InvalidGlob { glob, reason },
-        Engine::InvalidPatch { reason } => PolicyError::InvalidPatch { reason },
     }
 }
 

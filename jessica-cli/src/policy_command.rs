@@ -8,11 +8,12 @@
 use std::path::Path;
 
 use jessica_core::types::ToolCall;
+use jessica_engine::{PolicyTool, PolicyV2, PolicyVerdict};
 use serde_json::Value;
 
 use crate::app::CliError;
 use crate::config::HarnessConfig;
-use crate::policy_v2::{PolicyTool, PolicyV2};
+use crate::engine_ports::{engine_approval, engine_policy};
 use crate::tools::{CatalogError, inspection_catalog};
 
 /// Subcommand requested under `jessica policy`.
@@ -72,22 +73,37 @@ async fn simulate(
         });
     }
 
-    let policy = PolicyV2::new(root, config).await?;
+    let policy_config = engine_policy(&config.policy);
+    let approval_config = engine_approval(&config.approval);
+    let policy = PolicyV2::new(root, &policy_config, &approval_config).await?;
     let call = ToolCall::new("policy-simulate", name, arguments);
     let verdict = policy
         .evaluate(&PolicyTool::from_descriptor(&entry.descriptor), &call)
         .await?;
-    let (decision, approval) = verdict.explain();
+    let (decision, approval) = verdict_output(&verdict);
     let rule = verdict.rule_id().unwrap_or("-");
     let reason = single_line(verdict.reason());
 
     println!("tool: {name}");
     println!("source: {}", entry.descriptor.source.as_str());
-    println!("decision: {}", decision.as_str());
+    println!("decision: {decision}");
     println!("rule: {rule}");
-    println!("approval: {}", approval.as_str());
+    println!("approval: {approval}");
     println!("reason: {reason}");
     Ok(())
+}
+
+/// Maps an engine verdict to the stable `decision` and `approval` labels
+/// reported by `policy simulate`.
+fn verdict_output(verdict: &PolicyVerdict) -> (&'static str, &'static str) {
+    match verdict {
+        PolicyVerdict::Allow { .. } => ("allow", "not_required"),
+        PolicyVerdict::Legacy { sensitive: true } => ("allow", "interactive"),
+        PolicyVerdict::Legacy { sensitive: false } => ("allow", "not_required"),
+        PolicyVerdict::AutoApprove { .. } => ("allow", "auto_approved"),
+        PolicyVerdict::Ask { .. } => ("ask", "ask"),
+        PolicyVerdict::Deny { .. } => ("deny", "denied"),
+    }
 }
 
 /// Collapses line breaks so each reported field stays one line.

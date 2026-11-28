@@ -1,6 +1,6 @@
 # Jessica 架构（当前实现）
 
-> 状态快照：2026-11-23，对应 workspace 版本 `0.11.0`。
+> 状态快照：2026-11-28，对应 workspace 版本 `0.12.0`。
 >
 > 本文只描述**已经落地并可验收**的架构，不描述未来计划。`README.md` 面向使用与行为说明，`PLAN.md` 面向任务与进度，本文面向代码结构与运行时数据流。若三者冲突，以代码与验收测试为准。
 
@@ -76,7 +76,7 @@ Jessica 是一个确定性 Rust Agent 运行时，核心目标不是让模型“
 
 ## 3. Workspace 与依赖方向
 
-Workspace 使用 `resolver = "2"`，版本单一来源为根 `Cargo.toml` 的 `[workspace.package] version = "0.11.0"`。
+Workspace 使用 `resolver = "2"`，版本单一来源为根 `Cargo.toml` 的 `[workspace.package] version = "0.12.0"`。
 
 | Crate | 角色 | 允许的内部依赖 | 关键实现依赖 |
 | --- | --- | --- | --- |
@@ -203,7 +203,7 @@ graph TD
 - `LlmProvider::stream_chat` 返回 `BoxStream<LlmEvent>`；实现负责网络和流式解析，运行时只消费文本增量、工具调用请求、用量和错误。
 - `Tool` 同时支持按参数执行和 `execute_with_call`；AgentLoop 负责给结果盖上原始 tool call id，避免工具实现伪造关联。
 - `Guard` 是纯判定函数：不调用模型、不做 I/O、不读墙钟。有状态 Guard（如 stuck detection）由宿主按会话/轮次构造。
-- `Policy` 只有 allow/deny 两态；三态策略（deny/ask/allow）由 engine 的 `PolicyV2` 在工具执行前执行，CLI 只为 `policy simulate` 保留只读 dry-run 评估器；两者都不进入冻结契约。
+- `Policy` 只有 allow/deny 两态；三态策略（deny/ask/allow）由 engine 的 `PolicyV2` 在工具执行前执行，CLI 的 `policy simulate` 复用同一 engine 实现做只读 dry-run；两者都不进入 `jessica-core` 契约。
 - `Sensor` 在工具结果产生后运行；`Hook` 在生命周期节点运行。两者都是扩展点，不决定内核循环结构。
 - `EventSink` 位于广播之前：生产者必须先 `emit` 成功，再广播事件；sink 失败必须终止本轮，而不是静默丢事件。
 
@@ -393,16 +393,16 @@ engine 不依赖终端、ACP、TOML、HTTP 或 wasmtime；这些留在适配器�
 engine 的 `build_turn_setup` 按以下顺序装配（CLI 不再保有这些步骤）：
 
 1. **Guards**：token、tool timeout、stuck、result size。
-2. **Policy**：`AllowlistPolicy` + 宿主侧 `PolicyV2`。
+2. **Policy**：`AllowlistPolicy` + engine `PolicyV2`（规则来自宿主配置）。
 3. **审批门**：ACP 协议门或 CLI 终端门。
 4. **Sensors**：可选的命令传感器。
 5. **Harness**：装配 guards、policy、sensors，取得事件广播通道。
 6. **TurnJournal**：生产者侧持久化 sink，绑定本轮取消 token。
 7. **GovernanceState**：把预算、事件和取消状态绑在一起；所有治理事件先进入 journal。
 8. **TokenCountingProvider**：包住 provider，观察 usage 并扣预算。
-9. **基础 ToolCatalog**：native + 进程级 WASM + 会话级 MCP，先按 policy/profile 过滤。
-10. **子 Agent 执行器**：父 catalog 暴露的原生工具集合作为 narrowing 依据。
-11. **最终 catalog**：加入 `delegate_task`（若启用）后重新构建并检查暴露预算。
+9. **基础 ToolCatalog**：native + 进程级 WASM + 会话级 MCP；engine 在 provider 返回后立即按 `EngineConfig::catalog_profile` 过滤，CLI 只上报 `not in tools.profile` 的 hidden reason。
+10. **子 Agent 执行器**：过滤后的父 catalog 原生工具集合作为 narrowing 依据，因此 profile 排除的工具不会成为子工具。
+11. **最终 catalog**：加入 `delegate_task`（若启用）后检查暴露预算；预算只统计 profile ∩ allowlist 的条目。
 12. **GovernedTool 注册表**：只包装最终暴露的工具。
 13. **AgentLoop**：绑定 counting provider、registry、budget、events 和 journal sink。
 14. **EventPump**：从 harness 广播通道消费事件，重建 transcript、渲染、跑传感器、检查 guards。
@@ -635,7 +635,7 @@ sequenceDiagram
 3. PolicyV2（deny / ask / allow / legacy）
 4. 审批门（ask 或 legacy sensitive）
 5. tokio::time::timeout(tool_timeout, execute_with_call)
-6. ResultManager（大结果落 artifact，返回有界预览）
+6. Engine ResultManager（大结果落 artifact，返回有界预览；`read_artifact` 自身结果绕过）
 7. ResultSizeGuard 最终兜底
 ```
 
@@ -779,6 +779,8 @@ Provider 提供的 annotations（MCP `annotations`、WASM manifest v2）是**不
 
 未暴露的工具**不注册**：不会出现在 provider schema 中，模型虚构该名称只会得到 `unknown tool`。`jessica tools list --all` 会解释每个隐藏原因；`inspect` 会显示 descriptor、能力和 schema digest。
 
+`tools.profile` 的表本身归 engine 所有（E1f）：`CatalogProfile::{Readonly, Coding, Ops, Full}` 的 `allows` 决定 source/name 组合，CLI 的 `ToolProfile` 只做 TOML 解析并映射到该枚举。engine 的两个完整 turn 入口都在 provider 返回后、catalog 预算、delegation 装配和 registry 注册之前应用 profile；CLI provider 仍负责省略 policy 不允许或 `bash` 被禁用的工具，但不决定 profile。CLI 的 `tools list --all`/`inspect` 复用同一 `CatalogProfile::allows` 计算 hidden reason，因此报告与轮次行为一致。
+
 Catalog 还会检查：
 
 - 最大暴露工具数；
@@ -790,7 +792,7 @@ Catalog 还会检查：
 
 ### 8.4 Policy v2 的判定顺序
 
-`PolicyV2` 位于 engine 的治理层（CLI 的 `policy simulate` 有自己的只读评估器），不进入 `jessica-core`。固定顺序：
+`PolicyV2` 位于 engine 的治理层，CLI 的 `policy simulate` 复用同一实现做只读 dry-run（E1e），不进入 `jessica-core`。固定顺序：
 
 1. 匹配的 `deny` 规则（按配置顺序）；
 2. 编辑器工具的受保护路径默认拒绝（除非匹配 `allow` 规则）；
@@ -887,8 +889,10 @@ Artifact 存储：
 - sidecar JSON 记录大小、工具名、创建时间、digest、原始大小、截断标志；
 - sidecar 不含凭据、环境变量、工具参数或命令文本；
 - artifact 正文不脱敏，**未加密**，可能包含任意工具输出；
-- 每轮首次 oversized 写入前运行一次有界清理：先删过期，再按总字节预算删最旧；
+- 每轮首次 oversized 写入前运行一次有界清理：按 sidecar `created_at` 先删过期，再按 data + sidecar 总字节预算删最旧；
 - 清理或写入失败只降级为有界 fallback 预览，不改变工具调用结果。
+
+`ArtifactStore`、`ResultManager`、`ReadArtifactTool` 与 v1 sidecar 校验的实现只在 `jessica-engine/src/artifacts.rs`；CLI 只从 TOML 生成 `ResultConfig`，并把同一个 engine manager 传给主 turn 与 delegation 子工具。engine 旧版无 sidecar 的 artifact 不在兼容范围内，读取会失败关闭。
 
 ---
 
@@ -1364,13 +1368,12 @@ cargo clippy -p <crate> -- -D warnings
 | Engine 公共 API / turn 编排 | `jessica-engine/src/{lib,api,config,ports,error}.rs` |
 | Engine 治理链 / 工具装配 | `jessica-engine/src/{governance,policy,tooling,journal,pump}.rs` |
 | Engine 事件存储与离线回放 | `jessica-engine/src/{recorder,replay}.rs` |
-| Engine artifact / result | `jessica-engine/src/artifacts.rs` |
+| Engine artifact / result / `read_artifact` | `jessica-engine/src/artifacts.rs` |
 | Embedder 示例 | `jessica-engine/examples/governed_turn.rs` |
 | CLI 组合根与端口适配 | `jessica-cli/src/{app,engine_ports}.rs` |
 | 配置 | `jessica-cli/src/config.rs` |
-| 工具目录与 descriptor | `jessica-cli/src/tools/{mod,catalog,descriptor}.rs` |
-| CLI 审批门与 `policy simulate` | `jessica-cli/src/{governance,policy_v2}.rs` |
-| CLI Result Manager 适配 | `jessica-cli/src/artifacts.rs` |
+| 工具目录与 descriptor | `jessica-engine/src/tooling.rs`（descriptor、`CatalogProfile`、catalog）；`jessica-cli/src/tools/{mod,catalog,descriptor}.rs`（候选装配、hidden reason 报告） |
+| CLI 审批门与 `policy simulate` | `jessica-cli/src/{governance,policy_command}.rs` |
 | 子 Agent 工厂 | `jessica-cli/src/delegation.rs` |
 | ACP | `jessica-cli/src/{acp,acp_events,acp_session,acp_store}.rs` |
 | MCP | `jessica-cli/src/mcp.rs` |

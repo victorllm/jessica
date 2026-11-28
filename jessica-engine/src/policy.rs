@@ -979,6 +979,77 @@ mod tests {
         }
     }
 
+    /// Builds the host facts for a native file tool.
+    fn file_tool(name: &str) -> PolicyTool {
+        PolicyTool {
+            name: name.to_owned(),
+            source: ToolSource::Native,
+            capabilities: Capabilities::for_tool(ToolSource::Native, name),
+            path_field: Some(if name == "apply_patch" {
+                "patch".to_owned()
+            } else {
+                "path".to_owned()
+            }),
+            legacy_sensitive: matches!(name, "write_file" | "apply_patch" | "edit_file"),
+        }
+    }
+
+    /// Builds the host facts for the `exec` tool.
+    fn exec_tool() -> PolicyTool {
+        PolicyTool {
+            name: "exec".to_owned(),
+            source: ToolSource::Native,
+            capabilities: Capabilities::for_tool(ToolSource::Native, "exec"),
+            path_field: None,
+            legacy_sensitive: true,
+        }
+    }
+
+    /// Builds the host facts for the `bash` tool.
+    fn bash_tool() -> PolicyTool {
+        PolicyTool {
+            name: "bash".to_owned(),
+            source: ToolSource::Native,
+            capabilities: Capabilities::for_tool(ToolSource::Native, "bash"),
+            path_field: None,
+            legacy_sensitive: true,
+        }
+    }
+
+    /// Builds the host facts for a destructive MCP tool.
+    fn mcp_tool() -> PolicyTool {
+        PolicyTool {
+            name: "mcp__srv__wipe".to_owned(),
+            source: ToolSource::Mcp,
+            capabilities: Capabilities::for_tool(ToolSource::Mcp, "wipe"),
+            path_field: None,
+            legacy_sensitive: false,
+        }
+    }
+
+    /// Builds one synthetic tool call.
+    fn call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall::new("call-1", name, arguments)
+    }
+
+    /// Builds a policy snapshot with the tools these tests exercise allowlisted.
+    fn policy_config(rules: Vec<PolicyRule>) -> PolicyConfig {
+        PolicyConfig {
+            allowed_tools: ["read_file", "write_file", "exec", "bash", "delegate_task"]
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            rules,
+        }
+    }
+
+    /// Builds an evaluator from the test's rules and approval snapshot.
+    async fn evaluator(root: &Path, rules: Vec<PolicyRule>, approval: ApprovalConfig) -> PolicyV2 {
+        PolicyV2::new(root, &policy_config(rules), &approval)
+            .await
+            .expect("policy must build")
+    }
+
     fn approval(mode: ApprovalMode, explicit: bool) -> ApprovalConfig {
         ApprovalConfig { mode, explicit }
     }
@@ -1146,8 +1217,23 @@ mod tests {
         assert!(!glob_matches("src/*.rs", "src/nested/main.rs").expect("glob"));
         assert!(glob_matches("src/**/*.rs", "src/main.rs").expect("glob"));
         assert!(glob_matches("src/**/*.rs", "src/a/b/main.rs").expect("glob"));
+        assert!(glob_matches("src/**", "src/a/b").expect("glob"));
         assert!(glob_matches("?.txt", "a.txt").expect("glob"));
         assert!(!glob_matches("?.txt", "ab.txt").expect("glob"));
+        assert!(!glob_matches("?.txt", ".txt").expect("glob"));
+        assert!(
+            glob_matches("[abc].txt", "[abc].txt").expect("brackets are literal"),
+            "character classes are not implemented"
+        );
+        assert!(!glob_matches("[abc].txt", "a.txt").expect("brackets are literal"));
+        assert!(glob_matches("a\\*b", "a\\*b").expect("backslash is literal"));
+        assert!(glob_matches("secrets/**", "secrets/keys/id").expect("glob"));
+        assert!(
+            glob_matches("secrets/**", "secrets").expect("glob"),
+            "** matches zero or more segments"
+        );
+        assert!(glob_matches("**", "a/b").expect("glob"));
+        assert!(glob_matches("**", ".").expect("glob"));
     }
 
     #[test]
@@ -1282,5 +1368,494 @@ mod tests {
 
         assert_eq!(verdict.rule_id(), Some("deny-source"));
         assert!(matches!(verdict, PolicyVerdict::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn ask_rules_win_over_allow_rules_and_the_first_ask_match_wins() {
+        let temp = TempDir::new("ask-priority");
+        let policy = evaluator(
+            &temp.path,
+            vec![
+                rule(
+                    "first-ask",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("read_file".to_owned())),
+                    None,
+                ),
+                rule(
+                    "second-ask",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("read_file".to_owned())),
+                    None,
+                ),
+                rule(
+                    "allow",
+                    RuleAction::Allow,
+                    Some(ToolSelector::One("read_file".to_owned())),
+                    None,
+                ),
+            ],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(
+                &file_tool("read_file"),
+                &call("read_file", json!({"path": "a"})),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        assert_eq!(verdict.rule_id(), Some("first-ask"));
+        assert!(matches!(verdict, PolicyVerdict::Ask { .. }));
+    }
+
+    #[tokio::test]
+    async fn path_rules_match_canonical_workspace_relative_paths() {
+        let temp = TempDir::new("paths");
+        std::fs::create_dir_all(temp.path.join("secrets")).expect("directory must exist");
+        std::fs::write(temp.path.join("secrets/token.txt"), "secret").expect("file must exist");
+        std::fs::create_dir_all(temp.path.join("public")).expect("directory must exist");
+        std::fs::write(temp.path.join("public/note.txt"), "note").expect("file must exist");
+        let policy = evaluator(
+            &temp.path,
+            vec![rule(
+                "protect-secrets",
+                RuleAction::Deny,
+                Some(ToolSelector::One("read_file".to_owned())),
+                Some("secrets/**"),
+            )],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let denied = policy
+            .evaluate(
+                &file_tool("read_file"),
+                &call("read_file", json!({"path": "secrets/token.txt"})),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(denied.rule_id(), Some("protect-secrets"));
+
+        let allowed = policy
+            .evaluate(
+                &file_tool("read_file"),
+                &call("read_file", json!({"path": "./public/../public/note.txt"})),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert!(matches!(allowed, PolicyVerdict::Allow { rule: None, .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escape_is_a_structured_path_error() {
+        let temp = TempDir::new("escape-root");
+        let outside = TempDir::new("escape-outside");
+        std::fs::write(outside.path.join("secret.txt"), "outside").expect("file must exist");
+        std::os::unix::fs::symlink(&outside.path, temp.path.join("link"))
+            .expect("symlink must be created");
+        let policy = evaluator(
+            &temp.path,
+            vec![rule(
+                "protect",
+                RuleAction::Deny,
+                Some(ToolSelector::One("read_file".to_owned())),
+                Some("**/secret.txt"),
+            )],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let error = policy
+            .evaluate(
+                &file_tool("read_file"),
+                &call("read_file", json!({"path": "link/secret.txt"})),
+            )
+            .await
+            .expect_err("a symlink escape must fail closed");
+        assert!(
+            matches!(error, PolicyError::Escape { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dangling_symlink_cannot_be_used_as_a_write_target() {
+        let temp = TempDir::new("dangling-root");
+        let outside = TempDir::new("dangling-outside");
+        std::os::unix::fs::symlink(outside.path.join("created.txt"), temp.path.join("dangling"))
+            .expect("symlink must be created");
+        let policy = evaluator(
+            &temp.path,
+            vec![rule(
+                "protect",
+                RuleAction::Deny,
+                Some(ToolSelector::One("write_file".to_owned())),
+                Some("**"),
+            )],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let error = policy
+            .evaluate(
+                &file_tool("write_file"),
+                &call(
+                    "write_file",
+                    json!({"path": "dangling", "content": "escape"}),
+                ),
+            )
+            .await
+            .expect_err("a dangling symlink must not be followed for writes");
+        assert!(
+            matches!(error, PolicyError::Escape { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_rules_match_program_argument_prefix_and_cwd() {
+        let temp = TempDir::new("exec-match");
+        std::fs::create_dir_all(temp.path.join("sub")).expect("cwd must exist");
+        let mut protect = rule(
+            "protect-git-push",
+            RuleAction::Deny,
+            Some(ToolSelector::One("exec".to_owned())),
+            Some("sub/**"),
+        );
+        protect.program = Some("git".to_owned());
+        protect.args_prefix = Some(vec!["push".to_owned(), "--force".to_owned()]);
+        let policy = evaluator(
+            &temp.path,
+            vec![protect],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let denied = policy
+            .evaluate(
+                &exec_tool(),
+                &call(
+                    "exec",
+                    json!({"program": "git", "args": ["push", "--force", "origin"], "cwd": "sub"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(denied.rule_id(), Some("protect-git-push"));
+
+        for arguments in [
+            json!({"program": "git", "args": ["push", "origin"], "cwd": "sub"}),
+            json!({"program": "git", "args": ["status"], "cwd": "sub"}),
+            json!({"program": "git", "args": ["push", "--force"], "cwd": "."}),
+        ] {
+            let allowed = policy
+                .evaluate(&exec_tool(), &call("exec", arguments))
+                .await
+                .expect("policy must evaluate");
+            assert!(
+                matches!(allowed, PolicyVerdict::Legacy { sensitive: true }),
+                "non-matching exec must fall back to legacy approval: {allowed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_commands_are_never_parsed_as_program_or_paths() {
+        let temp = TempDir::new("bash-opaque");
+        std::fs::create_dir_all(temp.path.join("secrets")).expect("directory must exist");
+        let mut dangerous = rule(
+            "no-rm",
+            RuleAction::Deny,
+            Some(ToolSelector::One("bash".to_owned())),
+            None,
+        );
+        dangerous.program = Some("rm".to_owned());
+        dangerous.args_prefix = Some(vec!["-rf".to_owned()]);
+        let policy = evaluator(
+            &temp.path,
+            vec![dangerous],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(
+                &bash_tool(),
+                &call("bash", json!({"command": "rm -rf secrets"})),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        assert!(
+            matches!(verdict, PolicyVerdict::Legacy { sensitive: true }),
+            "bash text must not satisfy program/args conditions: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_approval_modes_are_observable_for_sensitive_and_mcp_tools() {
+        let temp = TempDir::new("approval-modes");
+
+        let deny = evaluator(&temp.path, vec![], approval(ApprovalMode::Deny, true)).await;
+        let verdict = deny
+            .evaluate(&exec_tool(), &call("exec", json!({"program": "true"})))
+            .await
+            .expect("policy must evaluate");
+        assert!(matches!(verdict, PolicyVerdict::Deny { .. }));
+
+        let allow = evaluator(&temp.path, vec![], approval(ApprovalMode::Allow, true)).await;
+        let verdict = allow
+            .evaluate(&exec_tool(), &call("exec", json!({"program": "true"})))
+            .await
+            .expect("policy must evaluate");
+        assert!(matches!(verdict, PolicyVerdict::AutoApprove { .. }));
+
+        let ask = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, true)).await;
+        let verdict = ask
+            .evaluate(&mcp_tool(), &call("mcp__srv__wipe", json!({})))
+            .await
+            .expect("policy must evaluate");
+        assert!(
+            matches!(verdict, PolicyVerdict::Ask { .. }),
+            "explicit approval must treat destructive MCP tools conservatively: {verdict:?}"
+        );
+
+        let no_approval = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, false)).await;
+        let verdict = no_approval
+            .evaluate(&mcp_tool(), &call("mcp__srv__wipe", json!({})))
+            .await
+            .expect("policy must evaluate");
+        assert!(
+            matches!(verdict, PolicyVerdict::Allow { .. }),
+            "without an explicit [approval] section MCP behavior must stay unchanged: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allow_rule_overrides_explicit_deny_mode() {
+        let temp = TempDir::new("allow-override");
+        let policy = evaluator(
+            &temp.path,
+            vec![rule(
+                "allow-status",
+                RuleAction::Allow,
+                Some(ToolSelector::One("exec".to_owned())),
+                None,
+            )],
+            approval(ApprovalMode::Deny, true),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(&exec_tool(), &call("exec", json!({"program": "git"})))
+            .await
+            .expect("policy must evaluate");
+
+        assert_eq!(verdict.rule_id(), Some("allow-status"));
+        assert!(matches!(verdict, PolicyVerdict::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn editor_tools_use_path_rules_and_apply_is_parsed_for_matching() {
+        let temp = TempDir::new("editor-rules");
+        std::fs::create_dir_all(temp.path.join("src")).expect("source dir must exist");
+        std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("file must exist");
+        let patch = "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n";
+        let policy = evaluator(
+            &temp.path,
+            vec![
+                rule(
+                    "deny-edit",
+                    RuleAction::Deny,
+                    Some(ToolSelector::One("edit_file".to_owned())),
+                    Some("src/**"),
+                ),
+                rule(
+                    "ask-patch",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("apply_patch".to_owned())),
+                    Some("src/**"),
+                ),
+            ],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
+
+        let edit = policy
+            .evaluate(
+                &file_tool("edit_file"),
+                &call(
+                    "edit_file",
+                    json!({"path": "src/app.txt", "old": "alpha", "new": "beta"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(edit.rule_id(), Some("deny-edit"));
+
+        let patch_verdict = policy
+            .evaluate(
+                &file_tool("apply_patch"),
+                &call("apply_patch", json!({"patch": patch})),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(patch_verdict.rule_id(), Some("ask-patch"));
+        assert!(matches!(patch_verdict, PolicyVerdict::Ask { .. }));
+    }
+
+    #[tokio::test]
+    async fn protected_paths_are_denied_unless_an_allow_rule_matches() {
+        let temp = TempDir::new("protected");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        std::fs::create_dir_all(temp.path.join(".git")).expect("git dir must exist");
+        std::fs::write(temp.path.join(".git/config"), "[core]\n").expect("config must exist");
+        let edit = file_tool("edit_file");
+
+        let no_rules = evaluator(&temp.path, vec![], approval(ApprovalMode::Allow, true)).await;
+        for path in [".env", ".git/config"] {
+            let verdict = no_rules
+                .evaluate(
+                    &edit,
+                    &call("edit_file", json!({"path": path, "old": "a", "new": "b"})),
+                )
+                .await
+                .expect("policy must evaluate");
+            match verdict {
+                PolicyVerdict::Deny { reason, .. } => assert!(
+                    reason.contains("protected path"),
+                    "the denial must explain the protection: {reason}"
+                ),
+                other => panic!("protected path `{path}` must be denied, got {other:?}"),
+            }
+        }
+
+        let allowed = evaluator(
+            &temp.path,
+            vec![rule(
+                "allow-env",
+                RuleAction::Allow,
+                Some(ToolSelector::One("edit_file".to_owned())),
+                Some(".env"),
+            )],
+            approval(ApprovalMode::Allow, true),
+        )
+        .await;
+        let verdict = allowed
+            .evaluate(
+                &edit,
+                &call(
+                    "edit_file",
+                    json!({"path": ".env", "old": "SECRET", "new": "PUBLIC"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+        assert_eq!(verdict.rule_id(), Some("allow-env"));
+        assert!(matches!(verdict, PolicyVerdict::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_ask_rule_does_not_turn_a_protected_default_denial_into_a_prompt() {
+        let temp = TempDir::new("protected-ask");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        let policy = evaluator(
+            &temp.path,
+            vec![rule(
+                "review-env",
+                RuleAction::Ask,
+                Some(ToolSelector::One("edit_file".to_owned())),
+                Some(".env"),
+            )],
+            approval(ApprovalMode::Allow, true),
+        )
+        .await;
+
+        let verdict = policy
+            .evaluate(
+                &file_tool("edit_file"),
+                &call(
+                    "edit_file",
+                    json!({"path": ".env", "old": "SECRET", "new": "PUBLIC"}),
+                ),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        match verdict {
+            PolicyVerdict::Deny { reason, .. } => assert!(
+                reason.contains("protected path"),
+                "the protected default must run before ask rules: {reason}"
+            ),
+            other => panic!("an ask rule must not bypass the protected default denial: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_keeps_its_pre_9_7_protected_path_behavior() {
+        let temp = TempDir::new("write-protected");
+        std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
+        let policy = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, false)).await;
+
+        let verdict = policy
+            .evaluate(
+                &file_tool("write_file"),
+                &call("write_file", json!({"path": ".env", "content": "x"})),
+            )
+            .await
+            .expect("policy must evaluate");
+
+        assert!(
+            matches!(verdict, PolicyVerdict::Legacy { sensitive: true }),
+            "write_file must retain its legacy approval path: {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_apply_patch_is_a_structured_policy_error() {
+        let temp = TempDir::new("bad-patch");
+        let policy = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, true)).await;
+
+        let error = policy
+            .evaluate(
+                &file_tool("apply_patch"),
+                &call("apply_patch", json!({"patch": "not a unified diff"})),
+            )
+            .await
+            .expect_err("a malformed patch must not receive a verdict");
+
+        assert!(
+            matches!(error, PolicyError::InvalidPatch { .. }),
+            "the failure must be structured: {error:?}"
+        );
+    }
+
+    #[test]
+    fn protected_path_classification_covers_metadata_environment_and_keys() {
+        for path in [
+            ".git/config",
+            "nested/.jessica/events.db",
+            ".env",
+            ".env.local",
+            "keys/server.pem",
+            "keys/server.key",
+            "id_rsa",
+            "home/.ssh/id_ed25519",
+        ] {
+            assert!(is_protected_path(path), "`{path}` must be protected");
+        }
+        for path in [
+            "src/main.rs",
+            ".environment",
+            "id_rsa.pub",
+            "docs/private-key.md",
+        ] {
+            assert!(!is_protected_path(path), "`{path}` must not be protected");
+        }
     }
 }

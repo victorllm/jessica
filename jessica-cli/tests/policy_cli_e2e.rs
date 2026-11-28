@@ -333,6 +333,55 @@ fn policy_simulate_matches_exec_program_and_argument_prefixes() {
 }
 
 #[test]
+fn policy_simulate_reports_legacy_and_auto_approved_sensitive_tools() {
+    let temp = TempDir::new("approval-modes");
+    let legacy_config = temp.path().join("legacy.toml");
+    std::fs::write(&legacy_config, "[policy]\nallowed_tools = [\"exec\"]\n")
+        .expect("configuration should be written");
+
+    let legacy = run_policy(
+        temp.path(),
+        &legacy_config,
+        "exec",
+        r#"{"program":"git","args":["status"],"cwd":"."}"#,
+    );
+    assert!(
+        legacy.status.success(),
+        "simulation must succeed: {}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&legacy.stdout);
+    assert_eq!(field(&stdout, "decision"), "allow");
+    assert_eq!(field(&stdout, "approval"), "interactive");
+    assert_eq!(field(&stdout, "rule"), "-");
+
+    let auto_config = temp.path().join("auto.toml");
+    std::fs::write(
+        &auto_config,
+        "[policy]\nallowed_tools = [\"exec\"]\n[approval]\nmode = \"allow\"\n",
+    )
+    .expect("configuration should be written");
+
+    let auto = run_policy(
+        temp.path(),
+        &auto_config,
+        "exec",
+        r#"{"program":"git","args":["status"],"cwd":"."}"#,
+    );
+    assert!(
+        auto.status.success(),
+        "simulation must succeed: {}",
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&auto.stdout);
+    assert_eq!(field(&stdout, "decision"), "allow");
+    assert_eq!(field(&stdout, "approval"), "auto_approved");
+    assert_eq!(field(&stdout, "rule"), "-");
+
+    assert_no_runtime_state(temp.path());
+}
+
+#[test]
 fn policy_simulate_rejects_invalid_rule_configuration_before_evaluating() {
     let temp = TempDir::new("bad-config");
     let config = temp.path().join("harness.toml");

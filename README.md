@@ -63,6 +63,18 @@ let outcome = engine
 entry points; `Engine::run_turn` is the trace-store-only variant for embedders
 that do not need acceptance, memory/skills, delegation, or resume.
 
+`EngineConfig::with_catalog_profile` narrows the host catalog before exposure
+budgets, delegation parent capabilities, and the model-visible registry are
+computed. `CatalogProfile::Full` is the default; the CLI maps its `tools.profile`
+onto the same enum.
+
+Artifact storage is engine-owned. Embedders can install the built-in
+`ResultManager` through `EngineBuilder::result_manager`, or construct one from
+`ResultConfig`, and register `ReadArtifactTool` with an `ArtifactStore` built by
+`ArtifactStore::from_result_config`. The manager writes the v1 sidecar, runs
+cleanup at most once per turn, and lets `read_artifact` results bypass result
+management. `READ_ARTIFACT_TOOL` is the stable tool name.
+
 The runnable example drives a tool through an approval gate and verifies the
 durable trace using only public APIs:
 
@@ -229,7 +241,9 @@ only when all of these host decisions agree:
 3. `tools.profile` permits that source/name pair;
 4. for the native `bash` tool, `[tools.bash] enabled = true` is set.
 
-Being in the allowlist is necessary but never sufficient.
+Being in the allowlist is necessary but never sufficient. The profile table is
+owned by `jessica-engine` (`CatalogProfile`); the CLI only parses
+`tools.profile` and reports the same decision in `jessica tools list --all`.
 
 ```toml
 [tools]
@@ -685,11 +699,11 @@ is trace-only and linked to the parent `delegate_task` call; see
 
 ### Result manager and artifacts
 
-Every tool result passes through the host result manager before it reaches the
-transcript, trace, sensor, or model. The manager is applied after execution and
-before `ResultSizeGuard`; the guard remains the final backstop, but a managed
-result never needs to trip it. Only `read_artifact`'s own output bypasses
-management, so pagination cannot recursively create artifacts.
+Every tool result passes through the engine result manager before it reaches
+the transcript, trace, sensor, or model. The manager is applied after execution
+and before `ResultSizeGuard`; the guard remains the final backstop, but a
+managed result never needs to trip it. Only `read_artifact`'s own output
+bypasses management, so pagination cannot recursively create artifacts.
 
 - A result at or below `inline_threshold_bytes` is returned unchanged.
 - A larger result is stored as a content-addressed artifact. The model receives
@@ -728,7 +742,10 @@ total size, and next offset. Offsets past the end, unknown or malformed digests,
 symlinked paths, and missing or inconsistent sidecars produce structured tool
 errors. The tool reads only files selected by digest under the configured
 artifact directory; it never executes a tool, accepts a filesystem path, or
-creates another artifact.
+creates another artifact. `ArtifactStore`, `ResultManager`, and
+`ReadArtifactTool` live in `jessica-engine`; the CLI only maps `[tools]` into
+the engine `ResultConfig`. Reads require the v1 sidecar, so an artifact written
+without one is rejected rather than served.
 
 Once per turn, before the first oversized write, the manager runs one bounded
 cleanup pass: artifacts older than `artifact_retention_days` are deleted first,

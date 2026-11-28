@@ -201,6 +201,26 @@ fn a_large_read_file_is_managed_and_paginated_through_read_artifact() {
         0o600,
         "artifact files must be private"
     );
+
+    let sidecar_path = artifacts[0].with_extension("json");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect("sidecar must exist"))
+            .expect("sidecar must be JSON");
+    assert_eq!(sidecar["version"], 1, "the engine must write sidecar v1");
+    assert_eq!(sidecar["digest"], digest);
+    assert_eq!(sidecar["size"], read_output.len());
+    assert_eq!(sidecar["tool"], "read_file");
+    assert_eq!(sidecar["original_bytes"], read_output.len());
+    assert_eq!(sidecar["truncated"], false);
+    assert_eq!(
+        std::fs::metadata(&sidecar_path)
+            .expect("sidecar metadata must read")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "sidecar files must be private"
+    );
 }
 
 /// Waits for the child, killing it when the overall budget expires.

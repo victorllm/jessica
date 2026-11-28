@@ -407,7 +407,8 @@ impl Engine {
             cancellation: &cancel,
             request: &request,
         };
-        let catalog = self.dependencies.tool_provider.provide(&context).await?;
+        let mut catalog = self.dependencies.tool_provider.provide(&context).await?;
+        self.apply_catalog_profile(&mut catalog);
         self.enforce_catalog_limits(&catalog)?;
         let policy_v2 = Arc::new(
             PolicyV2::new(
@@ -1003,6 +1004,7 @@ impl Engine {
             request,
         };
         let mut catalog = self.dependencies.tool_provider.provide(&context).await?;
+        self.apply_catalog_profile(&mut catalog);
         let allowed: BTreeSet<&str> = self
             .config
             .policy()
@@ -1257,6 +1259,16 @@ impl Engine {
                 self.config.tools().max_result_bytes,
             )),
         }
+    }
+
+    /// Narrows a host-provided catalog to the configured [`CatalogProfile`].
+    ///
+    /// This runs before exposure budgets, delegation assembly, and registry
+    /// construction, so a tool rejected by the profile cannot consume budget,
+    /// become a child capability, or reach the model.
+    fn apply_catalog_profile(&self, catalog: &mut ToolCatalog) {
+        let profile = self.config.catalog_profile();
+        catalog.retain(|entry| profile.allows(entry.descriptor.source, &entry.descriptor.name));
     }
 
     /// Detects an over-budget model-visible catalog before any provider call.
@@ -2090,8 +2102,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AcceptanceConfig, ApprovalConfig, ApprovalMode, PolicyConfig, PolicyRule, ResultConfig,
-        RuleAction, ToolExecutionConfig, ToolSelector, TracePolicy,
+        AcceptanceConfig, ApprovalConfig, ApprovalMode, CatalogLimits, PolicyConfig, PolicyRule,
+        ResultConfig, RuleAction, ToolExecutionConfig, ToolSelector, TracePolicy,
     };
     use crate::ports::{
         IdSource, MemoryPort, SessionStore, SkillPort, SystemPromptSource, ToolContext,
@@ -2099,7 +2111,8 @@ mod tests {
     };
     use crate::recorder::{EventJournal, RecorderError, SqliteTraceStore, StoredSession};
     use crate::tooling::{
-        ApprovalPolicy, ToolCatalog, ToolDescriptor, ToolLimits, ToolMetadata, ToolSource,
+        ApprovalPolicy, CatalogProfile, ToolCatalog, ToolDescriptor, ToolLimits, ToolMetadata,
+        ToolSource,
     };
 
     struct UnusedProvider;
@@ -2497,6 +2510,130 @@ mod tests {
         }
     }
 
+    /// Records the model-visible tool names on every provider call.
+    struct ToolCapturingProvider {
+        seen: Mutex<Vec<Vec<String>>>,
+        calls: AtomicU32,
+    }
+
+    impl ToolCapturingProvider {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                calls: AtomicU32::new(0),
+            }
+        }
+
+        fn offered_tools(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .expect("tool names must not be poisoned")
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn call_count(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolCapturingProvider {
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .expect("tool names must not be poisoned")
+                .push(
+                    tools
+                        .iter()
+                        .map(|schema| {
+                            schema["function"]["name"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
+                        .collect(),
+                );
+            Ok(Box::pin(futures::stream::iter(text_events("done"))))
+        }
+    }
+
+    /// A tool whose name is chosen at runtime for child factories.
+    struct NamedMockTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedMockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn schema(&self) -> ToolSchema {
+            json!({
+                "type": "function",
+                "function": {"name": self.name, "parameters": {"type": "object"}}
+            })
+        }
+
+        async fn execute(&self, _args: Value) -> ToolResult {
+            ToolResult::success(String::new(), "ok")
+        }
+    }
+
+    /// Records the narrowed tool set offered to every child agent.
+    #[derive(Default)]
+    struct RecordingChildFactory {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingChildFactory {
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .expect("child factory calls must not be poisoned")
+                .clone()
+        }
+    }
+
+    impl ChildToolFactory for RecordingChildFactory {
+        fn build(
+            &self,
+            names: &[String],
+        ) -> Result<Vec<Arc<dyn jessica_core::tool::Tool>>, jessica_runtime::DelegationError>
+        {
+            self.calls
+                .lock()
+                .expect("child factory calls must not be poisoned")
+                .push(names.to_vec());
+            Ok(names
+                .iter()
+                .map(|name| Arc::new(NamedMockTool { name: name.clone() }) as Arc<dyn Tool>)
+                .collect())
+        }
+    }
+
+    fn delegate_events(task: &str, tools: &[&str]) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::ToolCallRequested {
+                call: ToolCall::new(
+                    "call-1",
+                    DELEGATE_TASK_TOOL_NAME,
+                    json!({"task": task, "tools": tools}),
+                ),
+            },
+            LlmEvent::Done {
+                usage: Some(TokenUsage::new(1, 1)),
+            },
+        ]
+    }
+
     /// Journal mock that retains the trace envelopes and session metadata.
     ///
     /// A trace write can be made to fail at a fixed one-based position so a
@@ -2848,6 +2985,31 @@ mod tests {
                 descriptor: descriptor(name),
             })
             .expect("catalog insert must succeed");
+        catalog
+    }
+
+    fn catalog_from(entries: &[(&'static str, ToolSource)]) -> ToolCatalog {
+        let mut catalog = ToolCatalog::new();
+        for (name, source) in entries {
+            catalog
+                .insert(ToolEntry {
+                    tool: Arc::new(MockTool::new(name, "ok")),
+                    descriptor: ToolDescriptor::new(
+                        (*name).to_owned(),
+                        *source,
+                        json!({
+                            "type": "function",
+                            "function": {"name": name, "parameters": {"type": "object"}}
+                        }),
+                        "test-version",
+                        ToolLimits::default(),
+                        ApprovalPolicy::NotRequired,
+                        &ToolMetadata::default(),
+                    )
+                    .expect("test schema must serialize"),
+                })
+                .expect("catalog insert must succeed");
+        }
         catalog
     }
 
@@ -4105,6 +4267,211 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(&entry.payload, TracePayload::TurnEnded { .. })),
             "an incomplete turn must never receive turn_ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_profile_filters_the_model_visible_tools_and_intersects_the_allowlist() {
+        let temp = TempDir::new("catalog-profile-visible");
+        let catalog = catalog_from(&[
+            ("read_file", ToolSource::Native),
+            ("write_file", ToolSource::Native),
+            ("bash", ToolSource::Native),
+            ("wasm_tool", ToolSource::Wasm),
+            ("mcp_tool", ToolSource::Mcp),
+            ("delegate_task", ToolSource::Delegation),
+            ("unlisted_tool", ToolSource::Native),
+        ]);
+        let allowed = [
+            "read_file",
+            "write_file",
+            "bash",
+            "wasm_tool",
+            "mcp_tool",
+            "delegate_task",
+        ];
+
+        for (profile, expected) in [
+            (CatalogProfile::Readonly, vec!["read_file"]),
+            (CatalogProfile::Coding, vec!["read_file", "write_file"]),
+            (CatalogProfile::Ops, vec!["bash", "read_file"]),
+            (
+                CatalogProfile::Full,
+                vec![
+                    "bash",
+                    "delegate_task",
+                    "mcp_tool",
+                    "read_file",
+                    "wasm_tool",
+                    "write_file",
+                ],
+            ),
+        ] {
+            let provider = Arc::new(ToolCapturingProvider::new());
+            let llm: Arc<dyn LlmProvider> = provider.clone();
+            let engine = build_engine(
+                llm,
+                Arc::new(StaticTools {
+                    catalog: catalog.clone(),
+                }),
+                run_config(&allowed, Vec::new(), 100_000).with_catalog_profile(profile),
+            );
+
+            engine
+                .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+                .await
+                .expect("the turn must complete");
+
+            assert_eq!(provider.offered_tools(), expected, "profile {profile:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_profile_is_applied_before_exposure_budgets() {
+        let temp = TempDir::new("catalog-profile-budget");
+        let catalog = catalog_from(&[
+            ("read_file", ToolSource::Native),
+            ("write_file", ToolSource::Native),
+        ]);
+        let limits = CatalogLimits {
+            max_exposed_tools: 1,
+            max_tool_schema_bytes: CatalogLimits::default().max_tool_schema_bytes,
+        };
+        let allowed = ["read_file", "write_file"];
+
+        let provider = Arc::new(ToolCapturingProvider::new());
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let engine = build_engine(
+            llm,
+            Arc::new(StaticTools {
+                catalog: catalog.clone(),
+            }),
+            run_config(&allowed, Vec::new(), 100_000)
+                .with_catalog_profile(CatalogProfile::Readonly)
+                .with_catalog_limits(limits),
+        );
+        engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect("the profile-filtered catalog must fit the budget");
+        assert_eq!(provider.offered_tools(), ["read_file"]);
+
+        let provider = Arc::new(ToolCapturingProvider::new());
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let engine = build_engine(
+            llm,
+            Arc::new(StaticTools { catalog }),
+            run_config(&allowed, Vec::new(), 100_000)
+                .with_catalog_profile(CatalogProfile::Full)
+                .with_catalog_limits(limits),
+        );
+        let error = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect_err("the unfiltered catalog must exceed the budget");
+        assert!(matches!(
+            error,
+            EngineError::CatalogTooLarge {
+                exposed: 2,
+                limit: 1
+            }
+        ));
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "the budget must fail before the model call"
+        );
+    }
+
+    fn delegation_config(allowed: &[&str], profile: CatalogProfile) -> EngineConfig {
+        run_config(allowed, Vec::new(), 1_000_000)
+            .with_catalog_profile(profile)
+            .with_delegation(Some(DelegationLimits::default()))
+    }
+
+    #[tokio::test]
+    async fn readonly_profile_narrows_delegation_parent_capabilities_before_the_child_runs() {
+        let temp = TempDir::new("catalog-profile-delegation");
+        let catalog = catalog_from(&[
+            ("read_file", ToolSource::Native),
+            ("write_file", ToolSource::Native),
+        ]);
+        let allowed = ["read_file", "write_file", "delegate_task"];
+
+        // `write_file` passes the allowlist but is removed by the profile, so
+        // the parent capabilities offered to the child cannot contain it.
+        let provider = Arc::new(RecordingProvider::new(vec![
+            delegate_events("child task", &["read_file", "write_file"]),
+            text_events("parent done"),
+        ]));
+        let factory = Arc::new(RecordingChildFactory::default());
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let engine = EngineBuilder::new()
+            .provider(llm)
+            .tool_provider(Arc::new(StaticTools {
+                catalog: catalog.clone(),
+            }))
+            .config(delegation_config(&allowed, CatalogProfile::Readonly))
+            .child_tool_factory(factory.clone())
+            .build()
+            .expect("the delegation engine must assemble");
+
+        engine
+            .run_turn_request(
+                TurnRequest::new("go")
+                    .with_workspace_root(&temp.path)
+                    .with_output(PumpOutput::Silent),
+            )
+            .await
+            .expect("a rejected child tool must not fail the parent turn");
+
+        assert!(
+            factory.calls().is_empty(),
+            "the child factory must not run for a tool absent from the filtered parent catalog"
+        );
+        let prompts = provider.prompts();
+        assert!(
+            prompts[1].iter().any(|message| {
+                message.content.contains("write_file")
+                    && message
+                        .content
+                        .contains("not permitted by the parent allowlist")
+            }),
+            "the parent must observe the structured delegation rejection: {:?}",
+            prompts[1]
+        );
+
+        // A read-only native tool survives the profile and is the only name
+        // the child factory receives.
+        let provider = Arc::new(RecordingProvider::new(vec![
+            delegate_events("child task", &["read_file"]),
+            text_events("child answer"),
+            text_events("parent done"),
+        ]));
+        let factory = Arc::new(RecordingChildFactory::default());
+        let llm: Arc<dyn LlmProvider> = provider.clone();
+        let engine = EngineBuilder::new()
+            .provider(llm)
+            .tool_provider(Arc::new(StaticTools { catalog }))
+            .config(delegation_config(&allowed, CatalogProfile::Readonly))
+            .child_tool_factory(factory.clone())
+            .build()
+            .expect("the delegation engine must assemble");
+
+        engine
+            .run_turn_request(
+                TurnRequest::new("go")
+                    .with_workspace_root(&temp.path)
+                    .with_output(PumpOutput::Silent),
+            )
+            .await
+            .expect("the delegated turn must complete");
+
+        assert_eq!(factory.calls(), vec![vec!["read_file".to_owned()]]);
+        assert_eq!(
+            provider.call_count(),
+            3,
+            "the scripted parent, child, and parent calls must all run"
         );
     }
 }

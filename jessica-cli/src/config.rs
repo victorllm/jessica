@@ -215,6 +215,17 @@ pub enum ToolProfile {
     Full,
 }
 
+impl From<ToolProfile> for jessica_engine::CatalogProfile {
+    fn from(profile: ToolProfile) -> Self {
+        match profile {
+            ToolProfile::Readonly => Self::Readonly,
+            ToolProfile::Coding => Self::Coding,
+            ToolProfile::Ops => Self::Ops,
+            ToolProfile::Full => Self::Full,
+        }
+    }
+}
+
 /// Optional per-tool limits.
 ///
 /// Both fields are optional. An absent timeout falls back to
@@ -731,6 +742,22 @@ impl ToolsConfig {
     pub fn effective_inline_threshold(&self, max_result_bytes: usize) -> usize {
         self.inline_threshold_bytes
             .min(self.effective_max_inline_bytes(max_result_bytes))
+    }
+
+    /// Maps the resolved tool settings into the engine's result configuration.
+    ///
+    /// The inline threshold and cap are clamped to `budget.max_result_bytes`
+    /// here, so the engine result manager and `read_artifact` tool share the
+    /// same effective limits as the rest of the CLI.
+    pub(crate) fn to_result_config(&self, max_result_bytes: usize) -> jessica_engine::ResultConfig {
+        jessica_engine::ResultConfig {
+            inline_threshold_bytes: self.effective_inline_threshold(max_result_bytes),
+            max_inline_bytes: self.effective_max_inline_bytes(max_result_bytes),
+            max_artifact_bytes: self.max_artifact_bytes,
+            artifact_dir: self.artifact_dir.clone(),
+            artifact_retention_days: self.artifact_retention_days,
+            artifact_max_bytes: self.artifact_max_bytes,
+        }
     }
 
     /// Rejects unusable exposure budgets, supervisor settings, and per-tool
@@ -1342,16 +1369,6 @@ pub enum ToolSelector {
     One(String),
     /// Multiple tool names.
     Many(Vec<String>),
-}
-
-impl ToolSelector {
-    /// Returns whether `name` is selected.
-    pub fn matches(&self, name: &str) -> bool {
-        match self {
-            Self::One(tool) => tool == name,
-            Self::Many(tools) => tools.iter().any(|tool| tool == name),
-        }
-    }
 }
 
 /// One ordered parameter-level policy rule.

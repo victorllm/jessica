@@ -21,7 +21,7 @@ use jessica_core::types::{Message, SessionId};
 use jessica_engine::{
     AcceptanceConfig, ApprovalConfig, ApprovalMode, CatalogLimits, ChildToolFactory, Engine,
     EngineBuilder, EngineConfig, EngineError, EventJournal, EventRecorder, IdSource, MemoryPort,
-    PolicyConfig, PolicyRule, PumpConsole, RecorderError, ResultConfig, RuleAction, SessionStore,
+    PolicyConfig, PolicyRule, PumpConsole, RecorderError, ResultManager, RuleAction, SessionStore,
     SkillPort, StoredSession, SystemPromptSource, ToolCatalog as EngineToolCatalog, ToolContext,
     ToolEntry, ToolExecutionConfig, ToolPermissionDecision, ToolPermissionGate, ToolProvider,
     ToolResultManager, ToolSelector, TracePolicy,
@@ -31,7 +31,6 @@ use jessica_runtime::DelegationLimits;
 
 use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::app::LoadedWasmTool;
-use crate::artifacts::ResultManager;
 use crate::config::{
     ApprovalConfig as CliApprovalConfig, ApprovalMode as CliApprovalMode, HarnessConfig,
     PolicyConfig as CliPolicyConfig, RuleAction as CliRuleAction, ToolProfile,
@@ -65,10 +64,14 @@ pub(crate) fn build_engine(
     allow_delegation: bool,
 ) -> Result<Engine, EngineError> {
     let delegation = delegation_limits(&config, allow_delegation);
-    let result_manager = Arc::new(ResultManager::new(root, &config));
-    let engine_result_manager: Arc<dyn ToolResultManager> = Arc::new(EngineResultManager {
-        inner: Arc::clone(&result_manager),
-    });
+    let result_config = config
+        .tools
+        .to_result_config(config.budget.max_result_bytes);
+    let result_manager: Arc<dyn ToolResultManager> = Arc::new(ResultManager::new(
+        root,
+        &result_config,
+        config.budget.max_result_bytes,
+    ));
 
     let protocol_gate = permission_gate;
     let approval_gate = protocol_gate
@@ -93,22 +96,12 @@ pub(crate) fn build_engine(
             max_args_bytes: None,
             max_result_bytes: config.budget.max_result_bytes,
         })
-        .with_result(ResultConfig {
-            inline_threshold_bytes: config
-                .tools
-                .effective_inline_threshold(config.budget.max_result_bytes),
-            max_inline_bytes: config
-                .tools
-                .effective_max_inline_bytes(config.budget.max_result_bytes),
-            max_artifact_bytes: config.tools.max_artifact_bytes,
-            artifact_dir: config.tools.artifact_dir.clone(),
-            artifact_retention_days: config.tools.artifact_retention_days,
-            artifact_max_bytes: config.tools.artifact_max_bytes,
-        })
+        .with_result(result_config)
         .with_catalog_limits(CatalogLimits {
             max_exposed_tools: config.tools.max_exposed_tools,
             max_tool_schema_bytes: config.tools.max_tool_schema_bytes,
         })
+        .with_catalog_profile(config.tools.profile.into())
         .with_delegation(delegation);
     if let Some(acceptance) = &config.acceptance {
         engine_config =
@@ -124,7 +117,7 @@ pub(crate) fn build_engine(
         .provider(provider)
         .tool_provider(tool_provider)
         .config(engine_config)
-        .result_manager(engine_result_manager)
+        .result_manager(Arc::clone(&result_manager))
         .console(Arc::new(CliConsole))
         .sensors(build_sensors(root, &config))
         .system_prompt(Arc::new(CliSystemPrompt {
@@ -235,7 +228,7 @@ fn engine_rule_action(action: CliRuleAction) -> RuleAction {
 }
 
 /// Maps the CLI policy configuration into the engine's rule model.
-fn engine_policy(config: &CliPolicyConfig) -> PolicyConfig {
+pub(crate) fn engine_policy(config: &CliPolicyConfig) -> PolicyConfig {
     PolicyConfig {
         allowed_tools: config.allowed_tools.clone(),
         rules: config
@@ -258,7 +251,7 @@ fn engine_policy(config: &CliPolicyConfig) -> PolicyConfig {
 }
 
 /// Maps the CLI approval configuration into the engine's approval model.
-fn engine_approval(config: &CliApprovalConfig) -> ApprovalConfig {
+pub(crate) fn engine_approval(config: &CliApprovalConfig) -> ApprovalConfig {
     ApprovalConfig {
         mode: match config.mode {
             CliApprovalMode::Ask => ApprovalMode::Ask,
@@ -291,7 +284,11 @@ impl ToolProvider for CliToolProvider {
 
         let catalog = ToolCatalog::build(candidates, &self.config).map_err(catalog_error)?;
         let mut engine_catalog = EngineToolCatalog::new();
-        for entry in catalog.exposed() {
+        for entry in catalog
+            .entries()
+            .iter()
+            .filter(|entry| entry.passes_host_filters())
+        {
             let Some(tool) = entry.tool.as_ref() else {
                 return Err(EngineError::MissingToolImplementation {
                     name: entry.descriptor.name.clone(),
@@ -317,24 +314,6 @@ fn catalog_error(error: CatalogError) -> EngineError {
             component: "tool catalog".to_owned(),
             message: other.to_string(),
         },
-    }
-}
-
-/// Adapts the CLI artifact manager to the engine result-manager port.
-struct EngineResultManager {
-    /// CLI manager bound to this turn's canonical root.
-    inner: Arc<ResultManager>,
-}
-
-#[async_trait]
-impl ToolResultManager for EngineResultManager {
-    async fn manage(
-        &self,
-        tool: &str,
-        format: jessica_engine::ResultFormat,
-        result: jessica_core::types::ToolResult,
-    ) -> jessica_core::types::ToolResult {
-        self.inner.manage(tool, format, result).await
     }
 }
 
