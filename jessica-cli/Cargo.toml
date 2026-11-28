@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 jessica-core = { path = "../jessica-core" }
+jessica-engine = { path = "../jessica-engine" }
 jessica-runtime = { path = "../jessica-runtime" }
 jessica-sandbox = { path = "../jessica-sandbox" }
 jessica-harness = { path = "../jessica-harness" }

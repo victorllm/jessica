@@ -1172,12 +1172,13 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jessica-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
  "futures",
  "jessica-core",
+ "jessica-engine",
  "jessica-harness",
  "jessica-memory",
  "jessica-providers",
@@ -1197,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1207,8 +1208,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "jessica-engine"
+version = "0.12.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "jessica-core",
+ "jessica-harness",
+ "jessica-memory",
+ "jessica-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "jessica-harness"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1222,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-memory"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1237,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-providers"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1251,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1264,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-sandbox"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "jessica-core",
  "thiserror 2.0.21",
@@ -1274,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "jessica-tools"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "jessica-core",

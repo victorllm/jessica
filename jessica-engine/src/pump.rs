@@ -1,10 +1,16 @@
-//! Event pump for the CLI: live rendering, transcript recovery, sensors, and
-//! guard checkpoints.
+//! Event pump: live rendering, transcript recovery, sensors, and guard
+//! checkpoints.
 //!
 //! The runtime loop returns only a [`SessionEndReason`](jessica_core::types::SessionEndReason).
 //! Acceptance retries need the full conversation, so this pump rebuilds it from
 //! the observable event stream. The same pump runs the post-tool sensor pipeline
 //! and evaluates guards at the first tool call of each model round.
+//!
+//! The pump is an observer. Durable recording happens on the producer side
+//! before an event is broadcast, so a slow pump cannot lose events from the
+//! trace. A pump gap still means the reconstructed transcript and sensor path
+//! are incomplete; [`PumpIntegrity`] decides whether that fails the session,
+//! keeps a human-console warning, or is merely reported in the outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -17,20 +23,20 @@ use jessica_harness::{Harness, SensorReport};
 use tokio::sync::{Notify, broadcast};
 
 use crate::governance::GovernanceState;
-use crate::journal::TurnJournal;
+use crate::ports::{PumpConsole, TurnObserver as UpdateSink};
 
 /// Conversation and final text recovered from one attempt's event stream.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SessionSnapshot {
+pub struct SessionSnapshot {
     /// Reconstructed conversation fed to the acceptance check and retries.
-    pub(crate) messages: Vec<Message>,
+    pub messages: Vec<Message>,
     /// Final assistant text from the attempt.
-    pub(crate) last_output: String,
+    pub last_output: String,
 }
 
 /// Human-readable output policy for the event pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PumpOutput {
+pub enum PumpOutput {
     /// Render events to the terminal exactly as the CLI always has.
     HumanConsole,
     /// Never render. Events reach a programmatic client only through its
@@ -38,24 +44,29 @@ pub(crate) enum PumpOutput {
     Silent,
 }
 
-/// Programmatic consumer for every event observed by the pump.
-///
-/// Events are published in the same order as persistence and rendering. The
-/// sink is called synchronously; a client that needs backpressure should
-/// enqueue non-blockingly and provide its own acknowledgement boundary.
-pub(crate) trait UpdateSink: Send + Sync {
-    /// Observes one event of the current turn.
-    fn publish(&self, event: &AgentEvent);
+/// What the pump should do when its broadcast receiver reports a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagHandling {
+    /// Keep running, mark the pump as lagged, and expose the gap in the
+    /// caller's outcome. The producer-side trace is unaffected.
+    Continue,
+    /// Mark the current session as failed, so waiting callers observe that its
+    /// reconstructed transcript is incomplete.
+    FailSession,
+    /// Keep running without marking the session, for human-console output that
+    /// already warns about the gap.
+    Warn,
 }
 
-/// Destination for human-readable pump rendering.
-pub(crate) trait PumpConsole: Send + Sync {
-    /// Writes one complete line.
-    fn line(&self, text: &str);
-    /// Writes inline text without a trailing newline and flushes it.
-    fn inline(&self, text: &str);
-    /// Writes a diagnostic that belongs on stderr.
-    fn diagnostic(&self, text: &str);
+/// Policy consulted when the pump loses events to broadcast lag.
+///
+/// The engine's own turns continue and report the gap in
+/// [`TurnOutcome::lagged`](crate::TurnOutcome). The CLI's journal fails an
+/// active trace while continuing to record the producer tail, and keeps its
+/// original no-persistence behavior.
+pub trait PumpIntegrity: Send + Sync {
+    /// Decides how to handle `skipped` events lost by the pump's receiver.
+    fn broadcast_lagged(&self, skipped: u64, output: PumpOutput) -> LagHandling;
 }
 
 /// Terminal renderer preserving the original CLI output.
@@ -215,14 +226,14 @@ struct PumpState {
 
 /// Reconstructs sessions, runs sensors, and evaluates guards from events.
 ///
-/// The pump is an observer. Durable recording happens on the producer side in
-/// [`TurnJournal`], so a slow pump cannot lose events from the trace. A pump
-/// gap still means the reconstructed transcript and sensor path are
-/// incomplete, which fails the turn when persistence is enabled.
-pub(crate) struct EventPump {
+/// The pump is an observer. Durable recording happens on the producer side
+/// before an event is broadcast, so a slow pump cannot lose events from the
+/// trace. A pump gap still means the reconstructed transcript and sensor path
+/// are incomplete; [`PumpIntegrity`] decides how the caller treats that gap.
+pub struct EventPump {
     harness: Arc<Harness>,
     governance: Arc<GovernanceState>,
-    journal: Arc<TurnJournal>,
+    integrity: Arc<dyn PumpIntegrity>,
     output: PumpOutput,
     console: Option<Arc<dyn PumpConsole>>,
     sink: Option<Arc<dyn UpdateSink>>,
@@ -232,31 +243,50 @@ pub(crate) struct EventPump {
 }
 
 impl EventPump {
-    /// Creates a pump around the harness, governance, and journal of one turn.
+    /// Creates a pump around the harness, governance, and integrity policy of
+    /// one turn.
     ///
-    /// The pump never writes to the journal itself. It shares `journal` only to
-    /// fail the turn when a broadcast gap makes the reconstructed transcript
-    /// incomplete. `output` selects terminal rendering; `sink` receives every
-    /// event in pump order.
-    pub(crate) fn new(
+    /// The pump never writes durable state itself. It shares `integrity` only
+    /// to report a broadcast gap; `output` selects terminal rendering; `sink`
+    /// receives every event in pump order.
+    pub fn new(
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
-        journal: Arc<TurnJournal>,
+        integrity: Arc<dyn PumpIntegrity>,
         output: PumpOutput,
         sink: Option<Arc<dyn UpdateSink>>,
     ) -> Self {
-        let console = match output {
-            PumpOutput::HumanConsole => Some(Arc::new(StdoutConsole) as Arc<dyn PumpConsole>),
-            PumpOutput::Silent => None,
-        };
-        Self::assemble(harness, governance, journal, output, console, sink)
+        Self::new_with_console(harness, governance, integrity, output, None, sink)
     }
 
-    /// Assembles a pump with an explicit console, used by behavior tests.
+    /// Creates a pump with a host-supplied human-console renderer.
+    ///
+    /// The console is used only when `output` is [`PumpOutput::HumanConsole`];
+    /// silent output never invokes it. A `None` console keeps the built-in
+    /// terminal renderer, so an embedder can override rendering without
+    /// changing the pump's event or guard behavior.
+    pub fn new_with_console(
+        harness: Arc<Harness>,
+        governance: Arc<GovernanceState>,
+        integrity: Arc<dyn PumpIntegrity>,
+        output: PumpOutput,
+        console: Option<Arc<dyn PumpConsole>>,
+        sink: Option<Arc<dyn UpdateSink>>,
+    ) -> Self {
+        let console = match output {
+            PumpOutput::HumanConsole => {
+                Some(console.unwrap_or_else(|| Arc::new(StdoutConsole) as Arc<dyn PumpConsole>))
+            }
+            PumpOutput::Silent => None,
+        };
+        Self::assemble(harness, governance, integrity, output, console, sink)
+    }
+
+    /// Assembles a pump from already-resolved rendering state.
     fn assemble(
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
-        journal: Arc<TurnJournal>,
+        integrity: Arc<dyn PumpIntegrity>,
         output: PumpOutput,
         console: Option<Arc<dyn PumpConsole>>,
         sink: Option<Arc<dyn UpdateSink>>,
@@ -264,7 +294,7 @@ impl EventPump {
         Self {
             harness,
             governance,
-            journal,
+            integrity,
             output,
             console,
             sink,
@@ -276,20 +306,18 @@ impl EventPump {
 
     /// Returns whether the pump lost events to broadcast lag.
     ///
-    /// Without persistence, silent mode fails the current session and the
-    /// human-console path keeps its warn-and-continue behavior. With
-    /// persistence, lag marks the turn's trace as permanently unclosable while
-    /// the journal continues recording the producer's complete event stream.
-    pub(crate) fn has_lagged(&self) -> bool {
+    /// [`LagHandling::Continue`] and [`LagHandling::FailSession`] set this
+    /// flag; [`LagHandling::Warn`] leaves it unset so human-console output
+    /// keeps its original behavior.
+    pub fn has_lagged(&self) -> bool {
         self.lagged.load(Ordering::SeqCst)
     }
 
     /// Registers the initial conversation before the agent starts.
     ///
     /// The session becomes the current attribution target so a resumed stream,
-    /// which has no `SessionStarted` event, still reaches the transcript and
-    /// the recorder.
-    pub(crate) fn register(&self, session_id: SessionId, messages: Vec<Message>) {
+    /// which has no `SessionStarted` event, still reaches the transcript.
+    pub fn register(&self, session_id: SessionId, messages: Vec<Message>) {
         let mut state = self.lock_state();
         state.ended.remove(&session_id);
         state
@@ -299,32 +327,25 @@ impl EventPump {
     }
 
     /// Consumes events until the channel closes.
-    pub(crate) async fn run(self: Arc<Self>, mut receiver: broadcast::Receiver<AgentEvent>) {
+    pub async fn run(self: Arc<Self>, mut receiver: broadcast::Receiver<AgentEvent>) {
         loop {
             match receiver.recv().await {
                 Ok(event) => self.handle(event).await,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    if self.journal.enabled() {
-                        // The producer already recorded every event in the
-                        // journal, so the trace itself has no gap. The pump's
-                        // transcript, sensors, and guard checkpoints are still
-                        // missing events, so the turn must fail and can never
-                        // receive `turn_ended`.
-                        self.lagged.store(true, Ordering::SeqCst);
-                        self.journal.fail_integrity(
-                            format!("the broadcast receiver lagged and skipped {skipped} events"),
-                            false,
-                        );
-                    } else {
-                        match self.output {
-                            // A protocol client cannot be told that its update
-                            // stream is incomplete, so silent mode treats the
-                            // lag as a failed turn instead of continuing with
-                            // a corrupt transcript.
-                            PumpOutput::Silent => self.mark_lagged(),
-                            PumpOutput::HumanConsole => {
-                                eprintln!("[warn] skipped {skipped} events");
-                            }
+                    match self.integrity.broadcast_lagged(skipped, self.output) {
+                        LagHandling::Continue => {
+                            // The producer recorded every event before
+                            // broadcasting, so the trace is complete even
+                            // though the pump's transcript is not.
+                            self.lagged.store(true, Ordering::SeqCst);
+                        }
+                        // A protocol client cannot be told that its update
+                        // stream is incomplete, so silent mode treats the lag
+                        // as a failed turn instead of continuing with a
+                        // corrupt transcript.
+                        LagHandling::FailSession => self.mark_lagged(),
+                        LagHandling::Warn => {
+                            eprintln!("[warn] skipped {skipped} events");
                         }
                     }
                 }
@@ -335,10 +356,10 @@ impl EventPump {
 
     /// Waits until the pump has processed `session_id`'s terminal event.
     ///
-    /// Returns `None` when the session was never registered or when silent
-    /// mode lost events for it to broadcast lag, which prevents a typo or a
-    /// torn-down pump from waiting forever.
-    pub(crate) async fn wait_for(&self, session_id: &SessionId) -> Option<SessionSnapshot> {
+    /// Returns `None` when the session was never registered or when the
+    /// integrity policy failed the session after a broadcast gap, which
+    /// prevents a typo or a torn-down pump from waiting forever.
+    pub async fn wait_for(&self, session_id: &SessionId) -> Option<SessionSnapshot> {
         loop {
             let notified = self.notify.notified();
             {
@@ -592,9 +613,26 @@ mod tests {
         vec![Message::system("system"), Message::user("fix it")]
     }
 
-    /// Creates an inert journal: no writer and no sink.
-    fn inert_journal() -> Arc<TurnJournal> {
-        TurnJournal::new(None, CancellationToken::new())
+    /// Integrity policy that keeps running after a gap.
+    struct ContinueIntegrity;
+
+    impl PumpIntegrity for ContinueIntegrity {
+        fn broadcast_lagged(&self, _skipped: u64, _output: PumpOutput) -> LagHandling {
+            LagHandling::Continue
+        }
+    }
+
+    /// Integrity policy that applies one fixed decision.
+    struct FixedIntegrity(LagHandling);
+
+    impl PumpIntegrity for FixedIntegrity {
+        fn broadcast_lagged(&self, _skipped: u64, _output: PumpOutput) -> LagHandling {
+            self.0
+        }
+    }
+
+    fn continue_integrity() -> Arc<dyn PumpIntegrity> {
+        Arc::new(ContinueIntegrity)
     }
 
     /// Console double that records every rendering call.
@@ -673,10 +711,10 @@ mod tests {
         ));
         let console = console.map(|console| console as Arc<dyn PumpConsole>);
         let sink = sink.map(|sink| sink as Arc<dyn UpdateSink>);
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             Arc::clone(&harness),
             governance,
-            inert_journal(),
+            continue_integrity(),
             output,
             console,
             sink,
@@ -897,17 +935,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_lag_fails_the_current_session() {
+    async fn a_failing_integrity_policy_marks_the_current_session() {
         let (sender, receiver) = broadcast::channel(1);
         let harness = Arc::new(Harness::with_event_capacity(Vec::new(), 8));
         let governance = Arc::new(GovernanceState::new(
             harness.events(),
             CancellationToken::new(),
         ));
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             harness,
             governance,
-            inert_journal(),
+            Arc::new(FixedIntegrity(LagHandling::FailSession)),
             PumpOutput::Silent,
             None,
             None,
@@ -928,14 +966,14 @@ mod tests {
 
         assert!(
             pump.wait_for(&session).await.is_none(),
-            "silent lag must be observable as a failed session, not a partial transcript"
+            "a failed session must be observable instead of a partial transcript"
         );
         assert!(pump.has_lagged(), "the pump must record the lag state");
         pump_task.abort();
     }
 
     #[tokio::test]
-    async fn human_console_lag_keeps_the_original_warn_and_continue_behavior() {
+    async fn a_warn_policy_keeps_the_original_console_behavior() {
         let (sender, receiver) = broadcast::channel(1);
         let harness = Arc::new(Harness::with_event_capacity(Vec::new(), 8));
         let governance = Arc::new(GovernanceState::new(
@@ -943,10 +981,10 @@ mod tests {
             CancellationToken::new(),
         ));
         let console = Arc::new(RecordingConsole::default());
-        let pump = Arc::new(EventPump::assemble(
+        let pump = Arc::new(EventPump::new_with_console(
             harness,
             governance,
-            inert_journal(),
+            Arc::new(FixedIntegrity(LagHandling::Warn)),
             PumpOutput::HumanConsole,
             Some(Arc::clone(&console) as Arc<dyn PumpConsole>),
             None,
@@ -983,6 +1021,60 @@ mod tests {
             "the dropped delta must not fabricate transcript content"
         );
         assert!(!pump.has_lagged());
+        pump_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_continue_policy_exposes_the_lag_and_still_reaches_the_terminal_event() {
+        let (sender, receiver) = broadcast::channel(1);
+        let harness = Arc::new(Harness::with_event_capacity(Vec::new(), 8));
+        let governance = Arc::new(GovernanceState::new(
+            harness.events(),
+            CancellationToken::new(),
+        ));
+        let pump = Arc::new(EventPump::new_with_console(
+            harness,
+            governance,
+            continue_integrity(),
+            PumpOutput::Silent,
+            None,
+            None,
+        ));
+        let session = SessionId::new("continue-lagged");
+        pump.register(session.clone(), base_messages());
+        let pump_task = tokio::spawn(Arc::clone(&pump).run(receiver));
+
+        for event in [
+            AgentEvent::SessionStarted {
+                session_id: session.clone(),
+                messages: Vec::new(),
+            },
+            AgentEvent::ModelDelta {
+                text: "lost".to_owned(),
+            },
+            AgentEvent::SessionEnded {
+                session_id: session.clone(),
+                reason: SessionEndReason::Completed,
+            },
+        ] {
+            sender
+                .send(event)
+                .expect("the pump receiver must stay open");
+        }
+
+        let snapshot = pump
+            .wait_for(&session)
+            .await
+            .expect("a continue policy must still observe the terminal event");
+        assert_eq!(
+            snapshot.messages,
+            base_messages(),
+            "the dropped event must not fabricate transcript content"
+        );
+        assert!(
+            pump.has_lagged(),
+            "a continue policy must expose the gap to its caller"
+        );
         pump_task.abort();
     }
 }

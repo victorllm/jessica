@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use jessica_core::tool::{Tool, ToolSchema};
 use thiserror::Error;
@@ -182,6 +181,18 @@ impl CatalogEntry {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// Returns whether every hidden reason is the engine-owned profile.
+    ///
+    /// The CLI provider forwards these entries instead of dropping them, so
+    /// the engine applies `tools.profile` to the turn itself. Entries excluded
+    /// by `policy.allowed_tools` or by disabled `bash` are never forwarded:
+    /// those are host availability decisions.
+    pub(crate) fn passes_host_filters(&self) -> bool {
+        self.hidden_reasons
+            .iter()
+            .all(|reason| *reason == HiddenReason::NotInProfile)
+    }
 }
 
 /// All configured tools for one turn, sorted by name.
@@ -211,7 +222,7 @@ impl ToolCatalog {
                 .tools
                 .timeout_for(&candidate.name, config.budget.tool_timeout());
             let limits = ToolLimits {
-                timeout_ms: duration_millis(timeout),
+                timeout: Some(timeout),
                 max_args_bytes: config.tools.max_args_bytes(&candidate.name),
                 max_inline_bytes: max_inline_bytes(candidate.source, config),
                 max_artifact_bytes: Some(config.tools.max_artifact_bytes),
@@ -238,6 +249,7 @@ impl ToolCatalog {
                 candidate.name.clone(),
                 candidate.source,
                 candidate.schema,
+                super::descriptor::version_for(candidate.source),
                 limits,
                 approval,
                 &candidate.metadata,
@@ -310,16 +322,9 @@ impl ToolCatalog {
     }
 
     /// Returns the sorted names of exposed tools.
+    #[cfg(test)]
     pub(crate) fn exposed_names(&self) -> Vec<String> {
         self.exposed()
-            .map(|entry| entry.descriptor.name.clone())
-            .collect()
-    }
-
-    /// Returns the sorted names of exposed native tools.
-    pub(crate) fn exposed_native_names(&self) -> Vec<String> {
-        self.exposed()
-            .filter(|entry| entry.descriptor.source == ToolSource::Native)
             .map(|entry| entry.descriptor.name.clone())
             .collect()
     }
@@ -350,34 +355,10 @@ impl ToolCatalog {
 
 /// Returns whether a profile exposes a source/name pair.
 ///
-/// Third-party tools and delegation are exposed only by `full`; the narrower
-/// profiles name the native tools they include. Native tools added in later
-/// phases must be added here explicitly so a new capability is never exposed by
-/// accident under a narrow profile.
+/// The profile table is owned by `jessica-engine`; the CLI reuses it for the
+/// hidden-reason report so `tools list --all` and a turn agree on exposure.
 fn profile_allows(profile: ToolProfile, source: ToolSource, name: &str) -> bool {
-    if source != ToolSource::Native {
-        return profile == ToolProfile::Full;
-    }
-    match profile {
-        ToolProfile::Full => true,
-        ToolProfile::Readonly => is_read_only_native(name),
-        ToolProfile::Coding => {
-            is_read_only_native(name)
-                || matches!(name, "write_file" | "apply_patch" | "edit_file" | "exec")
-        }
-        ToolProfile::Ops => is_read_only_native(name) || matches!(name, "bash" | "exec"),
-    }
-}
-
-/// Returns whether a native tool has no host side effects.
-///
-/// The list is explicit so a newly added native tool is never exposed by a
-/// narrow profile until its capabilities have been reviewed here.
-fn is_read_only_native(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file" | "read_artifact" | "list_dir" | "grep" | "git_status" | "git_diff"
-    )
+    jessica_engine::CatalogProfile::from(profile).allows(source, name)
 }
 
 /// Returns the descriptor's output-line cap for tools that bound rendered lines.
@@ -390,10 +371,6 @@ fn max_output_lines(name: &str, config: &HarnessConfig) -> Option<usize> {
         "grep" => Some(config.tools.grep.max_matches),
         _ => None,
     }
-}
-
-fn duration_millis(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn max_inline_bytes(source: ToolSource, config: &HarnessConfig) -> usize {
@@ -865,13 +842,13 @@ mod tests {
         .expect("catalog must build");
 
         let read = catalog.find("read_file").expect("read must exist");
-        assert_eq!(read.descriptor.limits.timeout_ms, 500);
+        assert_eq!(read.descriptor.limits.timeout_ms(), Some(500));
         assert_eq!(read.descriptor.limits.max_args_bytes, Some(2048));
         assert_eq!(read.descriptor.approval, ApprovalPolicy::NotRequired);
         assert_eq!(read.descriptor.limits.max_inline_bytes, 64 * 1024);
 
         let bash = catalog.find("bash").expect("bash must exist");
-        assert_eq!(bash.descriptor.limits.timeout_ms, 3000);
+        assert_eq!(bash.descriptor.limits.timeout_ms(), Some(3000));
         assert_eq!(bash.descriptor.approval, ApprovalPolicy::Interactive);
 
         let delegate = catalog.find("delegate_task").expect("delegate must exist");

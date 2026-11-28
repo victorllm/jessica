@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jessica_core::types::{Message, Role, SessionId};
+use jessica_engine::EventRecorder;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -31,7 +32,6 @@ use tokio::io::AsyncWriteExt;
 use crate::acp_session::{HistoryLimits, complete_tool_pairs, trim_history};
 use crate::app::CliError;
 use crate::config::HarnessConfig;
-use crate::events::EventRecorder;
 
 /// Current on-disk index schema version.
 const INDEX_VERSION: u64 = 1;

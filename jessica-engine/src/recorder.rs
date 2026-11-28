@@ -1,30 +1,40 @@
-//! Bridging the CLI event stream to the SQLite event store.
+//! SQLite-backed trace recording and the event-journal seam.
 //!
-//! The runtime and harness are synchronous observers of the agent's event
-//! stream, while [`jessica_memory::EventStore`] is blocking. [`EventRecorder`]
-//! owns the store behind a mutex and performs every database operation in
-//! `spawn_blocking`, so the pump never blocks a Tokio worker.
+//! The runtime, harness, and governance layers are asynchronous, while
+//! [`jessica_memory::EventStore`] is blocking. [`EventRecorder`] owns the store
+//! behind a mutex and performs every database operation in `spawn_blocking`, so
+//! no Tokio worker is blocked by SQLite.
 //!
-//! The recorder is also the read side of `--resume`: it loads the immutable
+//! The recorder is also the read side of resume: it loads the immutable
 //! bootstrap messages plus the recorded events and converts the stored rows into
 //! the runtime's [`RecordedEvent`]s.
 //!
-//! [`EventJournal`] is the narrow write interface used by the pump and turn
-//! orchestration. Tests inject deterministic failures through it; production
-//! code uses [`EventRecorder`], which performs every database operation on the
-//! blocking pool.
+//! [`EventJournal`] is the narrow write interface used by [`crate::TurnJournal`].
+//! Tests inject deterministic failures through it; production code uses
+//! [`EventRecorder`], which performs every database operation on the blocking
+//! pool.
+//!
+//! [`SqliteTraceStore`] implements the turn-oriented [`TraceStore`] port on top
+//! of the same canonical [`EventStore`] implementation. It writes
+//! `turn_started`, one trace entry per agent event (with the legacy mirror where
+//! recovery requires one), and `turn_ended` in the same transactions as the
+//! canonical store. There is deliberately no second storage implementation.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use jessica_core::trace::TraceEvent;
+use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode, TurnId};
 use jessica_core::types::{AgentEvent, Message, SessionId};
 use jessica_memory::{EventStore, EventStoreError, Timestamp};
 use jessica_runtime::RecordedEvent;
 use thiserror::Error;
 use tokio::task::JoinError;
+
+use crate::api::TurnOutcome;
+use crate::error::EngineError;
+use crate::ports::{SessionStore, TraceStore, TurnTrace};
 
 /// Write-only interface for session metadata and versioned traces.
 ///
@@ -32,7 +42,7 @@ use tokio::task::JoinError;
 /// narrow lets behavior tests force storage failures without touching the
 /// filesystem, while production uses [`EventRecorder`].
 #[async_trait]
-pub(crate) trait EventJournal: Send + Sync {
+pub trait EventJournal: Send + Sync {
     /// Records the immutable bootstrap messages of a new session.
     async fn record_session_start(
         &self,
@@ -53,16 +63,16 @@ pub(crate) trait EventJournal: Send + Sync {
 }
 
 /// A persisted session ready to be replayed.
-pub(crate) struct StoredSession {
+pub struct StoredSession {
     /// Messages recorded before the session's first model call.
-    pub(crate) initial_messages: Vec<Message>,
+    pub initial_messages: Vec<Message>,
     /// Recorded events in sequence order.
-    pub(crate) events: Vec<RecordedEvent>,
+    pub events: Vec<RecordedEvent>,
 }
 
 /// Shared handle to the append-only event store.
 #[derive(Clone)]
-pub(crate) struct EventRecorder {
+pub struct EventRecorder {
     /// SQLite store; a blocking mutex is safe because no lock is held across
     /// an await point (all access happens inside `spawn_blocking`).
     store: Arc<Mutex<EventStore>>,
@@ -74,7 +84,7 @@ impl EventRecorder {
     ///
     /// The event store itself intentionally does not create directories, so the
     /// CLI does it here for both default trace persistence and explicit paths.
-    pub(crate) async fn open(path: PathBuf) -> Result<Self, RecorderError> {
+    pub async fn open(path: PathBuf) -> Result<Self, RecorderError> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -95,11 +105,22 @@ impl EventRecorder {
         })
     }
 
+    /// Creates an in-memory recorder, useful for tests and ephemeral embedders.
+    pub async fn in_memory() -> Result<Self, RecorderError> {
+        let store = tokio::task::spawn_blocking(EventStore::open_in_memory)
+            .await
+            .map_err(RecorderError::Task)?
+            .map_err(RecorderError::Store)?;
+        Ok(Self {
+            store: Arc::new(Mutex::new(store)),
+        })
+    }
+
     /// Records the immutable bootstrap messages of a new session.
     ///
     /// Must be awaited before the session's first event is appended so a
     /// recoverable session always has metadata.
-    pub(crate) async fn record_session_start(
+    pub async fn record_session_start(
         &self,
         session_id: &SessionId,
         messages: &[Message],
@@ -120,9 +141,8 @@ impl EventRecorder {
     ///
     /// Production writes go through [`EventJournal::record_traced`] so the
     /// legacy mirror and the trace entry commit together. This direct helper
-    /// exists for recovery-focused tests that do not build a full turn.
-    #[cfg(test)]
-    pub(crate) async fn append(
+    /// exists for recovery-focused callers that do not build a full turn.
+    pub async fn append(
         &self,
         session_id: &SessionId,
         event: &AgentEvent,
@@ -150,7 +170,7 @@ impl EventRecorder {
     /// the conversation the model originally received.
     ///
     /// Returns `None` only when neither source has messages.
-    pub(crate) async fn load(
+    pub async fn load(
         &self,
         session_id: SessionId,
     ) -> Result<Option<StoredSession>, RecorderError> {
@@ -264,6 +284,18 @@ impl EventJournal for EventRecorder {
     }
 }
 
+#[async_trait]
+impl SessionStore for EventRecorder {
+    async fn load_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, EngineError> {
+        EventRecorder::load(self, session_id)
+            .await
+            .map_err(EngineError::Recorder)
+    }
+}
+
 /// Locks the store, recovering from a poisoned mutex.
 fn lock_store(store: &Mutex<EventStore>) -> MutexGuard<'_, EventStore> {
     store
@@ -271,10 +303,127 @@ fn lock_store(store: &Mutex<EventStore>) -> MutexGuard<'_, EventStore> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// SQLite implementation of the turn-oriented [`TraceStore`] port.
+///
+/// This is the canonical persistence adapter. It reuses
+/// [`jessica_memory::EventStore`] and its single-transaction legacy+trace write
+/// instead of introducing a second storage format, so the SHA-256 chain,
+/// trace schema versions, bundle digests, and replay readers remain the ones
+/// owned by `jessica-memory` and `jessica-core`.
+pub struct SqliteTraceStore {
+    /// Shared recorder over the canonical event store.
+    recorder: EventRecorder,
+}
+
+impl SqliteTraceStore {
+    /// Opens or creates the database at `path`, creating missing parent
+    /// directories first.
+    pub async fn open(path: PathBuf) -> Result<Self, RecorderError> {
+        Ok(Self {
+            recorder: EventRecorder::open(path).await?,
+        })
+    }
+
+    /// Creates an in-memory store, useful for tests and ephemeral embedders.
+    pub async fn in_memory() -> Result<Self, RecorderError> {
+        let store = tokio::task::spawn_blocking(EventStore::open_in_memory)
+            .await
+            .map_err(RecorderError::Task)?
+            .map_err(RecorderError::Store)?;
+        Ok(Self {
+            recorder: EventRecorder {
+                store: Arc::new(Mutex::new(store)),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl TraceStore for SqliteTraceStore {
+    async fn begin_turn(
+        &self,
+        trace: &TurnTrace,
+        mode: TraceTurnMode,
+        messages: &[Message],
+    ) -> Result<(), EngineError> {
+        let event = TraceEvent::new(
+            TurnId::new(trace.turn_id.clone()),
+            None,
+            Some(trace.session_id.clone()),
+            TracePayload::TurnStarted {
+                mode,
+                messages: messages.to_vec(),
+            },
+        );
+        self.recorder
+            .record_traced(event, None)
+            .await
+            .map_err(|error| trace_incomplete(trace, error))?;
+        self.recorder
+            .record_session_start(&trace.session_id, messages)
+            .await
+            .map_err(|error| trace_incomplete(trace, error))
+    }
+
+    async fn record(&self, trace: &TurnTrace, event: AgentEvent) -> Result<(), EngineError> {
+        let attempt = match &event {
+            AgentEvent::AcceptanceFailed { attempt, .. } => Some(*attempt),
+            _ => trace.attempt,
+        };
+        // Acceptance failures, permission decisions, and child lifecycle are
+        // trace-only: mirroring them into the legacy log would make replay
+        // observe facts it cannot reproduce.
+        let legacy = match &event {
+            AgentEvent::AcceptanceFailed { .. }
+            | AgentEvent::PermissionDecided { .. }
+            | AgentEvent::ChildSessionStarted { .. }
+            | AgentEvent::ChildSessionEnded { .. } => None,
+            _ => Some((trace.session_id.clone(), event.clone())),
+        };
+        let trace_event = TraceEvent::new(
+            TurnId::new(trace.turn_id.clone()),
+            attempt,
+            Some(trace.session_id.clone()),
+            TracePayload::Agent { event },
+        );
+        self.recorder
+            .record_traced(trace_event, legacy)
+            .await
+            .map_err(|error| trace_incomplete(trace, error))
+    }
+
+    async fn finish_turn(
+        &self,
+        trace: &TurnTrace,
+        outcome: &TurnOutcome,
+    ) -> Result<(), EngineError> {
+        let event = TraceEvent::new(
+            TurnId::new(trace.turn_id.clone()),
+            None,
+            None,
+            TracePayload::TurnEnded {
+                reason: outcome.reason,
+            },
+        );
+        self.recorder
+            .record_traced(event, None)
+            .await
+            .map_err(|error| trace_incomplete(trace, error))
+    }
+}
+
+/// Maps a recorder failure to the engine's fail-closed trace error.
+fn trace_incomplete(trace: &TurnTrace, error: RecorderError) -> EngineError {
+    EngineError::TraceIncomplete {
+        turn_id: trace.turn_id.clone(),
+        cause: error.to_string(),
+    }
+}
+
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
 ///
-/// Persistence is the only place the CLI reads the host clock; replay itself
-/// uses the recorded values.
+/// Persistence is the only place the host clock is read; replay itself uses
+/// the recorded values.
 fn now() -> Timestamp {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -285,7 +434,7 @@ fn now() -> Timestamp {
 
 /// Errors raised while recording or loading events.
 #[derive(Debug, Error)]
-pub(crate) enum RecorderError {
+pub enum RecorderError {
     /// The event store's parent directory could not be created.
     #[error("failed to create event store directory `{path}`: {source}")]
     CreateParent {

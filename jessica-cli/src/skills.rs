@@ -763,7 +763,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use jessica_core::types::SessionEndReason;
-    use jessica_harness::{TurnSignals, WorkerTimestamp};
+    use jessica_harness::{GuideError, TurnSignals, WorkerTimestamp};
     use jessica_memory::{SkillLog, WorkspaceScope};
 
     use super::*;
@@ -866,6 +866,46 @@ mod tests {
             "open failures must degrade to no skills"
         );
         assert!(blocker.is_file());
+    }
+
+    /// Guide that always fails to render.
+    struct FailingGuide;
+
+    #[async_trait]
+    impl Guide for FailingGuide {
+        async fn render(
+            &self,
+            _session: &SessionId,
+            _query: &str,
+        ) -> Result<Option<Message>, GuideError> {
+            Err(GuideError::Render {
+                message: "skill backend unavailable".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_failure_is_fail_open_and_injects_nothing() {
+        let temp = TempDir::new("recall-failure");
+        let config = SkillsConfig {
+            path: PathBuf::from("skills.db"),
+            ..enabled_config()
+        };
+        let provider = Arc::new(UnusedProvider) as Arc<dyn LlmProvider>;
+        let mut assembly = SkillsAssembly::open(&config, &temp.path, provider)
+            .await
+            .expect("valid skills configuration should open");
+        assembly.guide = Arc::new(FailingGuide);
+
+        assert!(
+            assembly
+                .recall(&SessionId::new("recall-failure-session"), "query")
+                .await
+                .is_none(),
+            "a failing guide must degrade to no injected skills"
+        );
+
+        assembly.drain().await;
     }
 
     #[tokio::test]

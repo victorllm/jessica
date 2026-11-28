@@ -25,7 +25,8 @@ use jessica_runtime::ChildEventSink;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::events::{EventJournal, RecorderError};
+use crate::pump::{LagHandling, PumpIntegrity, PumpOutput};
+use crate::recorder::{EventJournal, RecorderError};
 
 /// Maximum number of journal commands waiting for the writer.
 const JOURNAL_QUEUE_CAPACITY: usize = 1024;
@@ -37,7 +38,7 @@ const JOURNAL_TIMEOUT: Duration = Duration::from_secs(30);
 type Ack = oneshot::Sender<Result<(), RecorderError>>;
 
 /// Per-turn attribution and persistence state.
-pub(crate) struct TurnJournal {
+pub struct TurnJournal {
     /// Whether a real backing journal was configured.
     enabled: bool,
     /// Bounded command queue to the single writer, absent when disabled.
@@ -166,10 +167,7 @@ impl TurnJournal {
     /// When `journal` is `None` the returned journal is inert and
     /// [`TurnJournal::sink`] returns `None`, preserving the no-persistence
     /// behaviour of the CLI.
-    pub(crate) fn new(
-        journal: Option<Arc<dyn EventJournal>>,
-        cancel: CancellationToken,
-    ) -> Arc<Self> {
+    pub fn new(journal: Option<Arc<dyn EventJournal>>, cancel: CancellationToken) -> Arc<Self> {
         Self::with_capacity(journal, cancel, JOURNAL_QUEUE_CAPACITY)
     }
 
@@ -206,12 +204,12 @@ impl TurnJournal {
     }
 
     /// Returns whether persistence is enabled for this turn.
-    pub(crate) fn enabled(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// Returns the producer-side sink, when persistence is enabled.
-    pub(crate) fn sink(self: &Arc<Self>) -> Option<Arc<dyn EventSink>> {
+    pub fn sink(self: &Arc<Self>) -> Option<Arc<dyn EventSink>> {
         self.enabled.then(|| Arc::clone(self) as Arc<dyn EventSink>)
     }
 
@@ -219,13 +217,13 @@ impl TurnJournal {
     ///
     /// The runtime attaches this to delegated child loops so their internal
     /// events become evidence under the parent turn's trace.
-    pub(crate) fn child_sink(self: &Arc<Self>) -> Option<Arc<dyn ChildEventSink>> {
+    pub fn child_sink(self: &Arc<Self>) -> Option<Arc<dyn ChildEventSink>> {
         self.enabled
             .then(|| Arc::clone(self) as Arc<dyn ChildEventSink>)
     }
 
     /// Returns the first integrity failure, if any.
-    pub(crate) fn integrity_failure(&self) -> Option<String> {
+    pub fn integrity_failure(&self) -> Option<String> {
         self.lock_state().failure.clone()
     }
 
@@ -234,7 +232,7 @@ impl TurnJournal {
     /// Returns immediately when a failure already exists. The future is used by
     /// attempt orchestration to stop waiting for a broadcast terminal event
     /// that the sink deliberately suppressed.
-    pub(crate) async fn failure_signal(&self) {
+    pub async fn failure_signal(&self) {
         let mut receiver = self.shared.failure.subscribe();
         if receiver.borrow().is_some() {
             return;
@@ -251,7 +249,7 @@ impl TurnJournal {
     /// `stop_writes` is true for storage and attribution failures, and false
     /// for an observer gap: after a gap the produced events are still recorded,
     /// but the turn can never close successfully.
-    pub(crate) fn fail_integrity(&self, cause: String, stop_writes: bool) {
+    pub fn fail_integrity(&self, cause: String, stop_writes: bool) {
         if !self.enabled {
             return;
         }
@@ -262,7 +260,7 @@ impl TurnJournal {
     ///
     /// The acknowledgement is the ordering barrier: no attempt may start until
     /// `turn_started` is durable.
-    pub(crate) async fn begin_turn(
+    pub async fn begin_turn(
         &self,
         turn_id: TurnId,
         mode: TraceTurnMode,
@@ -293,7 +291,7 @@ impl TurnJournal {
     }
 
     /// Records immutable bootstrap messages for one attempt or outer session.
-    pub(crate) async fn record_session_start(
+    pub async fn record_session_start(
         &self,
         session_id: &SessionId,
         messages: &[Message],
@@ -317,11 +315,7 @@ impl TurnJournal {
     ///
     /// The mapping survives the attempt's terminal event so a later acceptance
     /// failure can be attributed to the attempt it judged.
-    pub(crate) fn begin_attempt(
-        &self,
-        attempt: u32,
-        session_id: &SessionId,
-    ) -> Result<(), RecorderError> {
+    pub fn begin_attempt(&self, attempt: u32, session_id: &SessionId) -> Result<(), RecorderError> {
         if attempt == 0 {
             return Err(integrity("attempt numbers start at one"));
         }
@@ -359,7 +353,7 @@ impl TurnJournal {
     /// Both entries are committed before the caller broadcasts them. The outer
     /// session has no attempt: it carries the governed turn's final reason,
     /// while each attempt keeps its own terminal event.
-    pub(crate) async fn record_outer_session(
+    pub async fn record_outer_session(
         &self,
         session_id: &SessionId,
         reason: SessionEndReason,
@@ -411,7 +405,7 @@ impl TurnJournal {
     /// Only after the writer acknowledges this command is the turn considered
     /// successful. Any earlier write failure or a pre-existing integrity
     /// failure refuses the close.
-    pub(crate) async fn finish_turn(&self, reason: SessionEndReason) -> Result<(), RecorderError> {
+    pub async fn finish_turn(&self, reason: SessionEndReason) -> Result<(), RecorderError> {
         if !self.enabled {
             return Ok(());
         }
@@ -454,7 +448,7 @@ impl TurnJournal {
     /// Unlike [`TurnJournal::finish_turn`], this is allowed after an integrity
     /// failure: it persists the events already captured for a turn that will
     /// remain unclosed.
-    pub(crate) async fn flush(&self) -> Result<(), RecorderError> {
+    pub async fn flush(&self) -> Result<(), RecorderError> {
         if !self.enabled {
             return Ok(());
         }
@@ -467,7 +461,7 @@ impl TurnJournal {
     ///
     /// Successful turns have already received their terminal acknowledgement.
     /// Failure paths flush first when they want to preserve captured events.
-    pub(crate) fn shutdown(&self) {
+    pub fn shutdown(&self) {
         if let Some(sender) = &self.sender {
             let _ = sender.try_send(JournalCommand::Shutdown);
         }
@@ -1035,6 +1029,27 @@ impl ChildEventSink for TurnJournal {
     }
 }
 
+impl PumpIntegrity for TurnJournal {
+    fn broadcast_lagged(&self, skipped: u64, output: PumpOutput) -> LagHandling {
+        if self.enabled {
+            // The producer already recorded every event in the journal, so the
+            // trace itself has no gap. The pump's transcript, sensors, and
+            // guard checkpoints are still missing events, so the turn must
+            // fail and can never receive `turn_ended`.
+            self.fail_integrity(
+                format!("the broadcast receiver lagged and skipped {skipped} events"),
+                false,
+            );
+            LagHandling::Continue
+        } else {
+            match output {
+                PumpOutput::Silent => LagHandling::FailSession,
+                PumpOutput::HumanConsole => LagHandling::Warn,
+            }
+        }
+    }
+}
+
 /// Single writer that turns commands into trace/legacy transactions.
 async fn writer_loop(
     journal: Arc<dyn EventJournal>,
@@ -1138,7 +1153,7 @@ fn record_failure(
         }
     };
     if first {
-        eprintln!("[error] trace integrity failure: {message}");
+        tracing::error!(cause = %message, "trace integrity failure");
     }
     cancel.cancel();
     let _ = shared.failure.send_replace(Some(message));
@@ -1650,10 +1665,11 @@ mod tests {
             .await
             .expect("turn must start");
         journal.begin_attempt(1, &session).expect("attempt");
+        let integrity: Arc<dyn PumpIntegrity> = journal.clone();
         let pump = Arc::new(EventPump::new(
             harness,
             governance,
-            Arc::clone(&journal),
+            integrity,
             PumpOutput::Silent,
             None,
         ));

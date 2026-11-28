@@ -1,10 +1,8 @@
-//! Host-side policy v2 evaluation.
+//! Engine-owned policy v2 evaluation.
 //!
-//! The frozen `jessica-core` policy trait can only express allow or deny, while
-//! policy v2 needs a three-way decision (`deny`, `ask`, `allow`). This module
-//! therefore evaluates rules in the CLI before the harness allowlist policy and
-//! returns a host-only verdict. It never enters `jessica-core`.
-//!
+//! The frozen core policy trait expresses only allow or deny. A governed turn
+//! also needs a three-way decision (`deny`, `ask`, `allow`) and parameter-level
+//! rules, so this module evaluates the host configuration before a tool runs.
 //! Evaluation order is fixed:
 //!
 //! 1. every matching `deny` rule, in configuration order;
@@ -12,7 +10,7 @@
 //! 3. every matching `ask` rule, in configuration order;
 //! 4. every matching `allow` rule, in configuration order;
 //! 5. the approval mode for sensitive tools;
-//! 6. otherwise the existing allowlist decision stands.
+//! 6. otherwise the allowlist decision stands.
 //!
 //! Paths are canonicalized before matching. A canonical target outside the
 //! workspace root, a dangling symlink, or an uncanonicalizable path is a
@@ -25,8 +23,8 @@ use jessica_core::types::ToolCall;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::config::{ApprovalMode, HarnessConfig, PolicyRuleConfig, RuleAction};
-use crate::tools::{Capabilities, ToolDescriptor, ToolSource};
+use crate::config::{ApprovalConfig, ApprovalMode, PolicyConfig, PolicyRule, RuleAction};
+use crate::tooling::{ApprovalPolicy, Capabilities, ToolDescriptor, ToolSource};
 
 /// Maximum number of missing trailing components accepted while resolving a
 /// write target. This is a guard against pathological paths, not a semantic
@@ -35,7 +33,7 @@ const MAX_MISSING_COMPONENTS: usize = 64;
 
 /// Error produced while matching a policy rule.
 #[derive(Debug, Error)]
-pub(crate) enum PolicyError {
+pub enum PolicyError {
     /// The workspace root itself could not be canonicalized.
     #[error("policy workspace root `{root}` could not be canonicalized: {source}")]
     Root {
@@ -96,7 +94,7 @@ pub(crate) enum PolicyError {
 /// Descriptors assign these facts from the tool source and name; tools cannot
 /// claim their own capabilities or approval class.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PolicyTool {
+pub struct PolicyTool {
     /// Model-visible name.
     pub name: String,
     /// Host-assigned source.
@@ -106,30 +104,26 @@ pub(crate) struct PolicyTool {
     /// Argument field carrying a filesystem path, when the tool has one.
     pub path_field: Option<String>,
     /// Whether the host descriptor requires one-time approval for this tool.
-    ///
-    /// This covers the pre-v2 native sensitive set and external WASM/MCP
-    /// tools the host classifies as destructive or open-world.
     pub legacy_sensitive: bool,
 }
 
 impl PolicyTool {
-    /// Builds the policy facts from a host descriptor.
-    pub(crate) fn from_descriptor(descriptor: &ToolDescriptor) -> Self {
+    /// Builds policy facts from a host descriptor.
+    pub fn from_descriptor(descriptor: &ToolDescriptor) -> Self {
         Self {
             name: descriptor.name.clone(),
             source: descriptor.source,
             capabilities: descriptor.capabilities,
             path_field: descriptor.policy_hints.path_field.clone(),
-            legacy_sensitive: descriptor.approval == crate::tools::ApprovalPolicy::Interactive,
+            legacy_sensitive: descriptor.approval == ApprovalPolicy::Interactive,
         }
     }
 
     /// Returns whether approval v2 treats this tool as sensitive.
     ///
-    /// Descriptors the host marks interactive stay sensitive, including
-    /// destructive MCP tools, declared-destructive or open-world WASM tools,
-    /// and `delegate_task`. With an explicit `[approval]` section, any other
-    /// descriptor marked destructive is also sensitive.
+    /// Descriptors the host marks interactive stay sensitive. With an explicit
+    /// `[approval]` configuration, any other descriptor marked destructive is
+    /// also sensitive.
     fn sensitive(&self, approval_explicit: bool) -> bool {
         self.legacy_sensitive || (approval_explicit && self.capabilities.destructive)
     }
@@ -137,66 +131,16 @@ impl PolicyTool {
 
 /// A matched rule and its configured explanation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuleMatch {
+pub struct RuleMatch {
     /// Stable rule id.
     pub rule_id: String,
-    /// Explanation shown in errors and simulate output.
+    /// Explanation shown in errors and diagnostics.
     pub reason: String,
-}
-
-/// Final decision exposed by `policy simulate`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FinalDecision {
-    /// The call may execute.
-    Allow,
-    /// One-time approval is required.
-    Ask,
-    /// The call is denied.
-    Deny,
-}
-
-impl FinalDecision {
-    /// Returns the stable lowercase name.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "allow",
-            Self::Ask => "ask",
-            Self::Deny => "deny",
-        }
-    }
-}
-
-/// Approval disposition that accompanies a final simulate decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApprovalDisposition {
-    /// No approval is involved.
-    NotRequired,
-    /// The host may ask when a permission gate is installed.
-    Interactive,
-    /// The host will ask before execution.
-    Ask,
-    /// Approval mode auto-approves and records the event.
-    AutoApproved,
-    /// Approval mode or a rule denies the call.
-    Denied,
-}
-
-impl ApprovalDisposition {
-    /// Returns the stable lowercase name.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::NotRequired => "not_required",
-            Self::Interactive => "interactive",
-            Self::Ask => "ask",
-            Self::AutoApproved => "auto_approved",
-            Self::Denied => "denied",
-        }
-    }
 }
 
 /// Verdict returned by [`PolicyV2::evaluate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PolicyVerdict {
+pub enum PolicyVerdict {
     /// No v2 rule matched and the tool is not sensitive.
     Allow {
         /// Why the call is allowed.
@@ -234,7 +178,7 @@ pub(crate) enum PolicyVerdict {
 
 impl PolicyVerdict {
     /// Returns the matched rule id, if a rule decided the outcome.
-    pub(crate) fn rule_id(&self) -> Option<&str> {
+    pub fn rule_id(&self) -> Option<&str> {
         match self {
             Self::Allow { rule, .. }
             | Self::AutoApprove { rule, .. }
@@ -245,7 +189,7 @@ impl PolicyVerdict {
     }
 
     /// Returns the explanation attached to this verdict.
-    pub(crate) fn reason(&self) -> &str {
+    pub fn reason(&self) -> &str {
         match self {
             Self::Allow { reason, .. }
             | Self::AutoApprove { reason, .. }
@@ -257,28 +201,12 @@ impl PolicyVerdict {
             Self::Legacy { sensitive: false } => "allowlisted; no policy rule matched",
         }
     }
-
-    /// Produces the decision and approval disposition reported by simulate.
-    pub(crate) fn explain(&self) -> (FinalDecision, ApprovalDisposition) {
-        match self {
-            Self::Allow { .. } => (FinalDecision::Allow, ApprovalDisposition::NotRequired),
-            Self::Legacy { sensitive: true } => {
-                (FinalDecision::Allow, ApprovalDisposition::Interactive)
-            }
-            Self::Legacy { sensitive: false } => {
-                (FinalDecision::Allow, ApprovalDisposition::NotRequired)
-            }
-            Self::AutoApprove { .. } => (FinalDecision::Allow, ApprovalDisposition::AutoApproved),
-            Self::Ask { .. } => (FinalDecision::Ask, ApprovalDisposition::Ask),
-            Self::Deny { .. } => (FinalDecision::Deny, ApprovalDisposition::Denied),
-        }
-    }
 }
 
 /// Effective policy v2 evaluator for one configuration snapshot.
 #[derive(Debug, Clone)]
-pub(crate) struct PolicyV2 {
-    rules: Vec<PolicyRuleConfig>,
+pub struct PolicyV2 {
+    rules: Vec<PolicyRule>,
     approval: ApprovalMode,
     approval_explicit: bool,
     canonical_root: PathBuf,
@@ -289,7 +217,11 @@ impl PolicyV2 {
     ///
     /// The root is canonicalized once so every path comparison is against the
     /// same resolved directory.
-    pub(crate) async fn new(root: &Path, config: &HarnessConfig) -> Result<Self, PolicyError> {
+    pub async fn new(
+        root: &Path,
+        policy: &PolicyConfig,
+        approval: &ApprovalConfig,
+    ) -> Result<Self, PolicyError> {
         let canonical_root =
             tokio::fs::canonicalize(root)
                 .await
@@ -298,15 +230,15 @@ impl PolicyV2 {
                     source,
                 })?;
         Ok(Self {
-            rules: config.policy.rules.clone(),
-            approval: config.approval.mode,
-            approval_explicit: config.approval.explicit,
+            rules: policy.rules.clone(),
+            approval: approval.mode,
+            approval_explicit: approval.explicit,
             canonical_root,
         })
     }
 
     /// Evaluates one call against the configured rules and approval mode.
-    pub(crate) async fn evaluate(
+    pub async fn evaluate(
         &self,
         tool: &PolicyTool,
         call: &ToolCall,
@@ -318,9 +250,9 @@ impl PolicyV2 {
             });
         }
 
-        // The protected-path default is a deny, so it must run before an `ask`
-        // rule could turn it into a prompt (and before `approval.mode = "allow"`
-        // could auto-approve it). Only an explicit `allow` rule overrides it.
+        // The protected-path default is a deny, so it runs before an `ask`
+        // rule could turn it into a prompt (and before `approval.mode = allow`
+        // could auto-approve it). Only an explicit allow rule overrides it.
         if matches!(tool.name.as_str(), "apply_patch" | "edit_file")
             && let Some(path) = self.matching_path(tool, call).await?
             && is_protected_path(&path)
@@ -374,8 +306,8 @@ impl PolicyV2 {
             });
         }
 
-        // No explicit `[approval]` section keeps the pre-v2 split: ACP asks
-        // through its gate, while a CLI turn without a gate runs the tool.
+        // No explicit `[approval]` section keeps the legacy split: an adapter
+        // with a gate asks, while a host without one runs the tool.
         if !self.approval_explicit {
             return Ok(PolicyVerdict::Legacy { sensitive: true });
         }
@@ -426,7 +358,7 @@ impl PolicyV2 {
     /// Returns whether every condition in `rule` matches.
     async fn rule_matches(
         &self,
-        rule: &PolicyRuleConfig,
+        rule: &PolicyRule,
         tool: &PolicyTool,
         call: &ToolCall,
     ) -> Result<bool, PolicyError> {
@@ -505,9 +437,8 @@ impl PolicyV2 {
             let Some(patch) = call.arguments.get("patch").and_then(Value::as_str) else {
                 return Ok(None);
             };
-            let summary = jessica_tools::summarize_patch(patch)
-                .map_err(|reason| PolicyError::InvalidPatch { reason })?;
-            return self.resolve_relative(&summary.path, false).await.map(Some);
+            let path = patch_target_path(patch)?;
+            return self.resolve_relative(&path, false).await.map(Some);
         }
         let Some(field) = &tool.path_field else {
             return Ok(None);
@@ -632,38 +563,234 @@ impl PolicyV2 {
     }
 }
 
+/// Extracts the target of a single-file unified diff for policy matching.
+///
+/// Policy only needs the target path, but it validates the same header and
+/// hunk structure as the execution parser, so it accepts and rejects exactly
+/// the patches the tool accepts and rejects. In particular, a `\t` timestamp
+/// after a header path is stripped, and a rename or `/dev/null` header is
+/// rejected instead of being matched under a path the tool would never use.
+/// Hunk contents are not applied here; the execution tool remains responsible
+/// for matching the target file.
+fn patch_target_path(input: &str) -> Result<String, PolicyError> {
+    const MAX_PATCH_BYTES: usize = 1024 * 1024;
+    if input.trim().is_empty() {
+        return Err(invalid_patch(
+            "apply_patch requires a non-empty unified diff",
+        ));
+    }
+    if input.len() > MAX_PATCH_BYTES {
+        return Err(invalid_patch(
+            "apply_patch input exceeds the 1 MiB policy limit",
+        ));
+    }
+    let mut lines: Vec<&str> = input.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.iter().any(|line| line.contains('\r')) {
+        return Err(invalid_patch(
+            "apply_patch supports LF line endings only; CRLF patches are rejected",
+        ));
+    }
+
+    let mut index = 0_usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.is_empty() || line.starts_with("diff --git ") || line.starts_with("index ") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let old_raw = lines
+        .get(index)
+        .and_then(|line| line.strip_prefix("--- "))
+        .ok_or_else(|| invalid_patch("apply_patch requires a `--- path` header"))?;
+    index += 1;
+    let new_raw = lines
+        .get(index)
+        .and_then(|line| line.strip_prefix("+++ "))
+        .ok_or_else(|| invalid_patch("apply_patch requires a `+++ path` header"))?;
+    index += 1;
+
+    let old_path = normalize_patch_path(old_raw)?;
+    let new_path = normalize_patch_path(new_raw)?;
+    let path = if let (Some(old), Some(new)) =
+        (old_path.strip_prefix("a/"), new_path.strip_prefix("b/"))
+    {
+        if old != new {
+            return Err(invalid_patch(
+                "apply_patch does not support renames; the `---` and `+++` paths must match",
+            ));
+        }
+        new.to_owned()
+    } else if old_path == new_path {
+        old_path
+    } else {
+        return Err(invalid_patch(
+            "apply_patch requires matching relative paths in the `---` and `+++` headers",
+        ));
+    };
+
+    validate_patch_hunks(&lines, index)?;
+
+    Ok(path)
+}
+
+/// Walks the hunk section and validates the same structure as the execution
+/// parser: at least one hunk, declared line counts, no second file header and
+/// no unsupported body lines.
+fn validate_patch_hunks(lines: &[&str], start: usize) -> Result<(), PolicyError> {
+    let mut index = start;
+    let mut hunks = 0_usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.is_empty() {
+            index += 1;
+            continue;
+        }
+        if line.starts_with("--- ") {
+            return Err(invalid_patch(
+                "apply_patch supports exactly one file per patch",
+            ));
+        }
+        let (old_count, new_count) = parse_patch_hunk_header(line)?;
+        index += 1;
+        let mut old_seen = 0_usize;
+        let mut new_seen = 0_usize;
+        while old_seen < old_count || new_seen < new_count {
+            let body_line = lines.get(index).ok_or_else(|| {
+                invalid_patch("patch hunk is truncated: fewer lines than its header declares")
+            })?;
+            if body_line.starts_with("@@ -") {
+                return Err(invalid_patch(
+                    "patch hunk ended before its declared line counts",
+                ));
+            }
+            match body_line.as_bytes().first() {
+                Some(b' ') => {
+                    if old_seen >= old_count || new_seen >= new_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more context lines than its header declares",
+                        ));
+                    }
+                    old_seen += 1;
+                    new_seen += 1;
+                }
+                Some(b'-') => {
+                    if old_seen >= old_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more removed lines than its header declares",
+                        ));
+                    }
+                    old_seen += 1;
+                }
+                Some(b'+') => {
+                    if new_seen >= new_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more added lines than its header declares",
+                        ));
+                    }
+                    new_seen += 1;
+                }
+                Some(b'\\') => {
+                    return Err(invalid_patch(
+                        "apply_patch does not support `\\ No newline at end of file` markers",
+                    ));
+                }
+                _ => {
+                    return Err(invalid_patch(
+                        "apply_patch encountered an invalid hunk line",
+                    ));
+                }
+            }
+            index += 1;
+        }
+        hunks += 1;
+    }
+    if hunks == 0 {
+        return Err(invalid_patch("apply_patch requires at least one hunk"));
+    }
+    Ok(())
+}
+
+/// Parses `@@ -start[,count] +start[,count] @@` into old/new line counts.
+fn parse_patch_hunk_header(line: &str) -> Result<(usize, usize), PolicyError> {
+    let rest = line
+        .strip_prefix("@@ -")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (old_part, rest) = rest
+        .split_once(" +")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (new_part, _) = rest
+        .split_once(" @@")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (old_start, old_count) = parse_patch_range(old_part)?;
+    let (new_start, new_count) = parse_patch_range(new_part)?;
+    if old_start == 0 && old_count > 0 {
+        return Err(invalid_patch(
+            "patch hunk old start must be at least 1 when it has lines",
+        ));
+    }
+    if new_start == 0 && new_count > 0 {
+        return Err(invalid_patch(
+            "patch hunk new start must be at least 1 when it has lines",
+        ));
+    }
+    Ok((old_count, new_count))
+}
+
+/// Parses one `start[,count]` hunk range, defaulting the count to 1.
+fn parse_patch_range(part: &str) -> Result<(usize, usize), PolicyError> {
+    let (start, count) = part.split_once(',').unwrap_or((part, "1"));
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| invalid_patch("patch hunk contains an invalid start line"))?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| invalid_patch("patch hunk contains an invalid line count"))?;
+    Ok((start, count))
+}
+
+/// Builds an invalid-patch error with a stable explanation.
+fn invalid_patch(reason: &str) -> PolicyError {
+    PolicyError::InvalidPatch {
+        reason: reason.to_owned(),
+    }
+}
+
+/// Normalizes one patch header path the same way the execution parser does.
+fn normalize_patch_path(raw: &str) -> Result<String, PolicyError> {
+    let path = raw.split('\t').next().unwrap_or("").trim();
+    if path.is_empty() {
+        return Err(invalid_patch("apply_patch header path must not be empty"));
+    }
+    if path == "/dev/null" {
+        return Err(invalid_patch(
+            "apply_patch does not support file creation or deletion (`/dev/null`)",
+        ));
+    }
+    if Path::new(path).is_absolute() {
+        return Err(invalid_patch(
+            "apply_patch path must be relative to the workspace root",
+        ));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(invalid_patch(
+                "apply_patch path contains an unsupported component",
+            ));
+        }
+    }
+    Ok(path.to_owned())
+}
+
 /// Builds an absolute, lexically normalized candidate path.
 ///
 /// `..` is resolved before any filesystem access. A path that walks above the
 /// filesystem root or above an absolute input root is rejected as an escape.
-/// Returns whether an edit target is protected by default.
-///
-/// The editor tools refuse to modify repository metadata, Jessica's own state,
-/// environment files, SSH material, and common private-key files unless an
-/// explicit `allow` rule matches the call. `write_file` keeps its pre-9.7
-/// behavior and is not covered here.
-fn is_protected_path(path: &str) -> bool {
-    for component in path.split('/') {
-        if matches!(component, ".git" | ".jessica" | ".ssh") {
-            return true;
-        }
-    }
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") {
-        return true;
-    }
-    if matches!(
-        lower.as_str(),
-        "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
-    ) {
-        return true;
-    }
-    [".pem", ".key", ".p12", ".pfx"]
-        .iter()
-        .any(|extension| lower.ends_with(extension))
-}
-
 fn lexical_absolute(root: &Path, raw: &str) -> Result<PathBuf, PolicyError> {
     let raw_path = Path::new(raw);
     let mut output = if raw_path.is_absolute() {
@@ -689,13 +816,41 @@ fn lexical_absolute(root: &Path, raw: &str) -> Result<PathBuf, PolicyError> {
     Ok(output)
 }
 
+/// Returns whether an edit target is protected by default.
+///
+/// The editor tools refuse to modify repository metadata, Jessica's own state,
+/// environment files, SSH material, and common private-key files unless an
+/// explicit `allow` rule matches the call. `write_file` keeps its pre-v2
+/// behavior and is not covered here.
+fn is_protected_path(path: &str) -> bool {
+    for component in path.split('/') {
+        if matches!(component, ".git" | ".jessica" | ".ssh") {
+            return true;
+        }
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
+    ) {
+        return true;
+    }
+    [".pem", ".key", ".p12", ".pfx"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
 /// Returns whether `path` matches the documented minimal glob subset.
 ///
 /// `**` is recognized only when it is a complete path segment and matches zero
 /// or more segments. Within one segment, `*` matches zero or more characters
 /// and `?` matches exactly one character. Character classes, brace expansion,
 /// and backslash escapes are not implemented; those bytes are literal.
-pub(crate) fn glob_matches(pattern: &str, path: &str) -> Result<bool, PolicyError> {
+pub fn glob_matches(pattern: &str, path: &str) -> Result<bool, PolicyError> {
     if pattern.is_empty() {
         return Err(PolicyError::InvalidGlob {
             glob: pattern.to_owned(),
@@ -711,7 +866,7 @@ pub(crate) fn glob_matches(pattern: &str, path: &str) -> Result<bool, PolicyErro
         path: &[&str],
         pattern_index: usize,
         path_index: usize,
-        memo: &mut Vec<Vec<Option<bool>>>,
+        memo: &mut [Vec<Option<bool>>],
     ) -> bool {
         if let Some(cached) = memo[pattern_index][path_index] {
             return cached;
@@ -767,7 +922,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::{ApprovalConfig, PolicyConfig, PolicyRuleConfig, RuleAction, ToolSelector};
+    use crate::config::ToolSelector;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -780,7 +935,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
             let path = std::env::temp_dir().join(format!(
-                "jessica-policy-{label}-{}-{id}",
+                "jessica-engine-policy-{label}-{}-{id}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).expect("temp dir must be created");
@@ -799,8 +954,8 @@ mod tests {
         action: RuleAction,
         tool: Option<ToolSelector>,
         path_glob: Option<&str>,
-    ) -> PolicyRuleConfig {
-        PolicyRuleConfig {
+    ) -> PolicyRule {
+        PolicyRule {
             id: id.to_owned(),
             tool,
             path_glob: path_glob.map(str::to_owned),
@@ -811,27 +966,20 @@ mod tests {
         }
     }
 
-    fn config(rules: Vec<PolicyRuleConfig>, approval: ApprovalConfig) -> HarnessConfig {
-        HarnessConfig {
-            policy: PolicyConfig {
-                allowed_tools: vec![
-                    "read_file".to_owned(),
-                    "write_file".to_owned(),
-                    "exec".to_owned(),
-                    "bash".to_owned(),
-                    "delegate_task".to_owned(),
-                ],
-                rules,
+    fn native_tool(name: &str) -> PolicyTool {
+        PolicyTool {
+            name: name.to_owned(),
+            source: ToolSource::Native,
+            capabilities: Capabilities {
+                writes_files: true,
+                ..Capabilities::default()
             },
-            approval,
-            ..HarnessConfig::default()
+            path_field: Some("path".to_owned()),
+            legacy_sensitive: matches!(name, "write_file" | "apply_patch" | "edit_file"),
         }
     }
 
-    fn approval(mode: ApprovalMode, explicit: bool) -> ApprovalConfig {
-        ApprovalConfig { mode, explicit }
-    }
-
+    /// Builds the host facts for a native file tool.
     fn file_tool(name: &str) -> PolicyTool {
         PolicyTool {
             name: name.to_owned(),
@@ -846,6 +994,7 @@ mod tests {
         }
     }
 
+    /// Builds the host facts for the `exec` tool.
     fn exec_tool() -> PolicyTool {
         PolicyTool {
             name: "exec".to_owned(),
@@ -856,6 +1005,7 @@ mod tests {
         }
     }
 
+    /// Builds the host facts for the `bash` tool.
     fn bash_tool() -> PolicyTool {
         PolicyTool {
             name: "bash".to_owned(),
@@ -866,6 +1016,7 @@ mod tests {
         }
     }
 
+    /// Builds the host facts for a destructive MCP tool.
     fn mcp_tool() -> PolicyTool {
         PolicyTool {
             name: "mcp__srv__wipe".to_owned(),
@@ -876,46 +1027,39 @@ mod tests {
         }
     }
 
+    /// Builds one synthetic tool call.
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall::new("call-1", name, arguments)
     }
 
-    async fn evaluator(root: &Path, config: &HarnessConfig) -> PolicyV2 {
-        PolicyV2::new(root, config)
+    /// Builds a policy snapshot with the tools these tests exercise allowlisted.
+    fn policy_config(rules: Vec<PolicyRule>) -> PolicyConfig {
+        PolicyConfig {
+            allowed_tools: ["read_file", "write_file", "exec", "bash", "delegate_task"]
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            rules,
+        }
+    }
+
+    /// Builds an evaluator from the test's rules and approval snapshot.
+    async fn evaluator(root: &Path, rules: Vec<PolicyRule>, approval: ApprovalConfig) -> PolicyV2 {
+        PolicyV2::new(root, &policy_config(rules), &approval)
             .await
             .expect("policy must build")
     }
 
-    #[test]
-    fn minimal_glob_supports_star_globstar_and_question_mark_only() {
-        assert!(glob_matches("src/*.rs", "src/main.rs").expect("glob must parse"));
-        assert!(!glob_matches("src/*.rs", "src/nested/main.rs").expect("glob must parse"));
-        assert!(glob_matches("src/**/*.rs", "src/main.rs").expect("glob must parse"));
-        assert!(glob_matches("src/**/*.rs", "src/a/b/main.rs").expect("glob must parse"));
-        assert!(glob_matches("src/**", "src/a/b").expect("glob must parse"));
-        assert!(glob_matches("?.txt", "a.txt").expect("glob must parse"));
-        assert!(!glob_matches("?.txt", "ab.txt").expect("glob must parse"));
-        assert!(!glob_matches("?.txt", ".txt").expect("glob must parse"));
-        assert!(
-            glob_matches("[abc].txt", "[abc].txt").expect("brackets are literal"),
-            "character classes are not implemented"
-        );
-        assert!(!glob_matches("[abc].txt", "a.txt").expect("brackets are literal"));
-        assert!(glob_matches("a\\*b", "a\\*b").expect("backslash is literal"));
-        assert!(glob_matches("secrets/**", "secrets/keys/id").expect("glob must parse"));
-        assert!(
-            glob_matches("secrets/**", "secrets").expect("glob must parse"),
-            "** matches zero or more segments"
-        );
-        assert!(glob_matches("**", "a/b").expect("glob must parse"));
-        assert!(glob_matches("**", ".").expect("glob must parse"));
+    fn approval(mode: ApprovalMode, explicit: bool) -> ApprovalConfig {
+        ApprovalConfig { mode, explicit }
     }
 
     #[tokio::test]
-    async fn deny_rules_win_over_ask_and_allow_regardless_of_configuration_order() {
+    async fn deny_rules_win_over_ask_and_allow_regardless_of_order() {
         let temp = TempDir::new("priority");
-        let config = config(
-            vec![
+        let policy = PolicyConfig {
+            allowed_tools: vec!["read_file".to_owned()],
+            rules: vec![
                 rule(
                     "allow-first",
                     RuleAction::Allow,
@@ -923,41 +1067,314 @@ mod tests {
                     None,
                 ),
                 rule(
-                    "ask-second",
-                    RuleAction::Ask,
-                    Some(ToolSelector::One("read_file".to_owned())),
-                    None,
-                ),
-                rule(
-                    "deny-third",
+                    "deny-second",
                     RuleAction::Deny,
                     Some(ToolSelector::One("read_file".to_owned())),
                     None,
                 ),
+                rule(
+                    "ask-third",
+                    RuleAction::Ask,
+                    Some(ToolSelector::One("read_file".to_owned())),
+                    None,
+                ),
             ],
-            approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, false))
+            .await
+            .expect("policy must build");
 
-        let verdict = policy
+        let verdict = evaluator
             .evaluate(
-                &file_tool("read_file"),
-                &call("read_file", json!({"path": "a"})),
+                &native_tool("read_file"),
+                &ToolCall::new("call-1", "read_file", json!({"path": "README.md"})),
+            )
+            .await
+            .expect("path matching must fail closed, not error");
+
+        match verdict {
+            PolicyVerdict::Deny { reason, rule } => {
+                assert_eq!(rule.expect("deny rule").rule_id, "deny-second");
+                assert_eq!(reason, "reason for deny-second");
+            }
+            other => panic!("deny must win, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_rules_return_ask_in_ask_mode() {
+        let temp = TempDir::new("ask");
+        let policy = PolicyConfig {
+            allowed_tools: vec!["exec".to_owned()],
+            rules: vec![rule(
+                "ask-exec",
+                RuleAction::Ask,
+                Some(ToolSelector::One("exec".to_owned())),
+                None,
+            )],
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, true))
+            .await
+            .expect("policy must build");
+
+        let verdict = evaluator
+            .evaluate(
+                &PolicyTool {
+                    name: "exec".to_owned(),
+                    source: ToolSource::Native,
+                    capabilities: Capabilities {
+                        executes: true,
+                        ..Capabilities::default()
+                    },
+                    path_field: None,
+                    legacy_sensitive: true,
+                },
+                &ToolCall::new("call-1", "exec", json!({"program": "true"})),
             )
             .await
             .expect("policy must evaluate");
 
-        assert!(matches!(
-            verdict,
-            PolicyVerdict::Deny { ref rule, .. }
-                if rule.as_ref().map(|rule| rule.rule_id.as_str()) == Some("deny-third")
-        ));
+        assert!(matches!(verdict, PolicyVerdict::Ask { .. }));
+    }
+
+    #[tokio::test]
+    async fn protected_editor_paths_are_denied_without_an_allow_rule() {
+        let temp = TempDir::new("protected");
+        std::fs::create_dir_all(temp.path.join(".git")).expect("metadata directory");
+        std::fs::write(temp.path.join(".git/config"), "[core]").expect("metadata file");
+        let policy = PolicyConfig {
+            allowed_tools: vec!["edit_file".to_owned()],
+            rules: Vec::new(),
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, false))
+            .await
+            .expect("policy must build");
+
+        let verdict = evaluator
+            .evaluate(
+                &native_tool("edit_file"),
+                &ToolCall::new(
+                    "call-1",
+                    "edit_file",
+                    json!({"path": ".git/config", "old": "a", "new": "b"}),
+                ),
+            )
+            .await
+            .expect("protected path must be a policy verdict");
+
+        match verdict {
+            PolicyVerdict::Deny { reason, rule } => {
+                assert!(reason.contains("protected path"), "{reason}");
+                assert!(rule.is_none());
+            }
+            other => panic!("protected path must be denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_escaping_path_is_a_structured_policy_error() {
+        let temp = TempDir::new("escape");
+        let policy = PolicyConfig {
+            allowed_tools: vec!["read_file".to_owned()],
+            rules: vec![rule(
+                "read-outside",
+                RuleAction::Deny,
+                Some(ToolSelector::One("read_file".to_owned())),
+                Some("../**"),
+            )],
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, false))
+            .await
+            .expect("policy must build");
+        let outside_name = format!(
+            "jessica-engine-policy-outside-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        let outside = temp
+            .path
+            .parent()
+            .expect("temp dir has a parent")
+            .join(&outside_name);
+        std::fs::create_dir_all(&outside).expect("outside directory must be created");
+        let raw = format!("../{outside_name}");
+
+        let error = evaluator
+            .evaluate(
+                &native_tool("read_file"),
+                &ToolCall::new("call-1", "read_file", json!({"path": raw})),
+            )
+            .await
+            .expect_err("escaping paths must not silently miss a rule");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        assert!(matches!(error, PolicyError::Escape { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn glob_supports_star_globstar_and_question_mark_only() {
+        assert!(glob_matches("src/*.rs", "src/main.rs").expect("glob"));
+        assert!(!glob_matches("src/*.rs", "src/nested/main.rs").expect("glob"));
+        assert!(glob_matches("src/**/*.rs", "src/main.rs").expect("glob"));
+        assert!(glob_matches("src/**/*.rs", "src/a/b/main.rs").expect("glob"));
+        assert!(glob_matches("src/**", "src/a/b").expect("glob"));
+        assert!(glob_matches("?.txt", "a.txt").expect("glob"));
+        assert!(!glob_matches("?.txt", "ab.txt").expect("glob"));
+        assert!(!glob_matches("?.txt", ".txt").expect("glob"));
+        assert!(
+            glob_matches("[abc].txt", "[abc].txt").expect("brackets are literal"),
+            "character classes are not implemented"
+        );
+        assert!(!glob_matches("[abc].txt", "a.txt").expect("brackets are literal"));
+        assert!(glob_matches("a\\*b", "a\\*b").expect("backslash is literal"));
+        assert!(glob_matches("secrets/**", "secrets/keys/id").expect("glob"));
+        assert!(
+            glob_matches("secrets/**", "secrets").expect("glob"),
+            "** matches zero or more segments"
+        );
+        assert!(glob_matches("**", "a/b").expect("glob"));
+        assert!(glob_matches("**", ".").expect("glob"));
+    }
+
+    #[test]
+    fn patch_headers_are_normalized_like_the_execution_parser() {
+        let cases = [
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- src/app.txt\n+++ src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\t2026-01-01 00:00:00\n+++ b/src/app.txt\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "diff --git a/src/app.txt b/src/app.txt\nindex abc..def 100644\n--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n--- removed comment\n+++ added comment\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n@@ -10 +10 @@\n-c\n+d\n",
+                "src/app.txt",
+            ),
+        ];
+
+        for (patch, expected) in cases {
+            assert_eq!(
+                patch_target_path(patch).expect("valid patch header"),
+                expected,
+                "unexpected target for {patch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_headers_reject_forms_the_execution_parser_rejects() {
+        let cases = [
+            ("", "empty"),
+            ("not a unified diff", "missing old header"),
+            (
+                "--- a/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "missing new header",
+            ),
+            (
+                "--- a/one.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "rename",
+            ),
+            (
+                "--- a/src/app.txt\n+++ src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "mismatched prefixes",
+            ),
+            (
+                "--- /dev/null\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "creation",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\r\n",
+                "crlf",
+            ),
+            (
+                "--- a/../app.txt\n+++ b/../app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "parent component",
+            ),
+            (
+                "--- /tmp/app.txt\n+++ /tmp/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "absolute",
+            ),
+            ("--- a/src/app.txt\n+++ b/src/app.txt\n", "no hunks"),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "second file",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n-a\n",
+                "truncated hunk",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n\\ No newline at end of file\n",
+                "no-newline marker",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -x +1 @@\n-a\n+b\n",
+                "invalid hunk range",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -0,1 +1 @@\n-a\n+b\n",
+                "zero start with lines",
+            ),
+        ];
+
+        for (patch, label) in cases {
+            let error = patch_target_path(patch).expect_err(label);
+            assert!(
+                matches!(error, PolicyError::InvalidPatch { .. }),
+                "{label} must be an invalid patch, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamped_patch_headers_still_match_path_rules() {
+        let temp = TempDir::new("timestamped-patch");
+        std::fs::create_dir_all(temp.path.join("src")).expect("source directory");
+        std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("source file");
+        let policy = PolicyConfig {
+            allowed_tools: vec!["apply_patch".to_owned()],
+            rules: vec![rule(
+                "deny-source",
+                RuleAction::Deny,
+                Some(ToolSelector::One("apply_patch".to_owned())),
+                Some("src/**"),
+            )],
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, false))
+            .await
+            .expect("policy must build");
+        let patch = "--- a/src/app.txt\t2026-01-01 00:00:00\n+++ b/src/app.txt\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-alpha\n+beta\n";
+
+        let verdict = evaluator
+            .evaluate(
+                &native_tool("apply_patch"),
+                &ToolCall::new("call-1", "apply_patch", json!({"patch": patch})),
+            )
+            .await
+            .expect("a valid timestamped patch must receive a verdict");
+
+        assert_eq!(verdict.rule_id(), Some("deny-source"));
+        assert!(matches!(verdict, PolicyVerdict::Deny { .. }));
     }
 
     #[tokio::test]
     async fn ask_rules_win_over_allow_rules_and_the_first_ask_match_wins() {
         let temp = TempDir::new("ask-priority");
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![
                 rule(
                     "first-ask",
@@ -979,8 +1396,8 @@ mod tests {
                 ),
             ],
             approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let verdict = policy
             .evaluate(
@@ -1001,7 +1418,8 @@ mod tests {
         std::fs::write(temp.path.join("secrets/token.txt"), "secret").expect("file must exist");
         std::fs::create_dir_all(temp.path.join("public")).expect("directory must exist");
         std::fs::write(temp.path.join("public/note.txt"), "note").expect("file must exist");
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![rule(
                 "protect-secrets",
                 RuleAction::Deny,
@@ -1009,8 +1427,8 @@ mod tests {
                 Some("secrets/**"),
             )],
             approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let denied = policy
             .evaluate(
@@ -1039,7 +1457,8 @@ mod tests {
         std::fs::write(outside.path.join("secret.txt"), "outside").expect("file must exist");
         std::os::unix::fs::symlink(&outside.path, temp.path.join("link"))
             .expect("symlink must be created");
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![rule(
                 "protect",
                 RuleAction::Deny,
@@ -1047,8 +1466,8 @@ mod tests {
                 Some("**/secret.txt"),
             )],
             approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let error = policy
             .evaluate(
@@ -1070,7 +1489,8 @@ mod tests {
         let outside = TempDir::new("dangling-outside");
         std::os::unix::fs::symlink(outside.path.join("created.txt"), temp.path.join("dangling"))
             .expect("symlink must be created");
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![rule(
                 "protect",
                 RuleAction::Deny,
@@ -1078,8 +1498,8 @@ mod tests {
                 Some("**"),
             )],
             approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let error = policy
             .evaluate(
@@ -1109,8 +1529,12 @@ mod tests {
         );
         protect.program = Some("git".to_owned());
         protect.args_prefix = Some(vec!["push".to_owned(), "--force".to_owned()]);
-        let config = config(vec![protect], approval(ApprovalMode::Ask, false));
-        let policy = evaluator(&temp.path, &config).await;
+        let policy = evaluator(
+            &temp.path,
+            vec![protect],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
 
         let denied = policy
             .evaluate(
@@ -1152,8 +1576,12 @@ mod tests {
         );
         dangerous.program = Some("rm".to_owned());
         dangerous.args_prefix = Some(vec!["-rf".to_owned()]);
-        let config = config(vec![dangerous], approval(ApprovalMode::Ask, false));
-        let policy = evaluator(&temp.path, &config).await;
+        let policy = evaluator(
+            &temp.path,
+            vec![dangerous],
+            approval(ApprovalMode::Ask, false),
+        )
+        .await;
 
         let verdict = policy
             .evaluate(
@@ -1173,25 +1601,22 @@ mod tests {
     async fn explicit_approval_modes_are_observable_for_sensitive_and_mcp_tools() {
         let temp = TempDir::new("approval-modes");
 
-        let deny = config(vec![], approval(ApprovalMode::Deny, true));
-        let policy = evaluator(&temp.path, &deny).await;
-        let verdict = policy
+        let deny = evaluator(&temp.path, vec![], approval(ApprovalMode::Deny, true)).await;
+        let verdict = deny
             .evaluate(&exec_tool(), &call("exec", json!({"program": "true"})))
             .await
             .expect("policy must evaluate");
         assert!(matches!(verdict, PolicyVerdict::Deny { .. }));
 
-        let allow = config(vec![], approval(ApprovalMode::Allow, true));
-        let policy = evaluator(&temp.path, &allow).await;
-        let verdict = policy
+        let allow = evaluator(&temp.path, vec![], approval(ApprovalMode::Allow, true)).await;
+        let verdict = allow
             .evaluate(&exec_tool(), &call("exec", json!({"program": "true"})))
             .await
             .expect("policy must evaluate");
         assert!(matches!(verdict, PolicyVerdict::AutoApprove { .. }));
 
-        let ask = config(vec![], approval(ApprovalMode::Ask, true));
-        let policy = evaluator(&temp.path, &ask).await;
-        let verdict = policy
+        let ask = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, true)).await;
+        let verdict = ask
             .evaluate(&mcp_tool(), &call("mcp__srv__wipe", json!({})))
             .await
             .expect("policy must evaluate");
@@ -1200,9 +1625,8 @@ mod tests {
             "explicit approval must treat destructive MCP tools conservatively: {verdict:?}"
         );
 
-        let no_approval = config(vec![], approval(ApprovalMode::Ask, false));
-        let policy = evaluator(&temp.path, &no_approval).await;
-        let verdict = policy
+        let no_approval = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, false)).await;
+        let verdict = no_approval
             .evaluate(&mcp_tool(), &call("mcp__srv__wipe", json!({})))
             .await
             .expect("policy must evaluate");
@@ -1213,9 +1637,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_allow_rule_overrides_explicit_deny_mode_and_records_no_auto_approval() {
+    async fn an_allow_rule_overrides_explicit_deny_mode() {
         let temp = TempDir::new("allow-override");
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![rule(
                 "allow-status",
                 RuleAction::Allow,
@@ -1223,8 +1648,8 @@ mod tests {
                 None,
             )],
             approval(ApprovalMode::Deny, true),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let verdict = policy
             .evaluate(&exec_tool(), &call("exec", json!({"program": "git"})))
@@ -1232,10 +1657,7 @@ mod tests {
             .expect("policy must evaluate");
 
         assert_eq!(verdict.rule_id(), Some("allow-status"));
-        assert!(matches!(
-            verdict.explain(),
-            (FinalDecision::Allow, ApprovalDisposition::NotRequired)
-        ));
+        assert!(matches!(verdict, PolicyVerdict::Allow { .. }));
     }
 
     #[tokio::test]
@@ -1244,7 +1666,8 @@ mod tests {
         std::fs::create_dir_all(temp.path.join("src")).expect("source dir must exist");
         std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("file must exist");
         let patch = "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n";
-        let config = config(
+        let policy = evaluator(
+            &temp.path,
             vec![
                 rule(
                     "deny-edit",
@@ -1260,8 +1683,8 @@ mod tests {
                 ),
             ],
             approval(ApprovalMode::Ask, false),
-        );
-        let policy = evaluator(&temp.path, &config).await;
+        )
+        .await;
 
         let edit = policy
             .evaluate(
@@ -1294,10 +1717,9 @@ mod tests {
         std::fs::write(temp.path.join(".git/config"), "[core]\n").expect("config must exist");
         let edit = file_tool("edit_file");
 
-        let no_rules = config(vec![], approval(ApprovalMode::Allow, true));
-        let policy = evaluator(&temp.path, &no_rules).await;
+        let no_rules = evaluator(&temp.path, vec![], approval(ApprovalMode::Allow, true)).await;
         for path in [".env", ".git/config"] {
-            let verdict = policy
+            let verdict = no_rules
                 .evaluate(
                     &edit,
                     &call("edit_file", json!({"path": path, "old": "a", "new": "b"})),
@@ -1313,7 +1735,8 @@ mod tests {
             }
         }
 
-        let allowed = config(
+        let allowed = evaluator(
+            &temp.path,
             vec![rule(
                 "allow-env",
                 RuleAction::Allow,
@@ -1321,9 +1744,9 @@ mod tests {
                 Some(".env"),
             )],
             approval(ApprovalMode::Allow, true),
-        );
-        let policy = evaluator(&temp.path, &allowed).await;
-        let verdict = policy
+        )
+        .await;
+        let verdict = allowed
             .evaluate(
                 &edit,
                 &call(
@@ -1343,15 +1766,13 @@ mod tests {
         std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
         let policy = evaluator(
             &temp.path,
-            &config(
-                vec![rule(
-                    "review-env",
-                    RuleAction::Ask,
-                    Some(ToolSelector::One("edit_file".to_owned())),
-                    Some(".env"),
-                )],
-                approval(ApprovalMode::Allow, true),
-            ),
+            vec![rule(
+                "review-env",
+                RuleAction::Ask,
+                Some(ToolSelector::One("edit_file".to_owned())),
+                Some(".env"),
+            )],
+            approval(ApprovalMode::Allow, true),
         )
         .await;
 
@@ -1379,11 +1800,7 @@ mod tests {
     async fn write_file_keeps_its_pre_9_7_protected_path_behavior() {
         let temp = TempDir::new("write-protected");
         std::fs::write(temp.path.join(".env"), "SECRET=value\n").expect("file must exist");
-        let policy = evaluator(
-            &temp.path,
-            &config(vec![], approval(ApprovalMode::Ask, false)),
-        )
-        .await;
+        let policy = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, false)).await;
 
         let verdict = policy
             .evaluate(
@@ -1402,11 +1819,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_apply_patch_is_a_structured_policy_error() {
         let temp = TempDir::new("bad-patch");
-        let policy = evaluator(
-            &temp.path,
-            &config(vec![], approval(ApprovalMode::Ask, true)),
-        )
-        .await;
+        let policy = evaluator(&temp.path, vec![], approval(ApprovalMode::Ask, true)).await;
 
         let error = policy
             .evaluate(

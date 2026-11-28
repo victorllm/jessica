@@ -7,6 +7,7 @@ members = [
     "jessica-providers",
     "jessica-tools",
     "jessica-memory",
+    "jessica-engine",
     "jessica-cli",
 ]
 resolver = "2"
@@ -14,7 +15,7 @@ resolver = "2"
 # Task 7.0b：版本单一来源。成员 crate 使用 `version.workspace = true`，
 # `jessica --version` 读取同一个 CARGO_PKG_VERSION，禁止在其他文件重复版本号。
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 
 # 第三方依赖版本集中管理，成员 crate 通过 `dep.workspace = true` 继承。
 [workspace.dependencies]

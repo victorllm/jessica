@@ -3,162 +3,28 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jessica_core::acceptance::AcceptanceCheck;
-use jessica_core::events::EventSink;
-use jessica_core::guard::Guard;
 use jessica_core::llm::{LlmError, LlmProvider};
-use jessica_core::policy::Policy;
-use jessica_core::sensor::Sensor;
-use jessica_core::tool::{Tool, ToolRegistry, ToolRegistryError};
-use jessica_core::trace::{TraceTurnMode, TurnId};
-use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, SessionId};
-use jessica_harness::{
-    AcceptanceOutcome, AcceptanceRunner, AllowlistPolicy, CommandSensor, DEFAULT_EVENT_CAPACITY,
-    Harness, ResultSizeGuard, SessionAttempt, StuckDetectionGuard, TokenBudgetGuard,
-    ToolTimeoutGuard, TurnSignals,
-};
-use jessica_runtime::{
-    AgentChildExecutor, AgentLoop, ChildEventSink, ChildToolFactory, DelegateTaskTool,
-    DelegationError, ParentCapabilities, SessionCheckpoint, recover_session,
-};
+use jessica_core::tool::Tool;
+use jessica_core::types::{Message, SessionEndReason, SessionId};
+use jessica_engine::replay::ReplayError;
+use jessica_engine::{EventRecorder, PolicyError, RecorderError, UpdateSink};
+use jessica_runtime::{DelegationError, recover_session};
 use jessica_tools::WasmTool;
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::acceptance_check::CommandAcceptanceCheck;
 use crate::acp_store::AcpStoreError;
-use crate::artifacts::ResultManager;
 use crate::config::{ConfigError, HarnessConfig};
-use crate::delegation::NativeChildToolFactory;
-use crate::events::{EventJournal, EventRecorder, RecorderError};
-use crate::governance::{
-    GovernanceState, GovernedTool, TokenCountingProvider, ToolPermissionGate, cli_permission_gate,
-};
-use crate::journal::TurnJournal;
+use crate::engine_ports::build_engine;
+use crate::governance::ToolPermissionGate;
 use crate::memory::MemoryAssembly;
-use crate::policy_v2::{PolicyError, PolicyTool, PolicyV2};
-use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
-use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
-use crate::tools::{
-    CatalogCandidate, CatalogError, ToolAnnotations, ToolCatalog, ToolMetadata, ToolSource,
-    native_candidates,
-};
+use crate::tools::{CatalogCandidate, CatalogError, ToolAnnotations, ToolMetadata};
 
-/// Maximum time to wait for the event pump to observe a terminal event.
-const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How a new attempt enters the agent loop.
-enum AttemptStart {
-    /// A new session with a fresh conversation.
-    Fresh {
-        /// Identifier assigned to the new session.
-        session_id: SessionId,
-        /// Messages the session starts with.
-        messages: Vec<Message>,
-    },
-    /// A recovered session continuing an interrupted loop.
-    Continue {
-        /// Checkpoint rebuilt from the recorded events.
-        checkpoint: SessionCheckpoint,
-    },
-}
-
-/// Shared governance objects wrapped around every exposed tool in one turn.
-struct ToolWiring {
-    /// Harness owning policy, guards, and sensors.
-    harness: Arc<Harness>,
-    /// Turn budget and cancellation state.
-    governance: Arc<GovernanceState>,
-    /// Timeout guard shared with the harness.
-    timeout_guard: Arc<ToolTimeoutGuard>,
-    /// Result-size guard shared with the harness.
-    result_guard: Arc<ResultSizeGuard>,
-    /// Result manager applied before the result-size guard.
-    result_manager: Arc<ResultManager>,
-    /// Optional protocol gate preserving the legacy sensitive-tool flow.
-    permission_gate: Option<Arc<dyn ToolPermissionGate>>,
-    /// Optional gate used by policy `ask` verdicts.
-    ///
-    /// ACP reuses its permission gate here. A terminal CLI turn supplies a
-    /// one-shot prompt when an `ask` rule exists, without changing the legacy
-    /// behavior of sensitive tools that no rule mentions.
-    ask_gate: Option<Arc<dyn ToolPermissionGate>>,
-    /// Policy v2 evaluator shared by every governed tool in the turn.
-    policy_v2: Arc<PolicyV2>,
-}
-
-/// Per-turn middleware, agent, and pump wiring.
-struct TurnSetup {
-    /// Harness owning the events, guards, policy, and sensors.
-    harness: Arc<Harness>,
-    /// Event channel shared by the harness, agent, and governance.
-    events: broadcast::Sender<AgentEvent>,
-    /// Cancellation token for the turn.
-    cancel: CancellationToken,
-    /// Budget and policy state observed by the wrappers and pump.
-    governance: Arc<GovernanceState>,
-    /// Agent loop for this turn.
-    agent: Arc<AgentLoop>,
-    /// Producer-side journal shared by every emitter and the turn lifecycle.
-    journal: Arc<TurnJournal>,
-    /// Transcript renderer and guard checkpoint observer.
-    pump: Arc<EventPump>,
-    /// Background task draining the event channel into the pump.
-    pump_task: tokio::task::JoinHandle<()>,
-    /// Stateful stuck guard reset per attempt.
-    stuck_guard: Arc<StuckDetectionGuard>,
-}
-
-impl TurnSetup {
-    /// Stops the background tasks owned by this turn.
-    ///
-    /// The turn's cancellation token is a child of the process-level token, so
-    /// dropping this setup does not affect the shutdown controller.
-    fn shutdown(self) {
-        self.pump_task.abort();
-        self.journal.shutdown();
-    }
-}
-
-/// Handles shared by every attempt in one turn.
-#[derive(Clone)]
-struct AttemptContext {
-    /// Agent loop for this turn.
-    agent: Arc<AgentLoop>,
-    /// Harness owning middleware and the event channel.
-    harness: Arc<Harness>,
-    /// Transcript renderer and guard checkpoint observer.
-    pump: Arc<EventPump>,
-    /// Budget and policy state observed by the wrappers and pump.
-    governance: Arc<GovernanceState>,
-    /// Stateful stuck guard reset per attempt.
-    stuck_guard: Arc<StuckDetectionGuard>,
-    /// Producer-side journal for this turn.
-    journal: Arc<TurnJournal>,
-    /// Cancellation token for the turn.
-    cancel: CancellationToken,
-}
-
-impl AttemptContext {
-    /// Clones the per-turn handles into an attempt context.
-    fn from_setup(setup: &TurnSetup) -> Self {
-        Self {
-            agent: Arc::clone(&setup.agent),
-            harness: Arc::clone(&setup.harness),
-            pump: Arc::clone(&setup.pump),
-            governance: Arc::clone(&setup.governance),
-            stuck_guard: Arc::clone(&setup.stuck_guard),
-            journal: Arc::clone(&setup.journal),
-            cancel: setup.cancel.clone(),
-        }
-    }
-}
+pub(crate) use jessica_engine::TurnOutcome;
 
 /// Workspace and cancellation context for one turn.
 ///
@@ -222,9 +88,9 @@ pub(crate) struct TurnRequest {
     pub(crate) user_input: String,
     /// Programmatic event consumer.
     ///
-    /// When present the pump runs with [`PumpOutput::Silent`] and every event
-    /// is published to this sink in pump order. When absent the pump keeps the
-    /// existing `HumanConsole` rendering.
+    /// When present the engine runs the pump silently and publishes every
+    /// event to this sink in pump order. When absent the pump keeps the
+    /// existing human-console rendering.
     pub(crate) update_sink: Option<Arc<dyn UpdateSink>>,
     /// Per-turn override for the configured acceptance retry budget.
     ///
@@ -243,10 +109,10 @@ pub(crate) struct TurnRequest {
     ///
     /// ACP uses this for MCP tools discovered for one session. Candidates keep
     /// the server's advisory annotations so the catalog can classify
-    /// destructive or open-world tools conservatively. Every executable tool
-    /// is still wrapped in [`GovernedTool`], so policy, timeout, approval, and
-    /// result-size rules apply exactly as they do to native tools. The CLI and
-    /// resume paths pass an empty vector.
+    /// destructive or open-world tools conservatively. The engine wraps every
+    /// executable tool, so policy, timeout, approval, and result-size rules
+    /// apply exactly as they do to native tools. The CLI and resume paths pass
+    /// an empty vector.
     pub(crate) extra_tools: Vec<CatalogCandidate>,
     /// Optional approval gate for sensitive native tools.
     ///
@@ -254,33 +120,9 @@ pub(crate) struct TurnRequest {
     /// `session/request_permission`. The CLI and resume paths pass `None`,
     /// leaving sensitive tools governed by policy alone. The fixed native
     /// sensitive set plus destructive or open-world WASM/MCP descriptors are
-    /// evaluated inside [`GovernedTool`]; read-only annotated external tools do
-    /// not request permission.
+    /// classified by the catalog; read-only annotated external tools do not
+    /// request permission.
     pub(crate) permission_gate: Option<Arc<dyn ToolPermissionGate>>,
-}
-
-/// Observable result of one reusable turn execution.
-pub(crate) struct TurnOutcome {
-    /// Final reason, including governance overrides.
-    pub(crate) reason: SessionEndReason,
-    /// Conversation reconstructed for this turn, including history.
-    ///
-    /// A turn cancelled before it starts returns an empty vector because no
-    /// attempt ran. The CLI only needs the reason; the programmatic turn path
-    /// consumes this transcript directly.
-    pub(crate) messages: Vec<Message>,
-    /// Index in [`Self::messages`] just after this turn's user message.
-    ///
-    /// The new user message itself is at `turn_start - 1`. Everything before
-    /// it is the system prompt, recalled guides, or history supplied by the
-    /// caller, and everything from this offset onward was generated by the
-    /// turn. A turn cancelled before it starts reports `0`.
-    pub(crate) turn_start: usize,
-    /// Whether the event pump lost events to broadcast lag.
-    ///
-    /// A programmatic caller must treat this as an internal failure rather
-    /// than presenting a truncated transcript as complete.
-    pub(crate) lagged: bool,
 }
 
 /// A compiled WASM tool plus the manifest metadata used by the catalog.
@@ -305,10 +147,10 @@ pub(crate) struct CliRuntime {
     /// the startup configuration.
     config: watch::Receiver<Arc<HarnessConfig>>,
     root: PathBuf,
-    wasm_tools: Vec<LoadedWasmTool>,
+    wasm_tools: Arc<Vec<LoadedWasmTool>>,
     recorder: Option<Arc<EventRecorder>>,
-    memory: Option<MemoryAssembly>,
-    skills: Option<SkillsAssembly>,
+    memory: Option<Arc<MemoryAssembly>>,
+    skills: Option<Arc<SkillsAssembly>>,
     /// Process-level shutdown state shared by every turn and the REPL.
     shutdown: Arc<ShutdownController>,
 }
@@ -317,8 +159,8 @@ impl CliRuntime {
     /// Creates a runtime for the current workspace.
     ///
     /// `config` must already contain the fully validated startup configuration;
-    /// the same value is cloned at the start of every turn so `initial_messages`
-    /// and `build_turn` cannot observe different snapshots.
+    /// the same value is cloned at the start of every turn so the engine can
+    /// build the whole turn from one immutable snapshot.
     /// `wasm_tools` contains plugins already loaded by [`load_wasm_tools`].
     /// Compilation happens once at startup rather than on every turn.
     /// `recorder` is present when the configuration enables event persistence.
@@ -345,10 +187,10 @@ impl CliRuntime {
             provider,
             config,
             root,
-            wasm_tools,
+            wasm_tools: Arc::new(wasm_tools),
             recorder,
-            memory,
-            skills,
+            memory: memory.map(Arc::new),
+            skills: skills.map(Arc::new),
             shutdown,
         }
     }
@@ -362,13 +204,6 @@ impl CliRuntime {
     /// next turn.
     fn config_snapshot(&self) -> Arc<HarnessConfig> {
         self.config.borrow().clone()
-    }
-
-    /// Returns the write-only journal shared by the pump and turn orchestration.
-    fn journal(&self) -> Option<Arc<dyn EventJournal>> {
-        self.recorder
-            .clone()
-            .map(|recorder| recorder as Arc<dyn EventJournal>)
     }
 
     /// Drains the skill worker before the process exits.
@@ -406,13 +241,12 @@ impl CliRuntime {
 
     /// Executes one turn with an explicit workspace scope and history.
     ///
-    /// A turn starts with `system prompt → recalled memory (if any) → recalled
-    /// skills (if any) → history → user input`. Memory and skills are recalled
-    /// exactly once per turn, before the first attempt; acceptance retries
-    /// reuse the same initial conversation. A turn that finally completes is
-    /// written to memory and may enqueue a skill job according to the
-    /// configured policies. Signal counts cover only messages created by this
-    /// turn, never tool calls replayed from `history`.
+    /// All ordering is delegated to `jessica-engine`. The CLI contributes its
+    /// configuration snapshot, native/WASM/MCP tools, event journal, sensors,
+    /// acceptance check, memory and skills, system prompt, and process-local
+    /// identifiers through host ports. Memory and skills are recalled once by
+    /// the engine before the first attempt; acceptance retries reuse the same
+    /// prefix, and post-turn work runs only for a completed, untripped turn.
     pub(crate) async fn run_turn_request(
         &self,
         request: TurnRequest,
@@ -428,342 +262,49 @@ impl CliRuntime {
             permission_gate,
         } = request;
 
-        // One snapshot for the whole turn. `build_turn` and
-        // `initial_messages` must never mix a newer published config with an
-        // older one, even if the watcher fires mid-turn.
+        // One snapshot for the whole turn: the tool provider, prompt, sensors,
+        // acceptance check, policy, and budgets all read this same value.
         let config = self.config_snapshot();
-        let setup = self
-            .build_turn(
-                &scope,
-                true,
-                &config,
-                update_sink,
-                &extra_tools,
-                permission_gate,
-            )
-            .await?;
-        let first_session = session_id.unwrap_or_else(next_session_id);
-        // A signal may arrive between the REPL's last check and this point.
-        // The child token is already cancelled in that case: skip memory and
-        // skill recall, session recording, and every model request. The turn
-        // still gets a complete start/end trace when persistence is enabled so
-        // every normal return has a closed trace.
-        if setup.cancel.is_cancelled() {
-            let turn_id = next_turn_id();
-            let result = close_empty_turn(
-                &setup.journal,
-                turn_id,
-                TraceTurnMode::Fresh,
-                Vec::new(),
-                first_session,
-            )
-            .await;
-            setup.shutdown();
-            result?;
-            return Ok(TurnOutcome {
-                reason: SessionEndReason::Cancelled,
-                messages: Vec::new(),
-                turn_start: 0,
-                lagged: false,
-            });
-        }
-        let initial = self
-            .initial_messages(
-                &scope,
-                &first_session,
-                &history,
-                user_input.as_str(),
-                &config,
-            )
-            .await;
-        // Everything before this offset is history or guide material and never
-        // contributes to this turn's structured counts.
-        let turn_start = initial.len();
+        let engine = build_engine(
+            Arc::clone(&self.provider),
+            config,
+            scope.root(),
+            self.recorder.as_ref(),
+            &self.wasm_tools,
+            self.memory.as_ref(),
+            self.skills.as_ref(),
+            &extra_tools,
+            permission_gate,
+            true,
+        )?;
 
-        let turn_id = next_turn_id();
-        if let Err(error) = setup
-            .journal
-            .begin_turn(
-                turn_id.clone(),
-                TraceTurnMode::Fresh,
-                initial.clone(),
-                first_session.clone(),
-            )
+        let mut engine_request = jessica_engine::TurnRequest::new(user_input)
+            .with_workspace_root(scope.root().to_path_buf())
+            .with_history(history)
+            .with_cancellation(scope.cancel_parent().clone());
+        if let Some(session_id) = session_id {
+            engine_request = engine_request.with_session_id(session_id);
+        }
+        if let Some(retries) = acceptance_retries {
+            engine_request = engine_request.with_acceptance_retries(retries);
+        }
+        if let Some(sink) = update_sink {
+            engine_request = engine_request.with_observer(sink);
+        }
+
+        engine
+            .run_turn_request(engine_request)
             .await
-        {
-            setup.shutdown();
-            return Err(CliError::Events(error));
-        }
-
-        let context = AttemptContext::from_setup(&setup);
-        let (
-            reason,
-            emit_outer,
-            final_session,
-            final_output,
-            final_messages,
-            signals,
-            attempt_start,
-        ) = if let Some(acceptance) = &config.acceptance {
-            let retries = acceptance_retries.unwrap_or(acceptance.max_retries);
-            let check = CommandAcceptanceCheck::new(
-                acceptance.name.clone(),
-                acceptance.command.clone(),
-                acceptance.args.clone(),
-                resolve_dir(scope.root(), acceptance.working_dir.as_deref()),
-            )
-            .with_supervisor(&config.resolved_supervisor());
-            let runner = AcceptanceRunner::new(
-                Arc::new(check) as Arc<dyn AcceptanceCheck>,
-                retries,
-                setup.events.clone(),
-            );
-            let runner = match setup.journal.sink() {
-                Some(sink) => runner.with_event_sink(sink),
-                None => runner,
-            };
-            let mut next_session = Some(first_session.clone());
-            let mut latest_session = None;
-            let mut latest_attempt_start = turn_start;
-            let mut attempt_number = 0_u32;
-            let outcome = runner
-                .run(initial, |messages| {
-                    latest_attempt_start = messages.len();
-                    attempt_number = attempt_number.saturating_add(1);
-                    let session_id = next_session.take().unwrap_or_else(next_session_id);
-                    latest_session = Some(session_id.clone());
-                    let context = context.clone();
-                    async move {
-                        run_attempt(
-                            context,
-                            AttemptStart::Fresh {
-                                session_id,
-                                messages,
-                            },
-                            attempt_number,
-                        )
-                        .await
-                    }
-                })
-                .await;
-            let signals = acceptance_signals(&outcome, latest_attempt_start);
-
-            (
-                outcome.reason,
-                true,
-                latest_session.unwrap_or(first_session),
-                outcome.last_output,
-                outcome.messages,
-                signals,
-                latest_attempt_start,
-            )
-        } else {
-            let attempt = run_attempt(
-                context,
-                AttemptStart::Fresh {
-                    session_id: first_session.clone(),
-                    messages: initial,
-                },
-                1,
-            )
-            .await;
-            let (tool_calls, rounds) = structured_counts(&attempt.messages, turn_start);
-            (
-                attempt.reason,
-                setup.governance.tripped(),
-                first_session,
-                attempt.last_output,
-                attempt.messages,
-                TurnSignals::new(attempt.reason, tool_calls, rounds),
-                turn_start,
-            )
-        };
-
-        // A persistence failure or broadcast gap leaves the turn permanently
-        // incomplete. Flush what the producer already captured, but never emit
-        // further events or write `turn_ended`: the caller must observe an
-        // error instead of a normal turn result.
-        if let Some(cause) = setup.journal.integrity_failure() {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-
-        // A budget trip overrides the runtime's Completed/Cancelled reason.
-        // Emit an outer session event so the final observable reason is the
-        // governed one rather than the last attempt's reason.
-        if emit_outer
-            && let Err(error) =
-                emit_outer_session(&setup.journal, &setup.pump, &setup.events, reason).await
-        {
-            let cause = format!("failed to persist the outer session: {error}");
-            setup.journal.fail_integrity(cause.clone(), true);
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-        if let Some(cause) = setup.journal.integrity_failure() {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-        if let Err(error) = setup.journal.finish_turn(reason).await {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause: error.to_string(),
-            });
-        }
-
-        let governed_completed =
-            reason == SessionEndReason::Completed && !setup.governance.tripped();
-        let turn_index = stable_turn_index(&final_messages);
-        if governed_completed {
-            // Memory describes the whole turn, including every acceptance
-            // attempt; skill signals describe the final attempt. Both slices
-            // exclude history and guide messages replayed from before the
-            // turn.
-            self.record_turn_memory(
-                &final_session,
-                &user_input,
-                &final_output,
-                final_messages.get(turn_start..).unwrap_or(&[]),
-                turn_index,
-            )
-            .await;
-            self.record_skill_job(
-                &final_session,
-                turn_index,
-                &user_input,
-                &final_output,
-                &signals,
-                final_messages.get(attempt_start..).unwrap_or(&[]),
-            )
-            .await;
-        }
-
-        let lagged = setup.pump.has_lagged();
-        setup.shutdown();
-        Ok(TurnOutcome {
-            reason,
-            messages: final_messages,
-            turn_start,
-            lagged,
-        })
-    }
-
-    /// Builds the initial conversation for a fresh turn.
-    ///
-    /// The order is fixed: system prompt, optional memory guide, optional
-    /// skill guide, history, then user input. A disabled or failed guide
-    /// simply omits that message. Memory and skills are each recalled exactly
-    /// once here; the system prompt is rendered from the same configuration
-    /// snapshot as the rest of the turn and from the turn's canonical root.
-    async fn initial_messages(
-        &self,
-        scope: &TurnScope,
-        session: &SessionId,
-        history: &[Message],
-        input: &str,
-        config: &HarnessConfig,
-    ) -> Vec<Message> {
-        let memory_message = match &self.memory {
-            Some(memory) => memory.recall(session, input).await,
-            None => None,
-        };
-        let skill_message = match &self.skills {
-            Some(skills) => skills.recall(session, input).await,
-            None => None,
-        };
-        fresh_conversation(
-            &system_prompt(scope.root(), config),
-            memory_message,
-            skill_message,
-            history,
-            input,
-        )
-    }
-
-    /// Writes the completed turn to memory when the policy allows it.
-    ///
-    /// `messages` must contain only messages created by this turn, so tool
-    /// calls replayed from history never inflate the recorded count. Memory
-    /// failures are warned about and never change the reason or exit code of
-    /// the turn.
-    async fn record_turn_memory(
-        &self,
-        session_id: &SessionId,
-        user_input: &str,
-        assistant_answer: &str,
-        messages: &[Message],
-        turn_index: u64,
-    ) {
-        let Some(memory) = &self.memory else {
-            return;
-        };
-        let tool_call_count = messages
-            .iter()
-            .map(|message| message.tool_calls.len())
-            .sum();
-        if let Err(error) = memory
-            .record_completed_turn(
-                session_id,
-                user_input,
-                assistant_answer,
-                tool_call_count,
-                turn_index,
-            )
-            .await
-        {
-            eprintln!("[warn] failed to write memory for session {session_id}: {error}");
-        }
-    }
-
-    /// Enqueues a skill job when the completed turn crosses the thresholds.
-    ///
-    /// Counts are taken from the final attempt: `messages` must already be
-    /// sliced to that attempt. The enqueue is idempotent and fail-open; it
-    /// never writes the event stream and never awaits distillation.
-    async fn record_skill_job(
-        &self,
-        session_id: &SessionId,
-        turn_index: u64,
-        user_input: &str,
-        assistant_answer: &str,
-        signals: &TurnSignals,
-        messages: &[Message],
-    ) {
-        let Some(skills) = &self.skills else {
-            return;
-        };
-        skills
-            .after_completed_turn(
-                session_id,
-                turn_index,
-                user_input,
-                assistant_answer,
-                signals,
-                messages,
-            )
-            .await;
+            .map_err(CliError::from)
     }
 
     /// Continues the interrupted loop recorded for `session_id`.
     ///
-    /// Recovery is read-only: the checkpoint supplies the messages and round
-    /// count, and [`AgentLoop::resume`] continues from there without calling
-    /// the model or any tool for work already in the log. An already-ended
-    /// session returns its recorded reason without starting a loop.
+    /// The CLI keeps the read-only pre-check so an already-ended session
+    /// reports its recorded reason without assembling an engine. An unfinished
+    /// session is handed to the engine, which reloads the same evidence,
+    /// resumes from the first missing model round, and never exposes
+    /// `delegate_task`.
     pub(crate) async fn resume_turn(
         &self,
         session_id: SessionId,
@@ -787,405 +328,28 @@ impl CliRuntime {
             return Ok(reason);
         }
 
-        let user_input = checkpoint
-            .messages()
-            .iter()
-            .find(|message| message.role == Role::User)
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
-
         let config = self.config_snapshot();
         let scope = TurnScope::new(self.root.clone(), self.shutdown.child_token()).await?;
-        let setup = self
-            .build_turn(&scope, false, &config, None, &[], None)
-            .await?;
-        let trace_messages = checkpoint.messages().to_vec();
-        if setup.cancel.is_cancelled() {
-            let turn_id = next_turn_id();
-            let result = close_empty_turn(
-                &setup.journal,
-                turn_id,
-                TraceTurnMode::Resumed,
-                trace_messages,
-                session_id.clone(),
-            )
-            .await;
-            setup.shutdown();
-            result?;
-            return Ok(SessionEndReason::Cancelled);
-        }
-
-        let turn_id = next_turn_id();
-        if let Err(error) = setup
-            .journal
-            .begin_turn(
-                turn_id.clone(),
-                TraceTurnMode::Resumed,
-                trace_messages,
-                session_id.clone(),
-            )
-            .await
-        {
-            setup.shutdown();
-            return Err(CliError::Events(error));
-        }
-
-        let context = AttemptContext::from_setup(&setup);
-        let attempt = run_attempt(context, AttemptStart::Continue { checkpoint }, 1).await;
-        let reason = attempt.reason;
-
-        if let Some(cause) = setup.journal.integrity_failure() {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-        if setup.governance.tripped()
-            && let Err(error) =
-                emit_outer_session(&setup.journal, &setup.pump, &setup.events, reason).await
-        {
-            let cause = format!("failed to persist the outer session: {error}");
-            setup.journal.fail_integrity(cause.clone(), true);
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-        if let Some(cause) = setup.journal.integrity_failure() {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause,
-            });
-        }
-        if let Err(error) = setup.journal.finish_turn(reason).await {
-            let _ = setup.journal.flush().await;
-            setup.shutdown();
-            return Err(CliError::TraceIncomplete {
-                turn_id: turn_id.to_string(),
-                cause: error.to_string(),
-            });
-        }
-
-        let governed_completed =
-            reason == SessionEndReason::Completed && !setup.governance.tripped();
-        let turn_index = stable_turn_index(&attempt.messages);
-        if governed_completed {
-            let (tool_calls, rounds) = structured_counts(&attempt.messages, 0);
-            let signals = TurnSignals::new(reason, tool_calls, rounds);
-            self.record_turn_memory(
-                &session_id,
-                &user_input,
-                &attempt.last_output,
-                &attempt.messages,
-                turn_index,
-            )
-            .await;
-            // Resume never injects skills, but a completed resumed turn may
-            // enqueue idempotently through the skills.db unique index.
-            self.record_skill_job(
-                &session_id,
-                turn_index,
-                &user_input,
-                &attempt.last_output,
-                &signals,
-                &attempt.messages,
-            )
-            .await;
-        }
-
-        setup.shutdown();
-        Ok(reason)
-    }
-
-    /// Builds the harness, governance wrappers, agent, and event pump for one
-    /// turn.
-    ///
-    /// `allow_delegation` is false on the resume path. Resume continues a
-    /// recorded loop but never constructs a child factory or executor; a fresh
-    /// turn constructs them only when `[delegation]` is enabled. `update_sink`
-    /// selects silent protocol output for a programmatic client; without a
-    /// sink the pump keeps rendering to the terminal. `extra_tools` contains
-    /// session-scoped tools such as MCP discoveries; each is still wrapped in
-    /// [`GovernedTool`] by [`CliRuntime::build_tool_registry`].
-    /// `permission_gate` is the ACP protocol gate. A terminal CLI turn also
-    /// installs an ask-only prompt for policy v2 `ask` verdicts; neither gate
-    /// changes the legacy sensitive-tool flow when no approval is configured.
-    async fn build_turn(
-        &self,
-        scope: &TurnScope,
-        allow_delegation: bool,
-        config: &HarnessConfig,
-        update_sink: Option<Arc<dyn UpdateSink>>,
-        extra_tools: &[CatalogCandidate],
-        permission_gate: Option<Arc<dyn ToolPermissionGate>>,
-    ) -> Result<TurnSetup, CliError> {
-        let timeout = config.budget.tool_timeout();
-        let token_guard = Arc::new(TokenBudgetGuard::new(config.budget.max_tokens));
-        let timeout_guard = Arc::new(ToolTimeoutGuard::new(timeout));
-        let stuck_guard = Arc::new(StuckDetectionGuard::new(config.budget.max_stuck_rounds));
-        let result_guard = Arc::new(ResultSizeGuard::new(config.budget.max_result_bytes));
-        let result_manager = Arc::new(ResultManager::new(scope.root(), config));
-
-        let guards: Vec<Arc<dyn Guard>> = vec![
-            Arc::clone(&token_guard) as Arc<dyn Guard>,
-            Arc::clone(&timeout_guard) as Arc<dyn Guard>,
-            Arc::clone(&stuck_guard) as Arc<dyn Guard>,
-            Arc::clone(&result_guard) as Arc<dyn Guard>,
-        ];
-        let policy: Arc<dyn Policy> =
-            Arc::new(AllowlistPolicy::new(config.policy.allowed_tools.clone()));
-        let policy_v2 = Arc::new(
-            PolicyV2::new(scope.root(), config)
-                .await
-                .map_err(CliError::PolicyV2)?,
-        );
-        // ACP supplies its protocol gate. A CLI turn installs a terminal
-        // prompt for `ask` verdicts (an explicit `ask` mode or an `ask` rule);
-        // without any gate an ask outcome fails closed. The CLI prompt is not
-        // used as the legacy sensitive-tool gate, so adding one `ask` rule
-        // does not start prompting for unrelated sensitive tools.
-        let cli_ask_gate = cli_permission_gate(scope.root(), config);
-        let ask_gate = permission_gate.clone().or(cli_ask_gate);
-        let sensors = self.build_sensors(scope, config);
-        let harness = Arc::new(
-            Harness::with_event_capacity(Vec::new(), DEFAULT_EVENT_CAPACITY)
-                .with_guards(guards)
-                .with_policy(policy)
-                .with_sensors(sensors),
-        );
-
-        let events = harness.events();
-        // Every turn derives its own child token; only the scope's parent and
-        // this turn (through the loop) may cancel it.
-        let cancel = scope.cancel_parent().child_token();
-        let journal = TurnJournal::new(self.journal(), cancel.clone());
-        let governance = Arc::new(
-            GovernanceState::new(events.clone(), cancel.clone()).with_event_sink(journal.sink()),
-        );
-        let provider: Arc<dyn LlmProvider> = Arc::new(TokenCountingProvider::new(
+        let engine = build_engine(
             Arc::clone(&self.provider),
-            Arc::clone(&governance),
-            Arc::clone(&token_guard),
-        ));
-        // Build the base catalog before delegation so a child can be granted
-        // only tools the parent profile actually exposes. The final catalog is
-        // rebuilt with the executable delegate tool and then checked against
-        // the exposure budgets.
-        let mut candidates = self.turn_candidates(scope, config, extra_tools);
-        let base = ToolCatalog::build(candidates.clone(), config).map_err(CliError::ToolCatalog)?;
-
-        // The child executor receives the same counting provider, so every
-        // child call charges the parent token guard and can cancel the turn.
-        let delegation = self.build_child_executor(
-            scope,
-            allow_delegation,
-            Arc::clone(&provider),
             config,
-            journal.sink(),
-            journal.child_sink(),
-            events.clone(),
-            ParentCapabilities::new(base.exposed_names(), base.exposed_native_names()),
-            Arc::clone(&result_manager),
+            scope.root(),
+            self.recorder.as_ref(),
+            &self.wasm_tools,
+            self.memory.as_ref(),
+            self.skills.as_ref(),
+            &[],
+            None,
+            false,
         )?;
-
-        let catalog = if let Some(executor) = delegation {
-            candidates.push(CatalogCandidate::from_tool(
-                Arc::new(DelegateTaskTool::new(executor)),
-                ToolSource::Delegation,
-            ));
-            ToolCatalog::build(candidates, config).map_err(CliError::ToolCatalog)?
-        } else {
-            base
-        };
-        catalog
-            .enforce_budget(config)
-            .map_err(CliError::ToolCatalog)?;
-
-        let wiring = ToolWiring {
-            harness: Arc::clone(&harness),
-            governance: Arc::clone(&governance),
-            timeout_guard: Arc::clone(&timeout_guard),
-            result_guard: Arc::clone(&result_guard),
-            result_manager,
-            permission_gate,
-            ask_gate,
-            policy_v2,
-        };
-        let registry = self.build_tool_registry(&catalog, &wiring)?;
-        let agent = AgentLoop::new(
-            provider,
-            Arc::new(registry),
-            config.budget.to_budget(),
-            events.clone(),
-        );
-        let agent = match journal.sink() {
-            Some(sink) => agent.with_event_sink(sink),
-            None => agent,
-        };
-        let agent = Arc::new(agent);
-        let output = if update_sink.is_some() {
-            PumpOutput::Silent
-        } else {
-            PumpOutput::HumanConsole
-        };
-        let pump = Arc::new(EventPump::new(
-            Arc::clone(&harness),
-            Arc::clone(&governance),
-            Arc::clone(&journal),
-            output,
-            update_sink,
-        ));
-        let pump_task = tokio::spawn(Arc::clone(&pump).run(harness.subscribe()));
-
-        Ok(TurnSetup {
-            harness,
-            events,
-            cancel,
-            governance,
-            agent,
-            journal,
-            pump,
-            pump_task,
-            stuck_guard,
-        })
-    }
-
-    fn build_sensors(&self, scope: &TurnScope, config: &HarnessConfig) -> Vec<Arc<dyn Sensor>> {
-        let Some(sensor) = &config.sensor else {
-            return Vec::new();
-        };
-        let supervisor = config.resolved_supervisor();
-        let command = CommandSensor::new(&sensor.name, &sensor.command)
-            .args(sensor.args.clone())
-            .with_current_dir(resolve_dir(scope.root(), sensor.working_dir.as_deref()))
-            .with_timeout(supervisor.sensor_timeout)
-            .with_output_limit(supervisor.max_output_bytes)
-            .with_env_allowlist(supervisor.env_allowlist);
-        vec![Arc::new(command) as Arc<dyn Sensor>]
-    }
-
-    /// Builds the child executor when delegation is enabled for this path.
-    ///
-    /// Returns `None` when delegation is disabled or when `allow_delegation`
-    /// is false, and in that case does not construct the factory or executor.
-    /// The executor receives the turn's sink and broadcast sender so the
-    /// parent-side child session lifecycle is traced alongside the parent, and
-    /// a child-event sink so child-internal events become trace evidence.
-    /// Child events never enter the legacy event log or the parent broadcast.
-    #[allow(clippy::too_many_arguments)]
-    fn build_child_executor(
-        &self,
-        scope: &TurnScope,
-        allow_delegation: bool,
-        provider: Arc<dyn LlmProvider>,
-        config: &HarnessConfig,
-        sink: Option<Arc<dyn EventSink>>,
-        child_sink: Option<Arc<dyn ChildEventSink>>,
-        events: broadcast::Sender<AgentEvent>,
-        parent: ParentCapabilities,
-        result_manager: Arc<ResultManager>,
-    ) -> Result<Option<Arc<AgentChildExecutor>>, CliError> {
-        if !allow_delegation || !config.delegation.enabled {
-            return Ok(None);
-        }
-
-        // The child factory receives the same resolved supervisor settings and
-        // result manager as the parent turn. Child bash/exec therefore share
-        // the environment allowlist, deadlines, output caps, and artifact
-        // storage instead of falling back to bare tool defaults.
-        let factory: Arc<dyn ChildToolFactory> = Arc::new(NativeChildToolFactory::new(
-            scope.root().to_path_buf(),
-            config,
-            result_manager,
-        ));
-        let mut executor =
-            AgentChildExecutor::new(provider, factory, parent, config.delegation.to_limits())?;
-        if let Some(sink) = sink {
-            executor = executor.with_event_sink(sink);
-        }
-        if let Some(child_sink) = child_sink {
-            executor = executor.with_child_event_sink(child_sink);
-        }
-        executor = executor.with_event_sender(events);
-        Ok(Some(Arc::new(executor)))
-    }
-
-    /// Builds candidate tools available to this turn before catalog filtering.
-    ///
-    /// Native tools are rebuilt per turn because they are bound to the turn's
-    /// canonical root. WASM tools are process-wide compiled plugins; MCP tools
-    /// arrive per session as `extra_tools`.
-    fn turn_candidates(
-        &self,
-        scope: &TurnScope,
-        config: &HarnessConfig,
-        extra_tools: &[CatalogCandidate],
-    ) -> Vec<CatalogCandidate> {
-        let mut candidates = native_candidates(scope.root(), config);
-        candidates.extend(self.wasm_tools.iter().map(|loaded| {
-            CatalogCandidate::from_tool(Arc::clone(&loaded.tool), ToolSource::Wasm)
-                .with_metadata(loaded.metadata.clone())
-        }));
-        candidates.extend(extra_tools.iter().cloned());
-        candidates
-    }
-
-    /// Wraps exactly the exposed catalog entries for the agent loop.
-    ///
-    /// Hidden tools are not registered, so they are absent from the provider
-    /// schema and an attempted call is an unknown tool. Each exposed tool uses
-    /// its descriptor's effective timeout and optional argument-size limit;
-    /// approval gates attach only to entries the host classified as
-    /// interactive.
-    fn build_tool_registry(
-        &self,
-        catalog: &ToolCatalog,
-        wiring: &ToolWiring,
-    ) -> Result<ToolRegistry, CliError> {
-        let mut registry = ToolRegistry::new();
-        for entry in catalog.exposed() {
-            let name = entry.descriptor.name.clone();
-            let tool = entry
-                .tool
-                .as_ref()
-                .ok_or_else(|| CatalogError::MissingImplementation { name: name.clone() })?;
-            let mut governed = GovernedTool::new(
-                Arc::clone(tool),
-                Arc::clone(&wiring.harness),
-                Arc::clone(&wiring.governance),
-                Duration::from_millis(entry.descriptor.limits.timeout_ms),
-                Arc::clone(&wiring.timeout_guard),
-                Arc::clone(&wiring.result_guard),
-            )
-            .with_max_args_bytes(entry.descriptor.limits.max_args_bytes)
-            .with_result_manager(
-                Some(Arc::clone(&wiring.result_manager)),
-                entry.descriptor.result_format,
-            )
-            .with_policy_v2(
-                Arc::clone(&wiring.policy_v2),
-                PolicyTool::from_descriptor(&entry.descriptor),
-            );
-            // A policy `ask` rule can target a tool that the legacy approval
-            // set never covered, so the ask gate is attached to every exposed
-            // tool. The evaluator decides which gate is consulted.
-            if wiring.permission_gate.is_some() {
-                governed = governed.with_permission_gate(wiring.permission_gate.clone());
-            }
-            if wiring.ask_gate.is_some() {
-                governed = governed.with_ask_gate(wiring.ask_gate.clone());
-            }
-            registry
-                .register(Arc::new(governed))
-                .map_err(|source| CliError::RegisterTool { name, source })?;
-        }
-        Ok(registry)
+        let request = jessica_engine::TurnRequest::new(String::new())
+            .with_workspace_root(scope.root().to_path_buf())
+            .with_cancellation(scope.cancel_parent().clone());
+        let outcome = engine
+            .resume_turn(session_id, request)
+            .await
+            .map_err(CliError::from)?;
+        Ok(outcome.reason)
     }
 }
 
@@ -1247,352 +411,6 @@ fn wasm_metadata(tool: &WasmTool) -> ToolMetadata {
     }
 }
 
-/// Outcome of racing the pump wait against a journal failure.
-enum PumpWait {
-    /// The pump returned its session snapshot or lost the session.
-    Snapshot(Option<SessionSnapshot>),
-    /// The journal failed before the pump could observe a terminal event.
-    JournalFailed,
-}
-
-/// Builds the fallback snapshot used when the pump cannot complete a session.
-fn fallback_snapshot(messages: Vec<Message>) -> SessionSnapshot {
-    SessionSnapshot {
-        messages,
-        last_output: String::new(),
-    }
-}
-
-/// Runs one agent attempt and waits until its transcript is complete.
-///
-/// The stuck guard is stateful per session, so it is reset before every
-/// acceptance retry; token usage remains cumulative across the whole turn.
-async fn run_attempt(
-    context: AttemptContext,
-    start: AttemptStart,
-    attempt_number: u32,
-) -> SessionAttempt {
-    context.stuck_guard.reset();
-    let (session_id, initial_messages) = match &start {
-        AttemptStart::Fresh {
-            session_id,
-            messages,
-        } => (session_id.clone(), messages.clone()),
-        AttemptStart::Continue { checkpoint } => (
-            checkpoint.session_id().clone(),
-            checkpoint.messages().to_vec(),
-        ),
-    };
-    let fallback_messages = initial_messages.clone();
-
-    // Once the trace is broken, no further attempt may start: its events could
-    // not be attributed and the turn can never close successfully.
-    if let Some(cause) = context.journal.integrity_failure() {
-        context.journal.fail_integrity(cause, true);
-        return SessionAttempt {
-            messages: fallback_messages,
-            last_output: String::new(),
-            reason: SessionEndReason::Error,
-        };
-    }
-
-    // A fresh session needs its immutable bootstrap messages before any event
-    // is appended. A resumed session already has them in the store. A metadata
-    // failure fails the turn: recovery would otherwise lack the user messages
-    // needed to replay the attempt. With persistence disabled this is a no-op.
-    if let AttemptStart::Fresh { messages, .. } = &start
-        && let Err(error) = context
-            .journal
-            .record_session_start(&session_id, messages)
-            .await
-    {
-        let cause = format!("failed to record session metadata for {session_id}: {error}");
-        context.journal.fail_integrity(cause, true);
-        return SessionAttempt {
-            messages: fallback_messages,
-            last_output: String::new(),
-            reason: SessionEndReason::Error,
-        };
-    }
-
-    if let Err(error) = context.journal.begin_attempt(attempt_number, &session_id) {
-        let cause = format!(
-            "failed to attribute attempt {attempt_number} to session {session_id}: {error}"
-        );
-        context.journal.fail_integrity(cause, true);
-        return SessionAttempt {
-            messages: fallback_messages,
-            last_output: String::new(),
-            reason: SessionEndReason::Error,
-        };
-    }
-
-    context
-        .pump
-        .register(session_id.clone(), initial_messages.clone());
-
-    let raw_reason = match start {
-        AttemptStart::Fresh { messages, .. } => {
-            context
-                .harness
-                .run(
-                    &session_id,
-                    context
-                        .agent
-                        .run(session_id.clone(), messages, context.cancel.clone()),
-                )
-                .await
-        }
-        AttemptStart::Continue { checkpoint } => {
-            context
-                .harness
-                .run(
-                    &session_id,
-                    context.agent.resume(checkpoint, context.cancel.clone()),
-                )
-                .await
-        }
-    };
-    let reason = if context.governance.tripped() && raw_reason != SessionEndReason::BudgetExceeded {
-        SessionEndReason::BudgetExceeded
-    } else {
-        raw_reason
-    };
-
-    // A sink failure suppresses the terminal broadcast, so the pump may never
-    // see `SessionEnded`. Race its wait against the journal's failure signal
-    // instead of waiting for the full timeout.
-    let waited = tokio::time::timeout(PUMP_TIMEOUT, async {
-        tokio::select! {
-            snapshot = context.pump.wait_for(&session_id) => PumpWait::Snapshot(snapshot),
-            _ = context.journal.failure_signal() => PumpWait::JournalFailed,
-        }
-    })
-    .await;
-    let (snapshot, pump_failed) = match waited {
-        Ok(PumpWait::Snapshot(Some(snapshot))) => (snapshot, false),
-        Ok(PumpWait::Snapshot(None)) => {
-            eprintln!("[warn] event pump lost session {session_id}");
-            (fallback_snapshot(fallback_messages), true)
-        }
-        Ok(PumpWait::JournalFailed) => (fallback_snapshot(fallback_messages), true),
-        Err(_) => {
-            eprintln!("[warn] event pump timed out for session {session_id}");
-            (fallback_snapshot(fallback_messages), true)
-        }
-    };
-    if pump_failed {
-        context.journal.fail_integrity(
-            format!("the event pump did not complete session {session_id}"),
-            true,
-        );
-    }
-
-    SessionAttempt {
-        messages: snapshot.messages,
-        last_output: snapshot.last_output,
-        reason: if pump_failed || context.journal.integrity_failure().is_some() {
-            SessionEndReason::Error
-        } else {
-            reason
-        },
-    }
-}
-
-/// Emits a final outer session event after acceptance orchestration.
-///
-/// Individual attempts already emitted their own terminal events. The outer
-/// event carries the governed turn's final reason, so a retry-exhausted turn is
-/// observable as [`SessionEndReason::AcceptanceFailed`] rather than ending with
-/// the last attempt's [`SessionEndReason::Completed`].
-async fn emit_outer_session(
-    journal: &TurnJournal,
-    pump: &EventPump,
-    events: &broadcast::Sender<AgentEvent>,
-    reason: SessionEndReason,
-) -> Result<(), RecorderError> {
-    let session_id = next_session_id();
-    if journal.enabled() {
-        // Fail closed before broadcasting: the outer session's metadata and
-        // terminal pair must be durable before any observer sees them.
-        journal.record_outer_session(&session_id, reason).await?;
-    }
-    pump.register(session_id.clone(), Vec::new());
-    let _ = events.send(AgentEvent::SessionStarted {
-        session_id: session_id.clone(),
-        messages: Vec::new(),
-    });
-    let _ = events.send(AgentEvent::SessionEnded {
-        session_id: session_id.clone(),
-        reason,
-    });
-
-    let waited = tokio::time::timeout(PUMP_TIMEOUT, pump.wait_for(&session_id)).await;
-    if journal.enabled() {
-        match waited {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(RecorderError::Integrity {
-                message: "the event pump did not observe the outer session".to_owned(),
-            }),
-            Err(_) => Err(RecorderError::Integrity {
-                message: "timed out while flushing the outer session event".to_owned(),
-            }),
-        }
-    } else {
-        match waited {
-            Ok(Some(_)) => {}
-            Ok(None) => eprintln!("[warn] outer session was not registered with the event pump"),
-            Err(_) => eprintln!("[warn] timed out while flushing the outer session event"),
-        }
-        Ok(())
-    }
-}
-
-fn resolve_dir(root: &Path, configured: Option<&Path>) -> PathBuf {
-    match configured {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => root.join(path),
-        None => root.to_path_buf(),
-    }
-}
-
-/// Builds a fresh conversation in its required order.
-///
-/// The order is fixed: system prompt, optional memory guide, optional skill
-/// guide, history, then user input. History is empty for a CLI turn and
-/// carries earlier multi-turn context for a programmatic client.
-fn fresh_conversation(
-    system_prompt: &str,
-    memory_message: Option<Message>,
-    skill_message: Option<Message>,
-    history: &[Message],
-    input: &str,
-) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(4 + history.len());
-    messages.push(Message::system(system_prompt));
-    if let Some(message) = memory_message {
-        messages.push(message);
-    }
-    if let Some(message) = skill_message {
-        messages.push(message);
-    }
-    messages.extend_from_slice(history);
-    messages.push(Message::user(input));
-    messages
-}
-
-/// Counts tool calls and assistant rounds in `messages[attempt_start..]`.
-///
-/// The acceptance runner passes the accumulated conversation into each retry,
-/// so the CLI records the start of the final attempt and counts only that
-/// attempt. Counts come from structured messages, never from model text.
-fn structured_counts(messages: &[Message], attempt_start: usize) -> (usize, usize) {
-    let attempt = messages.get(attempt_start..).unwrap_or(&[]);
-    let tool_calls = attempt.iter().map(|message| message.tool_calls.len()).sum();
-    let rounds = attempt
-        .iter()
-        .filter(|message| message.role == Role::Assistant)
-        .count();
-    (tool_calls, rounds)
-}
-
-/// Builds trigger signals from an acceptance outcome and the final attempt
-/// start offset.
-fn acceptance_signals(outcome: &AcceptanceOutcome, attempt_start: usize) -> TurnSignals {
-    let (tool_calls, rounds) = structured_counts(&outcome.messages, attempt_start);
-    TurnSignals::from_acceptance(outcome, tool_calls, rounds)
-}
-
-/// Derives a stable turn index from the session transcript.
-///
-/// The index is the number of user turns already present before this one,
-/// counted from structured messages. A CLI turn starts one session and both a
-/// fresh turn and every resume of that turn derive `0`; a multi-turn client
-/// that carries history derives the number of earlier user turns. The value
-/// never depends on a process-local counter and is stable across restarts.
-fn stable_turn_index(messages: &[Message]) -> u64 {
-    let user_turns = messages
-        .iter()
-        .filter(|message| message.role == Role::User)
-        .count();
-    u64::try_from(user_turns.saturating_sub(1)).unwrap_or(u64::MAX)
-}
-
-fn system_prompt(root: &Path, config: &HarnessConfig) -> String {
-    let allowed = config
-        .policy
-        .allowed_tools
-        .iter()
-        .filter(|name| config.tools.bash.enabled || *name != "bash")
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let allowed = if allowed.is_empty() {
-        "none".to_owned()
-    } else {
-        allowed.join(", ")
-    };
-    format!(
-        "You are Jessica, a deterministic coding agent. The workspace root is {}. \
-         Use read_file, list_dir, grep, git_status, git_diff, write_file, apply_patch, and \
-         edit_file with paths relative to the workspace root. exec runs one program with an \
-         explicit argument \
-         array and never goes through a shell. Tool calls are subject to this allowlist: \
-         {allowed}. A denied call returns an error result, so adapt instead of repeating it. \
-         A command sensor runs after every tool result. If an acceptance check fails, its \
-         feedback is injected as a user message: fix the underlying problem and retry. \
-         Verify your work with tools instead of claiming success. When the task is complete, \
-         reply with a concise summary.",
-        root.display()
-    )
-}
-
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
-static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generates a process-local session id.
-fn next_session_id() -> SessionId {
-    let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    SessionId::new(format!("cli-{}-{counter}", std::process::id()))
-}
-
-/// Generates a process-unique turn id.
-///
-/// The timestamp, process id, and per-process counter make collisions
-/// practically impossible. The store rejects a duplicate id instead of
-/// silently merging two turns, so a collision still fails closed.
-fn next_turn_id() -> TurnId {
-    let counter = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    TurnId::new(format!("turn-{}-{nanos}-{counter}", std::process::id()))
-}
-
-/// Starts and immediately closes a turn that never ran an attempt.
-///
-/// A cancelled-before-start turn is still a normal return, so it must not
-/// leave an open trace when persistence is enabled.
-async fn close_empty_turn(
-    journal: &TurnJournal,
-    turn_id: TurnId,
-    mode: TraceTurnMode,
-    messages: Vec<Message>,
-    first_session: SessionId,
-) -> Result<(), CliError> {
-    journal
-        .begin_turn(turn_id.clone(), mode, messages, first_session)
-        .await
-        .map_err(CliError::Events)?;
-    journal
-        .finish_turn(SessionEndReason::Cancelled)
-        .await
-        .map_err(|error| CliError::TraceIncomplete {
-            turn_id: turn_id.to_string(),
-            cause: error.to_string(),
-        })
-}
-
 /// Errors produced while assembling or running a CLI turn.
 #[derive(Debug, Error)]
 pub(crate) enum CliError {
@@ -1631,15 +449,6 @@ pub(crate) enum CliError {
     PolicySimulation {
         /// Structured reason such as hidden tool, invalid JSON, or path error.
         message: String,
-    },
-    /// A tool could not be registered.
-    #[error("failed to register the `{name}` tool: {source}")]
-    RegisterTool {
-        /// Name of the tool that could not be registered.
-        name: String,
-        /// Underlying registry error.
-        #[source]
-        source: ToolRegistryError,
     },
     /// A wasm tool manifest or module could not be loaded.
     #[error("failed to load wasm tools: {0}")]
@@ -1919,6 +728,35 @@ pub(crate) enum CliError {
         /// Unrecognized argument.
         argument: String,
     },
+    /// The governed engine failed with an error the CLI does not reclassify.
+    #[error("governed engine failed: {0}")]
+    Engine(#[source] Box<jessica_engine::EngineError>),
+}
+
+impl From<jessica_engine::EngineError> for CliError {
+    fn from(error: jessica_engine::EngineError) -> Self {
+        use jessica_engine::EngineError as Engine;
+        match error {
+            Engine::TraceIncomplete { turn_id, cause } => Self::TraceIncomplete { turn_id, cause },
+            Engine::UnknownSession { session_id } => Self::UnknownSession { session_id },
+            Engine::Recorder(error) => Self::Events(error),
+            Engine::Recovery(error) => Self::Recovery(error),
+            Engine::Delegation(error) => Self::Delegation(error),
+            Engine::Policy(error) => Self::PolicyV2(error),
+            Engine::Workspace { root, source } => Self::CanonicalizeRoot { path: root, source },
+            Engine::CatalogTooLarge { exposed, limit } => {
+                Self::ToolCatalog(CatalogError::TooManyTools { exposed, limit })
+            }
+            Engine::SchemaBudgetExceeded { bytes, limit } => {
+                Self::ToolCatalog(CatalogError::SchemaBytes { bytes, limit })
+            }
+            Engine::DuplicateTool { name } => Self::ToolCatalog(CatalogError::Duplicate { name }),
+            Engine::MissingToolImplementation { name } => {
+                Self::ToolCatalog(CatalogError::MissingImplementation { name })
+            }
+            other => Self::Engine(Box::new(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1927,17 +765,21 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use futures::StreamExt;
     use jessica_core::llm::{LlmEvent, LlmStream};
     use jessica_core::tool::ToolSchema;
-    use jessica_core::trace::{TraceEvent, TracePayload};
-    use jessica_core::types::{TokenUsage, ToolCall};
-    use jessica_memory::{EventStore, StoredTraceTurn, Timestamp};
+    use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode};
+    use jessica_core::types::{AgentEvent, Role, TokenUsage, ToolCall};
+    use jessica_memory::{
+        EventStore, MemoryLog, MemoryRecord, SqliteMemoryStore, StoredTraceTurn, Timestamp,
+    };
     use jessica_runtime::{CHILD_AGENT_SYSTEM_PROMPT, DELEGATE_TASK_TOOL_NAME};
     use serde_json::json;
 
+    use crate::governance::ToolPermissionDecision;
     use crate::shutdown::ShutdownSignal;
 
     /// One captured provider call.
@@ -2233,11 +1075,72 @@ mod tests {
         )
     }
 
-    /// Creates a turn scope rooted at the process current directory.
-    async fn test_scope() -> TurnScope {
-        TurnScope::new(PathBuf::from("."), CancellationToken::new())
+    /// Builds a runtime with an already-opened memory assembly.
+    fn runtime_with_memory(
+        provider: Arc<ScriptedProvider>,
+        config: HarnessConfig,
+        root: PathBuf,
+        memory: MemoryAssembly,
+    ) -> CliRuntime {
+        let (_sender, receiver) = watch::channel(Arc::new(config));
+        CliRuntime::new(
+            provider,
+            receiver,
+            root,
+            Vec::new(),
+            None,
+            Some(memory),
+            None,
+            Arc::new(ShutdownController::new()),
+        )
+    }
+
+    /// Creates a turn scope rooted at `root`.
+    async fn test_scope_at(root: PathBuf) -> TurnScope {
+        TurnScope::new(root, CancellationToken::new())
             .await
             .expect("the test workspace must canonicalize")
+    }
+
+    /// Creates a turn scope rooted at the process current directory.
+    async fn test_scope() -> TurnScope {
+        test_scope_at(PathBuf::from(".")).await
+    }
+
+    /// Reads the live memory entries written for `session`.
+    fn memory_entries(database: &Path, root: &Path, session: &SessionId) -> Vec<MemoryRecord> {
+        let store =
+            SqliteMemoryStore::open(database, root, None).expect("memory store must reopen");
+        let log = MemoryLog::open(database).expect("memory log must reopen");
+        log.recent_for_session(session, store.workspace_scope(), 10)
+            .expect("memory entries must load")
+    }
+
+    /// Gate that records every approval request and allows it.
+    #[derive(Default)]
+    struct AllowOnceGate {
+        calls: Mutex<Vec<ToolCall>>,
+    }
+
+    impl AllowOnceGate {
+        /// Returns the tool calls that requested approval.
+        fn calls(&self) -> Vec<ToolCall> {
+            self.calls
+                .lock()
+                .expect("gate calls mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolPermissionGate for AllowOnceGate {
+        async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision {
+            self.calls
+                .lock()
+                .expect("gate calls mutex poisoned")
+                .push(call.clone());
+            ToolPermissionDecision::Allow
+        }
     }
 
     /// Builds a runtime over the given provider, config, and event database.
@@ -2311,99 +1214,38 @@ mod tests {
     async fn delegate_tool_is_present_only_on_enabled_fresh_turns() {
         let enabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let enabled_runtime = runtime_with(Arc::clone(&enabled_provider), enabled_config());
-        let enabled_config_snapshot = enabled_runtime.config_snapshot();
-        let setup = enabled_runtime
-            .build_turn(
-                &test_scope().await,
-                true,
-                &enabled_config_snapshot,
-                None,
-                &[],
-                None,
-            )
-            .await
-            .expect("turn should build");
-        let reason = setup
-            .agent
-            .run(
-                SessionId::new("enabled"),
-                vec![Message::user("hi")],
-                setup.cancel.clone(),
-            )
-            .await;
-        assert_eq!(reason, SessionEndReason::Completed);
-        setup.shutdown();
+
+        assert_eq!(
+            enabled_runtime
+                .run_turn("hi".to_owned())
+                .await
+                .expect("the enabled turn must finish"),
+            SessionEndReason::Completed
+        );
 
         let enabled_calls = enabled_provider.calls();
-        let enabled_names = schema_names(&enabled_calls[0].tools);
         assert_eq!(
-            enabled_names,
+            schema_names(&enabled_calls[0].tools),
             vec!["bash", "delegate_task", "read_file", "write_file"]
         );
 
         let disabled_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
         let disabled_runtime =
             runtime_with(Arc::clone(&disabled_provider), HarnessConfig::default());
-        let disabled_config_snapshot = disabled_runtime.config_snapshot();
-        let setup = disabled_runtime
-            .build_turn(
-                &test_scope().await,
-                true,
-                &disabled_config_snapshot,
-                None,
-                &[],
-                None,
-            )
-            .await
-            .expect("turn should build");
-        setup
-            .agent
-            .run(
-                SessionId::new("disabled"),
-                vec![Message::user("hi")],
-                setup.cancel.clone(),
-            )
-            .await;
-        setup.shutdown();
 
-        let disabled_calls = disabled_provider.calls();
-        let disabled_names = schema_names(&disabled_calls[0].tools);
         assert_eq!(
-            disabled_names,
-            vec!["read_file", "write_file"],
-            "bash is disabled by default even though the default allowlist names it"
+            disabled_runtime
+                .run_turn("hi".to_owned())
+                .await
+                .expect("the disabled turn must finish"),
+            SessionEndReason::Completed
         );
 
-        let resume_provider = Arc::new(ScriptedProvider::new(vec![done_text("ok", 1)]));
-        let resume_runtime = runtime_with(Arc::clone(&resume_provider), enabled_config());
-        let resume_config_snapshot = resume_runtime.config_snapshot();
-        let setup = resume_runtime
-            .build_turn(
-                &test_scope().await,
-                false,
-                &resume_config_snapshot,
-                None,
-                &[],
-                None,
-            )
-            .await
-            .expect("turn should build");
-        setup
-            .agent
-            .run(
-                SessionId::new("resume"),
-                vec![Message::user("hi")],
-                setup.cancel.clone(),
-            )
-            .await;
-        setup.shutdown();
-
-        let resume_calls = resume_provider.calls();
-        let resume_names = schema_names(&resume_calls[0].tools);
         assert_eq!(
-            resume_names,
-            vec!["bash", "read_file", "write_file"],
-            "the resume path must not register delegate_task"
+            schema_names(&disabled_provider.calls()[0].tools),
+            vec!["read_file", "write_file"],
+            "bash is disabled by default even though the default allowlist names it, \
+             and delegation must stay off unless configured"
         );
     }
 
@@ -2832,34 +1674,34 @@ mod tests {
 
     #[tokio::test]
     async fn child_calls_charge_the_parent_token_budget_through_the_shared_wrapper() {
+        // The parent alone spends 20 tokens (two calls), the child spends 10
+        // more. A limit of 25 therefore completes only if the child usage is
+        // invisible to the parent's budget.
         let provider = Arc::new(ScriptedProvider::new(vec![
             delegate_request(),
             done_text("child answer", 10),
             done_text("parent done", 10),
         ]));
-        let runtime = runtime_with(Arc::clone(&provider), enabled_config());
-        let config = runtime.config_snapshot();
-        let setup = runtime
-            .build_turn(&test_scope().await, true, &config, None, &[], None)
+        let config = HarnessConfig::from_toml_str(
+            "[budget]\nmax_tokens = 25\n\
+             [delegation]\nenabled = true\n\
+             [policy]\n\
+             allowed_tools = [\"bash\", \"read_file\", \"write_file\", \"delegate_task\"]\n\
+             [tools.bash]\nenabled = true\n",
+        )
+        .expect("delegation and budget config must parse");
+        let runtime = runtime_with(Arc::clone(&provider), config);
+
+        let reason = runtime
+            .run_turn("parent task".to_owned())
             .await
-            .expect("turn should build");
+            .expect("the turn must finish");
 
-        let reason = setup
-            .agent
-            .run(
-                SessionId::new("shared-provider"),
-                vec![Message::user("parent task")],
-                setup.cancel.clone(),
-            )
-            .await;
-
-        assert_eq!(reason, SessionEndReason::Completed);
         assert_eq!(
-            setup.governance.tokens_used(),
-            30,
-            "parent and child usage must both be charged"
+            reason,
+            SessionEndReason::BudgetExceeded,
+            "the child's 10 tokens must be charged to the parent's budget"
         );
-        setup.shutdown();
 
         let calls = provider.calls();
         assert_eq!(
@@ -3121,132 +1963,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn guides_are_injected_in_system_memory_skill_user_order() {
-        let messages = fresh_conversation(
-            "system prompt",
-            Some(Message::system("[记忆参考] remembered fact")),
-            Some(Message::system("[技能参考] reusable procedure")),
-            &[],
-            "new question",
-        );
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0], Message::system("system prompt"));
-        assert_eq!(messages[1], Message::system("[记忆参考] remembered fact"));
-        assert_eq!(
-            messages[2],
-            Message::system("[技能参考] reusable procedure")
-        );
-        assert_eq!(messages[3], Message::user("new question"));
-        assert_eq!(
-            messages
-                .iter()
-                .map(|message| message.role)
-                .collect::<Vec<_>>(),
-            vec![Role::System, Role::System, Role::System, Role::User]
-        );
-    }
-
-    #[test]
-    fn absent_guides_keep_the_original_system_then_user_order() {
-        let messages = fresh_conversation("system prompt", None, None, &[], "question");
-
-        assert_eq!(
-            messages,
-            vec![Message::system("system prompt"), Message::user("question"),]
-        );
-    }
-
-    #[test]
-    fn a_skill_guide_without_memory_stays_adjacent_to_the_user() {
-        let messages = fresh_conversation(
-            "system prompt",
-            None,
-            Some(Message::system("[技能参考] reuse")),
-            &[],
-            "question",
-        );
-
-        assert_eq!(
-            messages,
-            vec![
-                Message::system("system prompt"),
-                Message::system("[技能参考] reuse"),
-                Message::user("question"),
-            ]
-        );
-    }
-
-    #[test]
-    fn acceptance_counts_use_only_the_final_attempt() {
-        let first_attempt = vec![
-            Message::system("system"),
-            Message::user("goal"),
-            Message::assistant_with_tool_calls(
-                "first",
-                vec![ToolCall::new("call-1", "read_file", json!({}))],
-            ),
-            Message::tool("call-1", "first output"),
-            Message::assistant("first answer"),
-            Message::user("acceptance feedback"),
-        ];
-        let final_attempt = vec![
-            Message::assistant_with_tool_calls(
-                "second",
-                vec![ToolCall::new("call-2", "bash", json!({}))],
-            ),
-            Message::tool("call-2", "second output"),
-            Message::assistant("second answer"),
-        ];
-        let mut messages = first_attempt;
-        let start = messages.len();
-        messages.extend(final_attempt);
-        let outcome = AcceptanceOutcome {
-            reason: SessionEndReason::Completed,
-            messages,
-            last_output: "second answer".to_owned(),
-            attempts: 2,
-        };
-
-        let signals = acceptance_signals(&outcome, start);
-
-        assert_eq!(signals.tool_call_count(), 1);
-        assert_eq!(signals.assistant_rounds(), 2);
-        assert_eq!(signals.acceptance_failures(), 1);
-        assert!(!jessica_harness::SkillTrigger::new(1, 2).should_trigger(&signals));
-    }
-
-    #[test]
-    fn structured_counts_include_recovered_checkpoint_work_on_resume() {
-        let messages = vec![
-            Message::system("system"),
-            Message::user("goal"),
-            Message::assistant_with_tool_calls(
-                "",
-                vec![ToolCall::new("call-1", "read_file", json!({}))],
-            ),
-            Message::tool("call-1", "output"),
-            Message::assistant("finished"),
-        ];
-
-        assert_eq!(structured_counts(&messages, 0), (1, 2));
-        assert_eq!(stable_turn_index(&messages), 0);
-    }
-
-    #[test]
-    fn the_turn_index_is_stable_and_does_not_use_a_process_counter() {
-        let first = vec![Message::system("system"), Message::user("goal")];
-        let resumed = vec![
-            Message::system("system"),
-            Message::user("goal"),
-            Message::assistant("partial"),
-        ];
-
-        assert_eq!(stable_turn_index(&first), 0);
-        assert_eq!(stable_turn_index(&resumed), 0);
-    }
-
     #[tokio::test]
     async fn a_shutdown_before_a_turn_prevents_any_model_request() {
         let provider = Arc::new(ScriptedProvider::new(Vec::new()));
@@ -3436,41 +2152,64 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_one_scope_parent_does_not_cancel_another_turn() {
-        let runtime = runtime_with(
-            Arc::new(ScriptedProvider::new(Vec::new())),
-            HarnessConfig::default(),
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn LlmProvider> = Arc::new(PendingProvider {
+            started: Arc::clone(&started),
+        });
+        let (_sender, receiver) = watch::channel(Arc::new(HarnessConfig::default()));
+        let runtime = CliRuntime::new(
+            provider,
+            receiver,
+            PathBuf::from("."),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Arc::new(ShutdownController::new()),
         );
-        let config = runtime.config_snapshot();
         let parent_a = CancellationToken::new();
         let parent_b = CancellationToken::new();
-        let scope_a = TurnScope::new(PathBuf::from("."), parent_a.clone())
-            .await
-            .expect("scope a must build");
         let scope_b = TurnScope::new(PathBuf::from("."), parent_b.clone())
             .await
             .expect("scope b must build");
-        let setup_a = runtime
-            .build_turn(&scope_a, false, &config, None, &[], None)
-            .await
-            .expect("turn a must build");
-        let setup_b = runtime
-            .build_turn(&scope_b, false, &config, None, &[], None)
-            .await
-            .expect("turn b must build");
+        let turn_b = runtime.run_turn_request(TurnRequest {
+            scope: scope_b,
+            history: Vec::new(),
+            user_input: "hang".to_owned(),
+            update_sink: None,
+            acceptance_retries: None,
+            session_id: None,
+            extra_tools: Vec::new(),
+            permission_gate: None,
+        });
+        tokio::pin!(turn_b);
+
+        tokio::select! {
+            _ = started.notified() => {}
+            outcome = &mut turn_b => {
+                panic!("turn b ended before the provider was entered: {outcome:?}");
+            }
+        }
 
         parent_a.cancel();
+        assert!(
+            !parent_b.is_cancelled(),
+            "an unrelated scope's parent must stay uncancelled"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut turn_b)
+                .await
+                .is_err(),
+            "cancelling another scope's parent must not end this turn"
+        );
 
-        assert!(
-            setup_a.cancel.is_cancelled(),
-            "cancelling the scope parent must cancel the child turn token"
+        parent_b.cancel();
+        let outcome = turn_b.await.expect("turn b must return an outcome");
+        assert_eq!(
+            outcome.reason,
+            SessionEndReason::Cancelled,
+            "the turn must only end when its own scope parent is cancelled"
         );
-        assert!(
-            !setup_b.cancel.is_cancelled(),
-            "another turn's token must stay independent"
-        );
-        assert!(!parent_b.is_cancelled());
-        setup_a.shutdown();
-        setup_b.shutdown();
     }
 
     #[tokio::test]
@@ -3595,22 +2334,27 @@ mod tests {
         assert_eq!(&observed[1..=history.len()], history.as_slice());
         assert_eq!(observed.last(), Some(&Message::user("new question")));
 
-        let turn_start = observed.len();
-        let counts = structured_counts(&outcome.messages, turn_start);
         assert_eq!(
-            counts,
-            (0, 1),
+            outcome.turn_start,
+            observed.len(),
+            "the outcome boundary must be the initial conversation, not the history"
+        );
+        let this_turn = &outcome.messages[outcome.turn_start..];
+        let tool_calls: usize = this_turn
+            .iter()
+            .map(|message| message.tool_calls.len())
+            .sum();
+        assert_eq!(
+            tool_calls, 0,
             "tool calls replayed from history must not count toward this turn"
         );
-        let signals = TurnSignals::new(SessionEndReason::Completed, counts.0, counts.1);
-        assert!(
-            !jessica_harness::SkillTrigger::new(1, 2).should_trigger(&signals),
-            "historical tool calls must not cross a one-call skill threshold"
-        );
         assert_eq!(
-            stable_turn_index(&outcome.messages),
+            this_turn
+                .iter()
+                .filter(|message| message.role == Role::Assistant)
+                .count(),
             1,
-            "one user turn precedes the new input in the carried history"
+            "only the new answer belongs to this turn"
         );
     }
 
@@ -3642,6 +2386,11 @@ mod tests {
             .expect("turn must run");
 
         assert_eq!(outcome.reason, SessionEndReason::Completed);
+        assert_eq!(
+            outcome.turn_start, 2,
+            "the system prompt and user input are the initial conversation"
+        );
+        assert!(!outcome.lagged, "a healthy pump must not mark the outcome");
         assert_eq!(outcome.messages.len(), 5);
         assert_eq!(outcome.messages[0].role, Role::System);
         assert_eq!(outcome.messages[1], Message::user("inspect"));
@@ -4035,8 +2784,7 @@ mod tests {
                 permission_gate: None,
             })
             .await
-            .err()
-            .expect("a metadata conflict must fail the turn");
+            .expect_err("a metadata conflict must fail the turn");
         assert!(
             matches!(&error, CliError::TraceIncomplete { cause, .. } if cause.contains("metadata")),
             "the failure must name the metadata write: {error}"
@@ -4065,6 +2813,280 @@ mod tests {
         assert!(
             load_legacy_events(database, session).await.is_empty(),
             "no event may be written for a session whose metadata failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_budget_trip_overrides_completed_and_skips_memory_writes() {
+        let workspace = TempDir::new("budget-memory");
+        let config = HarnessConfig::from_toml_str(
+            "[budget]\nmax_tokens = 1\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("budget and memory config must parse");
+        let session = SessionId::new("budget-memory-session");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 10)]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(
+            outcome.reason,
+            SessionEndReason::BudgetExceeded,
+            "a charged token trip must override the runtime's Completed result"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "the cancelled turn must not make another model call"
+        );
+        drop(runtime);
+
+        let entries = memory_entries(
+            &workspace.path().join("memory.db"),
+            workspace.path(),
+            &session,
+        );
+        assert!(
+            entries.is_empty(),
+            "a tripped turn must not be written to memory: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_failed_turn_does_not_write_memory() {
+        let workspace = TempDir::new("acceptance-memory");
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 0\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("acceptance and memory config must parse");
+        let session = SessionId::new("acceptance-memory-session");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 1)]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "the zero retry budget must stop after the first failed check"
+        );
+        drop(runtime);
+
+        let entries = memory_entries(
+            &workspace.path().join("memory.db"),
+            workspace.path(),
+            &session,
+        );
+        assert!(
+            entries.is_empty(),
+            "an acceptance-failed turn must not be remembered: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_retry_reuses_the_initial_prefix_and_recalls_memory_once() {
+        let workspace = TempDir::new("acceptance-prefix");
+        let session = SessionId::new("acceptance-prefix-session");
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 1\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("acceptance and memory config must parse");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        memory
+            .record_completed_turn(
+                &session,
+                "the build command is cargo test",
+                "MEMORY_SENTINEL_ANSWER",
+                0,
+                0,
+            )
+            .await
+            .expect("the seeded turn must be written");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "what is the build command?".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "one failed check must run one retry");
+        let initial = &calls[0].messages;
+        assert_eq!(
+            initial.len(),
+            3,
+            "the first attempt must receive system, memory, and user messages: {initial:?}"
+        );
+        assert_eq!(
+            outcome.turn_start,
+            initial.len(),
+            "the outcome must point at the first attempt's initial boundary"
+        );
+        assert!(!outcome.lagged, "a healthy pump must not mark the outcome");
+        assert_eq!(initial[0].role, Role::System);
+        assert_eq!(initial[1].role, Role::System);
+        assert!(
+            initial[1].content.contains("MEMORY_SENTINEL_ANSWER"),
+            "the recalled memory must be the second system message: {initial:?}"
+        );
+        assert_eq!(
+            initial[2],
+            Message::user("what is the build command?"),
+            "the user input must follow the guides"
+        );
+        assert_eq!(
+            &calls[1].messages[..initial.len()],
+            initial.as_slice(),
+            "the retry must reuse the first attempt's prefix unchanged"
+        );
+        assert_eq!(
+            calls[1]
+                .messages
+                .iter()
+                .filter(|message| message.content.contains("MEMORY_SENTINEL_ANSWER"))
+                .count(),
+            1,
+            "memory must be recalled once, not re-injected into the retry: {:?}",
+            calls[1].messages
+        );
+        assert_eq!(
+            calls[1].messages.get(initial.len()),
+            Some(&Message::assistant("first answer")),
+            "the retry must continue from the first attempt instead of restarting"
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_delegate_approval_covers_the_child_run() {
+        let workspace = TempDir::new("delegate-approval");
+        let config = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [approval]\nmode = \"ask\"\n\
+             [policy]\nallowed_tools = [\"bash\", \"delegate_task\"]\n\
+             [tools.bash]\nenabled = true\n",
+        )
+        .expect("delegation and approval config must parse");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            delegate_request_for(&["bash"]),
+            bash_request("child-bash", "printf child > child.txt"),
+            done_text("child answer", 1),
+            done_text("parent answer", 1),
+        ]));
+        let gate = Arc::new(AllowOnceGate::default());
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "delegate".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: None,
+                extra_tools: Vec::new(),
+                permission_gate: Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+
+        let decisions = gate.calls();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "only the top-level delegate_task may request approval: {decisions:?}"
+        );
+        assert_eq!(decisions[0].name.as_str(), DELEGATE_TASK_TOOL_NAME);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("child.txt"))
+                .expect("the child command must create its file"),
+            "child",
+            "the approved delegation must execute the child's tool call"
+        );
+
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            4,
+            "one parent call, one child tool round, one child answer, and one parent answer"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash"],
+            "the child must see only the granted parent tool"
         );
     }
 }
