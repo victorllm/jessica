@@ -5,17 +5,20 @@
 //! of reusable middleware, and this crate is the only assembly layer an
 //! embedder needs in order to run a turn without bypassing governance.
 //!
-//! # E1c status
+//! # E1d status
 //!
 //! This crate contains the public API, ports, configuration, and the
 //! provider-to-tool governance vertical slice introduced by Tasks E1a and E1b.
 //! Task E1c added the producer-side event sink, host policy and result-manager
 //! ports, and the CLI adapter that delegates its governed-tool ordering here.
-//! Descriptor/catalog/artifact ownership is still CLI-side, and journal, pump,
-//! acceptance, memory, skill, delegation and resume orchestration remain
-//! absent until the corresponding Phase 11 tasks migrate them.
-//! [`TracePolicy::Required`] is rejected rather than silently downgraded until
-//! E2 implements durable trace persistence.
+//! Task E1d moved descriptor metadata, schema digests, policy hints, and
+//! artifact retention cleanup into the engine and aligned the engine patch
+//! parser with the execution parser. CLI catalog filtering and the CLI
+//! artifact sidecar store remain adapter-owned, and journal, pump, acceptance,
+//! memory, skill, delegation and resume orchestration remain absent until the
+//! corresponding Phase 11 tasks migrate them. [`TracePolicy::Required`] is
+//! rejected rather than silently downgraded until E2 implements durable trace
+//! persistence.
 
 #![deny(missing_docs)]
 
@@ -29,7 +32,9 @@ mod ports;
 mod tooling;
 
 pub use api::{Engine, EngineBuilder, TurnOutcome, TurnRequest};
-pub use artifacts::{ArtifactError, ArtifactPage, ArtifactStore, ResultManager, StoredArtifact};
+pub use artifacts::{
+    ArtifactError, ArtifactPage, ArtifactStore, CleanupReport, ResultManager, StoredArtifact,
+};
 pub use config::{
     ApprovalConfig, ApprovalMode, EngineConfig, PolicyConfig, PolicyRule, ResultConfig, RuleAction,
     ToolExecutionConfig, ToolSelector, TracePolicy,
@@ -43,8 +48,9 @@ pub use ports::{
     TraceStore, TurnObserver, TurnTrace,
 };
 pub use tooling::{
-    ApprovalPolicy, Capabilities, ResultFormat, ToolCatalog, ToolDescriptor, ToolEntry, ToolLimits,
-    ToolSource,
+    ApprovalPolicy, Capabilities, PolicyHints, ResultFormat, ToolAnnotations, ToolCatalog,
+    ToolDescriptor, ToolEntry, ToolLimits, ToolMetadata, ToolSource, digest_schema,
+    policy_hints_for, result_format_for,
 };
 
 pub use jessica_core::acceptance::AcceptanceCheck;

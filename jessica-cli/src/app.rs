@@ -1159,7 +1159,7 @@ impl CliRuntime {
                 Arc::clone(tool),
                 Arc::clone(&wiring.harness),
                 Arc::clone(&wiring.governance),
-                Duration::from_millis(entry.descriptor.limits.timeout_ms),
+                entry.descriptor.limits.timeout.unwrap_or_default(),
                 Arc::clone(&wiring.timeout_guard),
                 Arc::clone(&wiring.result_guard),
             )

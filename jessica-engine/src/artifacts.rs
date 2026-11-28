@@ -6,14 +6,15 @@
 //! temporary file, `fsync`, and rename, and never leave a partially written
 //! artifact under its final name.
 //!
-//! E1 stores artifacts but does not yet run retention cleanup or expose the
-//! `read_artifact` tool. Those remain adapter/later-phase concerns.
+//! E1d adds retention and byte-budget cleanup. The `read_artifact` tool
+//! remains an adapter/later-phase concern.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use jessica_core::types::ToolResult;
@@ -124,6 +125,24 @@ pub struct ArtifactPage {
     pub content: String,
 }
 
+/// Observable outcome of one cleanup pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Artifacts scanned in the store.
+    pub scanned: usize,
+    /// Artifacts whose data file was removed.
+    pub deleted: usize,
+    /// Removal failures.
+    pub failed: usize,
+    /// Bytes freed by successful removals.
+    pub freed_bytes: u64,
+    /// Bytes retained after cleanup.
+    pub retained_bytes: u64,
+}
+
+/// Maximum number of artifact files inspected by one cleanup pass.
+const MAX_CLEANUP_ENTRIES: usize = 4096;
+
 /// Content-addressed artifact store rooted in one workspace.
 #[derive(Debug, Clone)]
 pub struct ArtifactStore {
@@ -133,6 +152,22 @@ pub struct ArtifactStore {
     artifact_dir: PathBuf,
     /// Maximum bytes stored for one artifact.
     max_artifact_bytes: usize,
+    /// Age beyond which artifacts are removed, when retention is configured.
+    retention: Option<Duration>,
+    /// Total byte budget for retained artifacts, when configured.
+    max_bytes: Option<u64>,
+}
+
+/// One artifact file considered for cleanup.
+struct CleanupEntry {
+    /// Artifact data file.
+    path: PathBuf,
+    /// File name, used as a deterministic tie breaker.
+    name: String,
+    /// Last modification time in Unix seconds.
+    modified: u64,
+    /// File length in bytes.
+    size: u64,
 }
 
 impl ArtifactStore {
@@ -146,6 +181,8 @@ impl ArtifactStore {
             workspace_root: workspace_root.into(),
             artifact_dir: artifact_dir.into(),
             max_artifact_bytes,
+            retention: None,
+            max_bytes: None,
         }
     }
 
@@ -156,6 +193,27 @@ impl ArtifactStore {
             config.artifact_dir.clone(),
             config.max_artifact_bytes,
         )
+        .with_retention(config.artifact_retention_days, config.artifact_max_bytes)
+    }
+
+    /// Configures retention and total-byte cleanup.
+    ///
+    /// A zero retention removes every artifact older than the current second;
+    /// a zero byte budget removes every artifact after the retention pass.
+    pub fn with_retention(mut self, retention_days: u64, max_bytes: u64) -> Self {
+        self.retention = Some(Duration::from_secs(retention_days.saturating_mul(86_400)));
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Runs one retention and size cleanup pass.
+    ///
+    /// The pass is best effort: unreadable entries and failed removals are
+    /// counted in the report and never abort the remaining work. An absent
+    /// artifact directory is a successful no-op.
+    pub async fn cleanup(&self) -> Result<CleanupReport, ArtifactError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.cleanup_sync()).await?
     }
 
     /// Writes `bytes` and returns their content address.
@@ -214,7 +272,11 @@ impl ArtifactStore {
         limit: u64,
     ) -> Result<ArtifactPage, ArtifactError> {
         let hex = normalize_digest(digest)?;
-        let root = self.resolve_existing_root()?;
+        let Some(root) = self.resolve_existing_root()? else {
+            return Err(ArtifactError::Unknown {
+                digest: format!("sha256:{hex}"),
+            });
+        };
         let path = root.join(&hex[..2]).join(&hex);
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -309,8 +371,8 @@ impl ArtifactStore {
     }
 
     /// Resolves an existing artifact directory without creating or modifying
-    /// it.
-    fn resolve_existing_root(&self) -> Result<PathBuf, ArtifactError> {
+    /// it, returning `None` when the artifact directory is absent.
+    fn resolve_existing_root(&self) -> Result<Option<PathBuf>, ArtifactError> {
         let workspace = fs::canonicalize(&self.workspace_root)
             .map_err(|error| ArtifactError::io(&self.workspace_root, error))?;
         if self.artifact_dir.components().next().is_none() {
@@ -342,6 +404,7 @@ impl ArtifactStore {
                         reason: "artifact path component is not a directory".to_owned(),
                     });
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => {
                     return Err(ArtifactError::io(&current, error));
                 }
@@ -355,7 +418,123 @@ impl ArtifactStore {
                 reason: "resolves outside the workspace".to_owned(),
             });
         }
-        Ok(canonical)
+        Ok(Some(canonical))
+    }
+
+    /// Removes expired and over-budget artifacts synchronously.
+    fn cleanup_sync(&self) -> Result<CleanupReport, ArtifactError> {
+        let Some(root) = self.resolve_existing_root()? else {
+            return Ok(CleanupReport::default());
+        };
+        let now = unix_seconds(SystemTime::now());
+        let cutoff = self
+            .retention
+            .map(|retention| now.saturating_sub(retention.as_secs()));
+        let mut entries = Vec::new();
+        let mut inspected = 0usize;
+
+        'shards: for shard in
+            fs::read_dir(&root).map_err(|error| ArtifactError::io(&root, error))?
+        {
+            if inspected >= MAX_CLEANUP_ENTRIES {
+                break;
+            }
+            let shard = shard.map_err(|error| ArtifactError::io(&root, error))?;
+            let shard_path = shard.path();
+            let Some(shard_name) = shard_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !is_hex(shard_name, 2) {
+                continue;
+            }
+            let shard_metadata = match fs::symlink_metadata(&shard_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(path = %shard_path.display(), error = %error, "artifact cleanup could not inspect a shard directory");
+                    continue;
+                }
+            };
+            if shard_metadata.file_type().is_symlink() || !shard_metadata.is_dir() {
+                continue;
+            }
+            let shard_entries = match fs::read_dir(&shard_path) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!(path = %shard_path.display(), error = %error, "artifact cleanup could not read a shard directory");
+                    continue;
+                }
+            };
+            for entry in shard_entries {
+                if inspected >= MAX_CLEANUP_ENTRIES {
+                    break 'shards;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        warn!(path = %shard_path.display(), error = %error, "artifact cleanup could not read an entry");
+                        continue;
+                    }
+                };
+                inspected += 1;
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !is_hex(name, 64) {
+                    continue;
+                }
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        warn!(path = %path.display(), error = %error, "artifact cleanup could not inspect an artifact");
+                        continue;
+                    }
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    continue;
+                }
+                let modified = metadata.modified().map_or(now, unix_seconds);
+                let name = name.to_owned();
+                entries.push(CleanupEntry {
+                    path,
+                    name,
+                    modified,
+                    size: metadata.len(),
+                });
+            }
+        }
+
+        entries.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let mut report = CleanupReport {
+            scanned: entries.len(),
+            ..CleanupReport::default()
+        };
+        let mut remaining = Vec::new();
+        for entry in entries {
+            let expired = cutoff.is_some_and(|cutoff| entry.modified < cutoff);
+            if expired && remove_entry(&entry, &mut report) {
+                continue;
+            }
+            remaining.push(entry);
+        }
+
+        let mut total: u64 = remaining.iter().map(|entry| entry.size).sum();
+        if let Some(max_bytes) = self.max_bytes {
+            for entry in &remaining {
+                if total <= max_bytes {
+                    break;
+                }
+                if remove_entry(entry, &mut report) {
+                    total = total.saturating_sub(entry.size);
+                }
+            }
+        }
+        report.retained_bytes = total;
+        Ok(report)
     }
 }
 
@@ -667,6 +846,37 @@ fn truncate_text(text: &str, max_bytes: usize) -> String {
     text[..floor_char_boundary(text, max_bytes)].to_owned()
 }
 
+/// Returns the Unix timestamp of `time` in seconds, saturating at the epoch.
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Returns whether `text` is exactly `len` lowercase hexadecimal characters.
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Removes one artifact file, logging failures without aborting the pass.
+fn remove_entry(entry: &CleanupEntry, report: &mut CleanupReport) -> bool {
+    match fs::remove_file(&entry.path) {
+        Ok(()) => {
+            report.deleted += 1;
+            report.freed_bytes = report.freed_bytes.saturating_add(entry.size);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            report.failed += 1;
+            warn!(path = %entry.path.display(), error = %error, "artifact cleanup could not remove an artifact");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -783,6 +993,137 @@ mod tests {
         assert!(
             matches!(error, ArtifactError::UnsafePath { .. }),
             "{error:?}"
+        );
+    }
+
+    /// Sets an artifact's modification time.
+    fn set_modified(path: &Path, modified: SystemTime) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("artifact must be openable");
+        file.set_modified(modified)
+            .expect("artifact mtime must be settable");
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_expired_artifacts_and_keeps_fresh_ones() {
+        let temp = TempDir::new("cleanup-expired");
+        let store = ArtifactStore::new(&temp.path, ".jessica/artifacts", 1024)
+            .with_retention(7, 1024 * 1024);
+        let old = store
+            .write(b"old", "echo")
+            .await
+            .expect("artifact write must succeed");
+        let fresh = store
+            .write(b"fresh", "echo")
+            .await
+            .expect("artifact write must succeed");
+        let now = SystemTime::now();
+        set_modified(&old.path, now - Duration::from_secs(8 * 86_400));
+        set_modified(&fresh.path, now + Duration::from_secs(60));
+
+        let report = store.cleanup().await.expect("cleanup must succeed");
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.freed_bytes, 3);
+        assert_eq!(report.retained_bytes, 5);
+        assert!(!old.path.exists());
+        assert!(fresh.path.exists());
+        let page = store
+            .read_page(&fresh.digest, 0, 10)
+            .await
+            .expect("fresh artifact must remain readable");
+        assert_eq!(page.content, "fresh");
+    }
+
+    #[tokio::test]
+    async fn cleanup_evicts_oldest_artifacts_to_meet_the_byte_budget() {
+        let temp = TempDir::new("cleanup-budget");
+        let store = ArtifactStore::new(&temp.path, ".jessica/artifacts", 1024)
+            .with_retention(u64::MAX, 150);
+        let oldest = store
+            .write(&[b'a'; 100], "echo")
+            .await
+            .expect("artifact write must succeed");
+        let middle = store
+            .write(&[b'b'; 100], "echo")
+            .await
+            .expect("artifact write must succeed");
+        let newest = store
+            .write(&[b'c'; 100], "echo")
+            .await
+            .expect("artifact write must succeed");
+        let now = SystemTime::now();
+        set_modified(&oldest.path, now - Duration::from_secs(300));
+        set_modified(&middle.path, now - Duration::from_secs(200));
+        set_modified(&newest.path, now - Duration::from_secs(100));
+
+        let report = store.cleanup().await.expect("cleanup must succeed");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.freed_bytes, 200);
+        assert_eq!(report.retained_bytes, 100);
+        assert!(!oldest.path.exists());
+        assert!(!middle.path.exists());
+        assert!(newest.path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_without_an_artifact_directory_is_a_no_op() {
+        let temp = TempDir::new("cleanup-absent");
+        let store =
+            ArtifactStore::new(&temp.path, ".jessica/artifacts", 1024).with_retention(7, 1024);
+
+        let report = store.cleanup().await.expect("cleanup must succeed");
+
+        assert_eq!(report, CleanupReport::default());
+        assert!(!temp.path.join(".jessica/artifacts").exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_entries_that_are_not_artifact_files() {
+        let temp = TempDir::new("cleanup-filter");
+        let store = ArtifactStore::new(&temp.path, ".jessica/artifacts", 1024)
+            .with_retention(7, 1024 * 1024);
+        let artifact = store
+            .write(b"artifact", "echo")
+            .await
+            .expect("artifact write must succeed");
+        let shard = artifact
+            .path
+            .parent()
+            .expect("artifact must have a shard")
+            .to_path_buf();
+        let junk = shard.join("notes.txt");
+        std::fs::write(&junk, b"keep me").expect("junk file must be written");
+        let fake_dir = shard.join("0".repeat(64));
+        std::fs::create_dir(&fake_dir).expect("fake artifact directory must be created");
+        let link = shard.join("f".repeat(64));
+        std::os::unix::fs::symlink(&artifact.path, &link).expect("symlink must be created");
+        set_modified(
+            &artifact.path,
+            SystemTime::now() - Duration::from_secs(8 * 86_400),
+        );
+
+        let report = store.cleanup().await.expect("cleanup must succeed");
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.failed, 0);
+        assert!(!artifact.path.exists());
+        assert_eq!(
+            std::fs::read(&junk).expect("junk file must remain"),
+            b"keep me"
+        );
+        assert!(fake_dir.is_dir());
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "symlink entries must not be removed"
         );
     }
 }

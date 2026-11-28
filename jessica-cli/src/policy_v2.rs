@@ -1422,6 +1422,159 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn engine_and_cli_policy_agree_on_patch_targets() {
+        let temp = TempDir::new("engine-parity");
+        std::fs::create_dir_all(temp.path.join("src")).expect("source directory");
+        std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("source file");
+
+        let cli_policy = evaluator(
+            &temp.path,
+            &config(
+                vec![rule(
+                    "deny-source",
+                    RuleAction::Deny,
+                    Some(ToolSelector::One("apply_patch".to_owned())),
+                    Some("src/**"),
+                )],
+                approval(ApprovalMode::Ask, false),
+            ),
+        )
+        .await;
+        let engine_policy = jessica_engine::PolicyV2::new(
+            &temp.path,
+            &jessica_engine::PolicyConfig {
+                allowed_tools: vec!["apply_patch".to_owned()],
+                rules: vec![jessica_engine::PolicyRule {
+                    id: "deny-source".to_owned(),
+                    tool: Some(jessica_engine::ToolSelector::One("apply_patch".to_owned())),
+                    path_glob: Some("src/**".to_owned()),
+                    program: None,
+                    args_prefix: None,
+                    action: jessica_engine::RuleAction::Deny,
+                    reason: Some("reason for deny-source".to_owned()),
+                }],
+            },
+            &jessica_engine::ApprovalConfig {
+                mode: jessica_engine::ApprovalMode::Ask,
+                explicit: false,
+            },
+        )
+        .await
+        .expect("engine policy must build");
+
+        let cli_tool = file_tool("apply_patch");
+        let engine_tool = jessica_engine::PolicyTool {
+            name: "apply_patch".to_owned(),
+            source: jessica_engine::ToolSource::Native,
+            capabilities: jessica_engine::Capabilities::for_tool(
+                jessica_engine::ToolSource::Native,
+                "apply_patch",
+            ),
+            path_field: Some("patch".to_owned()),
+            legacy_sensitive: true,
+        };
+        let cases = [
+            (
+                "standard",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "timestamped",
+                "--- a/src/app.txt\t2026-01-01 00:00:00\n+++ b/src/app.txt\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "plain path",
+                "--- src/app.txt\n+++ src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "leading metadata",
+                "diff --git a/src/app.txt b/src/app.txt\nindex abc..def 100644\n--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "hunk body starting with header-like text",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n--- removed comment\n+++ added comment\n",
+            ),
+            (
+                "multiple hunks",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n@@ -10 +10 @@\n-gamma\n+delta\n",
+            ),
+            (
+                "rename",
+                "--- a/src/app.txt\n+++ b/src/other.txt\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "creation",
+                "--- /dev/null\n+++ b/src/app.txt\n@@ -1 +1 @@\n+beta\n",
+            ),
+            (
+                "parent component",
+                "--- a/../app.txt\n+++ b/../app.txt\n@@ -1 +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "crlf",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-alpha\n+beta\r\n",
+            ),
+            ("no hunk", "--- a/src/app.txt\n+++ b/src/app.txt\n"),
+            (
+                "truncated hunk",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n-alpha\n",
+            ),
+            (
+                "no-newline marker",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n\\ No newline at end of file\n",
+            ),
+            (
+                "invalid hunk range",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -x +1 @@\n-alpha\n+beta\n",
+            ),
+            (
+                "zero start with lines",
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -0,1 +1 @@\n-alpha\n+beta\n",
+            ),
+            ("not a diff", "not a unified diff"),
+        ];
+
+        for (label, patch) in cases {
+            let cli = cli_policy
+                .evaluate(&cli_tool, &call("apply_patch", json!({"patch": patch})))
+                .await;
+            let engine = engine_policy
+                .evaluate(&engine_tool, &call("apply_patch", json!({"patch": patch})))
+                .await;
+            match (cli, engine) {
+                (Ok(cli), Ok(engine)) => {
+                    assert_eq!(
+                        cli.rule_id(),
+                        engine.rule_id(),
+                        "{label}: CLI and engine must match the same rule"
+                    );
+                    assert!(
+                        matches!(cli, PolicyVerdict::Deny { .. }),
+                        "{label}: the test rule must deny"
+                    );
+                    assert!(
+                        matches!(engine, jessica_engine::PolicyVerdict::Deny { .. }),
+                        "{label}: the engine must deny"
+                    );
+                }
+                (Err(cli), Err(engine)) => {
+                    assert!(
+                        matches!(cli, PolicyError::InvalidPatch { .. }),
+                        "{label}: CLI error must be InvalidPatch"
+                    );
+                    assert!(
+                        matches!(engine, jessica_engine::PolicyError::InvalidPatch { .. }),
+                        "{label}: engine error must be InvalidPatch"
+                    );
+                }
+                (cli, engine) => {
+                    panic!("{label}: CLI and engine disagreed: CLI={cli:?}, engine={engine:?}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn protected_path_classification_covers_metadata_environment_and_keys() {
         for path in [

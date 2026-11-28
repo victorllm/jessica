@@ -2377,9 +2377,9 @@ Phase 10 恢复实施后仍保留在 Deferred（不在上述 Task 内提前实�
 
 ---
 
-Phase 11（E0 已完成；E1a/E1b engine 侧切片与 E1c CLI 治理原语接入已完成；E1 剩余 descriptor/catalog/artifact 对齐与 E2–E5 候选，未排期）：jessica-engine 受治理运行时抽取
+Phase 11（E0 已完成；E1a/E1b engine 侧切片、E1c CLI 治理原语接入与 E1d descriptor/patch/artifact 对齐已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属，E2–E5 候选，未排期）：jessica-engine 受治理运行时抽取
 
-当前状态：E0 已于 2026-11-28 完成，仅新增/加强 `jessica-cli` 测试并做 mutation check，未改生产路径。2026-11-28 用户确认方向并要求写入 `PLAN.md`，随后分别授权开始 E0、E1 与 E1c；E1 因范围较大按计划拆为 E1a/E1b，E1a 已完成 crate/API/端口/配置骨架，E1b 已完成 engine 侧治理原语与最小 `run_turn` 垂直切片，E1c 已完成 CLI 治理原语接入（2026-11-28）。E1c 后 CLI 依赖 engine，并复用 engine 的 `GovernanceState`/`TokenCountingProvider`；CLI `GovernedTool` 保留为宿主适配层，把 allowlist、CLI `PolicyV2`、CLI `ResultManager` 与权限门适配为 engine 端口，治理顺序由 engine 执行。CLI/ACP 可观察行为未变，CLI 413 个测试与 engine 32 个测试通过。E1 仍未完成：CLI 仍保有 `PolicyV2`/`ArtifactStore`/`ResultManager`/`ToolCatalog`/descriptor 的具体实现，engine 版本仍是简化投影；descriptor/catalog/artifact 行为对齐、CLI policy patch 解析等价性证明与 artifact retention/`ReadArtifactTool` 归属尚未完成。E1 剩余对齐与 E2–E5 仍是候选、未排期、未开工；每个 Task 开工前必须单独确认范围、依赖与验收，且一次会话只做一个 Task。E0–E4 不得修改 `jessica-core` 公共 API；若实施中发现必须修改，先停下询问用户并单开 Task。E1 新增 workspace crate 与更新 `CLAUDE.md` 依赖表已获用户授权并完成。
+当前状态：E0 已于 2026-11-28 完成，仅新增/加强 `jessica-cli` 测试并做 mutation check，未改生产路径。2026-11-28 用户确认方向并要求写入 `PLAN.md`，随后分别授权开始 E0、E1、E1c 与 E1d；E1 因范围较大按计划拆为 E1a/E1b，E1a 已完成 crate/API/端口/配置骨架，E1b 已完成 engine 侧治理原语与最小 `run_turn` 垂直切片，E1c 已完成 CLI 治理原语接入，E1d 已完成 descriptor 元数据迁移、engine/CLI patch 解析等价性行为测试与 engine artifact retention/GC（均为 2026-11-28）。E1c 后 CLI 依赖 engine，并复用 engine 的 `GovernanceState`/`TokenCountingProvider`；CLI `GovernedTool` 保留为宿主适配层，把 allowlist、CLI `PolicyV2`、CLI `ResultManager` 与权限门适配为 engine 端口，治理顺序由 engine 执行。E1d 后 CLI descriptor 类型改为 re-export engine 类型，engine `ToolCatalog` 保留 descriptor metadata/limits，engine `PolicyV2` 的 patch 头与 hunk 结构校验已通过 CLI/engine 等价行为测试，engine `ArtifactStore` 支持 retention 与字节预算 cleanup。CLI/ACP 可观察行为未变；全 workspace 1193 个测试通过（CLI 单元 407、engine 47）。E1 仍未完成：CLI 仍保有 `PolicyV2`/`ArtifactStore`/`ResultManager`/`ToolCatalog` 的具体实现，其中 catalog profile 过滤/hidden reason/exposure budget、artifact sidecar/record 与 `ReadArtifactTool` 尚未迁入 engine；engine policy 只做结构与路径校验，不把 hunk 应用到文件，实际上下文匹配与写入仍由执行工具负责。E1 剩余对齐与 E2–E5 仍是候选、未排期、未开工；每个 Task 开工前必须单独确认范围、依赖与验收，且一次会话只做一个 Task。E0–E4 不得修改 `jessica-core` 公共 API；若实施中发现必须修改，先停下询问用户并单开 Task。E1 新增 workspace crate 与更新 `CLAUDE.md` 依赖表已获用户授权并完成。
 
 背景：当前完整受治理流程只存在于 `jessica-cli`。`jessica-cli` 是 binary-only crate（`Cargo.toml` 只有 `[[bin]]`，`src/main.rs` 以 `mod` 声明模块，没有 `lib.rs`），`build_turn`、`run_turn_request`、`run_attempt`、`GovernedTool`、`TurnJournal`、`EventPump`、acceptance、memory/skill 调用点、delegation 装配、resume 与 shutdown 均为私有或 `pub(crate)`。`jessica-runtime` 只提供裸 `AgentLoop`，`jessica-harness` 只提供 middleware/guard/policy/sensor 骨架；二者都不定义“一轮受治理会话”的完整顺序与不变量。结果是 embedder 只能依赖 CLI 内部、复制装配逻辑，或绕过治理直接调用 `AgentLoop`；治理是否生效取决于调用方的装配纪律，而不是类型/API 合同。
 
@@ -2434,12 +2434,12 @@ jessica-cli ──> jessica-engine ──> jessica-core
 - `ToolPermissionGate`、`TurnObserver`（UpdateSink）、`PumpConsole`。
 - `ChildToolFactory`（`jessica-runtime` 已有）、`AcceptanceCheck`（`jessica-core` 已有）、`SystemPromptSource`、`IdSource`。
 
-Phase 11 任务序列（E0 已完成；E1–E5 候选，未排期）：
+Phase 11 任务序列（E0 与 E1a–E1d 已完成；E1 剩余对齐与 E2–E5 候选，未排期）：
 
 | Task | 内容 | 改 core | 新依赖 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | **E0** | 行为基线：审计并补齐 11 条不变量的 characterization tests，最终不改生产路径 | 否 | 无 | 无 | 已完成（2026-11-28） |
-| **E1** | 新增 `jessica-engine` 骨架、端口、治理原语与最小 `run_turn` 垂直切片 | 否 | 无（仅 workspace 已批准依赖） | E0 | 部分完成（E1a/E1b engine 切片、E1c CLI 治理接入 2026-11-28；descriptor/catalog/artifact 未对齐） |
+| **E1** | 新增 `jessica-engine` 骨架、端口、治理原语与最小 `run_turn` 垂直切片 | 否 | 无（仅 workspace 已批准依赖） | E0 | 部分完成（E1a/E1b engine 切片、E1c CLI 治理接入、E1d descriptor/patch/artifact 对齐 2026-11-28；CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 仍属 CLI） |
 | **E2** | 迁入 journal/pump/EventRecorder，落地 `TraceStore` 与 `TracePolicy::Required` | 否 | 无 | E1 | 候选 |
 | **E3** | 完整 turn 编排、acceptance、memory/skills、delegation、resume，CLI 委托 engine | 否 | 无 | E2 | 候选 |
 | **E4** | CLI/ACP 适配器收薄，删除重复装配，确保只有一条受治理路径 | 否 | 无 | E3 | 候选 |
@@ -2497,7 +2497,7 @@ E0 完成记录（2026-11-28）：
   - `git diff -- jessica-harness/src/acceptance.rs` 为空；`app.rs`/`governance.rs`/`memory.rs`/`skills.rs` 的生产代码 diff 为空，改动均位于 `mod tests`。
 - 偏离计划：无功能性偏离；仅将 app 层 `lagged=true` 的确定性测试留到 E2 的可控端口，避免为测试暴露生产接口。
 
-Task E1（进行中：E1a/E1b/E1c 已完成；剩余 descriptor/catalog/artifact 对齐）：`jessica-engine` 骨架、端口与治理原语
+Task E1（进行中：E1a/E1b/E1c/E1d 已完成；剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属）：`jessica-engine` 骨架、端口与治理原语
 
 范围与约束：
 
@@ -2582,6 +2582,28 @@ E1c 完成记录（2026-11-28，CLI 治理原语接入；E1 仍未完成）：
   5. journal/pump/acceptance/memory/skills/delegation/resume 未在 E1c 引入；`TracePolicy::Required` 仍被拒绝，E2/E3 继续。
 - 后续建议：E1 剩余工作聚焦“CLI descriptor/catalog/artifact 与 engine 对齐”——先补 CLI/engine policy patch 解析等价性与 catalog 元数据行为测试，再决定是否迁入具体类型；该工作需用户明确单开 Task（暂记 E1d，候选，未开工）。E2 仍应优先实现 journal/pump/trace，不应与 E1d 混做。
 
+E1d 完成记录（2026-11-28，descriptor/patch/artifact 对齐；E1 仍未完成）：
+
+- 实际耗时：跨会话续作且经历上下文压缩，累计约 45 分钟（起始时刻未精确记录；2026-11-28 完成全量验收）。
+- 改动范围：`jessica-engine` 与 `jessica-cli`；未改 `jessica-core`、其他 crate 或第三方依赖，未新增公共依赖。
+- 交付：
+  - descriptor 元数据迁入 engine：新增 `ToolAnnotations`/`ToolMetadata`/`PolicyHints`，扩展 `Capabilities`（按 source 分类、MCP/WASM annotation 收窄/升级）、`ToolLimits`（timeout、max_args_bytes、max_inline_bytes、max_artifact_bytes、max_output_lines 与 `timeout_ms`）和 `ToolDescriptor`（version、canonical `schema_digest`、`schema_bytes`、`policy_hints`、`result_format`）；新增 `digest_schema`/`policy_hints_for`/`result_format_for` 公共函数。CLI `tools/descriptor.rs` 改为 re-export engine 类型并只保留 CLI 默认 version 标签；CLI catalog 用 engine `ToolDescriptor::new` 装配 per-tool limits 与 metadata，CLI 行为不变。
+  - patch 目标解析对齐：engine `PolicyV2` 的 patch target 解析改为与 `jessica_tools::summarize_patch` 相同的头与 hunk 结构语义——跳过前导空行/`diff --git`/`index`，要求 `---` + `+++`，去除 tab 时间戳，处理 `a/`/`b/` 前缀；hunk 部分按声明行数遍历并校验 truncated/over-count、`@@ -old +new @@` 范围、`\ No newline` 标记与第二个文件头；拒绝 rename、`/dev/null`、绝对路径、`.`/`..` 组件、CRLF 与超过 1MiB。修复了此前带时间戳的 `+++ b/src/app.txt\t...` 可能绕过 `src/**` glob 的差异。
+  - artifact cleanup：engine `ArtifactStore` 新增 `CleanupReport`、`with_retention(retention_days, max_bytes)` 与异步 `cleanup`（内部 `spawn_blocking`）；按 mtime 过期清理、剩余按最老优先驱逐至字节预算、单次最多检查 4096 个目录项、删除失败计数并继续；跳过非 64 位小写 hex 文件、目录与符号链接；artifact 目录不存在时 cleanup 为成功 no-op。`resolve_existing_root` 改为返回 `Option`，目录缺失时读取返回 `ArtifactError::Unknown` 而不是 I/O 错误。
+- 行为测试：`jessica-engine` 47 passed（E1c 32 → +15）：descriptor/schema digest/annotation/catalog metadata 与 per-tool limits 测试迁入 engine（CLI 对应 7 个单元测试移除）；新增 patch 头/hunk 规范化的接受/拒绝矩阵（含 hunk body 以 `---`/`+++` 开头、多 hunk、truncated、no-newline 标记、非法范围、0 起始行）与带时间戳 patch 仍命中 `src/**` 拒绝规则共 3 个；新增 catalog metadata 行为测试 1 个；新增 artifact cleanup 4 个（过期删除且保留新鲜、按最老优先满足字节预算、目录缺失 no-op、跳过非 artifact/目录/符号链接）。`jessica-cli` 单元测试 407 passed，并新增 `policy_v2::tests::engine_and_cli_policy_agree_on_patch_targets`，对标准 patch、带时间戳 patch、`a/`/`b/` 同路径、`diff --git`/`index` 前导、hunk body 以 `---`/`+++` 开头、多 hunk，以及 rename、`/dev/null`、`..`、CRLF、无 hunk、truncated hunk、no-newline 标记、非法 hunk 范围、0 起始行、非 diff 输入逐项断言 CLI/engine 的 Deny 规则与 `InvalidPatch` 分类一致。未写“调用后断言 Ok”的自证测试。
+- 验收结果（2026-11-28）：
+  - `cargo fmt --check`：通过。
+  - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+  - `cargo test --workspace`：1193 passed，0 failed，2 ignored；`jessica-cli` 单元 407 passed、`jessica-engine` 47 passed，其余集成/E2E 套件全绿。
+  - `cargo tree -p jessica-engine --edges normal`：内部依赖仍仅 `jessica-core`/`jessica-runtime`/`jessica-harness`；无 CLI/providers/tools/sandbox/memory 与禁止第三方依赖。
+- 偏离/边界（E1 仍不能标记完成）：
+  1. CLI `ToolCatalog` 未迁入 engine：profile 过滤、hidden reason、exposure budget、tool candidate 装配仍是 CLI 配置特有行为；engine catalog 现在保留 descriptor metadata/limits，但不做 profile 过滤。
+  2. CLI `ArtifactStore`/`ResultManager`/`ReadArtifactTool` 仍归 CLI：CLI artifact store 的 sidecar schema、record 与 cleanup 没有被替换；engine 新增的 cleanup 基于 mtime、没有 sidecar，且尚未接入 CLI 运行路径。`CleanupReport` 已从 engine 导出，供后续适配。
+  3. patch 解析在 engine policy 内校验与执行解析器相同的头与 hunk 结构/行数，但不把 hunk 应用到文件；上下文匹配与原子写入仍由执行工具负责。两处实现无共享 crate（engine 不能依赖 `jessica-tools`），后续若修改 patch 语法需同时更新并维持 CLI/engine 等价测试。
+  4. `PolicyV2`、`ResultManager`、`ArtifactStore` 具体类型仍由 CLI 拥有；E1d 只迁移 descriptor 元数据并补等价性测试。
+  5. journal/pump/acceptance/memory/skills/delegation/resume 未在 E1d 引入；`TracePolicy::Required` 仍被拒绝，E2/E3 继续。
+- 后续建议：E1 剩余对齐（CLI catalog 过滤迁入 engine，或 CLI artifact sidecar/`ReadArtifactTool` 迁入 engine）需用户明确单开 Task，且应先补 CLI/engine 行为等价测试再替换具体类型；E2 仍应优先实现 journal/pump/trace，不应与剩余 E1 对齐混做。
+
 Task E2（候选，未排期）：journal、pump 与 trace 持久化
 
 范围与约束：
@@ -2638,14 +2660,14 @@ Task E5（候选，未排期）：冻结 engine 公共 API 与文档
 
 Phase 11 开工前需确认的事项（候选阶段不预判结论）：
 
-- E1 新增 crate 与 `CLAUDE.md` 依赖表更新已获用户授权并完成（E1a，2026-11-28）；E1b engine 侧切片已完成（E1b，2026-11-28）；E1c CLI 治理原语接入已完成（E1c，2026-11-28）。E1 剩余 descriptor/catalog/artifact 对齐不得在未确认的情况下顺手改变 CLI 行为；其范围与顺序需用户确认（暂记 E1d）。
+- E1 新增 crate 与 `CLAUDE.md` 依赖表更新已获用户授权并完成（E1a，2026-11-28）；E1b engine 侧切片已完成（E1b，2026-11-28）；E1c CLI 治理原语接入已完成（E1c，2026-11-28）；E1d descriptor/patch/artifact 对齐已完成（E1d，2026-11-28）。E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属不得在未确认的情况下顺手改变 CLI 行为；其范围与顺序需用户确认。
 - E0 已完成（测试放在现有 `#[cfg(test)]` 模块，mutation check 已执行并还原）；以下事项仅针对 E1–E5。
 - `EngineConfig` 与 `HarnessConfig` 的拆分边界，尤其是 `ResultManager`/artifact store 的配置来源。
 - `TraceStore` 首版是否直接绑定 `jessica-memory` 的 SQLite 实现；若未来需要轻量嵌入，再评估 feature 或 `jessica-engine-sqlite` 拆分。
 - engine 公共 API 初版（E1）与冻结（E5）之间的兼容策略；E1–E4 是否允许破坏性调整。
 - 子 Agent 治理合同：顶层 `delegate_task` approval 覆盖子 run，逐子工具 policy/approval 另开 Task。
 - 并发模型：同一 session 串行、跨 session 并发；保持现有 `PromptBusy` 行为。
-- E1 已按 E1a/E1b/E1c 拆分；剩余 descriptor/catalog/artifact 对齐是否单开 E1d（或并入 E2/E3）需用户确认。E3 是否需要按 E3a/E3b 拆分；拆分只影响实施节奏，不影响总验收。
+- E1 已按 E1a/E1b/E1c/E1d 拆分；剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属是否继续单开 Task（或并入 E2/E3）需用户确认。E3 是否需要按 E3a/E3b 拆分；拆分只影响实施节奏，不影响总验收。
 
 Phase 11 Deferred（不在 E0–E5 内提前实现）：
 
@@ -2659,7 +2681,7 @@ Phase 11 Deferred（不在 E0–E5 内提前实现）：
 - 配置/提示摘要写入 trace（需 core schema 审批）。
 - `jessica-engine-sqlite` 拆分或轻量 feature；ACP 独立 crate 化。
 
-恢复说明：E0、E1a、E1b 与 E1c 已完成（E1c 仅完成 CLI 治理原语接入，未完成 descriptor/catalog/artifact 对齐）；E1 剩余对齐与 E2–E5 仍为候选，不占用 Phase 10 的暂缓/恢复条件，Phase 10 仍按原 Deferred 条目处理。E1 剩余对齐与 E2–E5 任何一项开始前，用户需明确指定该 Task 并确认上述相关事项；未确认前不得以“候选已写入 PLAN”为由开始实现。E1a/E1b/E1c 只交付 engine 骨架、最小切片与 CLI 治理适配层，CLI 仍保有 policy/artifact/catalog 具体实现，不能把当前 engine 当作 CLI 完全采用的可用受治理运行时。
+恢复说明：E0、E1a、E1b、E1c 与 E1d 已完成（E1 仍为部分完成：descriptor 元数据、patch 解析等价性与 engine artifact cleanup 已对齐，CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 仍归 CLI）；E1 剩余对齐与 E2–E5 仍为候选，不占用 Phase 10 的暂缓/恢复条件，Phase 10 仍按原 Deferred 条目处理。E1 剩余对齐与 E2–E5 任何一项开始前，用户需明确指定该 Task 并确认上述相关事项；未确认前不得以“候选已写入 PLAN”为由开始实现。E1a–E1d 只交付 engine 骨架、最小切片、CLI 治理适配层与部分 descriptor/artifact 对齐，CLI 仍保有 policy/artifact/catalog 具体实现，不能把当前 engine 当作 CLI 完全采用的可用受治理运行时。
 
 ---
 
@@ -2765,7 +2787,7 @@ Task 9.1 ☑ 耗时未精确计时（含方案确认、实现、测试与全量�
 
 Deferred（待办，由用户决定是否单开 Task）
 
-· Phase 11（E0 已完成；E1a/E1b engine 侧切片与 E1c CLI 治理原语接入已完成；E1 剩余 descriptor/catalog/artifact 对齐与 E2–E5 候选，未排期）：`jessica-engine` 受治理运行时抽取。2026-11-28 用户确认方向并要求作为候选写入 `PLAN.md`，随后完成 E0 行为基线；E1 获授权后按计划拆分，E1a 已交付 crate/API/端口/配置骨架，E1b 已交付 engine 侧 `PolicyV2`/`ArtifactStore`/`ResultManager`/`GovernanceState`/`GovernedTool` 与最小 `run_turn` 垂直切片，E1c 已交付 `EventSink` 兼容面、`ToolPolicy`/`ToolResultManager` 端口与 CLI 治理适配层；CLI 已依赖 engine 并复用 engine 的 `GovernanceState`/`TokenCountingProvider`/`GovernedTool` 顺序，但仍保有 policy/artifact/catalog 具体实现，E1 未完成。E1 剩余对齐与 E2–E5 不表示已排期或已开工。详见 Phase 11 章；E1c 后仍不能把当前 engine 当作 CLI 完全采用的可用受治理运行时。
+· Phase 11（E0 已完成；E1a/E1b engine 侧切片、E1c CLI 治理原语接入与 E1d descriptor/patch/artifact 对齐已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属，E2–E5 候选，未排期）：`jessica-engine` 受治理运行时抽取。2026-11-28 用户确认方向并要求作为候选写入 `PLAN.md`，随后完成 E0 行为基线；E1 获授权后按计划拆分，E1a 已交付 crate/API/端口/配置骨架，E1b 已交付 engine 侧 `PolicyV2`/`ArtifactStore`/`ResultManager`/`GovernanceState`/`GovernedTool` 与最小 `run_turn` 垂直切片，E1c 已交付 `EventSink` 兼容面、`ToolPolicy`/`ToolResultManager` 端口与 CLI 治理适配层，E1d 已交付 descriptor 元数据迁移、CLI/engine patch 解析等价性测试与 engine artifact retention/GC；CLI 已依赖 engine 并复用 engine 的 `GovernanceState`/`TokenCountingProvider`/`GovernedTool` 顺序，但仍保有 policy/artifact/catalog 具体实现，E1 未完成。E1 剩余对齐与 E2–E5 不表示已排期或已开工。详见 Phase 11 章；E1d 后仍不能把当前 engine 当作 CLI 完全采用的可用受治理运行时。
 · Phase 10 Web Search（2026-11-22 用户决定暂缓）：当前没有 Brave Search API key，10.1a/10.1b 均未开始。暂缓期间不得向 `jessica-tools` 增加 `reqwest`/`tracing` 引用，不得新增 `web_search` 工具、配置、审批项、测试或文档承诺。恢复条件：用户提供可用 Brave API key，或明确选择 SearXNG endpoint/自托管方案，并重新确认后端顺序、审批与父 Agent 隔离边界；恢复后仍按 Phase 10 的两个 Task 拆分验收。
 · Task 9.1 的系统提示仍展示完整 `policy.allowed_tools`，而不是 Catalog 的 profile 过滤后暴露集。窄 profile 下模型可能在提示中看到未暴露名称并尝试调用，随后得到 `unknown tool`。若要求提示与 schema 严格一致，需把按 turn 构建的 exposed 集传入 `initial_messages`，并决定 WASM/MCP/委派名称在提示中的呈现方式；不在 9.1 顺手改。
 · Task 9.1 的 per-tool `timeout_ms`/`max_args_bytes` 只覆盖 `read_file`、`write_file`、`bash` 三个原生工具；WASM manifest、MCP server 与 `delegate_task` 尚无独立 per-tool 配置，仍分别受 manifest 限额、MCP 固定边界和委派 limits 约束。若需要统一配置面，需单开 Task 扩展 `[tools]` 并定义第三方工具的默认来源。

@@ -114,7 +114,7 @@ impl PolicyTool {
             name: descriptor.name.clone(),
             source: descriptor.source,
             capabilities: descriptor.capabilities,
-            path_field: descriptor.path_field.clone(),
+            path_field: descriptor.policy_hints.path_field.clone(),
             legacy_sensitive: descriptor.approval == ApprovalPolicy::Interactive,
         }
     }
@@ -565,37 +565,226 @@ impl PolicyV2 {
 
 /// Extracts the target of a single-file unified diff for policy matching.
 ///
-/// The execution tool performs full patch validation. Policy only needs the
-/// target path, so this parser accepts the two standard header forms and
-/// rejects input with no target.
+/// Policy only needs the target path, but it validates the same header and
+/// hunk structure as the execution parser, so it accepts and rejects exactly
+/// the patches the tool accepts and rejects. In particular, a `\t` timestamp
+/// after a header path is stripped, and a rename or `/dev/null` header is
+/// rejected instead of being matched under a path the tool would never use.
+/// Hunk contents are not applied here; the execution tool remains responsible
+/// for matching the target file.
 fn patch_target_path(input: &str) -> Result<String, PolicyError> {
-    let mut plus_target = None;
-    let mut minus_target = None;
-    for line in input.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let rest = rest.trim();
-            if rest != "/dev/null" {
-                plus_target = Some(strip_diff_prefix(rest).to_owned());
-            }
-        } else if let Some(rest) = line.strip_prefix("--- ") {
-            let rest = rest.trim();
-            if rest != "/dev/null" {
-                minus_target = Some(strip_diff_prefix(rest).to_owned());
-            }
-        }
+    const MAX_PATCH_BYTES: usize = 1024 * 1024;
+    if input.trim().is_empty() {
+        return Err(invalid_patch(
+            "apply_patch requires a non-empty unified diff",
+        ));
     }
-    plus_target
-        .or(minus_target)
-        .ok_or_else(|| PolicyError::InvalidPatch {
-            reason: "patch has no `---` or `+++` file header".to_owned(),
-        })
+    if input.len() > MAX_PATCH_BYTES {
+        return Err(invalid_patch(
+            "apply_patch input exceeds the 1 MiB policy limit",
+        ));
+    }
+    let mut lines: Vec<&str> = input.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.iter().any(|line| line.contains('\r')) {
+        return Err(invalid_patch(
+            "apply_patch supports LF line endings only; CRLF patches are rejected",
+        ));
+    }
+
+    let mut index = 0_usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.is_empty() || line.starts_with("diff --git ") || line.starts_with("index ") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let old_raw = lines
+        .get(index)
+        .and_then(|line| line.strip_prefix("--- "))
+        .ok_or_else(|| invalid_patch("apply_patch requires a `--- path` header"))?;
+    index += 1;
+    let new_raw = lines
+        .get(index)
+        .and_then(|line| line.strip_prefix("+++ "))
+        .ok_or_else(|| invalid_patch("apply_patch requires a `+++ path` header"))?;
+    index += 1;
+
+    let old_path = normalize_patch_path(old_raw)?;
+    let new_path = normalize_patch_path(new_raw)?;
+    let path = if let (Some(old), Some(new)) =
+        (old_path.strip_prefix("a/"), new_path.strip_prefix("b/"))
+    {
+        if old != new {
+            return Err(invalid_patch(
+                "apply_patch does not support renames; the `---` and `+++` paths must match",
+            ));
+        }
+        new.to_owned()
+    } else if old_path == new_path {
+        old_path
+    } else {
+        return Err(invalid_patch(
+            "apply_patch requires matching relative paths in the `---` and `+++` headers",
+        ));
+    };
+
+    validate_patch_hunks(&lines, index)?;
+
+    Ok(path)
 }
 
-/// Removes the conventional `a/` or `b/` prefix from a diff path.
-fn strip_diff_prefix(path: &str) -> &str {
-    path.strip_prefix("a/")
-        .or_else(|| path.strip_prefix("b/"))
-        .unwrap_or(path)
+/// Walks the hunk section and validates the same structure as the execution
+/// parser: at least one hunk, declared line counts, no second file header and
+/// no unsupported body lines.
+fn validate_patch_hunks(lines: &[&str], start: usize) -> Result<(), PolicyError> {
+    let mut index = start;
+    let mut hunks = 0_usize;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.is_empty() {
+            index += 1;
+            continue;
+        }
+        if line.starts_with("--- ") {
+            return Err(invalid_patch(
+                "apply_patch supports exactly one file per patch",
+            ));
+        }
+        let (old_count, new_count) = parse_patch_hunk_header(line)?;
+        index += 1;
+        let mut old_seen = 0_usize;
+        let mut new_seen = 0_usize;
+        while old_seen < old_count || new_seen < new_count {
+            let body_line = lines.get(index).ok_or_else(|| {
+                invalid_patch("patch hunk is truncated: fewer lines than its header declares")
+            })?;
+            if body_line.starts_with("@@ -") {
+                return Err(invalid_patch(
+                    "patch hunk ended before its declared line counts",
+                ));
+            }
+            match body_line.as_bytes().first() {
+                Some(b' ') => {
+                    if old_seen >= old_count || new_seen >= new_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more context lines than its header declares",
+                        ));
+                    }
+                    old_seen += 1;
+                    new_seen += 1;
+                }
+                Some(b'-') => {
+                    if old_seen >= old_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more removed lines than its header declares",
+                        ));
+                    }
+                    old_seen += 1;
+                }
+                Some(b'+') => {
+                    if new_seen >= new_count {
+                        return Err(invalid_patch(
+                            "patch hunk has more added lines than its header declares",
+                        ));
+                    }
+                    new_seen += 1;
+                }
+                Some(b'\\') => {
+                    return Err(invalid_patch(
+                        "apply_patch does not support `\\ No newline at end of file` markers",
+                    ));
+                }
+                _ => {
+                    return Err(invalid_patch(
+                        "apply_patch encountered an invalid hunk line",
+                    ));
+                }
+            }
+            index += 1;
+        }
+        hunks += 1;
+    }
+    if hunks == 0 {
+        return Err(invalid_patch("apply_patch requires at least one hunk"));
+    }
+    Ok(())
+}
+
+/// Parses `@@ -start[,count] +start[,count] @@` into old/new line counts.
+fn parse_patch_hunk_header(line: &str) -> Result<(usize, usize), PolicyError> {
+    let rest = line
+        .strip_prefix("@@ -")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (old_part, rest) = rest
+        .split_once(" +")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (new_part, _) = rest
+        .split_once(" @@")
+        .ok_or_else(|| invalid_patch("apply_patch requires a `@@ -old +new @@` hunk header"))?;
+    let (old_start, old_count) = parse_patch_range(old_part)?;
+    let (new_start, new_count) = parse_patch_range(new_part)?;
+    if old_start == 0 && old_count > 0 {
+        return Err(invalid_patch(
+            "patch hunk old start must be at least 1 when it has lines",
+        ));
+    }
+    if new_start == 0 && new_count > 0 {
+        return Err(invalid_patch(
+            "patch hunk new start must be at least 1 when it has lines",
+        ));
+    }
+    Ok((old_count, new_count))
+}
+
+/// Parses one `start[,count]` hunk range, defaulting the count to 1.
+fn parse_patch_range(part: &str) -> Result<(usize, usize), PolicyError> {
+    let (start, count) = part.split_once(',').unwrap_or((part, "1"));
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| invalid_patch("patch hunk contains an invalid start line"))?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| invalid_patch("patch hunk contains an invalid line count"))?;
+    Ok((start, count))
+}
+
+/// Builds an invalid-patch error with a stable explanation.
+fn invalid_patch(reason: &str) -> PolicyError {
+    PolicyError::InvalidPatch {
+        reason: reason.to_owned(),
+    }
+}
+
+/// Normalizes one patch header path the same way the execution parser does.
+fn normalize_patch_path(raw: &str) -> Result<String, PolicyError> {
+    let path = raw.split('\t').next().unwrap_or("").trim();
+    if path.is_empty() {
+        return Err(invalid_patch("apply_patch header path must not be empty"));
+    }
+    if path == "/dev/null" {
+        return Err(invalid_patch(
+            "apply_patch does not support file creation or deletion (`/dev/null`)",
+        ));
+    }
+    if Path::new(path).is_absolute() {
+        return Err(invalid_patch(
+            "apply_patch path must be relative to the workspace root",
+        ));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(invalid_patch(
+                "apply_patch path contains an unsupported component",
+            ));
+        }
+    }
+    Ok(path.to_owned())
 }
 
 /// Builds an absolute, lexically normalized candidate path.
@@ -959,5 +1148,139 @@ mod tests {
         assert!(glob_matches("src/**/*.rs", "src/a/b/main.rs").expect("glob"));
         assert!(glob_matches("?.txt", "a.txt").expect("glob"));
         assert!(!glob_matches("?.txt", "ab.txt").expect("glob"));
+    }
+
+    #[test]
+    fn patch_headers_are_normalized_like_the_execution_parser() {
+        let cases = [
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- src/app.txt\n+++ src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\t2026-01-01 00:00:00\n+++ b/src/app.txt\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "diff --git a/src/app.txt b/src/app.txt\nindex abc..def 100644\n--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n--- removed comment\n+++ added comment\n",
+                "src/app.txt",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n@@ -10 +10 @@\n-c\n+d\n",
+                "src/app.txt",
+            ),
+        ];
+
+        for (patch, expected) in cases {
+            assert_eq!(
+                patch_target_path(patch).expect("valid patch header"),
+                expected,
+                "unexpected target for {patch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_headers_reject_forms_the_execution_parser_rejects() {
+        let cases = [
+            ("", "empty"),
+            ("not a unified diff", "missing old header"),
+            (
+                "--- a/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "missing new header",
+            ),
+            (
+                "--- a/one.txt\n+++ b/two.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "rename",
+            ),
+            (
+                "--- a/src/app.txt\n+++ src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "mismatched prefixes",
+            ),
+            (
+                "--- /dev/null\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "creation",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n+b\r\n",
+                "crlf",
+            ),
+            (
+                "--- a/../app.txt\n+++ b/../app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "parent component",
+            ),
+            (
+                "--- /tmp/app.txt\n+++ /tmp/app.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "absolute",
+            ),
+            ("--- a/src/app.txt\n+++ b/src/app.txt\n", "no hunks"),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1 +1 @@\n-a\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n",
+                "second file",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n-a\n",
+                "truncated hunk",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -1,2 +1,2 @@\n alpha\n\\ No newline at end of file\n",
+                "no-newline marker",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -x +1 @@\n-a\n+b\n",
+                "invalid hunk range",
+            ),
+            (
+                "--- a/src/app.txt\n+++ b/src/app.txt\n@@ -0,1 +1 @@\n-a\n+b\n",
+                "zero start with lines",
+            ),
+        ];
+
+        for (patch, label) in cases {
+            let error = patch_target_path(patch).expect_err(label);
+            assert!(
+                matches!(error, PolicyError::InvalidPatch { .. }),
+                "{label} must be an invalid patch, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timestamped_patch_headers_still_match_path_rules() {
+        let temp = TempDir::new("timestamped-patch");
+        std::fs::create_dir_all(temp.path.join("src")).expect("source directory");
+        std::fs::write(temp.path.join("src/app.txt"), "alpha\n").expect("source file");
+        let policy = PolicyConfig {
+            allowed_tools: vec!["apply_patch".to_owned()],
+            rules: vec![rule(
+                "deny-source",
+                RuleAction::Deny,
+                Some(ToolSelector::One("apply_patch".to_owned())),
+                Some("src/**"),
+            )],
+        };
+        let evaluator = PolicyV2::new(&temp.path, &policy, &approval(ApprovalMode::Ask, false))
+            .await
+            .expect("policy must build");
+        let patch = "--- a/src/app.txt\t2026-01-01 00:00:00\n+++ b/src/app.txt\t2026-01-01 00:00:01\n@@ -1 +1 @@\n-alpha\n+beta\n";
+
+        let verdict = evaluator
+            .evaluate(
+                &native_tool("apply_patch"),
+                &ToolCall::new("call-1", "apply_patch", json!({"patch": patch})),
+            )
+            .await
+            .expect("a valid timestamped patch must receive a verdict");
+
+        assert_eq!(verdict.rule_id(), Some("deny-source"));
+        assert!(matches!(verdict, PolicyVerdict::Deny { .. }));
     }
 }
