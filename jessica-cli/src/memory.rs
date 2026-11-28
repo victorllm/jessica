@@ -220,6 +220,8 @@ enum MemoryOpenError {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use async_trait::async_trait;
+    use jessica_harness::GuideError;
     use jessica_memory::{MemoryLog, MemoryRecord};
 
     use super::*;
@@ -462,5 +464,39 @@ mod tests {
         assert_eq!(message.role, jessica_core::types::Role::System);
         assert!(message.content.contains("the build command is cargo test"));
         assert!(message.content.contains("use cargo test"));
+    }
+
+    /// Guide that always fails to render.
+    struct FailingGuide;
+
+    #[async_trait]
+    impl Guide for FailingGuide {
+        async fn render(
+            &self,
+            _session: &SessionId,
+            _query: &str,
+        ) -> Result<Option<Message>, GuideError> {
+            Err(GuideError::Render {
+                message: "memory backend unavailable".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_failure_is_fail_open_and_injects_nothing() {
+        let temp = TempDir::new("recall-failure");
+        let config = enabled_config("memory.db");
+        let mut assembly = MemoryAssembly::open(&config, &temp.path)
+            .await
+            .expect("memory should open");
+        assembly.guide = Arc::new(FailingGuide);
+
+        assert!(
+            assembly
+                .recall(&SessionId::new("recall-failure-session"), "query")
+                .await
+                .is_none(),
+            "a failing guide must degrade to no injected memory"
+        );
     }
 }

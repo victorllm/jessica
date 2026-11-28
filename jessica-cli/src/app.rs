@@ -1934,10 +1934,13 @@ mod tests {
     use jessica_core::tool::ToolSchema;
     use jessica_core::trace::{TraceEvent, TracePayload};
     use jessica_core::types::{TokenUsage, ToolCall};
-    use jessica_memory::{EventStore, StoredTraceTurn, Timestamp};
+    use jessica_memory::{
+        EventStore, MemoryLog, MemoryRecord, SqliteMemoryStore, StoredTraceTurn, Timestamp,
+    };
     use jessica_runtime::{CHILD_AGENT_SYSTEM_PROMPT, DELEGATE_TASK_TOOL_NAME};
     use serde_json::json;
 
+    use crate::governance::ToolPermissionDecision;
     use crate::shutdown::ShutdownSignal;
 
     /// One captured provider call.
@@ -2233,11 +2236,72 @@ mod tests {
         )
     }
 
-    /// Creates a turn scope rooted at the process current directory.
-    async fn test_scope() -> TurnScope {
-        TurnScope::new(PathBuf::from("."), CancellationToken::new())
+    /// Builds a runtime with an already-opened memory assembly.
+    fn runtime_with_memory(
+        provider: Arc<ScriptedProvider>,
+        config: HarnessConfig,
+        root: PathBuf,
+        memory: MemoryAssembly,
+    ) -> CliRuntime {
+        let (_sender, receiver) = watch::channel(Arc::new(config));
+        CliRuntime::new(
+            provider,
+            receiver,
+            root,
+            Vec::new(),
+            None,
+            Some(memory),
+            None,
+            Arc::new(ShutdownController::new()),
+        )
+    }
+
+    /// Creates a turn scope rooted at `root`.
+    async fn test_scope_at(root: PathBuf) -> TurnScope {
+        TurnScope::new(root, CancellationToken::new())
             .await
             .expect("the test workspace must canonicalize")
+    }
+
+    /// Creates a turn scope rooted at the process current directory.
+    async fn test_scope() -> TurnScope {
+        test_scope_at(PathBuf::from(".")).await
+    }
+
+    /// Reads the live memory entries written for `session`.
+    fn memory_entries(database: &Path, root: &Path, session: &SessionId) -> Vec<MemoryRecord> {
+        let store =
+            SqliteMemoryStore::open(database, root, None).expect("memory store must reopen");
+        let log = MemoryLog::open(database).expect("memory log must reopen");
+        log.recent_for_session(session, store.workspace_scope(), 10)
+            .expect("memory entries must load")
+    }
+
+    /// Gate that records every approval request and allows it.
+    #[derive(Default)]
+    struct AllowOnceGate {
+        calls: Mutex<Vec<ToolCall>>,
+    }
+
+    impl AllowOnceGate {
+        /// Returns the tool calls that requested approval.
+        fn calls(&self) -> Vec<ToolCall> {
+            self.calls
+                .lock()
+                .expect("gate calls mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ToolPermissionGate for AllowOnceGate {
+        async fn request_permission(&self, call: &ToolCall) -> ToolPermissionDecision {
+            self.calls
+                .lock()
+                .expect("gate calls mutex poisoned")
+                .push(call.clone());
+            ToolPermissionDecision::Allow
+        }
     }
 
     /// Builds a runtime over the given provider, config, and event database.
@@ -3642,6 +3706,11 @@ mod tests {
             .expect("turn must run");
 
         assert_eq!(outcome.reason, SessionEndReason::Completed);
+        assert_eq!(
+            outcome.turn_start, 2,
+            "the system prompt and user input are the initial conversation"
+        );
+        assert!(!outcome.lagged, "a healthy pump must not mark the outcome");
         assert_eq!(outcome.messages.len(), 5);
         assert_eq!(outcome.messages[0].role, Role::System);
         assert_eq!(outcome.messages[1], Message::user("inspect"));
@@ -4065,6 +4134,280 @@ mod tests {
         assert!(
             load_legacy_events(database, session).await.is_empty(),
             "no event may be written for a session whose metadata failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_budget_trip_overrides_completed_and_skips_memory_writes() {
+        let workspace = TempDir::new("budget-memory");
+        let config = HarnessConfig::from_toml_str(
+            "[budget]\nmax_tokens = 1\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("budget and memory config must parse");
+        let session = SessionId::new("budget-memory-session");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 10)]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(
+            outcome.reason,
+            SessionEndReason::BudgetExceeded,
+            "a charged token trip must override the runtime's Completed result"
+        );
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "the cancelled turn must not make another model call"
+        );
+        drop(runtime);
+
+        let entries = memory_entries(
+            &workspace.path().join("memory.db"),
+            workspace.path(),
+            &session,
+        );
+        assert!(
+            entries.is_empty(),
+            "a tripped turn must not be written to memory: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_failed_turn_does_not_write_memory() {
+        let workspace = TempDir::new("acceptance-memory");
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 0\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("acceptance and memory config must parse");
+        let session = SessionId::new("acceptance-memory-session");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        let provider = Arc::new(ScriptedProvider::new(vec![done_text("answer", 1)]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "question".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session.clone()),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "the zero retry budget must stop after the first failed check"
+        );
+        drop(runtime);
+
+        let entries = memory_entries(
+            &workspace.path().join("memory.db"),
+            workspace.path(),
+            &session,
+        );
+        assert!(
+            entries.is_empty(),
+            "an acceptance-failed turn must not be remembered: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_retry_reuses_the_initial_prefix_and_recalls_memory_once() {
+        let workspace = TempDir::new("acceptance-prefix");
+        let session = SessionId::new("acceptance-prefix-session");
+        let config = HarnessConfig::from_toml_str(
+            "[acceptance]\n\
+             name = \"always-fails\"\n\
+             command = \"false\"\n\
+             max_retries = 1\n\
+             [memory]\nenabled = true\npath = \"memory.db\"\nembedder = \"none\"\n",
+        )
+        .expect("acceptance and memory config must parse");
+        let memory = MemoryAssembly::open(&config.memory, workspace.path())
+            .await
+            .expect("memory must open");
+        memory
+            .record_completed_turn(
+                &session,
+                "the build command is cargo test",
+                "MEMORY_SENTINEL_ANSWER",
+                0,
+                0,
+            )
+            .await
+            .expect("the seeded turn must be written");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            done_text("first answer", 1),
+            done_text("second answer", 1),
+        ]));
+        let runtime = runtime_with_memory(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+            memory,
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "what is the build command?".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: Some(session),
+                extra_tools: Vec::new(),
+                permission_gate: None,
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::AcceptanceFailed);
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "one failed check must run one retry");
+        let initial = &calls[0].messages;
+        assert_eq!(
+            initial.len(),
+            3,
+            "the first attempt must receive system, memory, and user messages: {initial:?}"
+        );
+        assert_eq!(
+            outcome.turn_start,
+            initial.len(),
+            "the outcome must point at the first attempt's initial boundary"
+        );
+        assert!(!outcome.lagged, "a healthy pump must not mark the outcome");
+        assert_eq!(initial[0].role, Role::System);
+        assert_eq!(initial[1].role, Role::System);
+        assert!(
+            initial[1].content.contains("MEMORY_SENTINEL_ANSWER"),
+            "the recalled memory must be the second system message: {initial:?}"
+        );
+        assert_eq!(
+            initial[2],
+            Message::user("what is the build command?"),
+            "the user input must follow the guides"
+        );
+        assert_eq!(
+            &calls[1].messages[..initial.len()],
+            initial.as_slice(),
+            "the retry must reuse the first attempt's prefix unchanged"
+        );
+        assert_eq!(
+            calls[1]
+                .messages
+                .iter()
+                .filter(|message| message.content.contains("MEMORY_SENTINEL_ANSWER"))
+                .count(),
+            1,
+            "memory must be recalled once, not re-injected into the retry: {:?}",
+            calls[1].messages
+        );
+        assert_eq!(
+            calls[1].messages.get(initial.len()),
+            Some(&Message::assistant("first answer")),
+            "the retry must continue from the first attempt instead of restarting"
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_delegate_approval_covers_the_child_run() {
+        let workspace = TempDir::new("delegate-approval");
+        let config = HarnessConfig::from_toml_str(
+            "[delegation]\nenabled = true\n\
+             [approval]\nmode = \"ask\"\n\
+             [policy]\nallowed_tools = [\"bash\", \"delegate_task\"]\n\
+             [tools.bash]\nenabled = true\n",
+        )
+        .expect("delegation and approval config must parse");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            delegate_request_for(&["bash"]),
+            bash_request("child-bash", "printf child > child.txt"),
+            done_text("child answer", 1),
+            done_text("parent answer", 1),
+        ]));
+        let gate = Arc::new(AllowOnceGate::default());
+        let runtime = runtime_at(
+            Arc::clone(&provider),
+            config,
+            workspace.path().to_path_buf(),
+        );
+
+        let outcome = runtime
+            .run_turn_request(TurnRequest {
+                scope: test_scope_at(workspace.path().to_path_buf()).await,
+                history: Vec::new(),
+                user_input: "delegate".to_owned(),
+                update_sink: None,
+                acceptance_retries: None,
+                session_id: None,
+                extra_tools: Vec::new(),
+                permission_gate: Some(Arc::clone(&gate) as Arc<dyn ToolPermissionGate>),
+            })
+            .await
+            .expect("the turn must finish");
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+
+        let decisions = gate.calls();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "only the top-level delegate_task may request approval: {decisions:?}"
+        );
+        assert_eq!(decisions[0].name.as_str(), DELEGATE_TASK_TOOL_NAME);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("child.txt"))
+                .expect("the child command must create its file"),
+            "child",
+            "the approved delegation must execute the child's tool call"
+        );
+
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            4,
+            "one parent call, one child tool round, one child answer, and one parent answer"
+        );
+        assert_eq!(
+            schema_names(&calls[1].tools),
+            vec!["bash"],
+            "the child must see only the granted parent tool"
         );
     }
 }
