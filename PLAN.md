@@ -2377,9 +2377,9 @@ Phase 10 恢复实施后仍保留在 Deferred（不在上述 Task 内提前实�
 
 ---
 
-Phase 11（E0 已完成；E1a/E1b engine 侧切片、E1c CLI 治理原语接入与 E1d descriptor/patch/artifact 对齐已完成；E2 journal/pump/trace、E3a engine 侧完整 turn/acceptance/resume、E3b delegation/CLI 委托/config 拆分与 E4 单一装配已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属、E5 API 冻结为候选，未排期）：jessica-engine 受治理运行时抽取
+Phase 11（E0 已完成；E1a/E1b engine 侧切片、E1c CLI 治理原语接入与 E1d descriptor/patch/artifact 对齐已完成；E2 journal/pump/trace、E3a engine 侧完整 turn/acceptance/resume、E3b delegation/CLI 委托/config 拆分与 E4 单一装配与 E5 API 冻结已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属为候选，未排期）：jessica-engine 受治理运行时抽取
 
-当前状态：E0 已于 2026-11-28 完成，仅新增/加强 `jessica-cli` 测试并做 mutation check，未改生产路径。2026-11-28 用户确认方向并要求写入 `PLAN.md`，随后分别授权开始 E0、E1、E1c 与 E1d；E1 因范围较大按计划拆为 E1a/E1b，E1a 已完成 crate/API/端口/配置骨架，E1b 已完成 engine 侧治理原语与最小 `run_turn` 垂直切片，E1c 已完成 CLI 治理原语接入，E1d 已完成 descriptor 元数据迁移、engine/CLI patch 解析等价性行为测试与 engine artifact retention/GC（均为 2026-11-28）。E1c 后 CLI 依赖 engine，并复用 engine 的 `GovernanceState`/`TokenCountingProvider`；CLI `GovernedTool` 保留为宿主适配层，把 allowlist、CLI `PolicyV2`、CLI `ResultManager` 与权限门适配为 engine 端口，治理顺序由 engine 执行。E1d 后 CLI descriptor 类型改为 re-export engine 类型，engine `ToolCatalog` 保留 descriptor metadata/limits，engine `PolicyV2` 的 patch 头与 hunk 结构校验已通过 CLI/engine 等价行为测试，engine `ArtifactStore` 支持 retention 与字节预算 cleanup。CLI/ACP 可观察行为未变；全 workspace 1193 个测试通过（CLI 单元 407、engine 47）。E1 仍未完成：CLI 仍保有 `PolicyV2`/`ArtifactStore`/`ResultManager`/`ToolCatalog` 的具体实现，其中 catalog profile 过滤/hidden reason/exposure budget、artifact sidecar/record 与 `ReadArtifactTool` 尚未迁入 engine；engine policy 只做结构与路径校验，不把 hunk 应用到文件，实际上下文匹配与写入仍由执行工具负责。E2 已完成 journal/pump/EventRecorder 迁入与 `TraceStore`/`TracePolicy::Required`（2026-11-28）。E3 因范围较大按 PLAN 允许项拆为 E3a/E3b：E3a 已完成 engine 侧 `run_turn_request`/`resume_turn`、固定初始消息顺序、memory/skill 每轮各 recall 一次与完成后 fail-open 后处理、acceptance 重试与每 attempt 独立 session、最终失败/治理 trip 的外层 session、budget reason 覆盖与基于已记录证据的 resume（2026-11-28）；E3b 已完成 delegation 父侧装配、`ChildToolFactory`、CLI `CliRuntime` 委托 engine、`HarnessConfig`/`EngineConfig` 拆分、sensors/`PumpConsole` 适配器并删除 CLI 并行 turn 装配，E3 全部完成（2026-11-28）。E4 已完成：删除 CLI 的 `events`/`pump`/`replay` 垫片，离线确定性 replay 迁入 engine `pub mod replay`，CLI/ACP 只经 `Engine` 执行 turn；`rg` 证明 `build_turn`/`GovernedTool`/治理链只在 engine，CLI 不再直接调用 `AgentLoop`（2026-11-28）。E1 剩余对齐与 E5 仍是候选、未排期、未开工；每个 Task 开工前必须单独确认范围、依赖与验收，且一次会话只做一个 Task。E0–E4 不得修改 `jessica-core` 公共 API；若实施中发现必须修改，先停下询问用户并单开 Task。E1 新增 workspace crate 与更新 `CLAUDE.md` 依赖表已获用户授权并完成。
+当前状态：E0 已于 2026-11-28 完成，仅新增/加强 `jessica-cli` 测试并做 mutation check，未改生产路径。2026-11-28 用户确认方向并要求写入 `PLAN.md`，随后分别授权开始 E0、E1、E1c 与 E1d；E1 因范围较大按计划拆为 E1a/E1b，E1a 已完成 crate/API/端口/配置骨架，E1b 已完成 engine 侧治理原语与最小 `run_turn` 垂直切片，E1c 已完成 CLI 治理原语接入，E1d 已完成 descriptor 元数据迁移、engine/CLI patch 解析等价性行为测试与 engine artifact retention/GC（均为 2026-11-28）。E1c 后 CLI 依赖 engine，并复用 engine 的 `GovernanceState`/`TokenCountingProvider`；CLI `GovernedTool` 保留为宿主适配层，把 allowlist、CLI `PolicyV2`、CLI `ResultManager` 与权限门适配为 engine 端口，治理顺序由 engine 执行。E1d 后 CLI descriptor 类型改为 re-export engine 类型，engine `ToolCatalog` 保留 descriptor metadata/limits，engine `PolicyV2` 的 patch 头与 hunk 结构校验已通过 CLI/engine 等价行为测试，engine `ArtifactStore` 支持 retention 与字节预算 cleanup。CLI/ACP 可观察行为未变；全 workspace 1193 个测试通过（CLI 单元 407、engine 47）。E1 仍未完成：CLI 仍保有 `PolicyV2`/`ArtifactStore`/`ResultManager`/`ToolCatalog` 的具体实现，其中 catalog profile 过滤/hidden reason/exposure budget、artifact sidecar/record 与 `ReadArtifactTool` 尚未迁入 engine；engine policy 只做结构与路径校验，不把 hunk 应用到文件，实际上下文匹配与写入仍由执行工具负责。E2 已完成 journal/pump/EventRecorder 迁入与 `TraceStore`/`TracePolicy::Required`（2026-11-28）。E3 因范围较大按 PLAN 允许项拆为 E3a/E3b：E3a 已完成 engine 侧 `run_turn_request`/`resume_turn`、固定初始消息顺序、memory/skill 每轮各 recall 一次与完成后 fail-open 后处理、acceptance 重试与每 attempt 独立 session、最终失败/治理 trip 的外层 session、budget reason 覆盖与基于已记录证据的 resume（2026-11-28）；E3b 已完成 delegation 父侧装配、`ChildToolFactory`、CLI `CliRuntime` 委托 engine、`HarnessConfig`/`EngineConfig` 拆分、sensors/`PumpConsole` 适配器并删除 CLI 并行 turn 装配，E3 全部完成（2026-11-28）。E4 已完成：删除 CLI 的 `events`/`pump`/`replay` 垫片，离线确定性 replay 迁入 engine `pub mod replay`，CLI/ACP 只经 `Engine` 执行 turn；`rg` 证明 `build_turn`/`GovernedTool`/治理链只在 engine，CLI 不再直接调用 `AgentLoop`（2026-11-28）。E5 已完成：冻结 engine 公共 API，补齐 3 个 `compile_fail` doctest、公开示例 `examples/governed_turn.rs` 与 architecture/embedding 文档，`cargo tree` 证明依赖边界（2026-11-28）。E1 剩余对齐仍是候选、未排期、未开工；每个 Task 开工前必须单独确认范围、依赖与验收，且一次会话只做一个 Task。E0–E5 不得修改 `jessica-core` 公共 API；若实施中发现必须修改，先停下询问用户并单开 Task。E1 新增 workspace crate 与更新 `CLAUDE.md` 依赖表已获用户授权并完成。
 
 背景：当前完整受治理流程只存在于 `jessica-cli`。`jessica-cli` 是 binary-only crate（`Cargo.toml` 只有 `[[bin]]`，`src/main.rs` 以 `mod` 声明模块，没有 `lib.rs`），`build_turn`、`run_turn_request`、`run_attempt`、`GovernedTool`、`TurnJournal`、`EventPump`、acceptance、memory/skill 调用点、delegation 装配、resume 与 shutdown 均为私有或 `pub(crate)`。`jessica-runtime` 只提供裸 `AgentLoop`，`jessica-harness` 只提供 middleware/guard/policy/sensor 骨架；二者都不定义“一轮受治理会话”的完整顺序与不变量。结果是 embedder 只能依赖 CLI 内部、复制装配逻辑，或绕过治理直接调用 `AgentLoop`；治理是否生效取决于调用方的装配纪律，而不是类型/API 合同。
 
@@ -2434,7 +2434,7 @@ jessica-cli ──> jessica-engine ──> jessica-core
 - `ToolPermissionGate`、`TurnObserver`（UpdateSink）、`PumpConsole`。
 - `ChildToolFactory`（`jessica-runtime` 已有）、`AcceptanceCheck`（`jessica-core` 已有）、`SystemPromptSource`、`IdSource`。
 
-Phase 11 任务序列（E0、E1a–E1d、E2、E3 与 E4 已完成；E1 剩余对齐与 E5 候选，未排期）：
+Phase 11 任务序列（E0、E1a–E1d、E2、E3、E4 与 E5 已完成；E1 剩余对齐候选，未排期）：
 
 | Task | 内容 | 改 core | 新依赖 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- | --- |
@@ -2443,9 +2443,9 @@ Phase 11 任务序列（E0、E1a–E1d、E2、E3 与 E4 已完成；E1 剩余对
 | **E2** | 迁入 journal/pump/EventRecorder，落地 `TraceStore` 与 `TracePolicy::Required` | 否 | 无 | E1 | 已完成（2026-11-28） |
 | **E3** | 完整 turn 编排、acceptance、memory/skills、delegation、resume，CLI 委托 engine | 否 | 无 | E2 | 已完成（2026-11-28；E3a engine turn/acceptance/memory/skills/resume，E3b delegation/CLI 委托/config 拆分与适配器） |
 | **E4** | CLI/ACP 适配器收薄，删除重复装配，确保只有一条受治理路径 | 否 | 无 | E3 | 已完成（2026-11-28） |
-| **E5** | 冻结 engine 公共 API、文档、compile-fail doctest 与依赖检查 | 否 | 无 | E4 | 候选 |
+| **E5** | 冻结 engine 公共 API、文档、compile-fail doctest 与依赖检查 | 否 | 无 | E4 | 已完成（2026-11-28） |
 
-说明：E0 已完成，E1–E4 的重构已有行为基线；E5 只在 E4 完成后开始。E1–E4 任一步发现必须修改 `jessica-core` 时立即停止，记录原因并单开 Task；不得用 CLI 侧包装绕过 core 契约。
+说明：E0 已完成，E1–E4 的重构已有行为基线；E5 已在 E4 后完成并冻结 engine 公共 API。E1–E5 任一步发现必须修改 `jessica-core` 时立即停止，记录原因并单开 Task；不得用 CLI 侧包装绕过 core 契约。
 
 Task E0（已完成，2026-11-28）：行为基线——把受治理流程固化为 characterization tests
 
@@ -2769,7 +2769,7 @@ E4 完成记录（2026-11-28）：
   4. 迁移 replay 时只调整聚合可见性（`pub(crate)` → `pub`）并补 doc comment；replay 算法、事件断言与 6 个行为测试未改。CLI 单元测试减少 6 个、engine 增加 6 个是测试移动，不是覆盖减少。
   5. 未新增 `Cargo.toml` 依赖；未触及 `jessica-core` 公共 API。
 
-Task E5（候选，未排期）：冻结 engine 公共 API 与文档
+Task E5（已完成，2026-11-28）：冻结 engine 公共 API 与文档
 
 范围与约束：
 
@@ -2782,13 +2782,36 @@ Task E5（候选，未排期）：冻结 engine 公共 API 与文档
 
 禁止：把未完成的 API 标记为冻结；用 feature 或 `doc(hidden)` 掩盖必须公开的受治理入口；修改 `jessica-core` 来迁就 engine。
 
+E5 完成记录（2026-11-28）：
+
+- 实际耗时：约 11 分钟（2026-11-28 16:03 +08 开始，16:14 +08 完成全量验收）。
+- 改动范围：`jessica-engine`（`src/lib.rs`、`src/api.rs`、`src/error.rs` 的文档与 `compile_fail` doctest；新增 `examples/governed_turn.rs`）；`CLAUDE.md`；`README.md`；`Arch.md`；`PLAN.md`。未改 `jessica-core`、其他 crate、`Cargo.toml` 或任何第三方依赖。
+- API 审查结论：
+  - `Engine::run_turn_request` 与 `Engine::resume_turn` 是完整 turn 入口，`Engine::run_turn` 是只绑定 `TraceStore` 的简化入口；三者是仅有的 turn 入口。
+  - `TurnRequest` 字段私有；`EngineBuilder` 只接受命名端口，不暴露预装配 `Harness`/`ToolRegistry`；`TracePolicy` 必须经 `EngineConfig::new` 显式传入。
+  - `EngineError` 是 `thiserror` 结构化 enum 且 `#[non_exhaustive]`；`#![deny(missing_docs)]` 保持，全部公共项有文档。
+  - 新增 3 个 `compile_fail` doctest：`TurnRequest` 私有字段不可伪造、`EngineBuilder` 没有 `harness` 后门、`TraceIncomplete` 不能当 `TurnOutcome`。
+  - 新增公开示例 `examples/governed_turn.rs`：只依赖 engine 公共端口，经 `ask` 规则触发审批门，执行工具并验证 SQLite trace 以 `turn_started`/`turn_ended` 闭合；`cargo run -p jessica-engine --example governed_turn` 输出 `turn turn-1 completed with a closed trace (12 durable events)`。
+  - 文档：`CLAUDE.md` 增加 engine 冻结与 semver 策略、`cargo tree` 检查命令；`README.md` 增加 engine crate 行与 embedding 示例；`Arch.md` 新增 engine 层、依赖图、端口/装配顺序与 API 冻结小节，并修正 CLI 组合根、`PolicyV2`、`EventRecorder` 的过期表述。
+- 验收结果（2026-11-28 16:14 +08）：
+  - `cargo fmt --check`：通过。
+  - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+  - `cargo test --workspace`：1181 passed，0 failed，2 ignored（E4 的 1178 + 3 个 doctest）。
+  - `cargo test -p jessica-engine --doc`：3 passed，全部为 `compile_fail`。
+  - `cargo tree -p jessica-engine --edges normal`：内部依赖仅 `jessica-core`/`jessica-runtime`/`jessica-harness`/`jessica-memory`；无 `jessica-cli`、`jessica-providers`、`jessica-tools`、`jessica-sandbox`，无 ACP/终端/HTTP/wasmtime 依赖（`rusqlite` 仅经 `jessica-memory` 传递）。
+- 偏离/边界：
+  1. E3a 记录中“`TraceStore` 与 `EventJournal` 两条 trace 缝统一留到 E3b/E5”未在 E5 实施：`run_turn`（TraceStore）与 `run_turn_request`/`resume_turn`（EventJournal）仍是两个受支持的公开入口。两条缝的语义已在 crate 文档与 `run_turn` 文档中明确区分；合并会删除已公开的 `run_turn` 并改变 embedder 契约，属于冻结后的破坏性变更，需单开 Task，因此 E5 明确保留并记录。
+  2. 未缩小既有公共导出面（`GovernanceState`/`GovernedTool`/`TurnJournal`/`EventPump` 等仍公开）。这些类型在 E1–E2 已作为公开 API 交付并文档化，且不提供绕过 `Engine` 的受治理 turn 入口；E5 不做冻结前的批量删减，避免超出“审查 + 冻结 + 文档”的范围。如需收窄，应在冻结后单开 Task。
+  3. `jessica-cli/src/policy_v2.rs` 归属仍未解决（E1 剩余）；E5 只在 `CLAUDE.md` 与 `Arch.md` 中明确它仅服务 `policy simulate` dry-run。
+  4. 未新增 `Cargo.toml` 依赖；未触及 `jessica-core` 公共 API。
+
 Phase 11 开工前需确认的事项（候选阶段不预判结论）：
 
 - E1 新增 crate 与 `CLAUDE.md` 依赖表更新已获用户授权并完成（E1a，2026-11-28）；E1b engine 侧切片已完成（E1b，2026-11-28）；E1c CLI 治理原语接入已完成（E1c，2026-11-28）；E1d descriptor/patch/artifact 对齐已完成（E1d，2026-11-28）。E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属不得在未确认的情况下顺手改变 CLI 行为；其范围与顺序需用户确认。
 - E0 已完成（测试放在现有 `#[cfg(test)]` 模块，mutation check 已执行并还原）；以下事项仅针对 E1–E5。
 - `EngineConfig` 与 `HarnessConfig` 的拆分边界，尤其是 `ResultManager`/artifact store 的配置来源。
 - `TraceStore` 首版是否直接绑定 `jessica-memory` 的 SQLite 实现；若未来需要轻量嵌入，再评估 feature 或 `jessica-engine-sqlite` 拆分。
-- engine 公共 API 初版（E1）与冻结（E5）之间的兼容策略；E1–E4 是否允许破坏性调整。
+- engine 公共 API 初版（E1）与冻结（E5）之间的兼容策略：E5 冻结时未做破坏性调整，保留 `run_turn` 与 `run_turn_request`/`resume_turn` 两个入口；冻结后任何变更需单开 Task。
 - 子 Agent 治理合同：顶层 `delegate_task` approval 覆盖子 run，逐子工具 policy/approval 另开 Task。
 - 并发模型：同一 session 串行、跨 session 并发；保持现有 `PromptBusy` 行为。
 - E1 已按 E1a/E1b/E1c/E1d 拆分；剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属是否继续单开 Task（或并入 E2/E3）需用户确认。E3 已按 PLAN 允许项拆为 E3a/E3b 实施：E3a/E3b 均已完成；拆分只影响实施节奏，不影响总验收。
@@ -2805,7 +2828,7 @@ Phase 11 Deferred（不在 E0–E5 内提前实现）：
 - 配置/提示摘要写入 trace（需 core schema 审批）。
 - `jessica-engine-sqlite` 拆分或轻量 feature；ACP 独立 crate 化。
 
-恢复说明：E0、E1a–E1d、E2、E3a–E3b 与 E4 已完成（E1 仍为部分完成：descriptor 元数据、patch 解析等价性与 engine artifact cleanup 已对齐，CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 仍归 CLI；E3 已完成 engine 侧完整 turn/acceptance/memory/skills/resume/delegation 与 CLI 委托）；E1 剩余对齐与 E5 仍为候选，不占用 Phase 10 的暂缓/恢复条件，Phase 10 仍按原 Deferred 条目处理。E1 剩余对齐与 E5 任何一项开始前，用户需明确指定该 Task 并确认上述相关事项；未确认前不得以“候选已写入 PLAN”为由开始实现。E4 后 CLI/ACP 已只经 `Engine` 执行 turn，CLI 并行 turn 装配已删除；CLI 仍保有 policy/artifact/catalog 具体实现（其中 `policy_v2.rs` 仅用于 `policy simulate` dry-run），因此 engine 是唯一受治理 turn 路径，但 E1 的 catalog/artifact 归属仍未完成。
+恢复说明：E0、E1a–E1d、E2、E3a–E3b、E4 与 E5 已完成（E1 仍为部分完成：descriptor 元数据、patch 解析等价性与 engine artifact cleanup 已对齐，CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 仍归 CLI；E3 已完成 engine 侧完整 turn/acceptance/memory/skills/resume/delegation 与 CLI 委托）；E1 剩余对齐仍为候选，不占用 Phase 10 的暂缓/恢复条件，Phase 10 仍按原 Deferred 条目处理。E1 剩余对齐开始前，用户需明确指定该 Task 并确认上述相关事项；未确认前不得以“候选已写入 PLAN”为由开始实现。E4 后 CLI/ACP 已只经 `Engine` 执行 turn，CLI 并行 turn 装配已删除；E5 已于 2026-11-28 冻结 engine 公共 API，冻结后的变更需单开 Task。CLI 仍保有 policy/artifact/catalog 具体实现（其中 `policy_v2.rs` 仅用于 `policy simulate` dry-run），因此 engine 是唯一受治理 turn 路径，但 E1 的 catalog/artifact 归属仍未完成。
 
 ---
 
@@ -2911,7 +2934,7 @@ Task 9.1 ☑ 耗时未精确计时（含方案确认、实现、测试与全量�
 
 Deferred（待办，由用户决定是否单开 Task）
 
-· Phase 11（E0、E1a–E1d、E2、E3a–E3b 与 E4 已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属、E5 候选，未排期）：`jessica-engine` 受治理运行时抽取。2026-11-28 用户确认方向并要求作为候选写入 `PLAN.md`，随后完成 E0 行为基线；E1 获授权后按计划拆分，E1a 已交付 crate/API/端口/配置骨架，E1b 已交付 engine 侧 `PolicyV2`/`ArtifactStore`/`ResultManager`/`GovernanceState`/`GovernedTool` 与最小 `run_turn` 垂直切片，E1c 已交付 `EventSink` 兼容面、`ToolPolicy`/`ToolResultManager` 端口与 CLI 治理适配层，E1d 已交付 descriptor 元数据迁移、CLI/engine patch 解析等价性测试与 engine artifact retention/GC；E2 已交付 journal/pump/EventRecorder 迁入、`TraceStore` 与 `TracePolicy::Required`；E3 按 E3a/E3b 拆分，E3a 交付 engine 侧 `run_turn_request`/`resume_turn`、acceptance、memory/skills 后处理与固定初始消息顺序，E3b 交付 delegation、CLI 委托与 config 拆分；E4 交付 CLI/ACP 单一装配，删除 `events`/`pump`/`replay` 垫片并把离线 replay 迁入 engine。CLI 已依赖 engine 并复用 engine 的 `GovernanceState`/`TokenCountingProvider`/`GovernedTool` 顺序，但仍保有 policy/artifact/catalog 具体实现（`policy_v2.rs` 仅供 `policy simulate` dry-run），E1 未完成。E5 不表示已排期或已开工。详见 Phase 11 章；engine 现为 CLI/ACP 唯一受治理 turn 路径。
+· Phase 11（E0、E1a–E1d、E2、E3a–E3b、E4 与 E5 已完成；E1 剩余 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属候选，未排期）：`jessica-engine` 受治理运行时抽取。2026-11-28 用户确认方向并要求作为候选写入 `PLAN.md`，随后完成 E0 行为基线；E1 获授权后按计划拆分，E1a 已交付 crate/API/端口/配置骨架，E1b 已交付 engine 侧 `PolicyV2`/`ArtifactStore`/`ResultManager`/`GovernanceState`/`GovernedTool` 与最小 `run_turn` 垂直切片，E1c 已交付 `EventSink` 兼容面、`ToolPolicy`/`ToolResultManager` 端口与 CLI 治理适配层，E1d 已交付 descriptor 元数据迁移、CLI/engine patch 解析等价性测试与 engine artifact retention/GC；E2 已交付 journal/pump/EventRecorder 迁入、`TraceStore` 与 `TracePolicy::Required`；E3 按 E3a/E3b 拆分，E3a 交付 engine 侧 `run_turn_request`/`resume_turn`、acceptance、memory/skills 后处理与固定初始消息顺序，E3b 交付 delegation、CLI 委托与 config 拆分；E4 交付 CLI/ACP 单一装配，删除 `events`/`pump`/`replay` 垫片并把离线 replay 迁入 engine；E5 冻结 engine 公共 API，新增 3 个 `compile_fail` doctest、公开示例与 `cargo tree` 依赖检查。CLI 已依赖 engine 并通过 ports 复用 engine 的治理顺序，但仍保有 policy/artifact/catalog 具体实现（`policy_v2.rs` 仅供 `policy simulate` dry-run），E1 未完成。E5 已于 2026-11-28 完成；冻结后 engine API 变更需单开 Task。详见 Phase 11 章；engine 现为 CLI/ACP 唯一受治理 turn 路径。
 · Phase 10 Web Search（2026-11-22 用户决定暂缓）：当前没有 Brave Search API key，10.1a/10.1b 均未开始。暂缓期间不得向 `jessica-tools` 增加 `reqwest`/`tracing` 引用，不得新增 `web_search` 工具、配置、审批项、测试或文档承诺。恢复条件：用户提供可用 Brave API key，或明确选择 SearXNG endpoint/自托管方案，并重新确认后端顺序、审批与父 Agent 隔离边界；恢复后仍按 Phase 10 的两个 Task 拆分验收。
 · Task 9.1 的系统提示仍展示完整 `policy.allowed_tools`，而不是 Catalog 的 profile 过滤后暴露集。窄 profile 下模型可能在提示中看到未暴露名称并尝试调用，随后得到 `unknown tool`。若要求提示与 schema 严格一致，需把按 turn 构建的 exposed 集传入 `initial_messages`，并决定 WASM/MCP/委派名称在提示中的呈现方式；不在 9.1 顺手改。
 · Task 9.1 的 per-tool `timeout_ms`/`max_args_bytes` 只覆盖 `read_file`、`write_file`、`bash` 三个原生工具；WASM manifest、MCP server 与 `delegate_task` 尚无独立 per-tool 配置，仍分别受 manifest 限额、MCP 固定边界和委派 limits 约束。若需要统一配置面，需单开 Task 扩展 `[tools]` 并定义第三方工具的默认来源。

@@ -14,7 +14,7 @@ Jessica 是一个确定性 Rust Agent 运行时，WASM 沙箱扩展，事件溯�
 
 1. 本次会话只执行 PLAN.md 中指定的一个 Task，不越界实现后续 Task。
 2. 已了解 Workspace 依赖单向规则与禁止事项。
-3. jessica-core 的公共 API 已冻结，变更必须先询问用户并单开 Task。
+3. jessica-core 与 jessica-engine 的公共 API 已冻结，变更必须先询问用户并单开 Task。
 4. Task 完成后运行验收命令、贴出结果，并更新 PLAN.md 的进度追踪。
 
 ## Workspace 布局与依赖单向规则
@@ -41,6 +41,17 @@ Workspace 使用 `resolver = "2"`，成员 crate 如下：
 - `jessica-cli` 依赖所有实现层（含 `jessica-engine`），用于最终装配。
 - 任何内部依赖只能指向更低层，禁止反向依赖或循环依赖。
 
+## 公共 API 冻结与版本策略
+
+- `jessica-core` 自 Phase 0 起冻结；`jessica-engine` 自 Task E5（2026-11-28）起冻结。二者的公共 API 变更（新增、删除、改签名或改语义）必须先停下询问用户，并单开 Task。
+- engine 的受治理入口不得用 feature 或 `doc(hidden)` 隐藏：`Engine::run_turn_request` 与 `Engine::resume_turn` 是完整 turn 入口，`Engine::run_turn` 是只绑定 `TraceStore` 的简化入口。
+- 版本遵循 semver：1.0 之前 minor 版本可含破坏性变更，patch 只含修复与文档；1.0 起按标准 semver。
+- 依赖边界用以下命令验证：
+
+```bash
+cargo tree -p jessica-engine --edges normal
+```
+
 ## 编码纪律
 
 - 所有公共 API（`pub` 类型、函数、Trait、方法、字段）必须有 doc comment（`///`）。
@@ -53,7 +64,7 @@ Workspace 使用 `resolver = "2"`，成员 crate 如下：
 
 - 不得引入未在 Cargo.toml 中显式批准的第三方 crate；新增依赖必须先修改 workspace 的 Cargo.toml，并在对应 Task 中说明理由。
 - 不得提前实现后续 Phase 的 Trait 方法或功能（例如 Phase 0.2 只定义 Trait 骨架、不实现 Guard；Phase 1 不实现重试/熔断）。
-- 不得修改已冻结的 jessica-core 公共 API。确需变更时，先停下询问用户，并单独开 Task。
+- 不得修改已冻结的 jessica-core 与 jessica-engine 公共 API。确需变更时，先停下询问用户，并单独开 Task。
 - 不得在 Task 范围外顺手重构；发现的问题记录到 PLAN.md 的 Deferred 列表，由用户决定是否单开 Task。
 - 验收命令失败时不得声明任务完成。
 
@@ -74,13 +85,20 @@ cargo test -p <crate>
 cargo clippy -p <crate> -- -D warnings
 ```
 
+engine 侧变更额外检查依赖边界与公开示例：
+
+```bash
+cargo tree -p jessica-engine --edges normal
+cargo run -p jessica-engine --example governed_turn
+```
+
 每个 Task 完成后必须更新 PLAN.md 中的复选框状态，并记录实际耗时和偏离计划的地方。
 
 ## Claude Code 执行纪律
 
 1. 一次会话只做一个 Task。完成后主动运行该 Task 的所有验收命令，并把结果贴出来。
 2. 验收命令失败时不得声明完成，应修复后重跑，或明确报告阻塞点。
-3. 修改 jessica-core 的公共 API 前必须先停下询问，因为这会破坏跨 Phase 契约。
+3. 修改 jessica-core 或 jessica-engine 的公共 API 前必须先停下询问，因为这会破坏跨 Phase 契约。
 4. 测试必须是行为测试，不得写“调用后断言返回 Ok”这类自证式测试；mock 必须构造真实的边界条件。
 5. 不要在 Task 范围外顺手重构，发现的问题记录到 PLAN.md 的 “Deferred” 列表，由用户决定是否单开 Task。
 6. 每个 Task 结束前更新 PLAN.md：勾选完成、记录实际耗时和偏离计划的地方。

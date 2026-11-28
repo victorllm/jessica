@@ -6,8 +6,8 @@ use crate::policy::PolicyError;
 
 /// Failure while configuring or assembling the governed engine.
 ///
-/// The enum is non-exhaustive: later Phase 11 tasks add lifecycle and trace
-/// failures without breaking downstream matches.
+/// The enum is non-exhaustive: callers must include a wildcard arm, and a
+/// later Task can add failures without breaking downstream compilation.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EngineError {

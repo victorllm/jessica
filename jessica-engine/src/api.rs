@@ -46,6 +46,20 @@ use crate::tooling::{
 const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Input for one governed turn.
+///
+/// Fields are private on purpose: the `with_*` methods are the only way to
+/// shape a request, so a caller cannot fabricate state the engine would not
+/// accept.
+///
+/// ```compile_fail
+/// use jessica_engine::TurnRequest;
+///
+/// // `input` and every other field are private.
+/// let forged = TurnRequest {
+///     input: "bypass".to_owned(),
+///     ..TurnRequest::new("bypass")
+/// };
+/// ```
 #[derive(Clone, Default)]
 pub struct TurnRequest {
     input: String,
@@ -216,6 +230,17 @@ impl TurnRequest {
 /// This is a successful turn record. A trace that could not be closed is
 /// returned as [`EngineError`] instead, never as an outcome with a misleading
 /// `Completed` reason.
+///
+/// ```compile_fail
+/// use jessica_engine::{EngineError, TurnOutcome};
+///
+/// let incomplete = EngineError::TraceIncomplete {
+///     turn_id: "turn-1".to_owned(),
+///     cause: "disk full".to_owned(),
+/// };
+/// // An incomplete trace is an error, never a successful outcome.
+/// let outcome: TurnOutcome = incomplete;
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     /// Why the turn stopped.
@@ -289,10 +314,11 @@ struct TurnTooling {
 /// A configured governed engine.
 ///
 /// The engine owns one immutable [`EngineConfig`] snapshot and runs the
-/// provider-to-tool vertical slice for each [`TurnRequest`]. Task E2 added the
-/// producer-side trace sink, the event pump, and the required-trace lifecycle.
-/// Acceptance orchestration, memory, skills, delegation, and resume remain
-/// later Phase 11 tasks.
+/// provider-to-tool vertical slice for each [`TurnRequest`]. It owns the
+/// complete turn lifecycle: the producer-side trace sink and event pump,
+/// acceptance retries, memory/skill post-processing, delegation parent
+/// assembly, and resume from recorded evidence. The CLI and ACP are adapters
+/// that supply the host ports.
 pub struct Engine {
     config: EngineConfig,
     dependencies: EngineDependencies,
@@ -313,8 +339,12 @@ impl Engine {
     /// [`jessica_runtime::AgentLoop`] through the token-counting provider. A
     /// required trace is opened before the agent starts, every producer event
     /// is recorded before it is broadcast, and the turn only succeeds after
-    /// `turn_ended` is acknowledged. Acceptance orchestration, memory, skills,
-    /// delegation, and resume belong to later Phase 11 tasks.
+    /// `turn_ended` is acknowledged.
+    ///
+    /// This path uses a [`TraceStore`] directly and does not run acceptance
+    /// retries, memory/skill post-processing, delegation, or resume. Use
+    /// [`Self::run_turn_request`] or [`Self::resume_turn`] for the complete
+    /// lifecycle.
     ///
     /// A budget trip is reported as [`SessionEndReason::BudgetExceeded`] even
     /// when the runtime loop itself returned another reason, because the
@@ -1795,6 +1825,13 @@ impl std::fmt::Debug for Engine {
 /// trace policy must be explicit. A required trace needs a [`TraceStore`]; a
 /// policy that can ask for approval also requires a permission gate at build
 /// time.
+///
+/// ```compile_fail
+/// use jessica_engine::EngineBuilder;
+///
+/// // There is no setter for a pre-assembled harness or tool registry.
+/// let builder = EngineBuilder::new().harness(());
+/// ```
 #[derive(Default)]
 pub struct EngineBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
