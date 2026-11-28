@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use jessica_core::tool::{Tool, ToolSchema};
 use thiserror::Error;
@@ -211,7 +210,7 @@ impl ToolCatalog {
                 .tools
                 .timeout_for(&candidate.name, config.budget.tool_timeout());
             let limits = ToolLimits {
-                timeout_ms: duration_millis(timeout),
+                timeout: Some(timeout),
                 max_args_bytes: config.tools.max_args_bytes(&candidate.name),
                 max_inline_bytes: max_inline_bytes(candidate.source, config),
                 max_artifact_bytes: Some(config.tools.max_artifact_bytes),
@@ -238,6 +237,7 @@ impl ToolCatalog {
                 candidate.name.clone(),
                 candidate.source,
                 candidate.schema,
+                super::descriptor::version_for(candidate.source),
                 limits,
                 approval,
                 &candidate.metadata,
@@ -390,10 +390,6 @@ fn max_output_lines(name: &str, config: &HarnessConfig) -> Option<usize> {
         "grep" => Some(config.tools.grep.max_matches),
         _ => None,
     }
-}
-
-fn duration_millis(timeout: Duration) -> u64 {
-    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn max_inline_bytes(source: ToolSource, config: &HarnessConfig) -> usize {
@@ -865,13 +861,13 @@ mod tests {
         .expect("catalog must build");
 
         let read = catalog.find("read_file").expect("read must exist");
-        assert_eq!(read.descriptor.limits.timeout_ms, 500);
+        assert_eq!(read.descriptor.limits.timeout_ms(), Some(500));
         assert_eq!(read.descriptor.limits.max_args_bytes, Some(2048));
         assert_eq!(read.descriptor.approval, ApprovalPolicy::NotRequired);
         assert_eq!(read.descriptor.limits.max_inline_bytes, 64 * 1024);
 
         let bash = catalog.find("bash").expect("bash must exist");
-        assert_eq!(bash.descriptor.limits.timeout_ms, 3000);
+        assert_eq!(bash.descriptor.limits.timeout_ms(), Some(3000));
         assert_eq!(bash.descriptor.approval, ApprovalPolicy::Interactive);
 
         let delegate = catalog.find("delegate_task").expect("delegate must exist");

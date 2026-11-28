@@ -394,8 +394,7 @@ mod tests {
     };
     use crate::ports::{ToolContext, ToolPermissionDecision};
     use crate::tooling::{
-        ApprovalPolicy, Capabilities, ResultFormat, ToolCatalog, ToolDescriptor, ToolLimits,
-        ToolSource,
+        ApprovalPolicy, ToolCatalog, ToolDescriptor, ToolLimits, ToolMetadata, ToolSource,
     };
 
     struct UnusedProvider;
@@ -696,15 +695,19 @@ mod tests {
     }
 
     fn descriptor(name: &str) -> ToolDescriptor {
-        ToolDescriptor {
-            name: name.to_owned(),
-            source: ToolSource::Native,
-            capabilities: Capabilities::default(),
-            approval: ApprovalPolicy::NotRequired,
-            result_format: ResultFormat::Text,
-            path_field: None,
-            limits: ToolLimits::default(),
-        }
+        ToolDescriptor::new(
+            name.to_owned(),
+            ToolSource::Native,
+            json!({
+                "type": "function",
+                "function": {"name": name, "parameters": {"type": "object"}}
+            }),
+            "test-version",
+            ToolLimits::default(),
+            ApprovalPolicy::NotRequired,
+            &ToolMetadata::default(),
+        )
+        .expect("test schema must serialize")
     }
 
     fn catalog_with(name: &'static str, tool: Arc<MockTool>) -> ToolCatalog {

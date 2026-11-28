@@ -242,7 +242,7 @@ fn render_list(catalog: &ToolCatalog, all: bool) {
                 "{:<name_width$}  {:<10}  {:<10}  {}",
                 entry.descriptor.name,
                 entry.descriptor.source.as_str(),
-                entry.descriptor.limits.timeout_ms,
+                entry.descriptor.limits.timeout_ms().unwrap_or(0),
                 entry.descriptor.schema_digest
             );
         }
@@ -277,7 +277,10 @@ fn render_inspect(entry: &CatalogEntry) {
         yes_no(descriptor.capabilities.parallel_safe)
     );
     println!("limits:");
-    println!("  timeout_ms: {}", descriptor.limits.timeout_ms);
+    println!(
+        "  timeout_ms: {}",
+        descriptor.limits.timeout_ms().unwrap_or(0)
+    );
     println!(
         "  max_args_bytes: {}",
         optional_bytes(descriptor.limits.max_args_bytes)
