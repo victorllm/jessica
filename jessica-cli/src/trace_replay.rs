@@ -18,11 +18,10 @@ use std::collections::BTreeMap;
 
 use jessica_core::trace::{TraceEvent, TracePayload, TraceTurnMode};
 use jessica_core::types::{AgentEvent, BudgetKind, Message, SessionEndReason, SessionId};
+use jessica_engine::StoredSession;
+use jessica_engine::replay::{ReplayError, replay_resumed_session, replay_session};
 use jessica_runtime::RecordedEvent;
 use serde::Serialize;
-
-use crate::events::StoredSession;
-use crate::replay::{ReplayError, replay_resumed_session, replay_session};
 
 /// Status of one replay parity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
