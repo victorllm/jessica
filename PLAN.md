@@ -2434,13 +2434,13 @@ jessica-cli ──> jessica-engine ──> jessica-core
 - `ToolPermissionGate`、`TurnObserver`（UpdateSink）、`PumpConsole`。
 - `ChildToolFactory`（`jessica-runtime` 已有）、`AcceptanceCheck`（`jessica-core` 已有）、`SystemPromptSource`、`IdSource`。
 
-Phase 11 任务序列（E0 与 E1a–E1d 已完成；E1 剩余对齐与 E2–E5 候选，未排期）：
+Phase 11 任务序列（E0、E1a–E1d 与 E2 已完成；E1 剩余对齐与 E3–E5 候选，未排期）：
 
 | Task | 内容 | 改 core | 新依赖 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | **E0** | 行为基线：审计并补齐 11 条不变量的 characterization tests，最终不改生产路径 | 否 | 无 | 无 | 已完成（2026-11-28） |
 | **E1** | 新增 `jessica-engine` 骨架、端口、治理原语与最小 `run_turn` 垂直切片 | 否 | 无（仅 workspace 已批准依赖） | E0 | 部分完成（E1a/E1b engine 切片、E1c CLI 治理接入、E1d descriptor/patch/artifact 对齐 2026-11-28；CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 仍属 CLI） |
-| **E2** | 迁入 journal/pump/EventRecorder，落地 `TraceStore` 与 `TracePolicy::Required` | 否 | 无 | E1 | 候选 |
+| **E2** | 迁入 journal/pump/EventRecorder，落地 `TraceStore` 与 `TracePolicy::Required` | 否 | 无 | E1 | 已完成（2026-11-28） |
 | **E3** | 完整 turn 编排、acceptance、memory/skills、delegation、resume，CLI 委托 engine | 否 | 无 | E2 | 候选 |
 | **E4** | CLI/ACP 适配器收薄，删除重复装配，确保只有一条受治理路径 | 否 | 无 | E3 | 候选 |
 | **E5** | 冻结 engine 公共 API、文档、compile-fail doctest 与依赖检查 | 否 | 无 | E4 | 候选 |
@@ -2604,7 +2604,7 @@ E1d 完成记录（2026-11-28，descriptor/patch/artifact 对齐；E1 仍未完�
   5. journal/pump/acceptance/memory/skills/delegation/resume 未在 E1d 引入；`TracePolicy::Required` 仍被拒绝，E2/E3 继续。
 - 后续建议：E1 剩余对齐（CLI catalog 过滤迁入 engine，或 CLI artifact sidecar/`ReadArtifactTool` 迁入 engine）需用户明确单开 Task，且应先补 CLI/engine 行为等价测试再替换具体类型；E2 仍应优先实现 journal/pump/trace，不应与剩余 E1 对齐混做。
 
-Task E2（候选，未排期）：journal、pump 与 trace 持久化
+Task E2（已完成，2026-11-28）：journal、pump 与 trace 持久化
 
 范围与约束：
 
@@ -2617,6 +2617,39 @@ Task E2（候选，未排期）：journal、pump 与 trace 持久化
 完成标准：新增行为测试覆盖 trace 写失败→`TraceIncomplete` 且无 `turn_ended`、pump lag 在 outcome 暴露、sink 失败先于 broadcast、`finish_turn` 未 ack 不算成功；`cargo test -p jessica-engine` 与 workspace 全绿。
 
 禁止：静默降级 trace；把 `TraceIncomplete` 映射为普通 outcome；修改 core trace schema；为 engine 引入 `toml`/`reqwest`/`wasmtime`/ACP 依赖。
+
+E2 完成记录（2026-11-28）：
+
+- 实际耗时：约 25 分钟（2026-11-28 13:44 +08 开始，14:07 +08 完成全量验收；不含 PLAN 更新）。
+- 改动范围：`jessica-engine`、`jessica-cli` 与 `jessica-engine/Cargo.toml`；未改 `jessica-core`、其他 crate 或任何第三方依赖。engine 新增内部依赖 `jessica-memory`（符合单向规则与 E2 范围），未新增第三方 crate。
+- 交付：
+  - `pump.rs`：`EventPump`、`SessionSnapshot`、`PumpOutput`、`UpdateSink`（即 `TurnObserver`）迁入 engine；新增 `PumpIntegrity` 端口与 `LagHandling::{Continue, FailSession, Warn}`，由宿主决定 broadcast lag 的处理方式。pump 从事件重建 transcript、运行 guards/sensors、检测 lag；`has_lagged`/`register`/`run`/`wait_for` 公开。
+  - `journal.rs`：`TurnJournal` 及其全部行为测试迁入 engine；保留单写者、有界 1024 队列、begin/finish ack、attempt/session 归属、legacy mirror、child bracket 与 fail-closed integrity。`TurnJournal` 实现 `PumpIntegrity`：journal 启用时 lag 记入 integrity 失败但继续消费（`Continue` + `lagged`），journal 禁用时 `Silent`→`FailSession`、`HumanConsole`→`Warn`，与 CLI 原行为一致。
+  - `recorder.rs`：`EventRecorder`、`EventJournal`、`RecorderError`、`StoredSession` 迁入 engine；新增 `SqliteTraceStore` 实现 `TraceStore`。它直接复用 `jessica_memory::EventStore::append_traced`，保持 legacy+trace 同事务、SHA-256 链、trace schema v1–v3、bundle/digest/replay 兼容；未新增存储后端。`begin_turn` 先写 `turn_started` 再写 session metadata；`record` 保留 trace-only 事件与 `AcceptanceFailed` attempt 覆盖；`finish_turn` 写 `turn_ended` 并以其 `Ok` 作为成功 ack。
+  - `ports.rs`：engine 定义 `TraceStore`/`TurnTrace`；`TurnObserver` 继续作为 `UpdateSink` 来源；`PumpConsole` 由 engine 定义。
+  - `config.rs`/`error.rs`：`TracePolicy::Required` 成为默认值；`EngineConfig::new` 不再拒绝 Required；删除 `UnsupportedTracePolicy`，新增 `MissingTraceStore` 与 `TraceIncomplete { turn_id, cause }`。
+  - `api.rs`：builder 新增 `trace_store`/`observer`，Required 缺 store 在装配期失败；`run_turn` 在 provider 前 `begin_turn`，为 `AgentLoop` 与 `GovernanceState` 安装同一个 producer-side `TraceEventSink`，保证 sink 先于 broadcast。首个 trace 写失败会取消 agent、立即返回 `TraceIncomplete`、不调用 `finish_turn`；pump 未收到 terminal event 或超时同样返回 `TraceIncomplete`；`finish_turn` 失败也返回 `TraceIncomplete`，不返回伪成功 outcome。pump lag 不丢弃 producer-complete trace：`TurnOutcome.lagged=true`，并用 runtime transcript 提供完整 messages/last_output。
+  - CLI：`events.rs`/`journal.rs`/`pump.rs` 改为 re-export engine 类型，保留原 import 路径；`app.rs` 显式构造 `Arc<dyn PumpIntegrity> = journal.clone()` 并传给新增 `EventPump::new` 的 integrity 参数。CLI/ACP 输出与恢复语义未变。
+- 行为测试：`jessica-engine` 89 passed。E2 新增 7 个关键行为测试：
+  - `api::tests::a_required_trace_without_a_store_fails_assembly`：Required 是默认策略，缺 store 返回 `MissingTraceStore`。
+  - `api::tests::a_trace_that_cannot_open_never_reaches_the_provider`：begin 失败返回 `TraceIncomplete`，provider 调用 0 次，record/finish 均为 0。
+  - `api::tests::a_trace_write_failure_returns_trace_incomplete_without_turn_ended`：第 3 次 record 失败后返回 `TraceIncomplete`，已记录仅前两个事件，无 `SessionEnded`，`finish_turn` 未调用（无 `turn_ended`）。
+  - `api::tests::a_rejected_event_is_never_broadcast_and_no_later_event_follows`：故障 record 等待 observer 看到 3 个已持久化事件后才失败；observer 只看到 3 个事件，被拒事件与后续事件均未广播，recorded 与 observed 前缀一致。
+  - `api::tests::an_unacknowledged_turn_end_is_not_a_successful_turn`：producer 流已完整（末事件 `SessionEnded`），但 `finish_turn` 失败仍返回 `TraceIncomplete`，不返回 outcome。
+  - `api::tests::a_pump_gap_is_exposed_in_an_otherwise_complete_turn`：2000 个 delta 超过 1024 broadcast 容量，`outcome.lagged==true`，runtime transcript 完整，trace 记录全部 2000 个 delta 且 turn 正常闭合。
+  - `api::tests::the_sqlite_store_closes_a_trace_and_keeps_the_legacy_mirror`：真实 SQLite 文件 reopen 后 `closed()` 为 true，共 7 条 trace（首 `turn_started` Fresh、末 `turn_ended` Completed），legacy 5 条事件与 session metadata 一致。
+  - 同时迁入并通过 journal（19）、pump（11）与 recorder（5）的原有行为测试；CLI 的对应测试随实现迁出，CLI 二进制单元测试 373 passed。
+- 验收结果（2026-11-28 14:07 +08）：
+  - `cargo fmt --check`：通过。
+  - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+  - `cargo test --workspace`：1201 passed，0 failed，2 ignored；`jessica-engine` 89 passed，`jessica-cli` 二进制单元 373 passed，其余集成/E2E 套件全绿。
+  - `cargo tree -p jessica-engine --edges normal`：内部依赖仅 `jessica-core`/`jessica-runtime`/`jessica-harness`/`jessica-memory`；无 `jessica-cli`、`jessica-providers`、`jessica-tools`、`jessica-sandbox`、`toml`、`reqwest`、`wasmtime`、`agent-client-protocol` 等禁止依赖。
+- 偏离/边界：
+  1. `TurnJournal::record_failure` 原 CLI 版向 stderr 重复打印失败行；迁入后按 CLAUDE.md 改为 `tracing::error!`。CLI 仍通过 `TraceIncomplete`/journal integrity 向用户报告失败，唯一可观察差异是少一条重复 stderr 行。
+  2. engine 自有 `TraceStore` 在 broadcast 前记录每个事件，因此 pump lag 只影响 observer 侧 transcript/sensor，不代表 trace 不完整；engine 通过 `TurnOutcome.lagged` 暴露 gap（符合 Task 的“明确的 outcome 标记”），CLI 仍通过 `PumpIntegrity` 保持原 journal 语义。只有 trace 写/关失败或 pump 未观测到 terminal 才映射为 `TraceIncomplete`。
+  3. `TraceStore` 首版面向单 session/单 attempt：`begin_turn`/`record`/`finish_turn` 使用一个 `TurnTrace`。多 attempt acceptance、child session 归属与外层失败记录留到 E3；`SqliteTraceStore` 已保留 `AcceptanceFailed` attempt 覆盖与 child 事件 trace-only 规则。
+  4. `TracePolicy::Disabled` 会忽略已配置的 `trace_store`（builder 文档已说明）；但 pump 未观测到 terminal 仍返回 `TraceIncomplete`，属于有意 fail-closed，不把未闭合 turn 当成功。
+  5. `EventPump::new` 新增 `integrity` 参数；CLI 仅新增该装配参数，未改变输出、journal 记录或恢复路径。E1 剩余的 CLI catalog 过滤与 artifact sidecar/`ReadArtifactTool` 归属未在 E2 处理，仍待用户单开 Task。
 
 Task E3（候选，未排期）：完整 turn 编排、acceptance、memory/skills、delegation、resume
 

@@ -7,6 +7,7 @@ edition = "2024"
 jessica-core = { path = "../jessica-core" }
 jessica-runtime = { path = "../jessica-runtime" }
 jessica-harness = { path = "../jessica-harness" }
+jessica-memory = { path = "../jessica-memory" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

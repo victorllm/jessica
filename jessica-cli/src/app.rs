@@ -41,7 +41,7 @@ use crate::governance::{
 use crate::journal::TurnJournal;
 use crate::memory::MemoryAssembly;
 use crate::policy_v2::{PolicyError, PolicyTool, PolicyV2};
-use crate::pump::{EventPump, PumpOutput, SessionSnapshot, UpdateSink};
+use crate::pump::{EventPump, PumpIntegrity, PumpOutput, SessionSnapshot, UpdateSink};
 use crate::replay::ReplayError;
 use crate::shutdown::ShutdownController;
 use crate::skills::{SkillCommandError, SkillsAssembly};
@@ -1034,10 +1034,11 @@ impl CliRuntime {
         } else {
             PumpOutput::HumanConsole
         };
+        let integrity: Arc<dyn PumpIntegrity> = journal.clone();
         let pump = Arc::new(EventPump::new(
             Arc::clone(&harness),
             Arc::clone(&governance),
-            Arc::clone(&journal),
+            integrity,
             output,
             update_sink,
         ));

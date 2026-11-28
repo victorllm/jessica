@@ -1215,6 +1215,7 @@ dependencies = [
  "futures",
  "jessica-core",
  "jessica-harness",
+ "jessica-memory",
  "jessica-runtime",
  "serde_json",
  "sha2",

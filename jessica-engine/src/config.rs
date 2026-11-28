@@ -9,8 +9,6 @@ use std::time::Duration;
 
 use jessica_core::types::Budget;
 
-use crate::error::EngineError;
-
 /// Default wall-clock timeout for one governed tool execution.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default hard cap on a tool result entering the model context.
@@ -28,17 +26,19 @@ const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Durability policy for the turn trace.
 ///
-/// E1 supports only [`TracePolicy::Disabled`]. E2 implements durable trace
-/// storage and makes [`TracePolicy::Required`] the default. A caller must
-/// therefore choose a policy explicitly today; the engine never silently
-/// downgrades a required trace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// [`TracePolicy::Required`] is the default. An embedder must opt out
+/// explicitly with [`TracePolicy::Disabled`]; the engine never silently
+/// downgrades a required trace, and a required turn only succeeds after its
+/// terminal `turn_ended` marker is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TracePolicy {
     /// Do not persist a turn trace.
-    Disabled,
-    /// Persist a turn trace and fail the turn if it cannot be completed.
     ///
-    /// Rejected by [`EngineConfig::new`] until E2 lands.
+    /// Only for embedders that explicitly provide their own evidence path.
+    Disabled,
+    /// Persist a turn trace and fail the turn if it cannot be opened,
+    /// recorded, or closed.
+    #[default]
     Required,
 }
 
@@ -213,22 +213,17 @@ impl EngineConfig {
     /// defaults for every other setting.
     ///
     /// The default budget allows no tokens; callers must opt into a positive
-    /// token budget with [`Self::with_budget`]. [`TracePolicy::Required`] is
-    /// rejected with [`EngineError::UnsupportedTracePolicy`] until E2.
-    pub fn new(trace_policy: TracePolicy) -> Result<Self, EngineError> {
-        if trace_policy != TracePolicy::Disabled {
-            return Err(EngineError::UnsupportedTracePolicy {
-                policy: trace_policy,
-            });
-        }
-        Ok(Self {
+    /// token budget with [`Self::with_budget`]. A required trace needs a
+    /// [`TraceStore`](crate::TraceStore) at assembly time.
+    pub fn new(trace_policy: TracePolicy) -> Self {
+        Self {
             budget: Budget::new(0, DEFAULT_TOOL_TIMEOUT, 32),
             max_tool_calls: None,
             policy: PolicyConfig::default(),
             approval: ApprovalConfig::default(),
             tools: ToolExecutionConfig::default(),
             trace_policy,
-        })
+        }
     }
 
     /// Replaces the session budget.
@@ -304,27 +299,29 @@ impl EngineConfig {
     }
 }
 
+impl Default for EngineConfig {
+    /// Returns a configuration whose trace policy is [`TracePolicy::Required`]
+    /// and whose budgets fail closed.
+    fn default() -> Self {
+        Self::new(TracePolicy::Required)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn required_trace_is_rejected_before_an_engine_can_be_built() {
-        let error = EngineConfig::new(TracePolicy::Required)
-            .expect_err("E1 must not silently accept a required trace");
+    fn a_required_trace_is_the_default_policy() {
+        let config = EngineConfig::default();
 
-        assert!(matches!(
-            error,
-            EngineError::UnsupportedTracePolicy {
-                policy: TracePolicy::Required
-            }
-        ));
+        assert_eq!(config.trace_policy(), TracePolicy::Required);
+        assert_eq!(config.budget().max_tokens, 0);
     }
 
     #[test]
     fn the_default_budget_fails_closed_until_a_caller_opts_in() {
-        let config =
-            EngineConfig::new(TracePolicy::Disabled).expect("disabled trace must be supported");
+        let config = EngineConfig::new(TracePolicy::Disabled);
 
         assert_eq!(config.budget().max_tokens, 0);
         assert_eq!(config.trace_policy(), TracePolicy::Disabled);
@@ -344,31 +341,25 @@ mod tests {
                 reason: Some("test ask".to_owned()),
             }],
         };
-        let config = EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace")
-            .with_policy(ask_policy);
+        let config = EngineConfig::new(TracePolicy::Disabled).with_policy(ask_policy);
         assert!(config.requires_approval_gate());
 
-        let plain = EngineConfig::new(TracePolicy::Disabled).expect("disabled trace");
+        let plain = EngineConfig::new(TracePolicy::Disabled);
         assert!(!plain.requires_approval_gate());
     }
 
     #[test]
     fn explicit_ask_mode_requires_a_gate_but_legacy_ask_does_not() {
-        let explicit = EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace")
-            .with_approval(ApprovalConfig {
-                mode: ApprovalMode::Ask,
-                explicit: true,
-            });
+        let explicit = EngineConfig::new(TracePolicy::Disabled).with_approval(ApprovalConfig {
+            mode: ApprovalMode::Ask,
+            explicit: true,
+        });
         assert!(explicit.requires_approval_gate());
 
-        let legacy = EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace")
-            .with_approval(ApprovalConfig {
-                mode: ApprovalMode::Ask,
-                explicit: false,
-            });
+        let legacy = EngineConfig::new(TracePolicy::Disabled).with_approval(ApprovalConfig {
+            mode: ApprovalMode::Ask,
+            explicit: false,
+        });
         assert!(!legacy.requires_approval_gate());
     }
 }
