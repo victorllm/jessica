@@ -310,16 +310,9 @@ impl ToolCatalog {
     }
 
     /// Returns the sorted names of exposed tools.
+    #[cfg(test)]
     pub(crate) fn exposed_names(&self) -> Vec<String> {
         self.exposed()
-            .map(|entry| entry.descriptor.name.clone())
-            .collect()
-    }
-
-    /// Returns the sorted names of exposed native tools.
-    pub(crate) fn exposed_native_names(&self) -> Vec<String> {
-        self.exposed()
-            .filter(|entry| entry.descriptor.source == ToolSource::Native)
             .map(|entry| entry.descriptor.name.clone())
             .collect()
     }

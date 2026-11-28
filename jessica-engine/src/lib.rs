@@ -5,20 +5,25 @@
 //! of reusable middleware, and this crate is the only assembly layer an
 //! embedder needs in order to run a turn without bypassing governance.
 //!
-//! # E2 status
+//! # E3a status
 //!
 //! This crate contains the public API, ports, configuration, and the governed
 //! provider-to-tool vertical slice introduced by Tasks E1a and E1b, the
-//! producer-side event sink and host policy/result-manager ports from E1c, and
-//! the descriptor/patch/artifact alignment from E1d. Task E2 moved the
-//! producer journal, event pump, and SQLite recorder here and added the
-//! [`TraceStore`] port with [`SqliteTraceStore`] as its canonical
-//! implementation. [`TracePolicy::Required`] is now the default: a required
-//! turn trace is opened before any provider call and only succeeds after
-//! `turn_ended` is durable. Acceptance retries, acceptance orchestration,
-//! memory, skills, delegation, and resume remain absent until Task E3; the CLI
-//! still owns those paths while re-exporting the migrated journal, pump, and
-//! recorder types.
+//! producer-side event sink and host policy/result-manager ports from E1c, the
+//! descriptor/patch/artifact alignment from E1d, and the producer journal,
+//! event pump, and SQLite recorder from E2. [`TracePolicy::Required`] is the
+//! default: a required turn trace is opened before any provider call and only
+//! succeeds after `turn_ended` is durable.
+//!
+//! Task E3a added the engine-owned complete-turn entry points
+//! [`Engine::run_turn_request`] and [`Engine::resume_turn`]: fixed initial
+//! message ordering, one memory and one skill recall per turn, acceptance
+//! retries with per-attempt sessions, the outer session recorded on final
+//! failure or a governance trip, budget-reason overrides, fail-open post-turn
+//! memory/skill hooks, and resume from recorded evidence without replaying
+//! completed work. Delegation parent assembly, CLI adoption of these entry
+//! points, and the `HarnessConfig`/`EngineConfig` split remain in E3b; the CLI
+//! still owns its parallel turn assembly until then.
 
 #![deny(missing_docs)]
 
@@ -39,15 +44,15 @@ pub use artifacts::{
     ArtifactError, ArtifactPage, ArtifactStore, CleanupReport, ResultManager, StoredArtifact,
 };
 pub use config::{
-    ApprovalConfig, ApprovalMode, EngineConfig, PolicyConfig, PolicyRule, ResultConfig, RuleAction,
-    ToolExecutionConfig, ToolSelector, TracePolicy,
+    AcceptanceConfig, ApprovalConfig, ApprovalMode, CatalogLimits, EngineConfig, PolicyConfig,
+    PolicyRule, ResultConfig, RuleAction, ToolExecutionConfig, ToolSelector, TracePolicy,
 };
 pub use error::EngineError;
 pub use governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 pub use journal::TurnJournal;
 pub use policy::{PolicyError, PolicyTool, PolicyV2, PolicyVerdict, RuleMatch, glob_matches};
 pub use ports::{
-    IdSource, MemoryPort, PumpConsole, SkillPort, SystemPromptSource, ToolContext,
+    IdSource, MemoryPort, PumpConsole, SessionStore, SkillPort, SystemPromptSource, ToolContext,
     ToolPermissionDecision, ToolPermissionGate, ToolPolicy, ToolProvider, ToolResultManager,
     TraceStore, TurnObserver, TurnObserver as UpdateSink, TurnTrace,
 };
@@ -60,4 +65,4 @@ pub use tooling::{
 };
 
 pub use jessica_core::acceptance::AcceptanceCheck;
-pub use jessica_runtime::ChildToolFactory;
+pub use jessica_runtime::{ChildToolFactory, DelegationLimits};

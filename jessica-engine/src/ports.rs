@@ -12,11 +12,13 @@ use jessica_core::trace::TraceTurnMode;
 use jessica_core::types::{
     AgentEvent, Message, PermissionDecision, SessionId, ToolCall, ToolResult,
 };
+use jessica_harness::TurnSignals;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{TurnOutcome, TurnRequest};
 use crate::error::EngineError;
 use crate::policy::{PolicyError, PolicyVerdict};
+use crate::recorder::StoredSession;
 use crate::tooling::{ResultFormat, ToolCatalog};
 
 /// Turn-specific inputs available while a host builds the tool catalog.
@@ -157,26 +159,81 @@ pub trait TraceStore: Send + Sync {
     ) -> Result<(), EngineError>;
 }
 
-/// Recalls long-term memory for one turn.
+/// Recalls long-term memory for one turn and records the completed turn.
 ///
-/// The engine calls this at most once per turn, before the user message is
-/// appended. Implementations should return `Ok(None)` when nothing matches;
-/// the engine treats an error as fail-open and logs it without changing the
-/// turn reason.
+/// The engine calls [`MemoryPort::recall`] at most once per turn, before the
+/// user message is appended. It calls
+/// [`MemoryPort::record_completed_turn`] only after a turn finishes with
+/// [`jessica_core::types::SessionEndReason::Completed`] without a governance
+/// trip. Both calls are
+/// fail-open: an error is logged and never changes the turn reason.
 #[async_trait]
 pub trait MemoryPort: Send + Sync {
     /// Returns one memory message for `user_input`, if any.
-    async fn recall(&self, user_input: &str) -> Result<Option<Message>, EngineError>;
+    async fn recall(
+        &self,
+        session_id: &SessionId,
+        user_input: &str,
+    ) -> Result<Option<Message>, EngineError>;
+
+    /// Records the durable facts of a completed turn.
+    ///
+    /// `tool_call_count` covers only messages created by this turn, never
+    /// history replayed by the caller or acceptance retries from earlier
+    /// attempts.
+    async fn record_completed_turn(
+        &self,
+        session_id: &SessionId,
+        turn_index: u64,
+        user_input: &str,
+        assistant_answer: &str,
+        tool_call_count: usize,
+    ) -> Result<(), EngineError>;
 }
 
-/// Recalls relevant skills for one turn.
+/// Recalls relevant skills for one turn and enqueues post-turn distillation.
 ///
-/// The engine calls this at most once per turn, after memory recall. Errors
-/// are fail-open, matching [`MemoryPort`].
+/// Recall is called at most once per turn, after memory recall. The post-turn
+/// hook is called only under the same completed-and-not-tripped condition as
+/// [`MemoryPort::record_completed_turn`]. Errors are fail-open.
 #[async_trait]
 pub trait SkillPort: Send + Sync {
     /// Returns one skill guidance message for `user_input`, if any.
-    async fn recall(&self, user_input: &str) -> Result<Option<Message>, EngineError>;
+    async fn recall(
+        &self,
+        session_id: &SessionId,
+        user_input: &str,
+    ) -> Result<Option<Message>, EngineError>;
+
+    /// Enqueues skill distillation for a completed turn.
+    ///
+    /// `messages` contains only the final attempt's messages, so acceptance
+    /// retries and replayed history do not inflate the structured signals.
+    async fn after_completed_turn(
+        &self,
+        session_id: &SessionId,
+        turn_index: u64,
+        user_input: &str,
+        assistant_answer: &str,
+        signals: &TurnSignals,
+        messages: &[Message],
+    ) -> Result<(), EngineError>;
+}
+
+/// Loads a recorded session for resume.
+///
+/// The engine never replays work that is already present in the loaded events;
+/// it hands them to [`jessica_runtime::recover_session`] and resumes from the
+/// resulting checkpoint.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Loads the bootstrap messages and events for `session_id`.
+    ///
+    /// Returns `Ok(None)` only when the session has no recorded evidence.
+    async fn load_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<StoredSession>, EngineError>;
 }
 
 /// Receives every event observed by the engine's event pump.
