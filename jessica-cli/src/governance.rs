@@ -1,185 +1,38 @@
-//! CLI-side enforcement wrappers around the frozen runtime loop.
+//! CLI-side adapters for engine governance primitives.
 //!
-//! `AgentLoop` deliberately knows nothing about token usage, measured tool
-//! durations, result sizes, or the tool policy. The CLI therefore wraps its
-//! provider and tools:
+//! [`GovernanceState`] and [`TokenCountingProvider`] are engine types
+//! re-exported here for existing CLI call sites. [`GovernedTool`] remains the
+//! CLI-facing wrapper: it adapts the harness allowlist, CLI policy v2
+//! evaluator, terminal and ACP permission gates, and artifact result manager
+//! into engine ports, then delegates ordering and enforcement to
+//! [`jessica_engine::GovernedTool`].
 //!
-//! - [`TokenCountingProvider`] observes `LlmEvent::Done` and charges usage
-//!   against a shared [`TokenBudgetGuard`];
-//! - [`GovernedTool`] evaluates the harness policy before execution, asks the
-//!   optional [`ToolPermissionGate`] for approval of sensitive tools, enforces
-//!   the wall-clock timeout, and checks the result-size guard afterwards.
-//!
-//! Both wrappers report budget trips through [`GovernanceState`], which emits
-//! the structured [`AgentEvent::BudgetExceeded`] event and cancels the session
-//! token. Policy denials are emitted but do not cancel: the model receives an
-//! error result and may adapt. Permission denial, cancellation, timeout, and
-//! delivery failure are also model-facing errors and never run the tool.
+//! Keeping the adapter in the CLI preserves host-owned configuration and
+//! descriptor types without duplicating the governance order in two crates.
 
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
-use jessica_core::events::EventSink;
-use jessica_core::guard::{Guard, GuardContext, GuardDecision};
-use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
+use jessica_core::policy::{Policy, PolicyDecision};
 use jessica_core::tool::{Tool, ToolSchema};
-use jessica_core::types::{AgentEvent, BudgetKind, PermissionDecision, ToolCall, ToolResult};
-use jessica_harness::{Harness, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard};
+use jessica_core::types::{AgentEvent, ToolCall, ToolResult};
+use jessica_harness::Harness;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use crate::approval::approval_request_input;
 use crate::artifacts::ResultManager;
 use crate::config::{ApprovalMode, HarnessConfig, RuleAction};
-use crate::policy_v2::{PolicyTool, PolicyV2, PolicyVerdict, RuleMatch};
+use crate::policy_v2::{
+    PolicyError as CliPolicyError, PolicyTool, PolicyV2, PolicyVerdict as CliPolicyVerdict,
+    RuleMatch as CliRuleMatch,
+};
 use crate::tools::ResultFormat;
 
-/// Shared budget state for one CLI turn.
-pub(crate) struct GovernanceState {
-    events: broadcast::Sender<AgentEvent>,
-    sink: Option<Arc<dyn EventSink>>,
-    cancel: CancellationToken,
-    tokens_used: AtomicU64,
-    tripped: AtomicBool,
-}
-
-impl GovernanceState {
-    /// Creates governance state that emits on `events` and cancels `cancel`.
-    pub(crate) fn new(events: broadcast::Sender<AgentEvent>, cancel: CancellationToken) -> Self {
-        Self {
-            events,
-            sink: None,
-            cancel,
-            tokens_used: AtomicU64::new(0),
-            tripped: AtomicBool::new(false),
-        }
-    }
-
-    /// Attaches the producer-side sink used before broadcasting.
-    ///
-    /// Governance events are part of a turn's trace, so they must reach the
-    /// sink before any observer. If the sink rejects one, the event is not
-    /// broadcast and the turn's cancellation token is fired.
-    pub(crate) fn with_event_sink(mut self, sink: Option<Arc<dyn EventSink>>) -> Self {
-        self.sink = sink;
-        self
-    }
-
-    /// Returns whether a budget trip has already occurred.
-    pub(crate) fn tripped(&self) -> bool {
-        self.tripped.load(Ordering::SeqCst)
-    }
-
-    /// Returns the number of tokens charged so far.
-    pub(crate) fn tokens_used(&self) -> u64 {
-        self.tokens_used.load(Ordering::SeqCst)
-    }
-
-    /// Sends an event without stopping the session.
-    ///
-    /// Returns false when the producer-side sink rejected the event. In that
-    /// case nothing is broadcast and the turn is cancelled by the sink's
-    /// integrity failure.
-    pub(crate) async fn emit(&self, event: AgentEvent) -> bool {
-        if let Some(sink) = &self.sink
-            && sink.emit(event.clone()).await.is_err()
-        {
-            self.cancel.cancel();
-            return false;
-        }
-        let _ = self.events.send(event);
-        true
-    }
-
-    /// Emits one budget event and cancels the session.
-    ///
-    /// Only the first trip emits; later trips are no-ops so the terminal trace
-    /// contains exactly one budget failure.
-    pub(crate) async fn trip(&self, event: AgentEvent) -> bool {
-        if self.tripped.swap(true, Ordering::SeqCst) {
-            return false;
-        }
-        if let Some(sink) = &self.sink
-            && sink.emit(event.clone()).await.is_err()
-        {
-            self.cancel.cancel();
-            return false;
-        }
-        let _ = self.events.send(event);
-        self.cancel.cancel();
-        true
-    }
-
-    /// Charges `tokens` and trips `guard` once the configured limit is crossed.
-    async fn charge_tokens(&self, tokens: u64, guard: &TokenBudgetGuard) {
-        let previous = self.tokens_used.fetch_add(tokens, Ordering::SeqCst);
-        let used = previous.saturating_add(tokens);
-        if let GuardDecision::Exceeded { kind, reason } =
-            guard.check(&GuardContext::new(0, used, ""))
-        {
-            self.trip(AgentEvent::BudgetExceeded {
-                kind,
-                message: reason,
-            })
-            .await;
-        }
-    }
-}
-
-/// Provider adapter that charges token usage before the loop sees `Done`.
-pub(crate) struct TokenCountingProvider {
-    inner: Arc<dyn LlmProvider>,
-    governance: Arc<GovernanceState>,
-    guard: Arc<TokenBudgetGuard>,
-}
-
-impl TokenCountingProvider {
-    /// Wraps `inner`, charging each reported usage against `guard`.
-    pub(crate) fn new(
-        inner: Arc<dyn LlmProvider>,
-        governance: Arc<GovernanceState>,
-        guard: Arc<TokenBudgetGuard>,
-    ) -> Self {
-        Self {
-            inner,
-            governance,
-            guard,
-        }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for TokenCountingProvider {
-    async fn stream_chat(
-        &self,
-        messages: &[jessica_core::types::Message],
-        tools: &[ToolSchema],
-    ) -> Result<LlmStream, LlmError> {
-        let stream = self.inner.stream_chat(messages, tools).await?;
-        let governance = Arc::clone(&self.governance);
-        let guard = Arc::clone(&self.guard);
-
-        Ok(stream
-            .then(move |event| {
-                let governance = Arc::clone(&governance);
-                let guard = Arc::clone(&guard);
-                async move {
-                    if let LlmEvent::Done { usage: Some(usage) } = &event {
-                        governance.charge_tokens(usage.total(), &guard).await;
-                    }
-                    event
-                }
-            })
-            .boxed())
-    }
-}
+pub(crate) use jessica_engine::{GovernanceState, TokenCountingProvider};
 
 /// Names of native tools that require explicit approval before running.
 ///
@@ -217,14 +70,16 @@ pub(crate) enum ToolPermissionDecision {
     TransportFailed,
 }
 
-/// Maps a gate decision to the persisted permission outcome.
-pub(crate) fn permission_decision(decision: ToolPermissionDecision) -> PermissionDecision {
+/// Maps a CLI gate decision to the engine port decision.
+fn engine_decision(decision: ToolPermissionDecision) -> jessica_engine::ToolPermissionDecision {
     match decision {
-        ToolPermissionDecision::Allow => PermissionDecision::Allow,
-        ToolPermissionDecision::Reject => PermissionDecision::Deny,
-        ToolPermissionDecision::Cancelled => PermissionDecision::Cancelled,
-        ToolPermissionDecision::TimedOut => PermissionDecision::TimedOut,
-        ToolPermissionDecision::TransportFailed => PermissionDecision::Failed,
+        ToolPermissionDecision::Allow => jessica_engine::ToolPermissionDecision::Allow,
+        ToolPermissionDecision::Reject => jessica_engine::ToolPermissionDecision::Reject,
+        ToolPermissionDecision::Cancelled => jessica_engine::ToolPermissionDecision::Cancelled,
+        ToolPermissionDecision::TimedOut => jessica_engine::ToolPermissionDecision::TimedOut,
+        ToolPermissionDecision::TransportFailed => {
+            jessica_engine::ToolPermissionDecision::TransportFailed
+        }
     }
 }
 
@@ -305,22 +160,150 @@ impl ToolPermissionGate for CliPermissionGate {
     }
 }
 
-/// Tool adapter that applies policy, permission, timeout, and result-size
-/// governance.
-pub(crate) struct GovernedTool {
-    inner: Arc<dyn Tool>,
+/// Adapts the CLI harness allowlist to the core policy contract.
+struct HarnessPolicy {
+    /// Harness holding the configured allowlist.
     harness: Arc<Harness>,
-    governance: Arc<GovernanceState>,
-    timeout: Duration,
-    timeout_guard: Arc<ToolTimeoutGuard>,
-    result_guard: Arc<ResultSizeGuard>,
-    max_args_bytes: Option<usize>,
-    permission: Option<Arc<dyn ToolPermissionGate>>,
-    ask_gate: Option<Arc<dyn ToolPermissionGate>>,
-    result_manager: Option<Arc<ResultManager>>,
-    result_format: ResultFormat,
-    policy_v2: Option<Arc<PolicyV2>>,
-    policy_tool: Option<PolicyTool>,
+}
+
+impl Policy for HarnessPolicy {
+    fn check(&self, call: &ToolCall) -> PolicyDecision {
+        match self.harness.authorize_tool_call(call) {
+            None => PolicyDecision::Allow,
+            Some(AgentEvent::PolicyDenied { reason, .. }) => PolicyDecision::Deny(reason),
+            Some(_) => PolicyDecision::Deny("tool denied by policy".to_owned()),
+        }
+    }
+}
+
+/// Adapts a CLI permission gate to the engine port.
+struct EngineGate {
+    /// CLI gate implementation.
+    inner: Arc<dyn ToolPermissionGate>,
+}
+
+#[async_trait]
+impl jessica_engine::ToolPermissionGate for EngineGate {
+    async fn request_permission(&self, call: &ToolCall) -> jessica_engine::ToolPermissionDecision {
+        engine_decision(self.inner.request_permission(call).await)
+    }
+}
+
+/// Adapts the CLI policy v2 evaluator to the engine port.
+struct EngineToolPolicy {
+    /// CLI evaluator.
+    inner: Arc<PolicyV2>,
+    /// Host facts for the tool.
+    tool: PolicyTool,
+}
+
+#[async_trait]
+impl jessica_engine::ToolPolicy for EngineToolPolicy {
+    async fn evaluate(
+        &self,
+        call: &ToolCall,
+    ) -> Result<jessica_engine::PolicyVerdict, jessica_engine::PolicyError> {
+        self.inner
+            .evaluate(&self.tool, call)
+            .await
+            .map(engine_verdict)
+            .map_err(engine_policy_error)
+    }
+}
+
+/// Maps a CLI policy verdict to the engine verdict.
+fn engine_verdict(verdict: CliPolicyVerdict) -> jessica_engine::PolicyVerdict {
+    match verdict {
+        CliPolicyVerdict::Allow { reason, rule } => jessica_engine::PolicyVerdict::Allow {
+            reason,
+            rule: rule.map(engine_rule),
+        },
+        CliPolicyVerdict::Legacy { sensitive } => {
+            jessica_engine::PolicyVerdict::Legacy { sensitive }
+        }
+        CliPolicyVerdict::AutoApprove { rule, reason } => {
+            jessica_engine::PolicyVerdict::AutoApprove {
+                rule: rule.map(engine_rule),
+                reason,
+            }
+        }
+        CliPolicyVerdict::Ask { rule, reason } => jessica_engine::PolicyVerdict::Ask {
+            rule: rule.map(engine_rule),
+            reason,
+        },
+        CliPolicyVerdict::Deny { rule, reason } => jessica_engine::PolicyVerdict::Deny {
+            rule: rule.map(engine_rule),
+            reason,
+        },
+    }
+}
+
+/// Maps a CLI matched rule to the engine matched rule.
+fn engine_rule(rule: CliRuleMatch) -> jessica_engine::RuleMatch {
+    jessica_engine::RuleMatch {
+        rule_id: rule.rule_id,
+        reason: rule.reason,
+    }
+}
+
+/// Maps a CLI policy error to the engine policy error without losing context.
+fn engine_policy_error(error: CliPolicyError) -> jessica_engine::PolicyError {
+    use jessica_engine::PolicyError as EnginePolicyError;
+    match error {
+        CliPolicyError::Root { root, source } => EnginePolicyError::Root { root, source },
+        CliPolicyError::EmptyPath => EnginePolicyError::EmptyPath,
+        CliPolicyError::Escape { path } => EnginePolicyError::Escape { path },
+        CliPolicyError::NotFound { path } => EnginePolicyError::NotFound { path },
+        CliPolicyError::Io { path, source } => EnginePolicyError::Io { path, source },
+        CliPolicyError::NonUtf8 { path } => EnginePolicyError::NonUtf8 { path },
+        CliPolicyError::InvalidGlob { glob, reason } => {
+            EnginePolicyError::InvalidGlob { glob, reason }
+        }
+        CliPolicyError::InvalidPatch { reason } => EnginePolicyError::InvalidPatch { reason },
+    }
+}
+
+/// Adapts the CLI result manager to the engine port.
+struct EngineResultManager {
+    /// CLI manager implementation.
+    inner: Arc<ResultManager>,
+}
+
+#[async_trait]
+impl jessica_engine::ToolResultManager for EngineResultManager {
+    async fn manage(
+        &self,
+        tool: &str,
+        format: jessica_engine::ResultFormat,
+        result: ToolResult,
+    ) -> ToolResult {
+        self.inner
+            .manage(tool, cli_result_format(format), result)
+            .await
+    }
+}
+
+/// Maps a CLI result format to the engine result format.
+fn engine_result_format(format: ResultFormat) -> jessica_engine::ResultFormat {
+    match format {
+        ResultFormat::Text => jessica_engine::ResultFormat::Text,
+        ResultFormat::Json => jessica_engine::ResultFormat::Json,
+    }
+}
+
+/// Maps an engine result format to the CLI result format.
+fn cli_result_format(format: jessica_engine::ResultFormat) -> ResultFormat {
+    match format {
+        jessica_engine::ResultFormat::Text => ResultFormat::Text,
+        jessica_engine::ResultFormat::Json => ResultFormat::Json,
+    }
+}
+
+/// Tool adapter that preserves the CLI builder surface while delegating the
+/// governed execution order to [`jessica_engine::GovernedTool`].
+pub(crate) struct GovernedTool {
+    /// Engine-owned wrapper.
+    inner: jessica_engine::GovernedTool,
 }
 
 impl GovernedTool {
@@ -333,23 +316,20 @@ impl GovernedTool {
         harness: Arc<Harness>,
         governance: Arc<GovernanceState>,
         timeout: Duration,
-        timeout_guard: Arc<ToolTimeoutGuard>,
-        result_guard: Arc<ResultSizeGuard>,
+        timeout_guard: Arc<jessica_harness::ToolTimeoutGuard>,
+        result_guard: Arc<jessica_harness::ResultSizeGuard>,
     ) -> Self {
+        let tool_name = inner.name().to_owned();
         Self {
-            inner,
-            harness,
-            governance,
-            timeout,
-            timeout_guard,
-            result_guard,
-            max_args_bytes: None,
-            permission: None,
-            ask_gate: None,
-            result_manager: None,
-            result_format: ResultFormat::Text,
-            policy_v2: None,
-            policy_tool: None,
+            inner: jessica_engine::GovernedTool::new(
+                inner,
+                Arc::new(HarnessPolicy { harness }),
+                governance,
+                timeout,
+                timeout_guard,
+                result_guard,
+            )
+            .with_legacy_sensitive(permission_required(&tool_name)),
         }
     }
 
@@ -359,8 +339,14 @@ impl GovernedTool {
     /// permission gate or execution. Without it the wrapper keeps the pre-v2
     /// approval behavior.
     pub(crate) fn with_policy_v2(mut self, policy: Arc<PolicyV2>, tool: PolicyTool) -> Self {
-        self.policy_v2 = Some(policy);
-        self.policy_tool = Some(tool);
+        let legacy_sensitive = tool.legacy_sensitive;
+        self.inner = self
+            .inner
+            .with_tool_policy(Arc::new(EngineToolPolicy {
+                inner: policy,
+                tool,
+            }))
+            .with_legacy_sensitive(legacy_sensitive);
         self
     }
 
@@ -370,20 +356,24 @@ impl GovernedTool {
     /// oversized call cannot reach any of them. Exceeding the limit returns an
     /// error result without tripping the session budget.
     pub(crate) fn with_max_args_bytes(mut self, max_args_bytes: Option<usize>) -> Self {
-        self.max_args_bytes = max_args_bytes;
+        self.inner = self.inner.with_max_args_bytes(max_args_bytes);
         self
     }
 
     /// Attaches the optional legacy approval gate for sensitive tools.
     ///
     /// The gate is consulted only when policy returns
-    /// [`PolicyVerdict::Legacy`] for a sensitive tool. ACP supplies it; a CLI
-    /// turn normally leaves it absent to preserve pre-v2 behavior.
+    /// [`jessica_engine::PolicyVerdict::Legacy`] for a sensitive tool. ACP
+    /// supplies it; a CLI turn normally leaves it absent to preserve pre-v2
+    /// behavior.
     pub(crate) fn with_permission_gate(
         mut self,
         permission: Option<Arc<dyn ToolPermissionGate>>,
     ) -> Self {
-        self.permission = permission;
+        let gate = permission.map(|gate| {
+            Arc::new(EngineGate { inner: gate }) as Arc<dyn jessica_engine::ToolPermissionGate>
+        });
+        self.inner = self.inner.with_permission_gate(gate);
         self
     }
 
@@ -393,7 +383,10 @@ impl GovernedTool {
     /// separate from [`Self::with_permission_gate`] so a CLI `ask` rule does
     /// not start prompting for unrelated legacy-sensitive tools.
     pub(crate) fn with_ask_gate(mut self, ask_gate: Option<Arc<dyn ToolPermissionGate>>) -> Self {
-        self.ask_gate = ask_gate;
+        let gate = ask_gate.map(|gate| {
+            Arc::new(EngineGate { inner: gate }) as Arc<dyn jessica_engine::ToolPermissionGate>
+        });
+        self.inner = self.inner.with_ask_gate(gate);
         self
     }
 
@@ -408,314 +401,11 @@ impl GovernedTool {
         result_manager: Option<Arc<ResultManager>>,
         result_format: ResultFormat,
     ) -> Self {
-        self.result_manager = result_manager;
-        self.result_format = result_format;
+        let manager = result_manager.map(|inner| Arc::new(EngineResultManager { inner }));
+        self.inner = self
+            .inner
+            .with_result_manager(manager, engine_result_format(result_format));
         self
-    }
-
-    /// Applies every pre-execution check and runs the tool under its timeout.
-    async fn execute_call(&self, call: &ToolCall) -> ToolResult {
-        if self.governance.tripped() {
-            return ToolResult::error(
-                String::new(),
-                "tool execution skipped because the session budget was exceeded",
-            );
-        }
-
-        if let Some(limit) = self.max_args_bytes {
-            let bytes = match serde_json::to_vec(&call.arguments) {
-                Ok(bytes) => bytes.len(),
-                Err(error) => {
-                    return ToolResult::error(
-                        String::new(),
-                        format!(
-                            "tool `{}` arguments could not be serialized for the size check: {error}",
-                            self.inner.name()
-                        ),
-                    );
-                }
-            };
-            if bytes > limit {
-                return ToolResult::error(
-                    String::new(),
-                    format!(
-                        "tool `{}` arguments are {bytes} bytes, exceeding the configured max_args_bytes of {limit}",
-                        self.inner.name()
-                    ),
-                );
-            }
-        }
-
-        if let Some(event) = self.harness.authorize_tool_call(call) {
-            self.governance.emit(event).await;
-            return ToolResult::error(
-                String::new(),
-                format!("tool `{}` was denied by policy", self.inner.name()),
-            );
-        }
-
-        let verdict = match (&self.policy_v2, &self.policy_tool) {
-            (Some(policy), Some(tool)) => match policy.evaluate(tool, call).await {
-                Ok(verdict) => verdict,
-                Err(error) => {
-                    // A path that cannot be canonicalized or that escapes the
-                    // workspace must fail closed instead of falling through to
-                    // the allowlist decision.
-                    let reason = error.to_string();
-                    self.governance
-                        .emit(AgentEvent::PolicyDenied {
-                            call: call.clone(),
-                            reason: reason.clone(),
-                        })
-                        .await;
-                    return ToolResult::error(
-                        String::new(),
-                        format!(
-                            "tool `{}` was denied by policy: {reason}",
-                            self.inner.name()
-                        ),
-                    );
-                }
-            },
-            _ => PolicyVerdict::Legacy {
-                sensitive: permission_required(self.inner.name()),
-            },
-        };
-
-        match verdict {
-            PolicyVerdict::Deny { reason, rule } => {
-                return self.policy_denial(call, reason, rule).await;
-            }
-            PolicyVerdict::Ask { reason, .. } => {
-                if let Err(result) = self.require_approval(call, reason).await {
-                    return result;
-                }
-            }
-            PolicyVerdict::AutoApprove { reason, .. } => {
-                if let Err(result) = self.record_auto_approval(call, &reason).await {
-                    return result;
-                }
-            }
-            PolicyVerdict::Allow { .. } => {}
-            PolicyVerdict::Legacy { sensitive } => {
-                if sensitive
-                    && let Some(gate) = &self.permission
-                    && let Err(result) = self.request_gate_decision(gate, call).await
-                {
-                    return result;
-                }
-            }
-        }
-
-        // The permission wait is not tool time: the timeout starts only after
-        // every pre-execution checkpoint has allowed the call.
-        let started = Instant::now();
-        let outcome = tokio::time::timeout(self.timeout, self.inner.execute_with_call(call)).await;
-        let elapsed = started.elapsed();
-
-        match outcome {
-            Err(_) => {
-                // The guard compares elapsed time to the configured limit. Use
-                // a value strictly past the limit so the trip is guaranteed
-                // even if the timer fired a hair before `elapsed` crossed it.
-                let crossed = self.timeout + Duration::from_nanos(1);
-                self.timeout_result(call, elapsed.max(crossed)).await
-            }
-            Ok(result) => {
-                // A tool may enforce the same deadline internally and return a
-                // regular error just before the outer `tokio::time::timeout`
-                // fires. Treat that result as a timeout too, so the session is
-                // tripped deterministically instead of depending on which
-                // timer wins the race.
-                if elapsed >= self.timeout {
-                    let crossed = self.timeout + Duration::from_nanos(1);
-                    return self.timeout_result(call, elapsed.max(crossed)).await;
-                }
-                let result = match &self.result_manager {
-                    Some(manager) => {
-                        manager
-                            .manage(self.inner.name(), self.result_format, result)
-                            .await
-                    }
-                    None => result,
-                };
-                let context = GuardContext::new(0, self.governance.tokens_used(), "")
-                    .with_tool_result(&result, Some(elapsed));
-                if let GuardDecision::Exceeded { kind, reason } = self.result_guard.check(&context)
-                {
-                    self.governance
-                        .trip(AgentEvent::BudgetExceeded {
-                            kind,
-                            message: reason.clone(),
-                        })
-                        .await;
-                    return ToolResult::error(String::new(), reason);
-                }
-                result
-            }
-        }
-    }
-
-    /// Emits a policy denial and returns the model-facing error result.
-    async fn policy_denial(
-        &self,
-        call: &ToolCall,
-        reason: String,
-        rule: Option<RuleMatch>,
-    ) -> ToolResult {
-        let reason = match rule {
-            Some(rule) => format!("policy rule `{}`: {reason}", rule.rule_id),
-            None => reason,
-        };
-        self.governance
-            .emit(AgentEvent::PolicyDenied {
-                call: call.clone(),
-                reason: reason.clone(),
-            })
-            .await;
-        ToolResult::error(
-            String::new(),
-            format!(
-                "tool `{}` was denied by policy: {reason}",
-                self.inner.name()
-            ),
-        )
-    }
-
-    /// Requires a one-time approval decision from an installed gate.
-    ///
-    /// The ask gate takes precedence because it exists specifically for policy
-    /// `ask` verdicts. Without either gate this fails closed. A rule that asks
-    /// must not silently become an allow just because the host cannot prompt.
-    async fn require_approval(&self, call: &ToolCall, reason: String) -> Result<(), ToolResult> {
-        let Some(gate) = self.ask_gate.as_ref().or(self.permission.as_ref()) else {
-            let message = format!(
-                "tool `{}` requires approval ({reason}) but no permission gate is available",
-                self.inner.name()
-            );
-            self.governance
-                .emit(AgentEvent::PolicyDenied {
-                    call: call.clone(),
-                    reason: message.clone(),
-                })
-                .await;
-            return Err(ToolResult::error(String::new(), message));
-        };
-        self.request_gate_decision(gate, call).await
-    }
-
-    /// Runs the selected permission gate and records its decision.
-    async fn request_gate_decision(
-        &self,
-        gate: &Arc<dyn ToolPermissionGate>,
-        call: &ToolCall,
-    ) -> Result<(), ToolResult> {
-        // ACP requires the provider's real tool-call id. A wrapper without one
-        // must fail closed instead of inventing an id for the client.
-        if call.id.is_empty() {
-            return Err(ToolResult::error(
-                String::new(),
-                format!(
-                    "tool `{}` requires a provider tool-call id for permission",
-                    self.inner.name()
-                ),
-            ));
-        }
-        let decision = gate.request_permission(call).await;
-        // The decision is recorded before the tool runs and before a denial is
-        // returned. An `Allow` whose event cannot be persisted must not
-        // execute: the trace would claim an unexplained run.
-        let recorded = self
-            .governance
-            .emit(AgentEvent::PermissionDecided {
-                call: call.clone(),
-                decision: permission_decision(decision),
-            })
-            .await;
-        match decision {
-            ToolPermissionDecision::Allow if recorded => Ok(()),
-            ToolPermissionDecision::Allow => Err(ToolResult::error(
-                String::new(),
-                format!(
-                    "tool `{}` was not executed because the permission decision could not be recorded",
-                    self.inner.name()
-                ),
-            )),
-            decision => {
-                let outcome = match decision {
-                    ToolPermissionDecision::Reject => "was denied by the user",
-                    ToolPermissionDecision::Cancelled => "permission request was cancelled",
-                    ToolPermissionDecision::TimedOut => "permission request timed out",
-                    ToolPermissionDecision::TransportFailed => {
-                        "permission request could not be completed"
-                    }
-                    ToolPermissionDecision::Allow => unreachable!("allow is handled above"),
-                };
-                Err(ToolResult::error(
-                    String::new(),
-                    format!("tool `{}` {outcome}", self.inner.name()),
-                ))
-            }
-        }
-    }
-
-    /// Records an auto-approval before execution.
-    ///
-    /// `approval.mode = "allow"` still produces a permission event so a trace
-    /// shows why a sensitive tool ran without a prompt.
-    async fn record_auto_approval(&self, call: &ToolCall, reason: &str) -> Result<(), ToolResult> {
-        if call.id.is_empty() {
-            return Err(ToolResult::error(
-                String::new(),
-                format!(
-                    "tool `{}` requires a provider tool-call id for an approval record",
-                    self.inner.name()
-                ),
-            ));
-        }
-        let recorded = self
-            .governance
-            .emit(AgentEvent::PermissionDecided {
-                call: call.clone(),
-                decision: PermissionDecision::Allow,
-            })
-            .await;
-        if !recorded {
-            return Err(ToolResult::error(
-                String::new(),
-                format!(
-                    "tool `{}` was not executed because the auto-approval could not be recorded",
-                    self.inner.name()
-                ),
-            ));
-        }
-        tracing::debug!(
-            tool = self.inner.name(),
-            reason,
-            "policy auto-approved a sensitive tool"
-        );
-        Ok(())
-    }
-
-    /// Reports a timeout and returns the model-facing error result.
-    async fn timeout_result(&self, call: &ToolCall, elapsed: Duration) -> ToolResult {
-        let mut context =
-            GuardContext::new(0, self.governance.tokens_used(), "").with_tool_call(call);
-        context.tool_elapsed = Some(elapsed);
-
-        let message = match self.timeout_guard.check(&context) {
-            GuardDecision::Exceeded { reason, .. } => reason,
-            GuardDecision::Allow => {
-                format!("tool `{}` exceeded its timeout", self.inner.name())
-            }
-        };
-        self.governance
-            .trip(AgentEvent::BudgetExceeded {
-                kind: BudgetKind::ToolTimeout,
-                message: message.clone(),
-            })
-            .await;
-        ToolResult::error(String::new(), message)
     }
 }
 
@@ -730,15 +420,11 @@ impl Tool for GovernedTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        // `Tool::execute` has no call id. Policy only needs the name and
-        // arguments; permission-gated tools fail closed in `execute_call`
-        // because ACP must never receive a synthetic id.
-        let call = ToolCall::new(String::new(), self.inner.name(), args);
-        self.execute_call(&call).await
+        self.inner.execute(args).await
     }
 
     async fn execute_with_call(&self, call: &ToolCall) -> ToolResult {
-        self.execute_call(call).await
+        self.inner.execute_with_call(call).await
     }
 }
 
@@ -746,11 +432,15 @@ impl Tool for GovernedTool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    use jessica_core::events::EventSinkError;
-    use jessica_core::types::{Message, TokenUsage};
-    use jessica_harness::AllowlistPolicy;
+    use futures::StreamExt;
+    use jessica_core::events::{EventSink, EventSinkError};
+    use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
+    use jessica_core::types::{BudgetKind, Message, PermissionDecision, TokenUsage};
+    use jessica_harness::{AllowlistPolicy, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     use crate::config::{ApprovalConfig, PolicyConfig, PolicyRuleConfig, RuleAction, ToolSelector};
     use crate::tools::{Capabilities, ToolSource};
@@ -1496,6 +1186,25 @@ mod tests {
         }
     }
 
+    /// Sink that observes the broadcast channel while it records.
+    struct EmptyReceiverSink {
+        /// Observer that must not see the event before the sink returns.
+        receiver: Mutex<broadcast::Receiver<AgentEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for EmptyReceiverSink {
+        async fn emit(&self, _event: AgentEvent) -> Result<(), EventSinkError> {
+            let mut receiver = self.receiver.lock().expect("sink receiver mutex poisoned");
+            assert_eq!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty),
+                "the sink must run before any observer can receive the event"
+            );
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn every_permission_decision_is_recorded_before_it_takes_effect() {
         let cases = [
@@ -1615,6 +1324,35 @@ mod tests {
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty),
             "a rejected event must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_governance_event_is_broadcast_only_after_the_sink() {
+        let (events, mut observer) = broadcast::channel(16);
+        let sink = Arc::new(EmptyReceiverSink {
+            receiver: Mutex::new(events.subscribe()),
+        });
+        let cancel = CancellationToken::new();
+        let governance = GovernanceState::new(events, cancel.clone())
+            .with_event_sink(Some(sink as Arc<dyn EventSink>));
+        let event = AgentEvent::PolicyDenied {
+            call: ToolCall::new("call-1", "bash", serde_json::json!({"command": "true"})),
+            reason: "denied for the ordering test".to_owned(),
+        };
+
+        assert!(
+            governance.emit(event.clone()).await,
+            "the sink accepted the event"
+        );
+        assert_eq!(
+            observer.try_recv(),
+            Ok(event),
+            "the accepted event must reach observers after the sink"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "an accepted event must not cancel the turn"
         );
     }
 

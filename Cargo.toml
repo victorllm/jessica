@@ -7,6 +7,7 @@ members = [
     "jessica-providers",
     "jessica-tools",
     "jessica-memory",
+    "jessica-engine",
     "jessica-cli",
 ]
 resolver = "2"

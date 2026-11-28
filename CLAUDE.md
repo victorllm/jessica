@@ -29,6 +29,7 @@ Workspace 使用 `resolver = "2"`，成员 crate 如下：
 | `jessica-harness` | Middleware、Guard、Sensor、Acceptance | `jessica-core` |
 | `jessica-providers` | OpenAI 兼容 Provider | `jessica-core` |
 | `jessica-memory` | 事件存储与记忆 | `jessica-core` |
+| `jessica-engine` | 受治理 turn 生命周期、ports 与治理顺序 | `jessica-core`、`jessica-runtime`、`jessica-harness`、`jessica-memory` |
 | `jessica-tools` | 原生工具与 WASM 工具注册 | `jessica-core`（Task 3.3 起可依赖 `jessica-sandbox`） |
 | `jessica-cli` | 可执行入口与装配 | 所有实现层 |
 
@@ -36,7 +37,8 @@ Workspace 使用 `resolver = "2"`，成员 crate 如下：
 
 - `jessica-core` 不得依赖任何其他内部 crate，也不得引入 wasmtime、sqlx/rusqlite、HTTP 客户端等实现层重依赖。
 - `jessica-runtime`、`jessica-sandbox`、`jessica-harness` 只依赖 `jessica-core`。
-- `jessica-cli` 依赖所有实现层，用于最终装配。
+- `jessica-engine` 只依赖 `jessica-core`、`jessica-runtime`、`jessica-harness`、`jessica-memory`；不得依赖 `jessica-cli`、`jessica-providers`、`jessica-tools`、`jessica-sandbox`。
+- `jessica-cli` 依赖所有实现层（含 `jessica-engine`），用于最终装配。
 - 任何内部依赖只能指向更低层，禁止反向依赖或循环依赖。
 
 ## 编码纪律
