@@ -5,20 +5,20 @@
 //! of reusable middleware, and this crate is the only assembly layer an
 //! embedder needs in order to run a turn without bypassing governance.
 //!
-//! # E1d status
+//! # E2 status
 //!
-//! This crate contains the public API, ports, configuration, and the
-//! provider-to-tool governance vertical slice introduced by Tasks E1a and E1b.
-//! Task E1c added the producer-side event sink, host policy and result-manager
-//! ports, and the CLI adapter that delegates its governed-tool ordering here.
-//! Task E1d moved descriptor metadata, schema digests, policy hints, and
-//! artifact retention cleanup into the engine and aligned the engine patch
-//! parser with the execution parser. CLI catalog filtering and the CLI
-//! artifact sidecar store remain adapter-owned, and journal, pump, acceptance,
-//! memory, skill, delegation and resume orchestration remain absent until the
-//! corresponding Phase 11 tasks migrate them. [`TracePolicy::Required`] is
-//! rejected rather than silently downgraded until E2 implements durable trace
-//! persistence.
+//! This crate contains the public API, ports, configuration, and the governed
+//! provider-to-tool vertical slice introduced by Tasks E1a and E1b, the
+//! producer-side event sink and host policy/result-manager ports from E1c, and
+//! the descriptor/patch/artifact alignment from E1d. Task E2 moved the
+//! producer journal, event pump, and SQLite recorder here and added the
+//! [`TraceStore`] port with [`SqliteTraceStore`] as its canonical
+//! implementation. [`TracePolicy::Required`] is now the default: a required
+//! turn trace is opened before any provider call and only succeeds after
+//! `turn_ended` is durable. Acceptance retries, acceptance orchestration,
+//! memory, skills, delegation, and resume remain absent until Task E3; the CLI
+//! still owns those paths while re-exporting the migrated journal, pump, and
+//! recorder types.
 
 #![deny(missing_docs)]
 
@@ -27,8 +27,11 @@ mod artifacts;
 mod config;
 mod error;
 mod governance;
+mod journal;
 mod policy;
 mod ports;
+mod pump;
+mod recorder;
 mod tooling;
 
 pub use api::{Engine, EngineBuilder, TurnOutcome, TurnRequest};
@@ -41,12 +44,15 @@ pub use config::{
 };
 pub use error::EngineError;
 pub use governance::{GovernanceState, GovernedTool, TokenCountingProvider};
+pub use journal::TurnJournal;
 pub use policy::{PolicyError, PolicyTool, PolicyV2, PolicyVerdict, RuleMatch, glob_matches};
 pub use ports::{
     IdSource, MemoryPort, PumpConsole, SkillPort, SystemPromptSource, ToolContext,
     ToolPermissionDecision, ToolPermissionGate, ToolPolicy, ToolProvider, ToolResultManager,
-    TraceStore, TurnObserver, TurnTrace,
+    TraceStore, TurnObserver, TurnObserver as UpdateSink, TurnTrace,
 };
+pub use pump::{EventPump, LagHandling, PumpIntegrity, PumpOutput, SessionSnapshot};
+pub use recorder::{EventJournal, EventRecorder, RecorderError, SqliteTraceStore, StoredSession};
 pub use tooling::{
     ApprovalPolicy, Capabilities, PolicyHints, ResultFormat, ToolAnnotations, ToolCatalog,
     ToolDescriptor, ToolEntry, ToolLimits, ToolMetadata, ToolSource, digest_schema,

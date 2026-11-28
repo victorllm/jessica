@@ -2,7 +2,6 @@
 
 use thiserror::Error;
 
-use crate::config::TracePolicy;
 use crate::policy::PolicyError;
 
 /// Failure while configuring or assembling the governed engine.
@@ -27,13 +26,19 @@ pub enum EngineError {
     /// The policy can require one-time approval, but no gate was installed.
     #[error("engine policy requires approval but no permission gate was installed")]
     MissingApprovalGate,
-    /// The requested trace policy is not implemented in this engine version.
-    #[error(
-        "trace policy `{policy:?}` is not supported yet; E1 accepts only TracePolicy::Disabled"
-    )]
-    UnsupportedTracePolicy {
-        /// Rejected policy.
-        policy: TracePolicy,
+    /// A required trace policy was configured without a trace store.
+    #[error("engine requires a trace store when `TracePolicy::Required` is configured")]
+    MissingTraceStore,
+    /// The turn trace could not be opened, recorded, or closed.
+    ///
+    /// A turn whose trace is incomplete is never returned as a normal outcome:
+    /// the missing terminal marker means the run cannot be proven complete.
+    #[error("trace for turn `{turn_id}` is incomplete: {cause}")]
+    TraceIncomplete {
+        /// Turn whose trace could not be completed.
+        turn_id: String,
+        /// Underlying storage, attribution, or acknowledgement failure.
+        cause: String,
     },
     /// A catalog entry's descriptor names a different tool.
     #[error("tool descriptor names `{descriptor}`, but the tool reports `{tool}`")]

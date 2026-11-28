@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use jessica_core::trace::TraceTurnMode;
 use jessica_core::types::{
     AgentEvent, Message, PermissionDecision, SessionId, ToolCall, ToolResult,
 };
@@ -106,29 +107,49 @@ pub trait ToolResultManager: Send + Sync {
     async fn manage(&self, tool: &str, format: ResultFormat, result: ToolResult) -> ToolResult;
 }
 
-/// Stable identity of one trace turn.
+/// Stable identity and attribution of one trace turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnTrace {
     /// Stable identifier for the turn.
     pub turn_id: String,
     /// Session whose events belong to the turn.
+    ///
+    /// A trace turn can contain several sessions when acceptance retries are
+    /// used. The engine supplies the session that owns the events currently
+    /// being recorded.
     pub session_id: SessionId,
+    /// One-based attempt that owns the events, when the host attributes them.
+    ///
+    /// Events that carry their own attempt attribution, such as an acceptance
+    /// failure, override this value.
+    pub attempt: Option<u32>,
 }
 
 /// Persists one governed turn.
 ///
-/// `begin_turn` must complete successfully before any provider call;
-/// `finish_turn` is the durability acknowledgement boundary. E2 supplies the
-/// first implementation and maps failures to `EngineError::TraceIncomplete`.
+/// `begin_turn` must complete successfully before any provider call and
+/// records the turn's initial conversation. `finish_turn` is the durability
+/// acknowledgement boundary: a turn whose trace could not be closed is never
+/// reported as a successful [`TurnOutcome`]. Implementations map storage
+/// failures to [`EngineError::TraceIncomplete`] on behalf of the engine.
 #[async_trait]
 pub trait TraceStore: Send + Sync {
-    /// Opens a trace turn.
-    async fn begin_turn(&self, trace: &TurnTrace) -> Result<(), EngineError>;
+    /// Opens a trace turn with its immutable initial messages.
+    async fn begin_turn(
+        &self,
+        trace: &TurnTrace,
+        mode: TraceTurnMode,
+        messages: &[Message],
+    ) -> Result<(), EngineError>;
 
     /// Records one event in an open trace turn.
     async fn record(&self, trace: &TurnTrace, event: AgentEvent) -> Result<(), EngineError>;
 
     /// Closes a trace turn after the outcome is known.
+    ///
+    /// Returning `Ok` acknowledges that the terminal marker is durable.
+    /// Returning an error leaves the trace incomplete; the engine maps it to
+    /// [`EngineError::TraceIncomplete`].
     async fn finish_turn(
         &self,
         trace: &TurnTrace,

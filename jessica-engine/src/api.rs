@@ -2,24 +2,35 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
+use async_trait::async_trait;
+use jessica_core::events::{EventSink, EventSinkError};
 use jessica_core::llm::LlmProvider;
 use jessica_core::policy::Policy;
 use jessica_core::tool::ToolRegistry;
-use jessica_core::types::{Message, Role, SessionEndReason, SessionId};
-use jessica_harness::{AllowlistPolicy, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard};
-use tokio::sync::broadcast;
+use jessica_core::trace::TraceTurnMode;
+use jessica_core::types::{AgentEvent, Message, Role, SessionEndReason, SessionId};
+use jessica_harness::{
+    AllowlistPolicy, Harness, ResultSizeGuard, TokenBudgetGuard, ToolTimeoutGuard,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::ResultManager;
-use crate::config::{EngineConfig, ResultConfig};
+use crate::config::{EngineConfig, ResultConfig, TracePolicy};
 use crate::error::EngineError;
 use crate::governance::{GovernanceState, GovernedTool, TokenCountingProvider};
 use crate::policy::{PolicyTool, PolicyV2};
-use crate::ports::{ToolContext, ToolPermissionGate, ToolProvider};
+use crate::ports::{
+    ToolContext, ToolPermissionGate, ToolProvider, TraceStore, TurnObserver, TurnTrace,
+};
+use crate::pump::{EventPump, LagHandling, PumpIntegrity, PumpOutput};
 use crate::tooling::ToolEntry;
+
+/// Maximum time to wait for the pump to observe a session's terminal event.
+const PUMP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Input for one governed turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +98,10 @@ struct EngineDependencies {
     tool_provider: Arc<dyn ToolProvider>,
     /// Optional approval gate.
     approval_gate: Option<Arc<dyn ToolPermissionGate>>,
+    /// Durable trace store, required by [`TracePolicy::Required`].
+    trace_store: Option<Arc<dyn TraceStore>>,
+    /// Optional observer of every event the pump processes.
+    observer: Option<Arc<dyn TurnObserver>>,
 }
 
 /// Shared governance objects wrapped around every exposed tool in one turn.
@@ -108,9 +123,10 @@ struct TurnTooling {
 /// A configured governed engine.
 ///
 /// The engine owns one immutable [`EngineConfig`] snapshot and runs the
-/// provider-to-tool vertical slice for each [`TurnRequest`]. Journal, pump,
-/// acceptance, memory, skill, delegation, and resume orchestration are later
-/// Phase 11 tasks.
+/// provider-to-tool vertical slice for each [`TurnRequest`]. Task E2 added the
+/// producer-side trace sink, the event pump, and the required-trace lifecycle.
+/// Acceptance orchestration, memory, skills, delegation, and resume remain
+/// later Phase 11 tasks.
 pub struct Engine {
     config: EngineConfig,
     result_config: ResultConfig,
@@ -129,17 +145,24 @@ impl Engine {
         &self.result_config
     }
 
-    /// Runs one minimal governed turn.
+    /// Runs one governed turn.
     ///
     /// The turn builds a fresh tool catalog, filters it through the allowlist,
     /// wraps every exposed tool with [`GovernedTool`], and drives
-    /// [`jessica_runtime::AgentLoop`] through the token-counting provider. It
-    /// deliberately does not persist a trace, pump UI events, run acceptance,
-    /// recall memory or skills, delegate, or resume; those belong to E2–E5.
+    /// [`jessica_runtime::AgentLoop`] through the token-counting provider. A
+    /// required trace is opened before the agent starts, every producer event
+    /// is recorded before it is broadcast, and the turn only succeeds after
+    /// `turn_ended` is acknowledged. Acceptance orchestration, memory, skills,
+    /// delegation, and resume belong to later Phase 11 tasks.
     ///
     /// A budget trip is reported as [`SessionEndReason::BudgetExceeded`] even
     /// when the runtime loop itself returned another reason, because the
     /// governance state is the authoritative budget signal.
+    ///
+    /// A pump gap does not discard a producer-complete trace: it sets
+    /// [`TurnOutcome::lagged`] so the caller knows the observer-side transcript
+    /// and sensor path are incomplete. Any trace write or close failure is
+    /// returned as [`EngineError::TraceIncomplete`] instead of a success.
     pub async fn run_turn(&self, request: TurnRequest) -> Result<TurnOutcome, EngineError> {
         let workspace_root = tokio::fs::canonicalize(request.workspace_root())
             .await
@@ -151,8 +174,37 @@ impl Engine {
         let turn_id = format!("turn-{sequence}");
         let session_id = SessionId::new(turn_id.clone());
         let cancel = CancellationToken::new();
-        let (events, _receiver) = broadcast::channel(1024);
-        let governance = Arc::new(GovernanceState::new(events.clone(), cancel.clone()));
+        let initial = vec![Message::user(request.input())];
+        let turn_start = initial.len();
+        let trace = TurnTrace {
+            turn_id: turn_id.clone(),
+            session_id: session_id.clone(),
+            attempt: Some(1),
+        };
+        let trace_store = match self.config.trace_policy() {
+            TracePolicy::Disabled => None,
+            TracePolicy::Required => Some(Arc::clone(
+                self.dependencies
+                    .trace_store
+                    .as_ref()
+                    .ok_or(EngineError::MissingTraceStore)?,
+            )),
+        };
+
+        let harness = Arc::new(Harness::new(Vec::new()));
+        let events = harness.events();
+        let trace_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink: Option<Arc<dyn EventSink>> = trace_store.as_ref().map(|store| {
+            Arc::new(TraceEventSink {
+                store: Arc::clone(store),
+                trace: trace.clone(),
+                cancel: cancel.clone(),
+                failure: Arc::clone(&trace_failure),
+            }) as Arc<dyn EventSink>
+        });
+        let governance = Arc::new(
+            GovernanceState::new(events.clone(), cancel.clone()).with_event_sink(sink.clone()),
+        );
 
         let provider: Arc<dyn LlmProvider> = Arc::new(TokenCountingProvider::new(
             Arc::clone(&self.dependencies.provider),
@@ -193,7 +245,7 @@ impl Engine {
         let result_guard = Arc::new(ResultSizeGuard::new(self.config.tools().max_result_bytes));
         let tooling = TurnTooling {
             allowlist,
-            governance,
+            governance: Arc::clone(&governance),
             policy_v2,
             result_manager,
             timeout_guard,
@@ -217,39 +269,98 @@ impl Engine {
             self.config.budget().clone(),
             events,
         );
-        let initial = vec![Message::user(request.input())];
-        let turn_start = initial.len();
+        let agent = match &sink {
+            Some(sink) => agent.with_event_sink(Arc::clone(sink)),
+            None => agent,
+        };
+        let pump = Arc::new(EventPump::new(
+            Arc::clone(&harness),
+            Arc::clone(&governance),
+            Arc::new(EnginePumpIntegrity),
+            PumpOutput::Silent,
+            self.dependencies.observer.clone(),
+        ));
+
+        if let Some(store) = &trace_store {
+            store
+                .begin_turn(&trace, TraceTurnMode::Fresh, &initial)
+                .await
+                .map_err(|error| trace_incomplete(&turn_id, error))?;
+        }
+
+        let pump_task = tokio::spawn(Arc::clone(&pump).run(harness.subscribe()));
+        pump.register(session_id.clone(), initial.clone());
+
         let transcript = agent
             .run_with_transcript(
-                session_id,
+                session_id.clone(),
                 initial,
                 self.config.max_tool_calls(),
                 cancel.clone(),
             )
             .await;
-        let reason = if tooling.governance.tripped()
-            && transcript.reason != SessionEndReason::BudgetExceeded
-        {
-            SessionEndReason::BudgetExceeded
-        } else {
-            transcript.reason
-        };
-        let last_output = transcript
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == Role::Assistant)
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
+        if let Some(cause) = failure_slot(&trace_failure).clone() {
+            pump_task.abort();
+            return Err(EngineError::TraceIncomplete { turn_id, cause });
+        }
 
-        Ok(TurnOutcome {
+        let snapshot = match tokio::time::timeout(PUMP_TIMEOUT, pump.wait_for(&session_id)).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                pump_task.abort();
+                return Err(EngineError::TraceIncomplete {
+                    turn_id,
+                    cause: "the event pump did not observe the session terminal event".to_owned(),
+                });
+            }
+            Err(_) => {
+                pump_task.abort();
+                return Err(EngineError::TraceIncomplete {
+                    turn_id,
+                    cause: "timed out waiting for the event pump".to_owned(),
+                });
+            }
+        };
+        let reason =
+            if governance.tripped() && transcript.reason != SessionEndReason::BudgetExceeded {
+                SessionEndReason::BudgetExceeded
+            } else {
+                transcript.reason
+            };
+        let lagged = pump.has_lagged();
+        let (messages, last_output) = if lagged {
+            // The observer lost events, so its transcript is not authoritative.
+            // The runtime transcript and the producer-side trace are complete;
+            // expose the gap instead of returning a silently shortened
+            // conversation as if it were whole.
+            let last_output = transcript
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::Assistant)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            (transcript.messages.clone(), last_output)
+        } else {
+            (snapshot.messages, snapshot.last_output)
+        };
+
+        let outcome = TurnOutcome {
             reason,
-            messages: transcript.messages,
+            messages,
             last_output,
             turn_start,
-            turn_id,
-            lagged: false,
-        })
+            turn_id: turn_id.clone(),
+            lagged,
+        };
+        if let Some(store) = &trace_store
+            && let Err(error) = store.finish_turn(&trace, &outcome).await
+        {
+            pump_task.abort();
+            return Err(trace_incomplete(&turn_id, error));
+        }
+        pump_task.abort();
+        Ok(outcome)
     }
 
     /// Wraps one host tool in the complete E1 governance chain.
@@ -287,6 +398,74 @@ impl Engine {
     }
 }
 
+/// Producer-side sink that records every event before it is broadcast.
+///
+/// The first failure is retained so `run_turn` can return the authoritative
+/// cause even though the runtime only reports a generic sink failure.
+struct TraceEventSink {
+    /// Durable trace store for the turn.
+    store: Arc<dyn TraceStore>,
+    /// Turn and session attribution for every recorded event.
+    trace: TurnTrace,
+    /// Cancels the agent so no later event is produced.
+    cancel: CancellationToken,
+    /// First trace failure, shared with `run_turn`.
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait]
+impl EventSink for TraceEventSink {
+    async fn emit(&self, event: AgentEvent) -> Result<(), EventSinkError> {
+        if let Some(cause) = failure_slot(&self.failure).clone() {
+            return Err(EventSinkError::new(cause));
+        }
+        match self.store.record(&self.trace, event).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let cause = trace_cause(error);
+                *failure_slot(&self.failure) = Some(cause.clone());
+                self.cancel.cancel();
+                Err(EventSinkError::new(cause))
+            }
+        }
+    }
+}
+
+/// Pump policy for engine-owned turns: a gap is reported in the outcome.
+struct EnginePumpIntegrity;
+
+impl PumpIntegrity for EnginePumpIntegrity {
+    fn broadcast_lagged(&self, _skipped: u64, _output: PumpOutput) -> LagHandling {
+        LagHandling::Continue
+    }
+}
+
+/// Locks the first trace-failure slot, recovering from poisoning.
+fn failure_slot(failure: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    failure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Normalizes any trace-port failure into [`EngineError::TraceIncomplete`].
+fn trace_incomplete(turn_id: &str, error: EngineError) -> EngineError {
+    match error {
+        error @ EngineError::TraceIncomplete { .. } => error,
+        other => EngineError::TraceIncomplete {
+            turn_id: turn_id.to_owned(),
+            cause: other.to_string(),
+        },
+    }
+}
+
+/// Extracts the underlying cause from a trace-port failure.
+fn trace_cause(error: EngineError) -> String {
+    match error {
+        EngineError::TraceIncomplete { cause, .. } => cause,
+        other => other.to_string(),
+    }
+}
+
 impl std::fmt::Debug for Engine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -299,15 +478,18 @@ impl std::fmt::Debug for Engine {
 
 /// Builds an [`Engine`] from explicit host ports and engine decisions.
 ///
-/// The builder deliberately accepts no pre-assembled `Harness`, `ToolRegistry`,
-/// or trace store: every governed dependency crosses a named port, and the
-/// trace policy must be explicit. A policy that can ask for approval also
-/// requires a permission gate at build time.
+/// The builder deliberately accepts no pre-assembled `Harness` or
+/// `ToolRegistry`: every governed dependency crosses a named port, and the
+/// trace policy must be explicit. A required trace needs a [`TraceStore`]; a
+/// policy that can ask for approval also requires a permission gate at build
+/// time.
 #[derive(Default)]
 pub struct EngineBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
     tool_provider: Option<Arc<dyn ToolProvider>>,
     approval_gate: Option<Arc<dyn ToolPermissionGate>>,
+    trace_store: Option<Arc<dyn TraceStore>>,
+    observer: Option<Arc<dyn TurnObserver>>,
     result_config: Option<ResultConfig>,
     config: Option<EngineConfig>,
 }
@@ -336,6 +518,25 @@ impl EngineBuilder {
         self
     }
 
+    /// Sets the durable trace store.
+    ///
+    /// [`TracePolicy::Required`] is the default and fails assembly without a
+    /// store. [`TracePolicy::Disabled`] writes no trace and leaves a configured
+    /// store unused.
+    pub fn trace_store(mut self, trace_store: Arc<dyn TraceStore>) -> Self {
+        self.trace_store = Some(trace_store);
+        self
+    }
+
+    /// Sets the observer that receives every event the pump processes.
+    ///
+    /// The observer runs after durable recording and before human-console
+    /// rendering. It is optional even when a trace is required.
+    pub fn observer(mut self, observer: Arc<dyn TurnObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Sets the result-management configuration.
     pub fn result_config(mut self, result_config: ResultConfig) -> Self {
         self.result_config = Some(result_config);
@@ -351,13 +552,17 @@ impl EngineBuilder {
     /// Validates the supplied ports and configuration and builds an engine.
     ///
     /// The missing-dependency checks run in a fixed order so callers get a
-    /// deterministic first error. An approval gate is required when the policy
-    /// contains an ask rule or when an explicit ask mode is configured.
+    /// deterministic first error. A required trace needs a store, and an
+    /// approval gate is required when the policy contains an ask rule or when
+    /// an explicit ask mode is configured.
     pub fn build(self) -> Result<Engine, EngineError> {
         let provider = self.provider.ok_or(EngineError::MissingProvider)?;
         let tool_provider = self.tool_provider.ok_or(EngineError::MissingToolProvider)?;
         let config = self.config.ok_or(EngineError::MissingConfig)?;
         let result_config = self.result_config.ok_or(EngineError::MissingResultConfig)?;
+        if config.trace_policy() == TracePolicy::Required && self.trace_store.is_none() {
+            return Err(EngineError::MissingTraceStore);
+        }
         if config.requires_approval_gate() && self.approval_gate.is_none() {
             return Err(EngineError::MissingApprovalGate);
         }
@@ -369,6 +574,8 @@ impl EngineBuilder {
                 provider,
                 tool_provider,
                 approval_gate: self.approval_gate,
+                trace_store: self.trace_store,
+                observer: self.observer,
             },
             next_turn: AtomicU64::new(0),
         })
@@ -378,13 +585,15 @@ impl EngineBuilder {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use jessica_core::llm::{LlmError, LlmEvent, LlmProvider, LlmStream};
     use jessica_core::tool::{Tool, ToolSchema};
+    use jessica_core::trace::{TracePayload, TraceTurnMode, TurnId};
     use jessica_core::types::{Budget, Message, TokenUsage, ToolCall, ToolResult};
+    use jessica_memory::EventStore;
     use serde_json::{Value, json};
 
     use super::*;
@@ -392,7 +601,8 @@ mod tests {
         ApprovalConfig, ApprovalMode, PolicyConfig, PolicyRule, RuleAction, ToolExecutionConfig,
         ToolSelector, TracePolicy,
     };
-    use crate::ports::{ToolContext, ToolPermissionDecision};
+    use crate::ports::{ToolContext, ToolPermissionDecision, TraceStore, TurnObserver, TurnTrace};
+    use crate::recorder::SqliteTraceStore;
     use crate::tooling::{
         ApprovalPolicy, ToolCatalog, ToolDescriptor, ToolLimits, ToolMetadata, ToolSource,
     };
@@ -439,7 +649,7 @@ mod tests {
     }
 
     fn config() -> EngineConfig {
-        EngineConfig::new(TracePolicy::Disabled).expect("disabled trace is supported")
+        EngineConfig::new(TracePolicy::Disabled)
     }
 
     fn base_builder() -> EngineBuilder {
@@ -502,9 +712,7 @@ mod tests {
                 reason: None,
             }],
         };
-        let configured = EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace is supported")
-            .with_policy(policy);
+        let configured = EngineConfig::new(TracePolicy::Disabled).with_policy(policy);
 
         let error = EngineBuilder::new()
             .provider(provider())
@@ -519,12 +727,10 @@ mod tests {
 
     #[test]
     fn a_gate_lets_an_explicit_ask_configuration_assemble() {
-        let configured = EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace is supported")
-            .with_approval(ApprovalConfig {
-                mode: ApprovalMode::Ask,
-                explicit: true,
-            });
+        let configured = EngineConfig::new(TracePolicy::Disabled).with_approval(ApprovalConfig {
+            mode: ApprovalMode::Ask,
+            explicit: true,
+        });
 
         let engine = EngineBuilder::new()
             .provider(provider())
@@ -694,6 +900,51 @@ mod tests {
         }
     }
 
+    /// Emits one text delta per entry, then a single `Done`.
+    struct DeltaProvider {
+        texts: Vec<String>,
+        usage: TokenUsage,
+    }
+
+    #[async_trait]
+    impl LlmProvider for DeltaProvider {
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            let mut events: Vec<LlmEvent> = self
+                .texts
+                .iter()
+                .map(|text| LlmEvent::TextDelta { text: text.clone() })
+                .collect();
+            events.push(LlmEvent::Done {
+                usage: Some(self.usage),
+            });
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Counts provider calls so a test can prove the model was never reached.
+    struct CountingProvider {
+        calls: Arc<AtomicU32>,
+        usage: TokenUsage,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn stream_chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![LlmEvent::Done {
+                usage: Some(self.usage),
+            }])))
+        }
+    }
+
     fn descriptor(name: &str) -> ToolDescriptor {
         ToolDescriptor::new(
             name.to_owned(),
@@ -723,7 +974,6 @@ mod tests {
 
     fn run_config(allowed: &[&str], rules: Vec<PolicyRule>, max_tokens: u64) -> EngineConfig {
         EngineConfig::new(TracePolicy::Disabled)
-            .expect("disabled trace")
             .with_budget(Budget::new(max_tokens, Duration::from_secs(1), 4))
             .with_policy(PolicyConfig {
                 allowed_tools: allowed.iter().map(|name| (*name).to_owned()).collect(),
@@ -748,6 +998,487 @@ mod tests {
             .result_config(ResultConfig::default())
             .build()
             .expect("engine must assemble")
+    }
+
+    /// A trace store that logs accepted events and can inject failures.
+    #[derive(Default)]
+    struct MockTraceStore {
+        begin_calls: AtomicU32,
+        record_calls: AtomicU32,
+        finish_calls: AtomicU32,
+        fail_begin: AtomicBool,
+        fail_record_at: AtomicU32,
+        fail_finish: AtomicBool,
+        recorded: Mutex<Vec<AgentEvent>>,
+        observed_prefix: Mutex<Option<(Arc<RecordingObserver>, usize)>>,
+    }
+
+    impl MockTraceStore {
+        fn fail_begin(&self) {
+            self.fail_begin.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_record_at(&self, call: u32) {
+            self.fail_record_at.store(call, Ordering::SeqCst);
+        }
+
+        fn fail_finish(&self) {
+            self.fail_finish.store(true, Ordering::SeqCst);
+        }
+
+        fn begin_count(&self) -> u32 {
+            self.begin_calls.load(Ordering::SeqCst)
+        }
+
+        fn record_count(&self) -> u32 {
+            self.record_calls.load(Ordering::SeqCst)
+        }
+
+        fn finish_count(&self) -> u32 {
+            self.finish_calls.load(Ordering::SeqCst)
+        }
+
+        fn recorded(&self) -> Vec<AgentEvent> {
+            self.recorded
+                .lock()
+                .expect("recorded events must not be poisoned")
+                .clone()
+        }
+
+        /// Makes the injected record failure wait until `observer` has seen
+        /// `count` broadcast events, so the test can prove the sink ran first.
+        fn observe_prefix(&self, observer: Arc<RecordingObserver>, count: usize) {
+            *self
+                .observed_prefix
+                .lock()
+                .expect("observed-prefix slot must not be poisoned") = Some((observer, count));
+        }
+    }
+
+    #[async_trait]
+    impl TraceStore for MockTraceStore {
+        async fn begin_turn(
+            &self,
+            trace: &TurnTrace,
+            _mode: TraceTurnMode,
+            _messages: &[Message],
+        ) -> Result<(), EngineError> {
+            self.begin_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_begin.load(Ordering::SeqCst) {
+                return Err(mock_trace_failure(trace, "injected begin failure"));
+            }
+            Ok(())
+        }
+
+        async fn record(&self, trace: &TurnTrace, event: AgentEvent) -> Result<(), EngineError> {
+            let call = self.record_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_record_at.load(Ordering::SeqCst) == call {
+                let watched = self
+                    .observed_prefix
+                    .lock()
+                    .expect("observed-prefix slot must not be poisoned")
+                    .clone();
+                if let Some((observer, count)) = watched {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while observer.event_count() < count {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect(
+                        "the pump must observe every durable event before the injected failure",
+                    );
+                }
+                return Err(mock_trace_failure(trace, "injected record failure"));
+            }
+            self.recorded
+                .lock()
+                .expect("recorded events must not be poisoned")
+                .push(event);
+            Ok(())
+        }
+
+        async fn finish_turn(
+            &self,
+            trace: &TurnTrace,
+            _outcome: &TurnOutcome,
+        ) -> Result<(), EngineError> {
+            self.finish_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_finish.load(Ordering::SeqCst) {
+                return Err(mock_trace_failure(trace, "injected finish failure"));
+            }
+            Ok(())
+        }
+    }
+
+    fn mock_trace_failure(trace: &TurnTrace, cause: &str) -> EngineError {
+        EngineError::TraceIncomplete {
+            turn_id: trace.turn_id.clone(),
+            cause: cause.to_owned(),
+        }
+    }
+
+    /// Records every event the pump publishes after durable recording.
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<AgentEvent> {
+            self.events
+                .lock()
+                .expect("observed events must not be poisoned")
+                .clone()
+        }
+
+        fn event_count(&self) -> usize {
+            self.events
+                .lock()
+                .expect("observed events must not be poisoned")
+                .len()
+        }
+    }
+
+    impl TurnObserver for RecordingObserver {
+        fn publish(&self, event: &AgentEvent) {
+            self.events
+                .lock()
+                .expect("observed events must not be poisoned")
+                .push(event.clone());
+        }
+    }
+
+    fn required_config() -> EngineConfig {
+        EngineConfig::default()
+            .with_budget(Budget::new(100, Duration::from_secs(1), 4))
+            .with_policy(PolicyConfig {
+                allowed_tools: Vec::new(),
+                rules: Vec::new(),
+            })
+            .with_tools(ToolExecutionConfig {
+                timeout: Duration::from_secs(1),
+                max_args_bytes: None,
+                max_result_bytes: 1024,
+            })
+    }
+
+    fn required_engine(provider: Arc<dyn LlmProvider>, store: Arc<dyn TraceStore>) -> Engine {
+        EngineBuilder::new()
+            .provider(provider)
+            .tool_provider(tools())
+            .trace_store(store)
+            .config(required_config())
+            .result_config(ResultConfig::default())
+            .build()
+            .expect("required-trace engine must assemble")
+    }
+
+    #[test]
+    fn a_required_trace_without_a_store_fails_assembly() {
+        assert_eq!(
+            EngineConfig::default().trace_policy(),
+            TracePolicy::Required
+        );
+
+        let error = EngineBuilder::new()
+            .provider(provider())
+            .tool_provider(tools())
+            .config(EngineConfig::default())
+            .result_config(ResultConfig::default())
+            .build()
+            .expect_err("a required trace must reject a missing store");
+
+        assert!(matches!(error, EngineError::MissingTraceStore));
+    }
+
+    #[tokio::test]
+    async fn a_trace_that_cannot_open_never_reaches_the_provider() {
+        let temp = TempDir::new("trace-begin-failure");
+        let store = Arc::new(MockTraceStore::default());
+        store.fail_begin();
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider: Arc<dyn LlmProvider> = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+            usage: TokenUsage::new(1, 1),
+        });
+        let store_port: Arc<dyn TraceStore> = store.clone();
+        let engine = required_engine(provider, store_port);
+
+        let error = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect_err("an unopened trace must fail the turn");
+
+        match &error {
+            EngineError::TraceIncomplete { turn_id, cause } => {
+                assert_eq!(turn_id, "turn-1");
+                assert!(
+                    cause.contains("injected begin failure"),
+                    "unexpected cause: {cause}"
+                );
+            }
+            other => panic!("expected TraceIncomplete, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the model must not run");
+        assert_eq!(store.begin_count(), 1);
+        assert_eq!(store.record_count(), 0);
+        assert_eq!(store.finish_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_trace_write_failure_returns_trace_incomplete_without_turn_ended() {
+        let temp = TempDir::new("trace-write-failure");
+        let store = Arc::new(MockTraceStore::default());
+        store.fail_record_at(3);
+        let provider: Arc<dyn LlmProvider> = Arc::new(DeltaProvider {
+            texts: vec!["first".to_owned(), "second".to_owned()],
+            usage: TokenUsage::new(1, 1),
+        });
+        let store_port: Arc<dyn TraceStore> = store.clone();
+        let engine = required_engine(provider, store_port);
+
+        let error = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect_err("an unrecorded event must fail the turn");
+
+        match &error {
+            EngineError::TraceIncomplete { turn_id, cause } => {
+                assert_eq!(turn_id, "turn-1");
+                assert!(
+                    cause.contains("injected record failure"),
+                    "unexpected cause: {cause}"
+                );
+            }
+            other => panic!("expected TraceIncomplete, got {other:?}"),
+        }
+        let recorded = store.recorded();
+        assert_eq!(recorded.len(), 2);
+        assert!(matches!(
+            recorded.first(),
+            Some(AgentEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            recorded.get(1),
+            Some(AgentEvent::RoundStarted { .. })
+        ));
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| matches!(event, AgentEvent::SessionEnded { .. })),
+            "a rejected trace must not observe the terminal event"
+        );
+        assert_eq!(
+            store.finish_count(),
+            0,
+            "a rejected trace must never receive turn_ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_event_is_never_broadcast_and_no_later_event_follows() {
+        let temp = TempDir::new("sink-before-broadcast");
+        let observer = Arc::new(RecordingObserver::default());
+        let store = Arc::new(MockTraceStore::default());
+        store.fail_record_at(4);
+        store.observe_prefix(Arc::clone(&observer), 3);
+        let provider: Arc<dyn LlmProvider> = Arc::new(DeltaProvider {
+            texts: vec!["first".to_owned(), "second".to_owned()],
+            usage: TokenUsage::new(1, 1),
+        });
+        let store_port: Arc<dyn TraceStore> = store.clone();
+        let observer_port: Arc<dyn TurnObserver> = observer.clone();
+        let engine = EngineBuilder::new()
+            .provider(provider)
+            .tool_provider(tools())
+            .trace_store(store_port)
+            .observer(observer_port)
+            .config(required_config())
+            .result_config(ResultConfig::default())
+            .build()
+            .expect("the observer engine must assemble");
+
+        let error = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect_err("the rejected event must fail the turn");
+
+        assert!(matches!(error, EngineError::TraceIncomplete { .. }));
+        let observed = observer.events();
+        assert_eq!(
+            observed.len(),
+            3,
+            "the rejected event and everything after it must stay off the broadcast"
+        );
+        assert!(matches!(
+            observed.first(),
+            Some(AgentEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            observed.get(1),
+            Some(AgentEvent::RoundStarted { .. })
+        ));
+        assert!(matches!(
+            observed.get(2),
+            Some(AgentEvent::ModelDelta { text }) if text == "first"
+        ));
+        assert_eq!(store.recorded().len(), 3);
+        assert_eq!(store.finish_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_turn_end_is_not_a_successful_turn() {
+        let temp = TempDir::new("trace-finish-failure");
+        let store = Arc::new(MockTraceStore::default());
+        store.fail_finish();
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider {
+            text: "answer",
+            usage: TokenUsage::new(1, 1),
+        });
+        let store_port: Arc<dyn TraceStore> = store.clone();
+        let engine = required_engine(provider, store_port);
+
+        let error = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect_err("a missing close acknowledgement must not be success");
+
+        match &error {
+            EngineError::TraceIncomplete { turn_id, cause } => {
+                assert_eq!(turn_id, "turn-1");
+                assert!(
+                    cause.contains("injected finish failure"),
+                    "unexpected cause: {cause}"
+                );
+            }
+            other => panic!("expected TraceIncomplete, got {other:?}"),
+        }
+        let recorded = store.recorded();
+        assert!(
+            matches!(recorded.last(), Some(AgentEvent::SessionEnded { .. })),
+            "the producer stream must be complete before the close is attempted"
+        );
+        assert_eq!(store.finish_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pump_gap_is_exposed_in_an_otherwise_complete_turn() {
+        let temp = TempDir::new("pump-lag");
+        let store = Arc::new(MockTraceStore::default());
+        let provider: Arc<dyn LlmProvider> = Arc::new(DeltaProvider {
+            texts: vec!["x".to_owned(); 2000],
+            usage: TokenUsage::new(1, 1),
+        });
+        let store_port: Arc<dyn TraceStore> = store.clone();
+        let engine = required_engine(provider, store_port);
+
+        let outcome = engine
+            .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+            .await
+            .expect("the producer trace has no gap and must succeed");
+
+        assert!(
+            outcome.lagged,
+            "the 1024-event broadcast buffer must have overflowed"
+        );
+        assert_eq!(outcome.reason, SessionEndReason::Completed);
+        assert_eq!(
+            outcome.messages,
+            vec![Message::user("go"), Message::assistant("x".repeat(2000))]
+        );
+        assert_eq!(outcome.last_output, "x".repeat(2000));
+        let recorded = store.recorded();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ModelDelta { .. }))
+                .count(),
+            2000,
+            "the producer trace must retain every delta despite the observer gap"
+        );
+        assert!(matches!(
+            recorded.first(),
+            Some(AgentEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            recorded.last(),
+            Some(AgentEvent::SessionEnded { .. })
+        ));
+        assert_eq!(store.finish_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_sqlite_store_closes_a_trace_and_keeps_the_legacy_mirror() {
+        let temp = TempDir::new("sqlite-trace");
+        let database = temp.path.join("trace.sqlite3");
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider {
+            text: "answer",
+            usage: TokenUsage::new(1, 1),
+        });
+        {
+            let store: Arc<dyn TraceStore> = Arc::new(
+                SqliteTraceStore::open(database.clone())
+                    .await
+                    .expect("the trace store must open"),
+            );
+            let engine = required_engine(provider, Arc::clone(&store));
+
+            let outcome = engine
+                .run_turn(TurnRequest::new("go").with_workspace_root(&temp.path))
+                .await
+                .expect("a durable required trace must close");
+            assert_eq!(outcome.reason, SessionEndReason::Completed);
+            assert!(!outcome.lagged);
+        }
+
+        let store = EventStore::open(&database).expect("the database must reopen");
+        let turn_id = TurnId::new("turn-1");
+        let trace = store
+            .trace_turn(&turn_id)
+            .expect("the trace must load")
+            .expect("the turn must exist");
+        assert!(trace.closed(), "the trace must end with turn_ended");
+        assert_eq!(trace.events().len(), 7);
+        match &trace.events()[0].event().payload {
+            TracePayload::TurnStarted { mode, messages } => {
+                assert_eq!(*mode, TraceTurnMode::Fresh);
+                assert_eq!(messages, &vec![Message::user("go")]);
+            }
+            other => panic!("expected turn_started, got {other:?}"),
+        }
+        match &trace
+            .events()
+            .last()
+            .expect("the trace must not be empty")
+            .event()
+            .payload
+        {
+            TracePayload::TurnEnded { reason } => {
+                assert_eq!(*reason, SessionEndReason::Completed);
+            }
+            other => panic!("expected turn_ended, got {other:?}"),
+        }
+
+        let session_id = SessionId::new("turn-1");
+        let legacy = store
+            .events(&session_id)
+            .expect("the legacy mirror must load");
+        assert_eq!(legacy.len(), 5);
+        assert!(matches!(
+            legacy.first().map(|event| event.event()),
+            Some(AgentEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            legacy.last().map(|event| event.event()),
+            Some(AgentEvent::SessionEnded { .. })
+        ));
+        assert_eq!(
+            store
+                .session_messages(&session_id)
+                .expect("session metadata must load"),
+            Some(vec![Message::user("go")])
+        );
     }
 
     #[tokio::test]
